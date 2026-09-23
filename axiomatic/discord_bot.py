@@ -23990,6 +23990,23 @@ _chat_transports: list = []
 _chat_transport_tasks: dict = {}
 
 
+def _own_platform_config() -> dict:
+    """交給 transport 註冊表的設定，**只含這個行程自己那個平台**。
+
+    ⚠️ 這裡收窄範圍不是最佳化，是正確性。`build_transports()` 會問**每一個**註冊過的
+    factory，而每個 factory 只看設定裡自己那一段。整份 `platforms` 餵下去的話，
+    discord 那個行程會連 telegram 的 transport 一起建起來——同一個憑證上跑兩條長輪詢、
+    每則訊息被處理兩次，而兩邊的紀錄看起來都正常。一個平台一個行程的前提就是
+    **一個行程只認自己那個平台**。
+
+    預設平台回空 dict：它走的是原生函式庫的事件迴圈，沒有、也不該有 transport。
+    """
+    if ACTIVE_PLATFORM == _platform_runtime.DEFAULT_PLATFORM:
+        return {}
+    section = (BOT_CONFIG.get("platforms") or {}).get(ACTIVE_PLATFORM)
+    return {ACTIVE_PLATFORM: section} if section else {}
+
+
 def _build_chat_transports() -> None:
     """第一次 `on_ready` 時建一次。沒設定的平台安靜缺席，整支永不 raise。"""
     global _chat_transports
@@ -23997,7 +24014,7 @@ def _build_chat_transports() -> None:
         return
     try:
         context = _chat_platform.TransportContext(
-            config=BOT_CONFIG.get("platforms") or {},
+            config=_own_platform_config(),
             owner_uid=OWNER_USER_ID,
             command_channel_id=CHANNEL_ID,
             handle_message=dispatch_external_message,

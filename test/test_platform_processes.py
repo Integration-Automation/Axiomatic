@@ -371,6 +371,32 @@ def test_the_stand_aside_notice_says_who_is_doing_it_and_what_to_do():
         assert banned not in text, f"讓位訊息裡出現了 {banned!r}：{text}"
 
 
+def test_a_process_only_builds_the_transport_for_its_own_platform(monkeypatch):
+    """**正確性，不是最佳化。**
+
+    `build_transports()` 會問每一個註冊過的 factory，而每個 factory 只看設定裡自己
+    那一段。整份 `platforms` 餵下去的話，預設平台那個行程會連別的平台的 transport
+    一起建起來——同一個憑證上跑兩條長輪詢、每則訊息被處理兩次，而兩邊的紀錄看起來
+    都正常。
+    """
+    import discord_bot as b  # noqa: PLC0415
+
+    both = {"platforms": {"discord": {"enabled": True},
+                          "telegram": {"enabled": True, "owner_user_ids": []}}}
+    monkeypatch.setattr(b, "BOT_CONFIG", both)
+
+    monkeypatch.setattr(b, "ACTIVE_PLATFORM", "telegram")
+    assert set(b._own_platform_config()) == {"telegram"}
+
+    monkeypatch.setattr(b, "ACTIVE_PLATFORM", pr.DEFAULT_PLATFORM)
+    assert b._own_platform_config() == {}, (
+        "預設平台走的是原生函式庫的事件迴圈，不該建任何 transport")
+
+    # 設定裡根本沒有這個平台時也不得憑空造一段出來。
+    monkeypatch.setattr(b, "ACTIVE_PLATFORM", "nowhere")
+    assert b._own_platform_config() == {}
+
+
 def test_the_batch_lock_is_not_per_platform():
     """批次**全機一份**，所以它的鎖刻意不帶平台名。
 

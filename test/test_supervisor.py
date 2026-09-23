@@ -1037,6 +1037,35 @@ def test_other_launcher_pids_collapses_the_shim_and_the_real_interpreter():
                                procs=procs) == [11]
 
 
+def test_other_launcher_pids_can_be_narrowed_to_one_platform():
+    """bot 的啟動器是**一個平台一個行程**，而它們共用同一個腳本檔名。
+
+    不收窄的話「telegram 那一支在跑嗎」會被另一個平台的那一支答成「在」，於是
+    `wake_autostart` 永遠叫不醒它——而那個症狀是「叫醒完成」，看起來完全正常。
+    """
+    from _supervisor import other_launcher_pids
+    script = "start_discord_bot.py"
+    procs = [(11, "python.exe",
+              ["C:/py/python.exe", f"D:/x/{script}", "--platform", "discord"], 1),
+             (12, "python.exe",
+              ["C:/py/python.exe", f"D:/x/{script}", "--platform", "telegram"], 1)]
+    assert other_launcher_pids(script, self_pid=99, procs=procs) == [11, 12]
+    assert other_launcher_pids(script, self_pid=99, procs=procs,
+                               also_contains="telegram") == [12]
+    assert other_launcher_pids(script, self_pid=99, procs=procs,
+                               also_contains="discord") == [11]
+
+
+def test_the_platform_filter_matches_a_whole_argument_not_a_substring():
+    """`telegram2` 不是 `telegram`。逐字比對一整個 argv 元素，不是子字串。"""
+    from _supervisor import other_launcher_pids
+    script = "start_discord_bot.py"
+    procs = [(11, "python.exe",
+              ["C:/py/python.exe", f"D:/x/{script}", "--platform", "telegram2"], 1)]
+    assert other_launcher_pids(script, self_pid=99, procs=procs,
+                               also_contains="telegram") == []
+
+
 def test_other_launcher_pids_never_raises_on_junk():
     """診斷用的東西不該把啟動器弄掛。"""
     from _supervisor import other_launcher_pids

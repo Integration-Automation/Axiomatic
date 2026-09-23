@@ -203,9 +203,9 @@ py -3 install_autostart.py --remove     # 移除
 有桌面的 Chrome 視窗，而開機觸發的工作跑在 session 0、沒有互動桌面，Chrome 在
 那裡起不來。代價是機器重開後停在鎖定畫面、沒有人登入的話工作不會觸發。
 
-已經註冊過的話，`py -3 wake_autostart.py` 可以直接從排程器叫醒兩個監督者，
-拿到的環境和登入自動啟動那一份一樣。只要其中一支就加 `--bot-only` 或
-`--batch-only`。
+已經註冊過的話，`py -3 wake_autostart.py` 可以直接從排程器叫醒**已註冊的每一筆**，
+拿到的環境和登入自動啟動那一份一樣。只要平台那幾筆就加 `--bot-only`，只要批次那一筆
+就加 `--batch-only`。
 
 ## 建置本文件（選用）
 

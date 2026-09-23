@@ -249,7 +249,8 @@ def acquire_single_instance_lock(path) -> InstanceLock | None:
 
 
 def other_launcher_pids(script_name: str, *, self_pid: int | None = None,
-                        procs=None) -> list[int]:
+                        procs=None, also_contains: str | None = None
+                        ) -> list[int]:
     """還活著、正在跑 `script_name` 這支啟動器的**其他**行程 pid。
 
     只給「已經有另一個實例在執行」那句訊息當診斷用——**永遠不參與決策**（決策是
@@ -261,6 +262,12 @@ def other_launcher_pids(script_name: str, *, self_pid: int | None = None,
 
     `procs` 可注入（`(pid, name, cmdline, ppid)` 的可迭代物），所以這段判定測得
     起來而不必真的去開兩個啟動器。
+
+    `also_contains` 再多要求命令列裡有這個參數。bot 的啟動器現在是**一個平台一個
+    行程**、共用同一個腳本檔名，所以只比對檔名的話「telegram 那一支在跑嗎」會被
+    discord 那一支答成「在」。傳 `also_contains="telegram"` 就只算那個平台的。
+    **這仍然只是診斷**：手動 `py -3 start_discord_bot.py` 起的預設平台不帶
+    `--platform`，所以這裡看不到它——真正的互斥永遠是單一實例鎖的事。
     """
     from axiomatic._process_control import (  # 延後匯入：避免啟動期的相依環
         cmdline_runs_script,
@@ -299,6 +306,10 @@ def other_launcher_pids(script_name: str, *, self_pid: int | None = None,
                 hit = cmdline_runs_script(cmdline, (script_name,))
             except Exception:  # pylint: disable=broad-except
                 continue
+            if hit and also_contains is not None:
+                # 逐字比對一整個參數，不是子字串：`--platform telegram` 會被拆成
+                # 兩個 argv 元素，而子字串比對會讓 `telegram2` 這種名字誤中。
+                hit = any(str(arg) == also_contains for arg in (cmdline or ()))
             if hit:
                 # 自己這一筆**要留下**，交給 collapse 排除——它得看得到自己的
                 # ppid，才排得掉「自己的轉接殼」那一半。

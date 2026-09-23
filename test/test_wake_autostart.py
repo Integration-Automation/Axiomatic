@@ -3,7 +3,10 @@
 這支腳本存在的理由是 2026-09-22 那一次：bot 是直接啟動的、沒有監督者，擁有者下了
 `/sys restart`，bot 就只是關掉了，當下只能手動去工作排程器把 `\\Axiomatic\\Bot`
 叫起來。所以要守的是三件事：已經在跑的不要再叫（不多開）、沒註冊或被拒絕要講清楚
-（不假裝成功）、預設兩支都叫醒（擁有者 2026-09-22 裁定），`--bot-only`／`--batch-only` 只叫一支。
+（不假裝成功）、預設**排程器裡有的全部**叫醒，`--bot-only`／`--batch-only` 只叫一邊。
+
+bot 的工作是一個平台一筆，而它們共用同一個腳本檔名，所以「它在跑嗎」要連平台一起
+問——不然其中一個平台的那一支會替別的平台回答「在跑」，而那個平台就永遠叫不醒。
 
 測試不碰真的工作排程器，也不看真的行程表：排程器呼叫、啟動器探測、睡眠與時鐘
 全部是注入的替身。
@@ -22,7 +25,10 @@ sys.path.insert(0, str(REPO_ROOT))
 import install_autostart as ia  # noqa: E402
 import wake_autostart as wa  # noqa: E402
 
-BOT_TASK, BOT_SCRIPT = ia.TASKS["bot"]
+# 合成的工作名：這幾支不碰真的排程器，所以名字只要形狀對就好。
+BOT_TASK = ia.bot_task("discord")[0]
+BOT_SCRIPT = "start_discord_bot.py"
+BATCH_TASK = ia.BATCH_TASK[0]
 
 
 class _Scheduler:
@@ -50,9 +56,11 @@ class _Launchers:
     def __init__(self, *answers: list[int]):
         self.answers = list(answers)
         self.asked: list[str] = []
+        self.filters: list = []
 
-    def __call__(self, script: str) -> list[int]:
+    def __call__(self, script: str, *, also_contains=None) -> list[int]:
         self.asked.append(script)
+        self.filters.append(also_contains)
         if len(self.answers) > 1:
             return self.answers.pop(0)
         return self.answers[0]
@@ -75,7 +83,7 @@ class _Clock:
 
 def _wake(scheduler, launchers, clock=None, timeout=wa.APPEAR_TIMEOUT_SEC):
     clock = clock or _Clock()
-    return wa.wake("bot", run=scheduler, running=launchers,
+    return wa.wake(BOT_TASK, run=scheduler, running=launchers,
                    sleep=clock.sleep, clock=clock.clock, timeout=timeout)
 
 
@@ -118,22 +126,41 @@ def test_waiting_in_vain_asks_the_scheduler_only_once_and_points_at_status(capsy
     assert "install_autostart.py --status" in capsys.readouterr().out
 
 
+_REGISTERED = [ia.bot_task("discord")[0], ia.bot_task("telegram")[0],
+               ia.BATCH_TASK[0]]
+
+
 @pytest.mark.parametrize("argv, expected", [
-    ([], ["bot", "batch"]),
-    (None, ["bot", "batch"]),
-    (["--bot-only"], ["bot"]),
-    (["--batch-only"], ["batch"]),
+    ([], _REGISTERED),
+    (None, _REGISTERED),
+    (["--bot-only"], _REGISTERED[:2]),
+    (["--batch-only"], _REGISTERED[2:]),
 ])
-def test_both_are_woken_unless_one_is_asked_for(monkeypatch, argv, expected):
-    """預設和登入時自動啟動的那一組一樣：bot 與批次都叫（擁有者 2026-09-22 裁定）。"""
+def test_everything_registered_is_woken_unless_one_side_is_asked_for(
+        monkeypatch, argv, expected):
+    """預設和登入時自動啟動的那一組一樣：**排程器裡有的全部**。
+
+    `--bot-only` 是「所有平台的那幾筆」，不是「某一個平台」——一個平台一個行程之後
+    那已經不是一筆工作了。
+    """
+    monkeypatch.setattr(ia, "registered_tasks", lambda: list(_REGISTERED))
     woken: list[str] = []
-    monkeypatch.setattr(wa, "wake", lambda key: woken.append(key) or 0)
+    monkeypatch.setattr(wa, "wake", lambda name: woken.append(name) or 0)
     assert wa.main(argv) == 0
     assert woken == expected
 
 
+def test_nothing_registered_is_a_failure_that_says_what_to_run(monkeypatch, capsys):
+    """一筆工作都沒有時要出聲：「叫醒完成、但一支都沒叫」跟成功印起來一模一樣。"""
+    monkeypatch.setattr(ia, "registered_tasks", lambda: [])
+    assert wa.main([]) == 1
+    assert "install_autostart.py --install" in capsys.readouterr().err
+
+
 def test_one_failure_makes_the_whole_run_fail(monkeypatch):
-    monkeypatch.setattr(wa, "wake", lambda key: 1 if key == "batch" else 0)
+    monkeypatch.setattr(ia, "registered_tasks", lambda: list(_REGISTERED))
+    monkeypatch.setattr(
+        wa, "wake", lambda name: 1 if name == ia.BATCH_TASK[0] else 0)
     assert wa.main([]) == 1
 
 
@@ -143,6 +170,27 @@ def test_the_two_only_flags_cannot_be_combined():
 
 
 def test_it_wakes_the_very_tasks_the_installer_registers():
-    """工作名稱只有一份（`install_autostart.TASKS`）；抄一份就會有一天對不上。"""
-    assert wa.TASKS is ia.TASKS
+    """工作名稱與排程器呼叫只有一份（`install_autostart`）；抄一份就會有一天對不上。"""
+    assert wa.BATCH_TASK is ia.BATCH_TASK
     assert wa._schtasks is ia._schtasks
+    assert wa._wanted_task_names is ia._wanted_task_names
+
+
+@pytest.mark.parametrize("task, script, platform", [
+    (ia.bot_task("discord")[0], "start_discord_bot.py", "discord"),
+    (ia.bot_task("telegram")[0], "start_discord_bot.py", "telegram"),
+    (ia.BATCH_TASK[0], ia.BATCH_TASK[1], None),
+])
+def test_each_task_maps_back_to_its_script_and_platform(task, script, platform):
+    """工作名 →（腳本, 平台）。平台那一半就是「它在跑嗎」問得準不準的關鍵。"""
+    assert wa.task_script(task) == (script, platform)
+
+
+def test_the_running_probe_is_asked_about_this_platform_only():
+    """否則其中一個平台的監督者會替另一個平台回答「在跑」，那個平台就永遠叫不醒。"""
+    launchers = _Launchers([1234])
+    wa.wake(ia.bot_task("telegram")[0], run=_Scheduler(), running=launchers)
+    assert launchers.filters == ["telegram"], launchers.filters
+    batch = _Launchers([1234])
+    wa.wake(ia.BATCH_TASK[0], run=_Scheduler(), running=batch)
+    assert batch.filters == [None], batch.filters
