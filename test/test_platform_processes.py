@@ -55,6 +55,26 @@ def test_a_platform_name_can_never_become_a_path(given):
     assert REPO_ROOT.resolve() in path.resolve().parents, path
 
 
+def test_the_platform_name_whitelist_stays_inside_the_shared_guard():
+    """私有白名單放行的東西，共用的路徑守衛必須也放行。
+
+    `_platform_runtime` 的那三個接合站點是靠 `normalise_platform()` 這個**私有**
+    白名單放行的（登記在 `test_bot_helpers._JOIN_GUARD_PRIVATE_WHITELIST`）。那筆
+    豁免的前提就是這一句：白名單比共用守衛**更嚴**。哪天有人放寬 `_VALID_NAME`
+    卻沒回頭看這裡，那筆豁免會繼續生效而沒有任何症狀——與 `_gui_control` 的兩份
+    名字白名單同一個處置、同一個理由。
+    """
+    import discord_bot as b  # noqa: PLC0415
+
+    candidates = ["discord", "telegram", "a", "x-y_z", "p9", "A", "..", "a/b",
+                  "a\\b", "", "   ", "9x", "-x", "x" * 80, "con", "nul"]
+    for raw in candidates:
+        name = pr.normalise_platform(raw)
+        assert not b._is_unsafe_folder_name(name), (
+            f"`normalise_platform({raw!r})` 回了 {name!r}，而共用守衛說它不安全——"
+            "私有白名單比共用守衛寬了，那筆接合豁免的前提就不成立了。")
+
+
 def test_two_platforms_never_share_a_state_file():
     """同一個基底檔名，兩個平台必須拿到兩個不同的路徑——這是整個模型的前提。"""
     a = pr.platform_file(REPO_ROOT / "dorossi_session.json", platform="discord")
@@ -395,6 +415,124 @@ def test_a_process_only_builds_the_transport_for_its_own_platform(monkeypatch):
     # 設定裡根本沒有這個平台時也不得憑空造一段出來。
     monkeypatch.setattr(b, "ACTIVE_PLATFORM", "nowhere")
     assert b._own_platform_config() == {}
+
+
+def test_a_non_default_platform_process_never_logs_into_the_default_one():
+    """**一個平台的連線由它自己那個行程持有。**
+
+    非預設平台的行程若也登入，同一個憑證上就會有兩條連線：每一則訊息被處理兩次、
+    互動被兩邊搶著回覆、狀態鏡像互相蓋掉——而兩邊的紀錄看起來都正常。所以那條路
+    是結構性的：`main()` 只有在服務預設平台時才去讀憑證，沒有憑證就沒有登入。
+
+    用 AST 釘 `main()` 的那個分支，不是跑它：跑它會真的去連線。
+    """
+    import ast as _ast  # noqa: PLC0415
+
+    tree = _ast.parse((PKG_ROOT / "discord_bot.py").read_text(encoding="utf-8"))
+    main_fn = next(node for node in tree.body
+                   if isinstance(node, _ast.FunctionDef) and node.name == "main")
+    source = _ast.unparse(main_fn)
+    assert "read_token" in source, "main() 不再讀憑證了？這支的前提變了"
+    assert "DEFAULT_PLATFORM" in source, (
+        "main() 沒有依平台決定要不要讀憑證——非預設平台的行程會跟著登入預設平台")
+    # 登入與「只跑 transport」是**兩條互斥的路**，不是一條路加一個旗標。
+    assert "client.run" in source and "_run_transport_only" in source, source[-400:]
+    # 沒有 transport 可跑時要回**致命 rc**，不然監督者會永遠重生一個什麼都不做的行程。
+    assert "RC_SETUP_INCOMPLETE" in source.split("_run_transport_only", 1)[1][:200], (
+        "`_run_transport_only()` 回 False 之後沒有回致命 rc")
+
+
+def test_a_background_task_starts_without_the_library_loop(monkeypatch):
+    """沒有登入的行程也要起得了背景任務。
+
+    `_start_supervised_task` 原本只走函式庫的 `client.loop`，而那在 `run()` 之前是
+    一個哨符、不是事件迴圈——於是非預設平台的行程一建 transport 就當場炸掉，而那是
+    在 `on_ready` 之外、沒有人接的地方。
+    """
+    import asyncio  # noqa: PLC0415
+
+    import discord_bot as b  # noqa: PLC0415
+
+    class _NoLoopClient:
+        loop = object()          # 函式庫在 `run()` 之前放的就是這種哨符
+
+    monkeypatch.setattr(b, "client", _NoLoopClient())
+
+    async def _probe():
+        async def _noop():
+            return None
+        task = b._start_supervised_task(_noop(), "probe")
+        assert task.get_name() == "probe"
+        await task
+
+    asyncio.run(_probe())
+
+
+def test_the_transport_only_loop_starts_and_revives_its_transport(monkeypatch):
+    """沒有登入的行程真的把 transport 跑起來，而且死掉會被救活。
+
+    救活那一半是這條路唯一的復原機制：預設平台那個行程靠重新連線觸發
+    `_ensure_background_tasks_alive`，這裡沒有連線可重，所以自己定期看一次。
+    """
+    import asyncio  # noqa: PLC0415
+
+    import discord_bot as b  # noqa: PLC0415
+
+    class _Transport:
+        name = "probe"
+
+        def __init__(self):
+            self.runs = 0
+
+        async def run(self):
+            self.runs += 1
+            raise RuntimeError("這個 transport 每次都馬上死掉")
+
+    transport = _Transport()
+    monkeypatch.setattr(b, "_chat_transports", [transport])
+    monkeypatch.setattr(b, "_chat_transport_tasks", {})
+    monkeypatch.setattr(b, "_build_chat_transports", lambda: None)
+    monkeypatch.setattr(b, "_TRANSPORT_ONLY_RECHECK_SEC", 0.01)
+
+    async def _probe():
+        task = asyncio.ensure_future(b._run_transport_only())
+        for _ in range(60):
+            await asyncio.sleep(0.01)
+            if transport.runs >= 2:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_probe())
+    assert transport.runs >= 2, (
+        f"transport 只跑了 {transport.runs} 次——死掉之後沒有被救活，"
+        "而那個症狀是「那個平台停了，沒有人講」")
+
+
+def test_the_transport_only_loop_says_so_when_it_has_nothing_to_run(capsys,
+                                                                    monkeypatch):
+    """沒有 transport 就停下來並講清楚。
+
+    留一個什麼都不做的行程在那裡，症狀跟「啟動了、只是沒有人跟它說話」一模一樣。
+    """
+    import asyncio  # noqa: PLC0415
+
+    import discord_bot as b  # noqa: PLC0415
+
+    monkeypatch.setattr(b, "_chat_transports", [])
+    monkeypatch.setattr(b, "_build_chat_transports", lambda: None)
+
+    def _boom(**_kw):
+        raise AssertionError("沒有 transport 卻還去救活它們")
+
+    monkeypatch.setattr(b, "_ensure_chat_transports_alive", _boom)
+    assert asyncio.run(b._run_transport_only()) is False, (
+        "回 True 的話呼叫端會當成正常收工，而監督者會每 5～300 秒重生一個註定什麼"
+        "都不做的行程——每一輪都看起來像正常啟動")
+    assert "transport" in capsys.readouterr().err
 
 
 def test_the_batch_lock_is_not_per_platform():

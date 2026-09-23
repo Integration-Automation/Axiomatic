@@ -15466,9 +15466,14 @@ def _claim_batch_supervision() -> bool:
     global _batch_supervisor_lock
     if _batch_supervisor_lock is not None:
         return True
+    degraded = False
     try:
         _batch_supervisor_lock = acquire_single_instance_lock(
             BATCH_SUPERVISOR_LOCK_FILE)
+        # `.degraded` 也在 try 裡面：這支的契約是**永不 raise**，而把讀屬性留在
+        # 外面等於那句契約只涵蓋一半。
+        degraded = bool(_batch_supervisor_lock is not None
+                        and _batch_supervisor_lock.degraded)
     except Exception as error:  # pylint: disable=broad-except
         print(f"batch supervision claim raised {error!r}", file=sys.stderr)
         _batch_supervisor_lock = None
@@ -15476,7 +15481,7 @@ def _claim_batch_supervision() -> bool:
         print("batch supervision is held by another platform process; "
               "batch control commands will stand aside here", file=sys.stderr)
         return False
-    if _batch_supervisor_lock.degraded:
+    if degraded:
         print("batch supervision lock is degraded on this host; "
               "assuming this process supervises the batch", file=sys.stderr)
     return True
@@ -23336,7 +23341,14 @@ def _start_supervised_task(coro, label: str):
     一眼認出是哪個功能。被取消（關機）時 `_bg_task_done` 會直接 return，
     不會吵。
     """
-    task = client.loop.create_task(coro, name=label)
+    # **非預設平台的行程不登入，所以函式庫的 loop 從來沒有被設起來**（在它被
+    # `run()` 之前那是一個哨符，不是事件迴圈）。那些行程跑的是 `_run_transport_only`
+    # 底下的迴圈，所以退回「現在正在跑的那一個」。兩條路都拿得到 loop，`create_task`
+    # 的語意也一樣；分不出來的時候讓它照常 raise，因為那代表根本沒有迴圈在跑。
+    loop = getattr(client, "loop", None)
+    if not isinstance(loop, asyncio.AbstractEventLoop) or loop.is_closed():
+        loop = asyncio.get_running_loop()
+    task = loop.create_task(coro, name=label)
     task.add_done_callback(_bg_task_done)
     return task
 
@@ -27247,6 +27259,45 @@ def _install_reconnect_log_filter() -> None:
         logger.addFilter(_ReconnectTracebackFilter())
 
 
+# ---------- 非預設平台的行程：**不登入預設平台** --------------------------
+#
+# 一個平台一個行程，而預設平台的連線是由**它自己那個行程**持有的。非預設平台的行程
+# 若也登入，同一個憑證上就會有兩條連線：每一則訊息被處理兩次、互動被兩邊搶著回覆
+# （其中一邊固定拿到「已經回覆過了」）、狀態鏡像互相蓋掉——而兩邊的紀錄看起來都正常。
+# 所以那些行程根本不登入：它們跑一個乾淨的事件迴圈，只有自己那個平台的 transport。
+#
+# **已知邊界（與 `docs/platforms.md` 寫的同一條）**：沒有登入就沒有那個平台的頻道，
+# 所以由背景迴圈主動貼出去的東西（批次事件回報、每日健康報告、狀態鏡像）在這些行程
+# 上不會發生。單輪的問答與指令完全不受影響——它們回的是**收到訊息的那個對話**，
+# 走的是 transport，不是那個頻道。
+_TRANSPORT_ONLY_RECHECK_SEC = 30.0
+
+
+async def _run_transport_only() -> bool:
+    """非預設平台的長命迴圈：建 transport、救活它們，然後一直跑下去。
+
+    回「有沒有東西可跑」。沒有的話呼叫端回 `RC_SETUP_INCOMPLETE`——那是**致命 rc**，
+    監督啟動器認得它並直接收工。不這樣做的話，一個沒設定好的平台會讓監督者每 5～300
+    秒重生一個註定什麼都不做的行程，而每一輪看起來都像正常啟動。
+
+    救活的節奏與 `_ensure_background_tasks_alive` 同一條規則：transport 自己會重連，
+    這一層兜的是「整個 task 死掉」——那在事件迴圈上是安靜的，不補就等於那個平台停了
+    而沒有人講。
+    """
+    _build_chat_transports()
+    if not _chat_transports:
+        # 起不來就**停下來並說清楚**，不要留一個什麼都不做的行程在那裡：那個症狀
+        # 跟「啟動了、只是沒有人跟它說話」一模一樣。
+        print(f"bot[{ACTIVE_PLATFORM}]: 這個平台沒有可用的 transport"
+              "（沒開、憑證讀不出來、或沒列進註冊表）。", file=sys.stderr)
+        return False
+    _ensure_chat_transports_alive(source="startup")
+    while True:
+        await asyncio.sleep(_TRANSPORT_ONLY_RECHECK_SEC)
+        _ensure_chat_transports_alive(source="watchdog")
+    return True  # pragma: no cover - 迴圈只由取消結束
+
+
 def main() -> int:
     # 單一實例閘門，擺在**最前面**：拿不到鎖時什麼都還沒做，連 token 都還沒讀，
     # 所以第二個實例不會碰到任何共用狀態就結束。鎖必須綁在區域變數上活到 return
@@ -27279,12 +27330,19 @@ def main() -> int:
         _install_reconnect_log_filter()
         try:
             check_setup()
-            token = read_token(TOKEN_FILE)
+            # 憑證只有**預設平台的那個行程**需要：其他平台的行程不登入它，讀了也
+            # 用不到，而「要求一個用不到的憑證」會讓只想跑另一個平台的人卡在 rc=5。
+            token = (read_token(TOKEN_FILE)
+                     if ACTIVE_PLATFORM == _platform_runtime.DEFAULT_PLATFORM
+                     else "")
         except SetupIncomplete as error:
             print(f"bot: {error}", file=sys.stderr)
             return RC_SETUP_INCOMPLETE
         try:
-            client.run(token)
+            if token:
+                client.run(token)
+            elif not asyncio.run(_run_transport_only()):
+                return RC_SETUP_INCOMPLETE
         finally:
             # `/host job` 的背景作業是這個行程的子行程，但 Windows 不會因為父行程結束
             # 就收掉它們。`/sys restart` 走的正是「client.close() → main() 回傳 → 行

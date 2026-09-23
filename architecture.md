@@ -79,8 +79,9 @@
   （`RC_ZERO_PROGRESS`）、`4` 被擋住不重生（`RC_GENERATION_BLOCKED`）、`5` 設定／憑證
   還沒填（`RC_SETUP_INCOMPLETE`，同樣不重生）。常數在 `_supervisor.py`。
 - **bot 回傳碼**：`3` 已經有另一個實例在跑（`RC_ALREADY_RUNNING`）、`5` 設定還沒填
-  （`RC_SETUP_INCOMPLETE`）。兩者都讓監督啟動器直接收工，不進退避重試
-  （`child_exit_is_fatal`）。
+  （`RC_SETUP_INCOMPLETE`，非預設平台「沒有可用的 transport」也走這個碼）。兩者都讓
+  監督啟動器直接收工，不進退避重試（`child_exit_is_fatal`）——否則一個沒設定好的平台
+  會讓監督者每 5～300 秒重生一個註定什麼都不做的行程。
 
 ## 4. 主要流程
 
@@ -91,8 +92,11 @@
    平台之間沒有共用的可變狀態，所以不需要跨行程鎖；一個平台崩潰或重啟不影響其他平台。
    **批次是唯一的共用資源**：誰拿到 `.batch_supervisor.lock` 誰監督它，沒拿到的行程對
    批次控制指令回一句讓位訊息（`BATCH_STAND_ASIDE_NOTICE`），不另外 spawn 監督者。
-   `_chat_platform` 的 transport 則是同一個行程裡的長命背景任務：預設平台走原生函式庫，
-   其餘平台走 `_*_transport.py`，收到的訊息一律交給 `dispatch_external_message`。
+   **預設平台的連線由它自己那個行程持有**：其餘平台的行程不讀憑證、不登入它，而是走
+   `_run_transport_only()`——一個只有自己那個平台 transport 的事件迴圈（兩條路互斥，
+   見 `main()`）。同一個憑證上兩條連線會讓每則訊息被處理兩次、互動被兩邊搶著回覆。
+   代價是那些行程沒有預設平台的頻道，所以背景迴圈主動貼出去的東西（批次事件回報、
+   每日健康報告、狀態鏡像）只發生在預設平台那個行程上；單輪的問答與指令不受影響。
 1. **批次產圖（`/run`）**：bot 取瀏覽器槽鎖（`_chrome_slot`）→ 清掃既有實例 → spawn webrunner、
    寫 `webrunner.pid`、放鎖 → `_watch_for_fallback` 監督 → webrunner `main()` →
    `run_preflight` → 建立 driver、登入與設定 → `ws.run_batch`：每個角色重讀四條佇列 →

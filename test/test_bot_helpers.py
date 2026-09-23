@@ -8969,8 +8969,17 @@ def _ndjson_literal_of(node, consts: dict):
     兩種形狀都要認：綁成常數的（`EVENTS_FILE`）與就地寫的
     （`PROJECT_ROOT / "x.ndjson"`）。只認前者的話，一個 inline 的 append 會完全
     隱形——而「隱形」正是這支守門要消滅的東西。
+
+    **第三種形狀：包了一層單引數呼叫。** 逐平台的狀態檔寫成
+    `_platform_state(PROJECT_ROOT / "x.ndjson")`，實體檔案落在
+    `state/<平台>/<平台>.x.ndjson`，但**基底檔名仍然是那個字面值**，而這支守門問的
+    「這個 append-only 紀錄檔有沒有上界」跟它住在哪個目錄無關。不認的話那幾個檔會
+    一夕之間全部從掃描裡消失——而「零筆無上界」跟「全部都有上界」長得一模一樣。
     """
     import ast
+    if (isinstance(node, ast.Call) and len(node.args) == 1
+            and not node.keywords):
+        node = node.args[0]
     if isinstance(node, ast.Name):
         return consts.get(node.id)
     if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
@@ -9206,7 +9215,11 @@ def test_every_spawn_rotated_log_is_also_rotated_on_a_timer():
     """
     spawn = _rotate_calls_inside("_spawn_webrunner")
     assert spawn, "`_spawn_webrunner` 裡一個 `_rotate_ndjson_tail` 都找不到了。"
-    periodic = {p.name for p in b._PERIODIC_ROTATE_FILES}
+    # 比的是**基底檔名**：逐平台的狀態檔實際叫 `state/<平台>/<平台>.x.ndjson`，而
+    # `spawn` 那一側是 AST 抽到的字面值。拿執行期的 `.name` 去對，兩邊永遠對不上。
+    periodic = {p.name.split(".", 1)[-1]
+                if p.name.startswith(b.ACTIVE_PLATFORM + ".") else p.name
+                for p in b._PERIODIC_ROTATE_FILES}
     missing = sorted(spawn - {"events.ndjson"} - periodic)
     assert not missing, (
         f"{missing} 只在 spawn 路徑輪替。只用 `/dorossi` 的機器從來不 spawn，"
@@ -9357,7 +9370,13 @@ def test_the_timer_rotated_logs_are_only_appended_synchronously():
     src = Path(b.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src)
     consts = _ndjson_constants_in(tree)
-    targets = {p.name for p in b._PERIODIC_ROTATE_FILES}
+    # **比的是基底檔名，不是磁碟上的檔名。** 逐平台的狀態檔實際叫
+    # `state/<平台>/<平台>.x.ndjson`，而 AST 那一側只看得到字面值 `x.ndjson`。拿
+    # 執行期的 `.name` 去對，兩邊永遠對不上，而紅字會講成「找不到 append 端」——
+    # 一個看起來像掃描器壞掉、其實只是命名規則的假訊號。
+    targets = {p.name.split(".", 1)[-1] if p.name.startswith(b.ACTIVE_PLATFORM + ".")
+               else p.name
+               for p in b._PERIODIC_ROTATE_FILES}
 
     # 先把「誰對這幾個檔做 append」機械地找出來，不要手抄一張函式名清單——手抄的
     # 清單會在有人換掉 helper 名字的那天無聲過期（這段註解自己就寫錯過兩個名字）。
@@ -10716,6 +10735,16 @@ def _module_dir_constants(tree) -> set[str]:
     for name, value, annotation in bindings:
         if not name.lstrip("_").isupper():
             continue
+        # **包了一層單引數呼叫的也算。** 逐平台的狀態檔寫成
+        # `_platform_state(PROJECT_ROOT / "dorossi_workspace")`，而不剝掉那層的話
+        # `DOROSSI_CC_WORKDIR` 就不再是「根」——於是 `dorossi_session_workdir` 裡那個
+        # `ROOT / "sessions" / f"{uid}_{sid}"` 一整個**從掃描裡消失**，而消失與乾淨
+        # 在輸出上一模一樣（那筆具名例外會被報成「已經不會被標出來」，這是唯一的訊號）。
+        if (isinstance(value, _ast.Call) and len(value.args) == 1
+                and not value.keywords
+                and isinstance(value.func, _ast.Name)
+                and value.func.id != "Path"):
+            value = value.args[0]
         # 註記必須**就是** `Path`，不是「裡面提到 Path」。`"Path" in unparse(...)`
         # 這種寫法會把 `_UNDO_STACK: list[tuple[Path, str]]` 一起收進來——一個裝
         # 路徑的容器不是一個根，而多收的名字會變成永遠不命中的幽靈條目
@@ -11628,6 +11657,23 @@ _JOIN_GUARD_PRIVATE_WHITELIST = {
         (1,
          "同 `layout_path`，白名單是 `MACRO_NAME_RE`，同一個字元集。兩支共用一支"
          "前提測試，而那支測試是從原始碼抽 regex 的，所以只改其中一支也會被抓到。"),
+    ("_platform_runtime.py", "state_dir"):
+        (1,
+         "接上去的是**平台名**，而它先過 `normalise_platform()`——私有白名單 "
+         "`_VALID_NAME`（`^[a-z][a-z0-9_-]{0,31}$`），字元集裡沒有分隔符、`:`、`.`，"
+         "長度也有上限，不合法的一律退回預設平台名（不是原樣放行）。前提由 "
+         "`test_platform_processes.test_a_platform_name_can_never_become_a_path` "
+         "與 `test_the_platform_name_whitelist_stays_inside_the_shared_guard` 兩向釘住。"),
+    ("_platform_runtime.py", "platform_file"):
+        (1,
+         "`leaf` 是 `<平台名>.<基底檔名>` 或 `.<平台名>.<基底檔名>`：平台名同上，"
+         "基底檔名來自呼叫端的 `Path(base).name`（`name` 依定義只有一層，`..` 與"
+         "分隔符都進不來）。兩段都是單一元件，接起來還是單一元件。"),
+    ("_platform_runtime.py", "token_file"):
+        (1,
+         "`f\"{normalise_platform(platform)}_bot_token.md\"`——平台名同上，前後各接"
+         "一段字面值，純追加變不出 `/`、`\\\\`、`..` 或磁碟機字首（與 "
+         "`cmd_debug_show` 那筆同一個形狀）。"),
 }
 
 
@@ -12353,7 +12399,12 @@ def test_the_gui_name_whitelists_stay_inside_the_shared_guard():
               / "_gui_control.py").read_text(encoding="utf-8")
     whitelists = _gui_name_whitelists(source)
 
-    expected = {fn for _f, fn in _JOIN_GUARD_PRIVATE_WHITELIST}
+    # **只看 `_gui_control.py` 那幾筆。** 這份例外清單後來也收了別的模組的私有
+    # 白名單（`_platform_runtime` 的平台名），而它們有自己的前提測試；不篩的話
+    # 這支會把「別的模組多了一筆」報成「抽取器壞了」——一個看起來很嚇人、其實
+    # 完全無關的假訊號。
+    expected = {fn for f, fn in _JOIN_GUARD_PRIVATE_WHITELIST
+                if f == "_gui_control.py"}
     assert set(whitelists) == expected, (
         f"抽到的白名單建構函式是 {sorted(whitelists)}，例外清單說的是 "
         f"{sorted(expected)}。抽取器抽不到就等於這支測試空轉——**而空轉跟全部"
@@ -18614,6 +18665,10 @@ def test_main_installs_the_reconnect_filter_before_connecting(monkeypatch):
     seen: list = []
 
     class _Lock:
+        # `InstanceLock` 的替身。`degraded` 不是可有可無的——`main()` 取的鎖有兩把
+        # （本體的單一實例鎖、批次的監督權），兩把都會讀它。
+        degraded = False
+
         def release(self):
             pass
 
