@@ -1,0 +1,24 @@
+{
+  "_comment": "Generation batch params shared between webrunner_novelai/webrunner_je_only (writers) and discord_bot (reader for !progress / !eta / !preview). Webrunner reads this at the start of each character iteration, so changes take effect on the NEXT character without restarting the run. Bot reads on every relevant command. Missing keys / parse errors fall back to hardcoded defaults — see _DEFAULT_BATCH_CONFIG in code.",
+  "_inter_image_delay_comment": "Random uniform between the two values, in seconds. Keep both > 5 to look human-paced and avoid NovelAI rate-limit.",
+  "_schedule_comment": "After cumulative run time exceeds schedule_limit_hours, webrunner sleeps rest_hours and resets its timer. Default 16h work / 6h rest.",
+  "images_per_character": 120,
+  "inter_image_delay_sec": [
+    20,
+    30
+  ],
+  "schedule_limit_hours": 16,
+  "rest_hours": 6,
+  "generate_max_retries": 4,
+  "generate_retry_delay_sec": [
+    25,
+    30
+  ],
+  "download_max_retries": 3,
+  "_restart_chrome_comment": "Quit + relaunch Chrome after every N completed characters to flush NovelAI's in-page memory leak (prevents 'Aw, Snap! Out of Memory'). 1 = after every character; 2 = every other; 0 = disable. Restart happens BETWEEN characters, so it cannot rescue a single character whose own images_per_character run OOMs mid-way — lower images_per_character if that happens.",
+  "restart_chrome_every_n_characters": 1,
+  "_quota_wait_comment": "When generation is blocked by a purchase/plan dialog, the runner closes the dialog, waits quota_wait_poll_sec, then retries the SAME image - it does not count as a failure and the process never exits, so no supervisor respawn and no repeated login+setup. quota_wait_max_sec caps the total wait; 0 = wait indefinitely (the quota refills over time). Set a positive value if you would rather stop (rc=4) when it is clearly not a refilling quota.",
+  "_quota_wait_poll_is_not_a_throughput_knob": "Do NOT lower this hoping for more images, and do NOT turn it into a backoff. Measured over 214 quota_blocked events spanning two settings of this key on the same account: ~14-min polling gave 7.87 images/hour (43 windows) and ~60-min polling gave 7.84 (151 windows) - a 0.4% difference over two weeks. Recomputing this requires the same filter: keep only windows <= 2h, or a single multi-hour downtime gap drags the aggregate and inverts the conclusion (the median is unaffected, which is why both statistics are quoted). Across all windows the coefficient of variation of the RATE is 0.131 while that of the COUNT is 0.427, and window length vs count correlates at r=0.118: the refill is a continuous drip whose rate is set account-side, so the poll interval cannot move it. Shorter polling only splits the same images into more, smaller bursts - and every wake-up pays another dismiss-the-dialog cycle.",
+  "quota_wait_poll_sec": 3600,
+  "quota_wait_max_sec": 0
+}

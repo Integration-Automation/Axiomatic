@@ -1,0 +1,6 @@
+{
+  "_README": "複製成 `presence_games.json` 再改。對應表：小寫 exe 檔名 → 要顯示的名稱。presence_probe 每次 probe tick（預設約 8 秒）重讀，不必重啟 bot。`_` 開頭的鍵是註解，比對時會忽略。整個檔案不存在 ＝ 不偵測遊戲，其他功能不受影響。",
+  "_priority_comment": "這裡列到的遊戲一律**贏過音樂**：只要有任何一個在跑，音樂（SMTC／前景視窗）就被忽略。exe 前面加 `*` 標成優先：同時有多個列管遊戲在跑時，優先的那個贏，不看誰在前景。",
+  "*example-priority-game.exe": "Example Priority Game",
+  "example-game.exe": "Example Game"
+}

@@ -1,0 +1,103 @@
+{
+  "_README": "複製成 `bot_config.json` 再填。`_` 開頭的鍵是註解，載入器會忽略它們。bot 只在啟動時讀一次，改完要 /sys restart。認不得的鍵會被忽略並印一行警告——鍵名打錯的症狀跟沒生效一模一樣，所以別靠感覺，對照這份範本。",
+
+  "_channel_id_comment": "必填。限頻道指令（佇列、批次、維運）只在這個頻道生效；@-mention 在任何頻道都行。取得方式：Discord 設定 → 進階 → 開啟開發者模式，然後右鍵頻道 → 複製頻道 ID。0 ＝還沒設定，bot 會在啟動時擋下來。",
+  "channel_id": 0,
+
+  "_owner_user_id_comment": "必填。你自己的 Discord 使用者 ID。操作主機的指令群（input / screen / win / clip / locate / macro / watch / proc / host / schedule / launcher）與 Dorossi 對話後端只認這一個 ID，其他人一律拒絕。取得方式同上，右鍵自己的名字 → 複製使用者 ID。0 ＝沒設定，那些指令對所有人都拒絕（fail-closed）。",
+  "owner_user_id": 0,
+
+  "_path_reveal_comment": "允許顯示完整主機路徑的頻道 ID。其他地方只顯示末段目錄名；1:1 私訊一律顯示完整路徑。空清單（預設）＝只有私訊看得到。列進來的頻道，同頻道的其他人也看得到那些路徑，所以只放你自己控制的頻道。",
+  "path_reveal_channel_ids": [],
+
+  "_api_contact_comment": "對外 HTTP 請求的 User-Agent 裡要附的聯絡方式（URL 或 email）。有些站台只吃這個：Wikimedia 的 REST API 對純描述式 UA 回 403，訊息叫你留下聯絡得到人的方式。空字串 ＝不附，那些站台會繼續 403。這個字串會被送到第三方站台，所以留給你自己決定。",
+  "api_contact": "",
+
+  "_presence_comment": "要把誰的 Discord 狀態鏡像到 bot 身上（使用者名稱，不分大小寫，開頭的點會被去掉）。空字串（預設）＝不鏡像。本機的遊戲／音樂偵測不受這個值影響。",
+  "target_presence_username": "",
+
+  "_help_lang_comment": "/help 的預設語言。合法值：en、zh-tw、zh-cn。",
+  "default_help_lang": "zh-tw",
+
+  "presence_probe_interval_sec": 8.0,
+  "event_poll_seconds": 5.0,
+
+  "_alert_comment": "批次出重大狀況時要 @ 誰（critical_error、快速失敗放棄、連續失敗、磁碟快滿）。0 或不填 ＝不 @ 人，通知照樣貼到頻道。通常填成跟 owner_user_id 一樣。",
+  "alert_user_id": 0,
+
+  "_disk_comment": "output/ 所在磁碟的最低可用空間（GB）。低於這個值 /run 會拒絕啟動，跑到一半掉下去會 @ alert_user_id。0 ＝停用這項檢查。",
+  "min_free_disk_gb": 5.0,
+
+  "_keep_bot_awake_comment": "監督批次期間，bot 持有 Windows 電源要求（PowerRequestExecutionRequired），讓 Modern Standby 不要暫停 bot 這個行程——否則批次在待命中崩潰要等主機醒來才有人重生它。保的是 bot 行程本身，不是「系統不進入待命」，也不涵蓋子行程。",
+  "keep_bot_awake": true,
+
+  "_dorossi_backend_comment": "Dorossi 對話後端。\"claude_code\" ＝呼叫本機的 Claude Code CLI（`claude -p`），用量走這台機器上那個登入帳號的方案；\"api\" ＝直接走 Anthropic API，憑證由 SDK 自己從 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN 環境變數解析，repo 裡不放任何祕密。兩個後端都是選用的：不裝也不填，整個 /dorossi 指令群就只是用不了，其他功能不受影響。",
+  "dorossi_backend": "claude_code",
+
+  "_dorossi_cc_tools_comment": "claude_code 後端的工具模式。\"off\"（預設，也是建議值）＝純聊天，停用所有工具，Dorossi 不能在主機執行 shell 或讀寫檔案。\"full\" ＝完整 agent（--permission-mode bypassPermissions），此時 owner_user_id 的訊息可以在主機**無確認**執行任意指令與讀寫檔案。只有你自己完全清楚後果時才開。",
+  "dorossi_cc_tools": "off",
+
+  "_dorossi_parallel_comment": "同時執行的後端回合數上限（cc_max_parallel）與同時進行的自走迴圈數上限（max_parallel_loops）。前者是記憶體／CPU 的天花板，後者管迴圈數，兩者獨立。",
+  "dorossi_cc_max_parallel": 3,
+  "dorossi_max_parallel_loops": 3,
+
+  "_dorossi_compact_context_tokens_comment": "脈絡超過這個 token 數就對該工作階段插入一次原地 /compact（保留 session id 與任務脈絡、壓掉舊歷史）。0 ＝停用。",
+  "dorossi_compact_context_tokens": 300000,
+
+  "_dorossi_self_judge_comment": "true ＝後端可以自己判定一個提問需要多輪自主完成而轉進自走迴圈（可能很耗 token）。false（預設）＝只保留「明確片語」觸發，一般提問一律單輪。",
+  "dorossi_self_judge_enabled": false,
+
+  "_roles_comment": "選用的權限分層。三個清單都空（預設）＝維持限頻道的舊行為，owner_user_id 永遠是 admin。任一清單非空時：viewer 只能下唯讀的狀態／健康／log 指令，operator 可以編佇列與啟停批次，admin 才能 kill／launch／restart／git_pull／config reload。",
+  "user_roles": {
+    "admin_user_ids": [],
+    "operator_user_ids": [],
+    "viewer_user_ids": []
+  },
+
+  "_daily_health_report_comment": "選用的每日健康報告。time 是 bot 所在時區的 HH:MM。channel_id 0 ＝沿用上面的 channel_id。",
+  "daily_health_report": {
+    "enabled": false,
+    "channel_id": 0,
+    "time": "09:00"
+  },
+
+  "_dashboard_comment": "本機唯讀狀態儀表板的預設值。啟動方式：py -3 axiomatic/dashboard_server.py",
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8765
+  },
+
+  "_dorossi_model_check_comment": "每日一次的後端模型目錄檢查：拿族別名叫一次後端 CLI，讀回它解析成哪一個完整模型，寫進 dorossi_models.json，載入時併回內建的模型表。讀到答案就把子行程砍掉，所以一次檢查是零 token。announce_channel_id 0 ＝沿用 daily_health_report.channel_id（它自己 0 ＝ channel_id）。",
+  "dorossi_model_check": {
+    "enabled": true,
+    "interval_hours": 24.0,
+    "announce_channel_id": 0
+  },
+
+  "_webrunner_supervisor_comment": "批次子行程的監督參數。fallback_window_sec 是 je → selenium 自動切換的視窗；respawn_backoff_{min,max}_sec 是崩潰後重生的退避；healthy_threshold_sec 是「活多久才算健康、可以把退避重設」。rapid_fail_* 擋「每次都在幾秒內就掛掉」（例如 Chrome 起不來）：連續 giveup_count 次就停下來並通知，要人重下 /run。zero_progress_giveup_count 是慢速版的同一件事：連續幾輪有嘗試產圖卻一張都沒存（rc=3）就停。oneshot_retry_* 是 /gen image 單張伺服器專用的閥門，跟批次監督者無關。",
+  "webrunner_supervisor": {
+    "fallback_window_sec": 300,
+    "respawn_backoff_min_sec": 5.0,
+    "respawn_backoff_max_sec": 300.0,
+    "healthy_threshold_sec": 60.0,
+    "rapid_fail_threshold_sec": 30.0,
+    "rapid_fail_giveup_count": 5,
+    "zero_progress_giveup_count": 2,
+    "oneshot_retry_giveup_count": 3,
+    "oneshot_retry_backoff_min_sec": 5.0,
+    "oneshot_retry_backoff_max_sec": 120.0
+  },
+
+  "_gui_control_comment": "/launcher start <name> 的兩個來源。launch_whitelist 是 exe 名稱或絕對路徑，比對不分大小寫（含/不含 .exe 以及 basename 都算），走 subprocess.Popen。launch_aliases 是自訂名稱 → 目標，目標可以是路徑或 URI（steam://、epic://…），URI 走 os.startfile。**shell 類（cmd / powershell / wt）刻意不放**：配合 /input type 等於遠端任意程式碼執行。空清單 ＝ /launcher start 全面停用。",
+  "gui_control": {
+    "launch_whitelist": [
+      "notepad.exe",
+      "calc.exe",
+      "mspaint.exe"
+    ],
+    "launch_aliases": {
+      "example-steam-game": "steam://rungameid/000000",
+      "example-local-game": "C:/path/to/Launcher.exe"
+    }
+  }
+}

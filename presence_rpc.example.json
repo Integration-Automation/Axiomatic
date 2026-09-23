@@ -1,0 +1,64 @@
+{
+  "_README": "複製成 `presence_rpc.json` 再填。Discord 本機 Rich Presence：把**你自己帳號**的狀態（含圖片）依本機在跑的遊戲／音樂／對話後端自動更新。需要 Discord 桌面版開著並登入。改這個檔不用重啟 bot，下個 probe tick（約 8 秒）自動生效。整個檔案不存在，或 enabled=false，或 client_id 留空 ＝ 整段功能安靜停用。",
+
+  "_setup": [
+    "1. 到 https://discord.com/developers/applications 建一個 Application，拿它的 Application ID 當 client_id（名稱不影響顯示，粗體那行用的是執行中的應用程式名）。",
+    "2. 把 Application ID 填到下面的 client_id。",
+    "3.（選用）想要圖片就到該 App 的 Rich Presence → Art Assets 上傳，並把 asset 名稱填到下面 kinds 的 large_image / small_image；留空 ＝ 不顯示圖片。",
+    "4. 把 enabled 改成 true。",
+    "5. 到桌面版的『活動隱私』設定，打開分享偵測到的活動。這一步不能跳過。",
+    "6. 用 /info probe_status 看連線狀態。"
+  ],
+
+  "_troubleshooting": "狀態沒變 → 先看 /info probe_status 最後那行「對外廣播」。⚠️ 收下了卻沒有廣播出去 ＝ 第 5 步那個開關沒開：關掉時桌面版照樣收下 SET_ACTIVITY、照樣回成功（連 large_image 都會被解析成真實 asset id），只是不對外廣播，所以「apply 結果 ok」「連線 connected」這些全部會顯示正常。那一行是 bot 從另一側（你在共同伺服器裡廣播出來的 activities）對出來的，是唯一分得出來的地方。",
+
+  "enabled": false,
+  "client_id": "",
+  "refresh_sec": 60,
+
+  "_mirror_note": "預設 true：bot 的遠端鏡像會略過『我們自己用 RPC 灌到你帳號上的 activity』，避免鏡像鏡到自己。設 false 則照舊把它也鏡進 bot。",
+  "mirror_ignore_own_rpc": true,
+
+  "_claude_note": "這一段由偵測端讀：沒遊戲也沒音樂時，要不要把本機在跑的對話後端 CLI 當成狀態顯示、以及偵測哪些 exe。不想要就把 enabled 改成 false。",
+  "claude": {
+    "enabled": false,
+    "process_names": ["claude.exe"]
+  },
+
+  "_kinds_note": "每個偵測種類怎麼顯示。name ＝最上面那行粗體字，預設 {name} ＝執行中的應用程式名（遊戲名／歌名／後端名）。name / details / state / large_text / small_text 都可以用 {name}。large_image / small_image 留空 ＝ 不顯示圖片；要圖片就填上傳到 Art Assets 的 asset key。type：0=Playing、2=Listening、3=Watching。show_timestamp=true 會顯示『已經過 MM:SS』。空字串 ＝ 該欄不顯示。",
+  "kinds": {
+    "claude": {
+      "type": 0,
+      "name": "{name}",
+      "details": "",
+      "state": "",
+      "large_image": "",
+      "large_text": "",
+      "small_image": "",
+      "small_text": "",
+      "show_timestamp": true
+    },
+    "playing": {
+      "type": 0,
+      "name": "{name}",
+      "details": "",
+      "state": "",
+      "large_image": "",
+      "large_text": "",
+      "small_image": "",
+      "small_text": "",
+      "show_timestamp": true
+    },
+    "listening": {
+      "type": 2,
+      "name": "{name}",
+      "details": "",
+      "state": "",
+      "large_image": "",
+      "large_text": "",
+      "small_image": "",
+      "small_text": "",
+      "show_timestamp": false
+    }
+  }
+}

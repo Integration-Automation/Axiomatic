@@ -1,0 +1,302 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+# `coverage json` 的輸出檔名是呼叫端自己取的，上面那幾條樣式蓋不到。
+# 2026-09-08 在 repo root 與套件目錄各撿到一份沒人引用的殘留（一份 365 KB）。
+cov.json
+cov*.json
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+#   For a library or package, you might want to ignore these files since the code is
+#   intended to run in multiple environments; otherwise, check them in:
+# .python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+#Pipfile.lock
+
+# poetry
+#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+#poetry.lock
+
+# pdm
+#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
+#pdm.lock
+#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
+#   in version control.
+#   https://pdm.fming.dev/#use-with-ide
+.pdm.toml
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+.idea/
+
+.wdm
+user_info.json
+
+# axiomatic — persisted Chrome session (contains login cookies)
+.chrome_profile/
+.chrome_profile_snap/
+.chrome_profile_verify/
+output/
+debug_*.png
+webrunner.pid
+webrunner.pid.tmp
+chrome_slot.lock
+chrome_slot.steal.lock
+webrunner_progress.json
+webrunner_progress.json.tmp
+dorossi_session.json
+dorossi_session.json.tmp
+dorossi_session.json.bad
+dorossi_usage.ndjson
+dorossi_usage.ndjson.tmp
+dorossi_models.json
+dorossi_models.json.tmp
+dorossi_workspace/
+events.ndjson
+events.ndjson.tmp
+.backup/
+recent_image_msgs.json
+recent_image_msgs.json.tmp
+dom_request.json
+dom_request.json.tmp
+single_image_request.json
+single_image_request.json.tmp
+audit.ndjson
+audit.ndjson.tmp
+chromedriver.log
+chromedriver.prev.log
+dorossi_events.ndjson
+dorossi_events.ndjson.tmp
+dorossi_queue.ndjson
+dorossi_queue.ndjson.tmp
+dorossi_queue_failed.ndjson
+dorossi_queue_failed.ndjson.tmp
+generate_history.ndjson
+generate_history.ndjson.tmp
+favorites.json
+favorites.json.tmp
+batch_label.txt
+batch_label.txt.tmp
+webrunner.pause
+webrunner.pause.tmp
+schedules.json.tmp
+# `/run in`／`/run at` 的延後啟動落地檔（bot 重啟後還原用）。本機執行期狀態。
+scheduled_run.json
+scheduled_run.json.tmp
+# 斷網時批次停下來、等網路回來就接續的落地檔（bot 重啟後還原用）。本機執行期狀態。
+network_resume.json
+network_resume.json.tmp
+# batch_config.json 本身是**追蹤的專案資產**（不可 ignore），但它是原子寫入的
+# （_batch_config._atomic_write_config），所以只有它的 .tmp 殘留要 ignore。
+batch_config.json.tmp
+
+# `!macro` 的巨集庫。內容是使用者自己的桌面操作腳本（含視窗標題片段、貼上的
+# 文字），屬本機資料而非專案資產。
+macros/
+
+# `!win layout` 的視窗版面存檔。每一筆都是這台機器上的視窗標題與座標——同上，
+# 是本機資料，而且標題常含絕對路徑。
+window_layouts/
+
+# `!screen` / `!click_image` 的暫存檔。兩者都在 finally 裡刪，但 bot 若在上傳
+# 途中被砍掉就會留下殘骸——別讓它們進版本庫。
+_screen_*.png
+_locate_*.png
+
+# 貼進根目錄的暫存截圖（不是專案資產）
+img.png
+img_[0-9]*.png
+
+# 文字辨識的語言資料。引擎安裝目錄在 `Program Files` 底下、沒有系統管理員權限
+# 寫不進去，所以語言檔放專案內並用 `TESSDATA_PREFIX` 指過來（見
+# `_gui_control.LOCAL_TESSDATA`）。是外部下載的二進位資料，不是專案資產。
+ocr_tessdata/
+
+# `!schedule` 的排程表。內容是使用者自己的排程（含指令字串），屬本機資料。
+schedules.json
+
+# 單一實例鎖（bot 啟動器一把、bot 本體一把、批次啟動器一把，刻意分成三個檔案——
+# 共用的話啟動器會擋掉自己 spawn 的子行程）。內容為空，只是給 OS 掛檔案鎖用的
+# 錨點，行程結束就釋放。純本機執行期產物，跟著機器走，不是專案資產。
+.discord_bot_supervisor.lock
+.discord_bot.lock
+.webrunner_supervisor.lock
+
+# 一次性腳本留下的備份（`discord_bot.py.bak_backoff` 之類）。備份本來就該寫到
+# repo 外，這幾條只是保險：真的漏了也進不了版本庫。沒有任何**已追蹤**檔案的名字
+# 含 `bak`，所以這個樣式不會蓋掉任何專案資產。
+*.bak
+*.bak[0-9]*
+*.bak_*
+
+# ---------------------------------------------------------------------------
+# 憑證與使用者自己的內容 —— 一律不追蹤
+# ---------------------------------------------------------------------------
+# repo 只帶 `*.example.*` 範本（那些**要**追蹤，所以下面的樣式都只寫精確檔名，
+# 不用萬用字元）。第一次設定就是把範本複製成同名的正式檔再填。
+#
+# 為什麼是硬規定而不是慣例：token 推上去是**不可逆**的——刪掉那一行救不回來，
+# 值已經在 commit 裡，處置只剩「換掉那個憑證」。`test_gitignore_coverage.py` 把
+# 每一個名字都釘在 `_IGNORED_RUNTIME`，新增一個沒分類的根目錄檔案當場變紅。
+
+# 憑證
+auth.md
+discord_bot_token.md
+
+# bot 設定：頻道 ID、擁有者 ID、可啟動程式白名單、主機路徑
+bot_config.json
+
+# presence 對應：application id、本機安裝的應用程式清單
+presence_games.json
+presence_music.json
+presence_rpc.json
+
+# 四條佇列（bot 寫、webrunner 讀）與各自為空時的 fallback 提示詞。
+# 內容是使用者自己排的工作，不是專案資產。
+todo_prompt.md
+todo_character1.md
+todo_character2.md
+todo_undesired.md
+todo_character_2_default.md
+prompt.md
+character1.md
+character2.md
+undesired.md
+default_prompt.md
+
+# `/tp` 的使用者提示詞範本目錄
+templates/

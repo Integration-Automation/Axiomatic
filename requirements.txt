@@ -1,0 +1,379 @@
+# 本專案的直接相依。**這裡宣告的是「直接 import 得到的東西」**，傳遞相依不列。
+#
+# ## 版本策略：只寫下限，不釘版本
+#
+# 全檔**不寫 `==`**——fresh clone 應該拿到當下最新版，這是刻意的（歷史理由見
+# `anthropic` 那一段的實測紀錄）。但「不釘版本」不等於「什麼都不寫」：少數套件
+# 帶 `>=` **下限**，理由一律寫在該行上面。下限擋的是**往下漂**，不擋往上升，所以
+# 與不釘版本的策略不衝突。
+#
+# 會加下限的只有一種情況：**這個版本以下有本專案搆得到的已知漏洞**。純粹「有新版
+# 可以升」不是加下限的理由，那屬於例行更新。
+#
+# 下限由 `test/test_dependency_floors.py` 守門——它拿**當前直譯器實際裝著的
+# 版本**去比對本檔宣告的下限。這條守門存在的理由是實測到的：本機有**三份**不同的
+# 相依組合（測試直譯器 `py -3`、正式直譯器 `.venv`、fresh clone 拿到的最新版），
+# 而 2026-08-29 查出來時兩個直譯器的 `aiohttp` 都停在 3.13.5、落後 14 個已知漏洞，
+# 整整幾週沒有任何訊號。`pip list --outdated` 要有人想到去跑才會看到；測試不用。
+#
+# ### 第三份（fresh clone）2026-09-12 已經實際量過一次
+#
+# 上面那句「三份相依組合」裡，前兩份天天在跑，第三份一直是**推論**——沒有任何東西
+# 在驗它（本檔下面 `anthropic` 那段也這麼寫）。2026-09-12 補了一次量測：在 repo
+# **之外**開乾淨 venv（`py -3 -m venv`，Python 3.14）、`pip install -r
+# requirements.txt`，15 個直接相依**全部解析成功**，傳遞閉包 69 個，跟兩個本機直譯器
+# 一樣。
+#
+# 量到的版本，與本機兩個直譯器**不同**的那幾個（本機 → fresh clone）：
+#   selenium 4.48.0 → **4.49.0**、anthropic 1.4.0 → **1.5.0**、
+#   matplotlib 3.11.1 → **3.11.2**、numpy 2.5.2 → **2.5.3**、
+#   webdriver-manager 4.0.2（`py -3`）／4.1.1（`.venv`）→ **4.1.2**。
+# 前三個正是本檔已經寫著「相容性先量過、等批次告一段落再升」的那三個，所以
+# **fresh clone 此刻拿到的就是那些還沒升的版本**——也就是說那三段紀錄描述的不是
+# 假設情境，而是任何人現在 clone 下來就會遇到的狀態。
+# `webdriver-manager` 是傳遞相依（`je_web_runner` 帶進來的），三份環境三個版本，
+# 這是本檔不列傳遞相依的必然結果，不是缺陷。
+#
+# 漏洞面：`axiomatic/audit_dependencies.py` 對**三份**環境各跑一次，
+# 相依閉包內的已知漏洞都是 **0**（2026-09-12）。
+#
+# ⚠️ 這是一次**快照**，不是一道守門。重跑的方式就是上面那段（repo 外開 venv →
+# 裝 → 跑 `audit_dependencies.py`）；不要把它做成測試，那會讓每一次跑測試都去打
+# 套件庫，而且沒網路就紅。
+#
+# ### 公告編號後面的 `（修於 X.Y.Z）` 是給測試讀的
+#
+# 每個下限的理由都會點名它擋的是哪幾條公告——但在 2026-09-11 之前，**沒有任何東西
+# 把那些公告和上面那個數字對起來**。`test_the_floor_reasons_are_written_down` 只驗
+# 註解「存在」，明寫不驗內容；`test_every_declared_floor_is_met` 比的是「裝著的版本
+# ≥ 下限」。所以把 `Pillow>=12.3.0` 調成 `>=12.2.0`（很自然的念頭：12.3.0 弄壞了
+# 什麼）之後，上面那段仍然理直氣壯地點名三條 12.3.0 才修掉的公告，而**全套測試照綠**
+# ——理由還在，保護已經沒了。這正是本專案一路在修的那個形狀（見 CLAUDE.md 的
+# `_OWNER_ONLY_SLASH`：守門照跑、集合還在、測試全綠）。
+#
+# 所以每個公告編號後面要接 `（修於 X.Y.Z）` 或 `（搆不到）`，
+# `test_the_floor_clears_every_advisory_it_names` 會把它們剖出來，要求下限 ≥ 同一段
+# 註解裡每一條 `修於` 的版本。這是**離線**檢查：漏洞資料庫要連網（所以不能做成
+# 測試），但「下限有沒有蓋住自己寫下來的理由」純粹是本檔內部的一致性。
+#
+# ⚠️ **沒有 `>=` 的套件上方，只能寫 `（搆不到）`，不能寫 `（修於 X）`。** 寫「修於 X」
+# 就等於主張這條公告搆得到，那它就必須有下限擋著。這個組合原本**兩個方向都看不見**
+# （收集時就跳過沒有 `>=` 的行，比對時又在沒有下限時早退），而本檔 15 條相依裡只有
+# 4 條帶 `>=`——也就是上面那組對帳檢查長期只看得到 27% 的內容。2026-09-17 補上
+# `test_a_reachable_advisory_may_not_sit_above_a_floorless_dependency`，理由見
+# `architecture_explore.md` §8.65。要嘛加下限，要嘛改標 `（搆不到）` 並寫清楚為什麼。
+#
+# ⚠️ **不要在註解裡寫死「有 N 條漏洞」而不附日期。** 那個數字會在沒有人碰這個檔案
+# 的情況下自己變動——舊版本會被追加新公告。2026-09-11 實測：本檔寫 12.2.0「有 17
+# 條」，向 OSV 逐版本查是 **13** 條；寫 urllib3 2.6.x「有兩條」，實際是 **三**條
+# （多出來的 PYSEC-2026-1996 修於 2.6.3，本來就在下限之下）。查法是帶 `version`
+# 去問 OSV，讓**伺服器**做區間比對——自己解析 `ranges`/`events` 在 intro 與 fixed
+# 交錯時很容易算錯。
+#
+# ### 去重要按**別名叢集**，不要收斂到 CVE（2026-09-11 更正）
+#
+# 同一條漏洞確實會以 CVE / GHSA / PYSEC / BIT 四種編號重複出現，所以直接數 OSV 的
+# 筆數會灌水（aiohttp 3.13.5 回 28 筆，實際 14 條）。但先前這裡指定的補救方式是
+# 「一律收斂到 CVE 再數」，而那條規則**會在另一個方向給出危險得多的錯誤答案**：
+# **不是每一條公告都有 CVE 別名**，沒有的整條消失，於是一個真的有漏洞的套件被數成
+# 零。實測反例：`bleach` 6.3.0 在 OSV 上有三條，三條的 `aliases` 全是 `null`，收斂
+# 到 CVE 之後是 **0**——而同一天 `pip-audit` 把 bleach 列為有漏洞。灌水只會讓人多
+# 看兩眼；判成乾淨會讓人完全不看。
+#
+# 正確的做法是**別名叢集**：把每筆的 `id` 與 `aliases` 當成圖的節點，同一個連通
+# 分量算一條。有 CVE 的自然併在一起，沒有 CVE 的各自成一組而不是消失。順帶要排掉
+# `withdrawn` 不為空的條目（OSV 撤回之後仍然會回傳）。上面四個數字已經用這個算法
+# 重算過，**都沒有變**——那幾個套件的公告剛好都有 CVE 別名。這正是這種錯誤難發現
+# 的原因：它在你拿來驗證它的資料上完全正確。
+#
+# ⚠️ **要回答「這個套件現在乾不乾淨」請跑 `axiomatic/audit_dependencies.py`**，
+# 不要自己寫一支查 OSV 的腳本。它走 `pip-audit`，沒有上面那個計數問題，而且已經
+# 把範圍收斂到本專案的相依閉包（這台機器的 `py -3` 裝了四百多個套件，其中二十幾個
+# 有漏洞而**沒有一個**在閉包裡；那種輸出不收斂的話只會被當雜訊忽略）。逐版本的
+# OSV 查詢只適合回答「版本 X 還中幾條」這種**寫註解用**的問題。
+#
+# ### 但那支工具有一個**時間差**盲點（2026-09-17 實測）
+#
+# 上面那句話仍然成立——它是本專案唯一該信的漏洞答案。但它答的是「**漏洞資料庫現在
+# 知道什麼**」，不是「這個版本有沒有漏洞」，而兩者之間有好幾天的落差。
+# 實測：`simpleeval` 1.0.8（2026-09-12 發行）修掉**三條**公告，發行說明直接寫著
+# 「3 Security improvements」並列出編號。五天後的 2026-09-17：
+#   * `audit_dependencies.py` 回報相依閉包內 **0 個**漏洞；
+#   * 帶 version 問 OSV，`simpleeval` 1.0.7 回 **0 筆**；
+#   * 三個編號去 GitHub 的**全域**公告庫查，全部 **404**。
+# 三者一致，而且都不是壞掉：那三條此刻只存在於專案自己的 repo 層公告，還沒有進到
+# 全域庫，所以 `pip-audit` 看不到它們。**正對照**（不然「查不到」跟「查詢壞了」長得
+# 一樣）：同一個查法問 `urllib3` 回三筆，問 `simpleeval` 也回得到較早的
+# GHSA-44vg-5wv2-h2hg（CVE-2026-32640，影響 < 1.0.5，本機 1.0.7 不受影響）——
+# 查詢本身是活的，缺的就是那三條。
+#
+# 教訓不是「別信那支工具」，是**乾淨的掃描結果有兩種來源**，而它們的輸出一模一樣：
+# 真的乾淨，或者公告還沒傳播到。
+#
+# **2026-09-17 補：這件事已經不靠人記得了。** 當天下午同一個形狀在 urllib3 上重演
+# （2.7.0 三條、兩條 high、修在 2.8.0，全域資料庫與 OSV 一樣都查不到），於是把
+# 「讀一眼發行說明」這個約定做成工具：
+#
+#     py -3 axiomatic/audit_dependencies.py --repo-advisories
+#
+# 它直接問每個套件**自己的倉庫**（`GET /repos/{owner}/{repo}/security-advisories`），
+# 也就是公告發布之後、被收進全域資料庫之前唯一看得到的地方。範圍跟預設模式一樣是
+# **整個相依閉包**（63 個，一輪約 90 秒）。結束碼 0＝每一個都查過且沒事、1＝有、
+# 2＝**有任何一個沒查到**（限速、沒網路、解析不出倉庫）。
+#
+# ⚠️ 兩個模式都要跑，它們答的不是同一個問題：預設模式看的是全域公告資料庫，
+# `--repo-advisories` 看的是倉庫層級、還沒傳播到全域的那些。本檔頂上那句
+# 「相依閉包內已知漏洞都是 0」是**前者**的結論。
+#
+# 2026-09-18 把範圍從直接相依拉到整個閉包時，撈到 `anyio` 一條 **critical**
+# （TLS 憑證偽冒，2026-07-07 發布、兩個月後全域資料庫仍然 404）。它只打到 `py -3`
+# 的 4.13.0，正式的 `.venv` 本來就是 4.14.2；`py -3` 已升到 4.15.1 對齊。
+# 同一輪也發現只看版本區間會製造大量假陽性（12 筆裡 10 筆），細節見 §8.67。
+
+# 桌面自動化函式庫。滑鼠／鍵盤／視窗／剪貼簿／文字辨識／圖片定位的**實作全部
+# 在這裡**，`_gui_control.py` 只做參數解析、環境政策與錯誤訊息去識別化；同一件
+# 事不要在本專案再寫一份。
+#
+# 本機是以可編輯模式指向原始碼樹（`pip install -e <path> --no-deps`），所以對它
+# 的修改立刻生效。套件庫上的版本會落後，缺的東西補在原始碼那邊而不是繞過它。
+#
+# **影像比對函式庫經由它間接進來（它宣告 `opencv-python<6,>=4.8`），而 fresh clone
+# 2026-09-19 解析到的是 5.0.0.93——大版本，本機兩個直譯器仍是 4.13。已量過，不需要
+# 在這裡加上限**（隔離 venv，套件庫上的 je_auto_control 0.0.222）：它原始碼裡用到的
+# 95 個 `cv2.*` 名字在 5.0 全部存在；`/locate image` 走的 `match_template_all` 在合成
+# 圖上 5.0 與 4.13 結果完全相同（中心座標一致、分數 1.0000）。
+je-auto-control
+# **2026-09-09：本機兩個直譯器都是 4.48.0，套件庫最新是 4.49.0——刻意先不升。**
+# 不是因為有疑慮，是因為**時機**：升級要動的是 `.venv`，而兩個正式批次
+# （已連續執行 50 小時）此刻正把 selenium 載在記憶體裡跑；`pip install -U` 換掉
+# 磁碟上的檔案，之後任何一次延遲 import 都可能拿到不匹配的模組。等批次告一段落
+# 再升，指令是 `<兩個直譯器各一次> -m pip install -U selenium`。
+# 相容性**已經先量過**，升級時不必重查（但要重量）：
+#   * 4.49.0 的變更是 CDP v151-153、BiDi 欄位名產生、mypy 型別註記、BiDi wire
+#     error 改丟具名例外、Linux arm64 的 Selenium Manager 預建執行檔。**沒有任何
+#     移除／改名／棄用**碰到 `webdriver.Chrome` / `ChromeOptions` / `Service` /
+#     Selenium Manager 的解析路徑／例外類別。
+#   * 唯一算行為改變的是 BiDi 那一條，而本專案**完全沒有用 BiDi**（掃過原始碼，
+#     零處）。
+#   * 2026-09-13 補一條上面漏掉的：4.49 還修了 **Selenium Manager 在 WOW64 下的
+#     架構偵測**。這一條值得單獨講，因為 selenium 變體的 driver 正是走 Selenium
+#     Manager 解析的（`build_stealth_driver` 建 `ChromeService` 時沒有指定
+#     `executable_path`），所以它不是「別人的平台」那類變更。**實測不適用本機**：
+#     兩個直譯器都是 64 位元、`PROCESSOR_ARCHITEW6432` 未設定（＝不是 WOW64），
+#     所以升級後這條不會有行為差異。記下來是因為上面那句「已經先量過，升級時不必
+#     重查」得是真的——一份宣稱完整卻漏掉 Windows 專屬項目的清單，比沒有清單更糟。
+#   * 在一個乾淨的 venv 裡裝 requirements.txt 的最新版（＝fresh clone 拿到的那一
+#     份，selenium 4.49.0 ／ je_auto_control 0.0.222）實跑：五個進入點 import 全過，
+#     selenium 相關的 211 支測試全綠。
+selenium
+discord.py
+# 直接被 import（discord_bot.py / _external_apis.py），不是只靠 discord.py 的
+# 傳遞相依 —— 直接宣告，否則 discord.py 換掉 HTTP client 時 fresh clone 會爆。
+#
+# **下限 3.14.3（安全下限）。** 3.13.5 帶著 14 個已知漏洞，但真正搆得到本專案的
+# 只有一個：PYSEC-2026-3545（修於 3.14.3）——C 寫的**回應**剖析器在替一個畸形回應
+# 組錯誤訊息時
+# 越界讀取堆積，觸發者是**對方伺服器**。`_external_apis` 會去 GET 第三方圖庫
+# API，那些回應本專案控制不了，一個畸形回應就足以讓 bot 的事件迴圈掛掉。
+# 次要的一個是 PYSEC-2026-3547（修於 3.14.2）——客戶端會解壓沒協商過
+# permessage-deflate 的 WebSocket 框，閘道連線走的正是 WebSocket 客戶端。
+# 其餘 12 個搆不到：不是 aiohttp **伺服器**側（請求走私、pipelining 塞爆記憶體、
+# `max_line_size` 繞過），就是 `CookieJar.load` / `MultipartWriter(headers=)` /
+# `DigestAuthMiddleware` / 逐請求 `cookies=` 這些本專案一行都沒用到的 API。
+# 本專案沒有跑任何 aiohttp 伺服器——儀表板用的是 stdlib 的 `http.server`。
+aiohttp>=3.14.3
+# 兩個 webrunner 變體都 `from urllib3.exceptions import ReadTimeoutError`
+# （selenium 不包這個例外，必須自己接），同理直接宣告而非依賴 selenium 傳遞。
+#
+# **下限 2.7.0（安全下限）。** 2.6.0 截至 2026-09-11 有**三**條（下面那句「兩條」
+# 是 2026-08-29 寫的，中間又多發一條——公告數會自己往上長，見檔頭）：
+# PYSEC-2026-142（修於 2.7.0）——串流讀取（`read(amt=N)`）在某些情況下會把
+# **整個**回應解壓進記憶體而不是只解要的那一段，等於串流 API 的記憶體上限失效；
+# PYSEC-2026-141（修於 2.7.0）——低階 `ProxyManager` 路徑跨來源重新導向時仍會
+# 轉送敏感標頭；PYSEC-2026-1996（修於 2.6.3）——跟著重新導向走的時候，串流 API
+# 的解壓縮炸彈防護會被繞過。第三條本來就在 2.7.0 之下，所以下限不用動。
+#
+# **2026-09-17：又多三條，修在 2.8.0，全部搆不到——下限刻意留在 2.7.0。**
+# 這三條 2026-09-15 才發布，而且只存在於**倉庫層級**：全域公告資料庫對三個編號
+# 都回 404、OSV 對 urllib3 2.7.0 回 0 筆，所以 `audit_dependencies.py`／pip-audit
+# 當天仍然報乾淨（與 simpleeval 那次完全同一個形狀，五天內在不同套件上重演）。
+# GHSA-vxq7-64xx-v4gw（搆不到）high，修在 2.8.0——`HTTPResponse.stream()` /
+# `read_chunked()` 會把沒有上限的 chunk-size 行整行吞進記憶體；
+# GHSA-gh4c-6fx4-qh6g（搆不到）medium，修在 2.8.0——分塊 deflate 串流可能進無窮
+# 迴圈（對無人值守的長批次來說是「掛住」而不是「報錯」，更難察覺）；
+# GHSA-8988-9cw3-xx77（搆不到）high，修在 2.8.0——HTTPS 代理的 TLS 設定可能被
+# 忽略或覆寫。
+#
+# **搆不到的理由是結構性的，只有一句話：本專案的 urllib3 只跟 localhost 的
+# chromedriver 講話。** 三條都需要一個有敵意的 HTTP 對端（前兩條要惡意的分塊回應、
+# 第三條要有 HTTPS 代理）。實測（AST 掃全部非測試模組）：`requests` 在 live
+# stack 出現 **0 次**（它也不在本檔的宣告裡），
+# `urllib3` 只出現在三支 webrunner／驗證模組，而且清一色是
+# `from urllib3.exceptions import ReadTimeoutError`；對外的圖庫／網路 API 走的是
+# aiohttp 不是 urllib3；全專案沒有任何一處設定 proxy。
+#
+# ⚠️ **這個前提會無聲失效**：live stack 只要多一行 `import requests`（或任何讓
+# urllib3 連到外部主機的程式碼），上面三條就立刻從「搆不到」變成「搆得到」，而
+# 註解會繼續寫著搆不到。所以前提本身有守門：
+# `test_dependency_floors.test_the_live_stack_keeps_urllib3_pointed_at_localhost`。
+urllib3>=2.7.0
+# PEP 440 的版本／區間比對。`audit_dependencies.py --repo-advisories` 要判斷「裝著的
+# 版本落不落在公告宣告的區間內」，而那個判斷不能自己寫：公告的
+# `vulnerable_version_range` 是作者手寫的自由文字，pre-release、post-release、epoch
+# 都可能出現，算錯的方向是**漏報**。
+#
+# 一直都在（pip／setuptools／matplotlib 等等都相依它），2026-09-17 之前只是沒有人
+# **直接** import；現在有了就照 DoD #4 宣告出來——本專案的規則是「import 得到不等於
+# 宣告過」，fresh clone 不該靠別人的傳遞相依。
+packaging
+pyfiglet
+# `/fun calc <運算式>` 的沙箱化運算求值。**這裡刻意沒有下限，而那是查過之後的結論，
+# 不是還沒查。**
+#
+# 1.0.8（2026-09-12）修掉三條公告，本機兩個直譯器都還在 1.0.7：
+#   * GHSA-v7m3-47hp-2wqw（搆不到）——被擋掉的函式包在 set／frozenset 裡時，
+#     擋不住；
+#   * GHSA-7g86-mgxq-vq42（搆不到）——`operator` 模組的 `itemgetter` /
+#     `attrgetter` / `methodcaller` 可以串出逃出沙箱的運算式；
+#   * GHSA-r2q2-xmpm-7fvh（搆不到）——`os` 的 exec／spawn 系列沒有被完整擋掉。
+#
+# 三條**全部**要求開發者自己把危險物件從 `names=` / `functions=` 餵進沙箱；套件自己
+# 的說明也明寫「使用者要為自己傳進去的 names/functions 負責」。本專案的唯一呼叫點是
+# `discord_bot.mcmd_calc` 的 `_simple_eval(rest)`——只有運算式，沒有第二個參數，所以
+# 依本檔的政策（下限只給「搆得到的」漏洞）不加下限；1.0.8 屬於例行升級。
+#
+# ⚠️ **這個「搆不到」完全建立在那些參數不存在上。** 簽名是
+# `simple_eval(expr, operators, functions, names, allowed_attrs)`，危險的三個都能用
+# **位置參數**傳，所以哪天為了支援 `sin()` 之類的東西補一個引數，三條同一秒全部變成
+# 搆得到，而上面那三個「搆不到」會繼續寫在這裡。
+# 釘住這個前提的是
+# `test_dependency_floors.test_the_sandboxed_evaluator_is_only_ever_handed_an_expression`
+# （AST 掃全部專案模組，關鍵字與額外位置參數都認，5/5 變異殺掉）。它紅了就回來重讀
+# 這三條，決定要不要改成 `simpleeval>=1.0.8`。
+#
+# 這一段也是檔頭那個「掃描器時間差」盲點的實例：撞到它的不是漏洞掃描，是
+# `pip list --outdated` 加上讀一眼發行說明。
+simpleeval
+# je_web_runner 的下限不是安全性，是 **API 存在性**：`webrunner_je_only.py` 呼叫
+# `wr.get_current_url` / `get_title` / `save_screenshot` /
+# `add_script_to_evaluate_on_new_document`，這四個在 0.0.88 之前的版本上不存在。
+# 少了會是**執行期**的 `AttributeError`，而執行期就是無人值守的批次跑到一半。
+# 2026-08-30 之前這台機器上裝的是 0.0.79（四個全缺），沒有炸只是因為
+# `webrunner_je_only.py` 會把 sibling checkout 插到 `sys.path[0]`——那是巧合不是
+# 設計。行為面由 `test_je_facade.py` 對**裝著的**套件實查，這條下限只是讓 pip 在
+# 安裝當下就擋掉。
+je_web_runner>=0.0.88
+# psutil：presence 的遊戲白名單比對、行程探查與清理。
+#
+# **pywin32 已經移除**（2026-08-17）：視窗查詢與操作全部轉呼叫 je-auto-control，
+# 本專案不再有任何 `import win32*`。要再用到 Win32 的東西，補進函式庫，不要在這裡
+# 長回來。
+#
+# SMTC（目前播放的曲名／演出者）走 PowerShell 子行程而不是 `winsdk`：winsdk
+# 沒有 Python 3.14 的 wheel，也不肯在沒有 Visual Studio 的機器上自行建置。
+psutil
+# `/grid <tag>` 拼 2x2 圖庫最新圖用。
+#
+# **下限 12.3.0（安全下限）。** 12.2.0 截至 2026-09-11 仍有 **13** 條去重後的已知
+# 漏洞（本行原本寫 17，是計數方式不同或當時的快照；實測值見檔頭那段說明），而本
+# 專案**餵給它的正是外部圖庫回傳的位元組**。最相關的三條：
+# PYSEC-2026-3451（修於 12.3.0）——`Image.paste()` / `crop()` /
+# `alpha_composite()` 在座標接近 32 位元上限時原生層越界寫入，拼格線用的就是
+# `paste()`；PYSEC-2026-3452（修於 12.3.0）——EPS 剖析器接受負的位元組數，
+# `Image.open()` 會原地無限迴圈；PYSEC-2026-2257（修於 12.3.0）——
+# `WindowsViewer.get_command()` 把檔案路徑直接插進 `shell=True` 的 cmd 字串，
+# 路徑裡的 shell 特殊字元可注入。
+Pillow>=12.3.0
+# 舊版本機 token 圖表 helper 的相容性測試仍會以 Agg 輸出 PNG；目前
+# `/dorossi tokens` 已改查後端的即時帳號用量，不再上傳此圖。
+matplotlib
+# `/dorossi ask <提問>` 的 `api` 後端用官方 SDK 呼叫後端模型。憑證由 SDK 解析
+# （ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN 環境變數，或 `ant auth login`
+# 的 OAuth profile），不需把金鑰寫進 repo。
+#
+# **本檔刻意不釘版本**（全檔皆然），所以 fresh clone 拿到的是當下最新版。
+# 2026-08-27 實測跨過 0.x → 1.x 的 major bump：1.x 移掉了
+# `temperature`／`top_p`／`top_k`（傳了直接 TypeError）、Text Completions
+# （`completions.create`／`HUMAN_PROMPT`／`AI_PROMPT`）、`LegacyAPIResponse`，
+# HTTP 層換成 `httpx2`，Python 下限提到 3.10。本專案只帶
+# model／max_tokens／system／messages 四個關鍵字，四個都還在，**不受影響**；
+# 例外類別（`RateLimitError`／`AuthenticationError`）與
+# `err.response.headers["retry-after"]` 也照舊。
+#
+# **2026-09-09：兩個直譯器都升到 1.4.0。** 起因是把本檔**每一個直接相依**拿去跟
+# 套件庫上的最新版對照——15 個裡面只有 `anthropic` 落後（兩邊都停在 1.3.0），
+# 其餘全部已是最新。這件事值得記下來的不是版號，是**為什麼查不到**：測試跑的是
+# 兩份**當時裝好就凍住**的環境，而 fresh clone 解析出來的是**第三份**，沒有任何
+# 東西在驗它，所以「fresh clone 拿到的版本」當時永遠是推論而不是量測。
+# **這句話 2026-09-12 起不再成立**——那一天第三份被實際建出來跑過（見檔頭「第三份
+# （fresh clone）2026-09-12 已經實際量過一次」）。保留這段是因為它記的是**當時為什麼
+# 查不到**，那個教訓沒有過期；但別再照著它推論「第三份沒人量過」。
+# 1.3.0 → 1.4.0 沒有破壞性改版（只有用量報表欄位、workspace ID、把「傳成 httpx
+# 而非 httpx2」的錯誤訊息講清楚）。升完實測：model／max_tokens／system／messages
+# 四個關鍵字都在，`RateLimitError`／`AuthenticationError` 都在，預設逾時仍是
+# read 600s ＋ 重試 2 次。
+# 這條路徑平常沒人走（要 `/dorossi ai api` 才會叫到），破壞性改版會安靜地躺著，
+# 所以由 `test_bot_helpers.test_the_api_backend_still_fits_the_installed_anthropic_sdk`
+# 從呼叫端 AST 抽關鍵字、對裝著的 SDK 簽名比對。
+#
+# **2026-09-12：套件庫已經是 1.5.0，本機兩個直譯器都還在 1.4.0——同樣先不升，理由
+# 跟 selenium 那一段一樣是時機而不是疑慮。** 相容性**先量過**，升級時不必重查
+# （但要重量）：1.5.0 沒有破壞性改版。變的是 `idempotency_key` 降為棄用的 no-op
+# （本專案零處使用）、tools 可以直接傳物件、`Message.to_param()`、串流時部分的
+# tool input JSON 不再掛上內容區塊，另外多了 `CredentialsError` 與
+# `IdentityTokenFileError` 兩個例外類別（本專案接的是 `RateLimitError` /
+# `AuthenticationError`，兩個都還在）。
+# 唯一需要看一眼的是「憑證檔的權限位元開給 group/other 就直接拒絕」這條新檢查：
+# 本專案建 client 時**不傳** `api_key`（`dorossi_backend` 約 984），憑證是交給 SDK
+# 自己解析的。但這台主機上 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 都沒設、
+# `~/.config/anthropic/` 也不存在（2026-09-12 實測），所以**根本沒有憑證檔可以被
+# 拒絕**——這條在本機搆不到，api 後端本來就是未設定狀態，而那條路已經會印出
+# 「設 `ANTHROPIC_API_KEY` 或跑 `ant auth login`」的明確提示。
+# ⚠️ 哪一天真的把憑證設起來，這條要**重新量**：Windows 的 `st_mode` 不照 POSIX 的
+# group/other 語意走，一個在這裡看起來無害的檢查可能整個擋掉。
+#
+# **2026-09-17：套件庫走到 1.6.0（09-15 發行），所以上面那段「已經量過」涵蓋的
+# 1.5.0 已經不是 fresh clone 現在拿到的版本了。** 這正是本檔一再記的那個形狀——
+# 相容性註解會因為**別人發新版**而過期，沒有人動這個檔案、也沒有任何測試會紅。
+# 補量 1.5.0 → 1.6.0：**沒有破壞性改版、沒有移除、沒有改名**。新增的是 Managed
+# Agents 的 auto 模式工具權限、compaction 參數與簽章區塊（beta）、工作區資料落地
+# 地理欄位的列舉型別、web fetch 的 `url_sources`、user profiles 的 `workspace_id`、
+# 非同步憑證 token provider——本專案一個都沒用到（只帶 model／max_tokens／system／
+# messages 四個關鍵字）。
+# 唯一值得看一眼的是修正面的「**客戶端現在會遵守大於 60 秒的 `Retry-After`**」：
+# SDK 內建重試（預設 2 次）以前實質上被 60 秒截斷，之後會真的睡滿伺服器要求的秒數，
+# 也就是同一次呼叫可能比以前阻塞久得多。
+#
+# **2026-09-19：上面那句「本專案讀 retry-after 的那條路不受影響、現在搆不到」低估了它，
+# 已經處理掉。** 本機假伺服器實測（假金鑰、不打外部服務，參數與 `_get_dorossi_client`
+# 相同）：429 ＋ `retry-after: 3600`，1.4.0 是 0.4／0.8 秒各重試一次、1.3 秒丟
+# `RateLimitError`；**1.7.0 是每次重試前睡 3600 秒，一輪卡約 2 小時**（`75` 則是 150
+# 秒）。改動在 1.6.0 的 `_calculate_retry_timeout`：`0 < retry_after <= 60` 那道上限換成
+# `min(retry_after, 4_294_967.0)`，而且**不限 429**——任何會被重試的狀態碼都照睡。後果
+# 不只是慢：那一輪握著工作階段鎖卡兩小時；bot 自己的用量上限處理（`reset_at = now +
+# retry_after`）要等 SDK 睡完才拿得到例外，算出來的重設時刻還晚了已經睡掉的那段；而
+# `dorossi_backend` 註解裡「最壞 600 × 3 ＝ 30 分鐘」那句從此不成立。fresh clone 今天
+# 解析到的就是 1.7.0，只有本機兩個直譯器還停在 1.4.0，所以這個缺陷在這台機器上看不到。
+#
+# 修法是本專案自己的兩層，**不靠版本號**（說明與理由在 `dorossi_backend.py` 的
+# `DOROSSI_API_TIMEOUT_SEC` 上方）：`_get_dorossi_client` 傳一個帶 response hook 的
+# `DefaultAsyncHttpxClient`（公開 API），SDK 會睡超過 60 秒時補 `x-should-retry: false`
+# 叫它不要自己重試；`_dorossi_via_api` 外面再框一層 `asyncio.timeout`，上限由逾時與重試
+# 次數算出。1.4.0 與 1.7.0 上都驗過（`test/test_dorossi_api_retry.py`，後者在 repo
+# 外的 scratch venv 跑）：429 ＋ 3600 秒只送 1 次、立刻變成用量上限；短的等待與沒帶等待的
+# 529 照舊由 SDK 重試。
+#
+# **所以不加下限、也不加上限。** 下限在本檔只給「搆得到的已知漏洞」，這不是漏洞；上限
+# （`<1.6`）違反「不釘版本」的原則，而且 hook 已經讓兩邊行為一致，擋掉新版只會擋掉之後
+# 的修正。升級 `.venv` 仍然要等正式批次告一段落（理由同 selenium 那一段），但這一條已經
+# **不再是**等它的理由。
+anthropic
+# `/locate text find` / `click` / `wait` 的文字辨識。**只裝這個 pip 套件
+# 是不夠的** —— 它只是外部辨識引擎執行檔的 wrapper，引擎要另外用安裝檔裝並放進
+# PATH。沒裝引擎時那三個指令會回「辨識引擎未安裝」的泛用提示（不會炸），其餘
+# GUI 指令與 `/locate image click`（走樣板比對，不需要引擎）照常可用。
+pytesseract
+# `/locate ui …` 的元素定位（Windows UI Automation）。作業系統知道畫面上有哪些
+# 按鈕、確切在哪，比座標／文字辨識／樣板比對可靠得多，所以是首選定位方式；
+# 裝不起來時那組指令會回泛用提示，其餘定位方式照常。
+comtypes

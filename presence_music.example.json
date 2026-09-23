@@ -1,0 +1,40 @@
+{
+  "_README": "複製成 `presence_music.json` 再改。這一份的預設值是通用的，多數人不用動。presence_probe 每次 probe tick 重讀，不必重啟 bot。整個檔案不存在 ＝ 用程式內建的同一組規則。",
+  "_comment": "Music-detection rules used by presence_probe. Loaded on every probe tick (~8s default), so edits take effect without restarting the bot.",
+  "_smtc_comment": "Substrings matched case-insensitive against the SMTC AUMID. Only approved streaming music apps/PWAs belong here; local-file players are deliberately excluded.",
+  "_browser_aumid_comment": "Substrings identifying a generic browser SMTC source (no per-PWA AUMID). A hit causes presence_probe to fall back to scanning visible window titles via browser_window_hints — needed so YT Music in a normal Edge tab still registers as music without false-positiving on regular YT videos.",
+  "_browser_window_hints_comment": "Per-entry: window_substring must appear in some visible window title TOGETHER with the SMTC song title. Only then do we promote the browser SMTC to music with the given label.",
+  "_foreground_patterns_comment": "Regex patterns (Python re) matched against the foreground window title when SMTC returns nothing. Must contain named group 'song'; 'artist' is optional. Anchored matching (use ^ explicitly if needed). Bad regexes are skipped with a stderr warning.",
+  "smtc_source_substrings": [
+    "spotify",
+    "ytmusic",
+    "youtube music",
+    "applemusic",
+    "apple music",
+    "tidal",
+    "deezer",
+    "qqmusic",
+    "neteasemusic",
+    "kkbox"
+  ],
+  "browser_aumid_substrings": [
+    "msedge",
+    "chrome",
+    "firefox",
+    "brave",
+    "opera",
+    "vivaldi"
+  ],
+  "browser_window_hints": [
+    {
+      "window_substring": "youtube music",
+      "label": "youtube music"
+    }
+  ],
+  "foreground_window_patterns": [
+    "^(?P<song>.+?) - (?P<artist>.+?) - YouTube Music",
+    "^Spotify - (?P<song>.+?) - (?P<artist>.+)$",
+    "^(?P<song>.+?) • (?P<artist>.+?) - Spotify",
+    "^(?P<song>.+?) by (?P<artist>.+?) - Apple Music"
+  ]
+}
