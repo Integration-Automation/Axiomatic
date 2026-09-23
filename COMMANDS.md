@@ -1,4 +1,4 @@
-# Bot 指令總覽
+# 指令總覽
 
 以 bot 即時 `/help` 為準（code 是 source of truth）。此為靜態快照，方便外部
 分享。對話平台不 render markdown table，全用 bullet。
@@ -6,11 +6,13 @@
 想看**逐個參數的型別、值域與權限**，到 [`commands/`](commands/README.md)——那裡
 一個指令群一檔，由指令樹產生。本檔是一頁看完的總覽。
 
-**指令一律是原生斜線指令**：打 `/` 就會自動補全，參數有型別與值域檢查。
+**這一份是指令本身，與平台無關。** 在有原生斜線選單的平台上，它們就是斜線指令：
+打 `/` 會自動補全，參數有型別與值域檢查。沒有斜線選單的平台走文字表面，指令名與
+權限閘完全一樣（見 [`docs/platforms.md`](docs/platforms.md)）。
 
 🔒 **限頻道**：只能在設定的頻道（`channel_id`）使用；擁有者可跨頻道。
 🌐 **跨頻道**：bot 看得到的任何頻道都能用。
-🔑 **限擁有者**：操作 bot 那台電腦的指令，閘門在派發前且**不看 `user_roles`**
+🔑 **限擁有者**：操作 bot 那台機器的指令，閘門在派發前且**不看 `user_roles`**
 ——`/input`、`/screen`、`/win`、`/clip`、`/locate`、`/macro`、`/watch`、
 `/proc`、`/host` 整群，加上 `/sys restart|git_pull|undo|audit|cleanup_debug`
 `|introspect_dom|dashboard`、`/config set|reset|reload`、`/log clear`、

@@ -72,6 +72,21 @@ _DELIBERATELY_NOT_CHECKED = {
     "程序": "台灣中文＝procedure；CLAUDE.md 自己註明它技術上有效，只是建議改寫。",
 }
 
+# **整份檔案刻意不是台灣繁體**的那幾份使用者文件，檔名 → 理由。
+#
+# 這條規則管的是「本專案寫的**中文**」，而四語 README 裡有兩份本來就不是它的對象：
+# 簡體那一份刻意是簡體（與 `_help_strings.py` 的 zh-CN 段落同一個處置），日文那一份
+# 根本不是中文。逐行豁免在這裡沒有意義——那兩份每一行都會命中，而一份寫滿理由的逐行
+# 清單只會讓人以為這件事有人在管。
+#
+# **單一正本**：字形那一側的同一份名單住在 `audit_simplified_chars.DELIBERATE_FILES`，
+# 而 `test_the_non_traditional_markdown_lists_agree` 兩個方向對帳它們——兩份平行清單
+# 只要有一份會被遺忘，這條規則就是壞的。
+_NON_TRADITIONAL_MARKDOWN = {
+    "README.zh-CN.md": "四語 README 的簡體版，整份刻意是簡體",
+    "README.ja.md": "四語 README 的日文版，根本不是中文",
+}
+
 # 使用者自己打的內容，不是本專案寫的文字。
 _DATA_MARKDOWN = {
     "auth.md", "discord_bot_token.md", "character1.md", "character2.md",
@@ -147,6 +162,8 @@ def _replacement_window(lines: list[str], number: int) -> str:
 
 
 def _offenders(path: Path) -> list[str]:
+    if path.name in _NON_TRADITIONAL_MARKDOWN:
+        return []
     text = path.read_text(encoding="utf-8")
     skip = _zh_cn_line_ranges(path)
     lines = text.splitlines()
@@ -180,6 +197,50 @@ def test_chinese_uses_taiwan_vocabulary(source):
         + "\n  ".join(problems)
         + "\n改法：換成右邊那個詞。真的是在**引用**這個詞（規則表、清理紀錄、"
           "grep 指令）就用反引號包起來，或在同一行寫出規定用詞。")
+
+
+def test_the_non_traditional_markdown_lists_agree():
+    """兩份名單是同一件事，所以兩個方向都對帳。
+
+    字形那一側（`audit_simplified_chars.DELIBERATE_FILES`）與用詞這一側
+    （`_NON_TRADITIONAL_MARKDOWN`）各自豁免同一批檔案。只改一邊的後果是**安靜的**：
+    那份檔案仍然被另一道守門掃，而紅字講的是一個沒有人打算修的「違規」，於是最省事
+    的反應是把那道守門也關掉。
+    """
+    assert set(_NON_TRADITIONAL_MARKDOWN) == set(_simplified.DELIBERATE_FILES), (
+        "兩份「整份不是台灣繁體」的名單對不上：\n"
+        f"  test_language: {sorted(_NON_TRADITIONAL_MARKDOWN)}\n"
+        f"  audit_simplified_chars: {sorted(_simplified.DELIBERATE_FILES)}")
+    for name, reason in _NON_TRADITIONAL_MARKDOWN.items():
+        assert reason.strip(), f"{name} 的豁免沒寫理由"
+        assert (REPO_ROOT / name).is_file(), f"{name} 不存在，這筆豁免已經過期"
+
+
+def test_the_whole_file_exemptions_are_not_stale():
+    """整份豁免也會過期：檔案改名、或它其實已經沒有非台灣標準字形了。
+
+    後者比前者危險——一個「不需要豁免」的條目留著，會讓下一個真的該被看的檔案被同一
+    筆默默放行。
+    """
+    stale = _simplified.stale_file_rules()
+    assert not stale, (
+        f"這些整份豁免已經過期：{stale}。把那一筆刪掉。")
+
+
+def test_the_translated_readmes_are_actually_in_their_language():
+    """正面對照：豁免掉的那兩份要真的不是台灣繁體。
+
+    不驗這件事的話，把一份繁體文件列進豁免名單就等於讓它永遠不被掃——而那跟「它是
+    翻譯版」長得一模一樣。
+    """
+    for name in _NON_TRADITIONAL_MARKDOWN:
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        hits = {ch for line in text.splitlines()
+                for ch in _simplified.outside_code_spans(line)
+                if ch in _simplified.NOT_TW_STANDARD}
+        assert hits, (
+            f"{name} 一個非台灣標準字形都沒有——它看起來是繁體，卻被列進了"
+            "「整份不是台灣繁體」的豁免名單。")
 
 
 def test_the_zh_cn_sections_are_the_only_carve_out():

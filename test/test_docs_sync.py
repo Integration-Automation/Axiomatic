@@ -584,16 +584,67 @@ def _count_prompt_files() -> int:
                 if path.is_file()])
 
 
+# README 引用的四個數字，**四種語言各一組樣式**。
+#
+# 那四份 README 是同一份文件的四個語言（`test_readme_parity` 釘結構與指令表），所以
+# 數字也必須四份一起對。只釘英文那一份的話，翻譯版可以停在一個舊數字上很久——而它
+# 讀起來完全正常，只有同時讀兩份的人才會發現。
+_README_NUMBER_PATTERNS = {
+    "README.md": (
+        r"\*\*(\d+) top-level slash commands\*\*",
+        r"\*\*(\d+) command groups\*\*",
+        r"\*\*(\d+) slash sub-commands\*\*",
+        r"(\d+) plain-text prompt files",
+    ),
+    "README.zh-TW.md": (
+        r"\*\*(\d+) 個頂層 slash 指令\*\*",
+        r"\*\*(\d+) 個指令群\*\*",
+        r"\*\*(\d+) 個斜線子指令\*\*",
+        r"(\d+) 個純文字檔",
+    ),
+    "README.zh-CN.md": (
+        r"\*\*(\d+) 个顶层 slash 命令\*\*",  # zh-CN 引用樣式
+        r"\*\*(\d+) 个命令组\*\*",  # zh-CN 引用樣式
+        r"\*\*(\d+) 个斜杠子命令\*\*",  # zh-CN 引用樣式
+        r"(\d+) 个纯文本文件",  # zh-CN 引用樣式
+    ),
+    "README.ja.md": (
+        r"\*\*(\d+) 個のトップレベルスラッシュコマンド\*\*",
+        r"\*\*(\d+) 個のコマンドグループ\*\*",
+        r"\*\*(\d+) 個のスラッシュサブコマンド\*\*",
+        r"(\d+) 個のプレーンテキストファイル",
+    ),
+}
+
+_README_NUMBER_LABELS = ("頂層斜線指令", "斜線指令群", "斜線葉指令", "prompt 檔")
+_README_NUMBER_MEASURES = (_count_slash_top, _count_slash_groups,
+                           _count_slash_leaves, _count_prompt_files)
+
 # (檔案, 抓數字的樣式, 這個數字是什麼, 怎麼量)
 CITATIONS = [
-    # README 是使用者文件：只講斜線面，不引用 `!` / `@bot` 的數字。
-    ("README.md", r"(\d+) 個頂層 slash 指令", "頂層斜線指令", _count_slash_top),
-    ("README.md", r"(\d+) 個指令群", "斜線指令群", _count_slash_groups),
-    ("README.md", r"(\d+) 個斜線子指令", "斜線葉指令", _count_slash_leaves),
-    ("README.md", r"(\d+) 個純文字檔", "prompt 檔", _count_prompt_files),
+    (doc, pattern, label, measure)
+    for doc, patterns in sorted(_README_NUMBER_PATTERNS.items())
+    for pattern, label, measure in zip(patterns, _README_NUMBER_LABELS,
+                                       _README_NUMBER_MEASURES)
+] + [
     ("axiomatic/discord_bot.py", r"目前 (\d+)/100",
      "頂層斜線指令總數", lambda: _count_slash_top() + _count_slash_groups()),
 ]
+
+
+def test_every_readme_language_has_its_own_number_citations():
+    """反方向：新增一個語言就要在這張表裡補一組樣式，否則那一份完全不被檢查。
+
+    `test_readme_parity.READMES` 是那一組語言的正本；這裡對帳的是「每一份都有人
+    在看它的數字」。
+    """
+    import test_readme_parity as parity  # noqa: PLC0415
+
+    missing = sorted(set(parity.READMES) - set(_README_NUMBER_PATTERNS))
+    assert not missing, (
+        f"這幾份 README 沒有數字引用的樣式：{missing}。它們寫錯數字不會有人發現。")
+    stale = sorted(set(_README_NUMBER_PATTERNS) - set(parity.READMES))
+    assert not stale, f"這幾筆樣式指向不存在的 README：{stale}"
 
 
 @pytest.mark.parametrize(

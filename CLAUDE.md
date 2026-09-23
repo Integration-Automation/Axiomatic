@@ -20,6 +20,26 @@ construction, so it is a rule:
 | Batch generation | `webrunner_novelai.py`, `webrunner_je_only.py` (two driver variants over one shared core, `_webrunner_shared.py`) |
 | Bot ↔ webrunner previews | `discord_bot.py`'s run-plan snapshot vs `_queue_consume`'s dynamic decisions |
 | Slash surface | the command tree, `_help_strings.py` (three languages), `README.md`, `COMMANDS.md`, `docs/commands_*.md`, `commands/*.md` |
+| The README set | `README.md` (English, the primary) and its three translations `README.zh-TW.md`, `README.zh-CN.md`, `README.ja.md` — same content, same structure, one language switcher linking all four |
+
+**The README set is four languages of one document, and that is guarded.**
+`test/test_readme_parity.py` reconciles the section sequence (every `##`
+heading carries a language-independent `<!-- section: <key> -->` marker above
+it), the set of slash-command tokens (language-independent, so all four must
+name exactly the same commands), and the switcher (present in all four, each
+marking itself and linking the other three). The number citations are per
+language in `test_docs_sync._README_NUMBER_PATTERNS`, reconciled against the
+parity module's language list, so a translation cannot sit on a stale count.
+**The Simplified and Japanese files are exempt from the Language rule as whole
+files** — that rule governs the Chinese *this project writes*, and one of those
+two is deliberately Simplified while the other is not Chinese at all. The
+exemption list lives in two places on purpose (the vocabulary side in
+`test_language._NON_TRADITIONAL_MARKDOWN`, the character-shape side in
+`audit_simplified_chars.DELIBERATE_FILES`) and
+`test_the_non_traditional_markdown_lists_agree` reconciles them, because
+exempting a file on one side only leaves the other guard crying wolf about a
+"violation" nobody intends to fix — and the cheapest reaction to that is to
+switch the guard off.
 
 ## Durable knowledge goes into the tree, not into a reply
 

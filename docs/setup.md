@@ -2,6 +2,9 @@
 
 這一頁是**全新 clone 到 bot 上線**的完整路徑。照順序做完就會有一個能用的機器人。
 
+預設會先接起有原生斜線選單的那個平台；要同時接第二、第三個平台（一個平台一個
+行程）請接著看 [其他對話平台](platforms.md)。
+
 ## 0. 先決條件
 
 | 需要 | 為什麼 | 沒有的話 |
@@ -9,7 +12,7 @@
 | **Windows 10/11** | 桌面自動化、Chrome 視窗、工作排程器都是 Windows API | 其他平台上大部分功能不會動 |
 | **Python 3.10+** | 建議用 `py -3` 啟動器 | — |
 | **Google Chrome** | webrunner 用 Selenium 驅動真的瀏覽器 | 批次產圖用不了 |
-| **一個 Discord application ＋ bot token** | bot 本體 | bot 起不來 |
+| **至少一個聊天平台的 bot 帳號與 token** | bot 要有地方上線；預設是有原生斜線選單的那個平台 | bot 起不來 |
 | **出圖服務的帳號** | webrunner 要登入才能產圖 | 批次產圖用不了 |
 
 下面三項是**選用**的，缺了只會少一組功能，不影響其他部分：
@@ -36,7 +39,10 @@ pip install -r requirements.txt
 「直接就能跑」，之後也不必每次都先 activate。
 ```
 
-## 2. 建立 Discord application 與 bot
+## 2. 建立預設平台的 application 與 bot
+
+以下是有原生斜線選單的那個平台（Discord）的步驟。其他平台各自的取 token 方式
+寫在 {doc}`platforms`。
 
 1. 到 <https://discord.com/developers/applications> → **New Application**。
 2. 左邊 **Bot** → **Reset Token** → 複製那一串。**它只會顯示一次。**
@@ -60,15 +66,21 @@ copy auth.example.md                auth.md
 copy discord_bot_token.example.md   discord_bot_token.md
 copy bot_config.example.json        bot_config.json
 # 以下選用
+copy telegram_bot_token.example.md  telegram_bot_token.md
 copy presence_games.example.json    presence_games.json
 copy presence_music.example.json    presence_music.json
 copy presence_rpc.example.json      presence_rpc.json
 ```
 
-### `discord_bot_token.md` — Discord bot token
+### `<平台>_bot_token.md` — 各平台的 bot token
 
-整個檔案就是 token，或者一行 `Token: <值>`。**必填**，沒有它 bot 不會啟動
-（會印一行說明叫你複製範本，不是 traceback）。
+憑證檔的命名是約定：一個平台一個檔，`<平台>_bot_token.md`。整個檔案就是 token，
+或者一行 `Token: <值>`。
+
+預設平台（有原生斜線選單的那一個）的 `discord_bot_token.md` 是**必填**，沒有它
+bot 不會啟動（會印一行說明叫你複製範本，不是 traceback）。其餘平台的 token 檔
+**不存在或是空的就等於那個平台關著**——那是缺席，不是失敗。要同時接第二個平台
+請看 {doc}`platforms`。
 
 ### `auth.md` — 出圖服務帳密
 
@@ -120,12 +132,17 @@ copy undesired.example.md   undesired.md
 ## 4. 啟動 bot
 
 ```powershell
-py -3 start_discord_bot.py
+py -3 start_platforms.py         # 把每個開著的平台各起一個行程
+py -3 start_discord_bot.py       # 或者只起預設平台那一個
 ```
+
+**一個平台一個行程**：`start_platforms.py` 讀設定，對每個「開著而且填了憑證」的
+平台各起一支監督者；`--list` 只列出哪些會起來、哪些不會與原因。要指定單一平台就
+`py -3 start_discord_bot.py --platform <名稱>`。詳見 {doc}`platforms`。
 
 `start_discord_bot.py` 是**監督式啟動器**：bot 崩潰就重啟，第一次等 5 秒，若
 60 秒內又崩潰則退避加倍（上限 300 秒），活滿 60 秒就重置回 5 秒。不要把它改成
-固定間隔重啟——壞掉的 token 在緊密迴圈裡會狂打 Discord 連線端點而被封鎖。
+固定間隔重啟——壞掉的 token 在緊密迴圈裡會狂打平台的連線端點而被封鎖。
 
 兩種情況啟動器會**直接收工而不重試**，因為重試不會有結果：
 
@@ -133,13 +150,13 @@ py -3 start_discord_bot.py
 - **設定還沒填好**（rc=5）——訊息會說缺哪一個檔、該複製哪個範本。
 
 bot 上線後在設定的頻道打 `/help` 看完整指令清單（可選 `tw` / `cn` / `en`）。
-斜線指令要幾分鐘才會在 Discord 的應用程式裡出現，這是平台端的同步延遲。
+在有原生斜線選單的平台上，斜線指令要幾分鐘才會出現，這是平台端的同步延遲。
 
 ## 5. 啟動批次產圖
 
 兩種方式**擇一**（不要同時用，會搶 Chrome profile 鎖）：
 
-1. **從 Discord**：在設定的頻道打 `/run`。
+1. **從聊天平台**：在設定的頻道打 `/run`。
 2. **獨立啟動器**：
 
    ```powershell
@@ -180,8 +197,9 @@ py -3 install_autostart.py --status     # 看目前註冊了什麼
 py -3 install_autostart.py --remove     # 移除
 ```
 
-它在 Windows 工作排程器底下註冊 `\Axiomatic\Bot` 與 `\Axiomatic\Batch` 兩個
-工作，觸發條件是**目前這個使用者登入時**。為什麼不是「開機時」：批次要開一個
+它在 Windows 工作排程器底下註冊的是「現在開著的東西」：**每個開著的平台各一筆**
+（`\Axiomatic\Bot-<平台>`），加上批次那一筆（`\Axiomatic\Batch`）。觸發條件是
+**目前這個使用者登入時**。為什麼不是「開機時」：批次要開一個
 有桌面的 Chrome 視窗，而開機觸發的工作跑在 session 0、沒有互動桌面，Chrome 在
 那裡起不來。代價是機器重開後停在鎖定畫面、沒有人登入的話工作不會觸發。
 

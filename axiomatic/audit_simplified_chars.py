@@ -78,6 +78,16 @@ AMBIGUOUS = {
 # 刻意保留的簡體，逐筆寫理由。比對方式是「檔名結尾 ＋ 該行含這個子字串」，不用行號
 # ——行號一天就漂掉了。過期的條目會被報出來：一個永遠對不上的豁免會安靜失效，
 # 而守門看起來照常在跑（與 `_OWNER_ONLY_SLASH` 同一個形狀）。
+# **整份檔案刻意不是台灣繁體**的那幾個，檔名 → 理由。逐行豁免在這裡沒有意義：
+# 一份簡體或日文的文件每一行都會命中，而一份寫滿理由的逐行清單只會讓人以為這件事
+# 沒人管。列進來的檔案整份跳過，但**兩個方向都對帳**（見 `stale_file_rules`）：
+# 檔案要存在，而且要真的含有非台灣標準字形——一個永遠對不上的豁免會安靜失效。
+DELIBERATE_FILES: dict[str, str] = {
+    "README.zh-CN.md": "四語 README 的簡體版，整份刻意是簡體（見 test_readme_parity）",
+    "README.ja.md": "四語 README 的日文版。日文漢字有大量新字體，與簡體字表重疊，"
+                    "而它本來就不是中文——語言規則管的是「本專案寫的中文」",
+}
+
 DELIBERATE: tuple[tuple[str, str, str], ...] = (
     ("discord_bot.py", '"zh-hans"',
      "語言代碼對照表，鍵本身就是使用者會輸入的簡體"),
@@ -87,6 +97,13 @@ DELIBERATE: tuple[tuple[str, str, str], ...] = (
      "使用者會打的指令動詞別名"),
     ("test_docs_sync.py", "@bot <",
      "zh-CN help 語料的預期值"),
+    ("test_docs_sync.py", "# zh-CN 引用樣式",
+     "四語 README 的簡體版引用樣式，行尾標記讓整組只要一筆豁免"),
+    ("README.md", "简体中文",
+     "語言切換器裡那個語言自己的名稱，不寫簡體就連不回去"),
+    ("README.zh-TW.md", "简体中文", "同上"),
+    ("test_readme_parity.py", "简体中文",
+     "語言切換器的正本清單（檔名 → 那個語言自己的名稱）"),
     ("test_docs_sync.py", "改法：把那幾行改寫成",
      "這是 zh-CN 守門自己的失敗訊息，本來就在教人寫簡體"),
     ("test_docs_sync.py", "不要**改成繁體去",
@@ -256,8 +273,15 @@ def scan():
         except (OSError, UnicodeDecodeError) as error:
             print(f"※ 讀不了 {path.name}：{error!r}")
             continue
-        skip = zh_cn_line_ranges(path)
         rel = path.relative_to(REPO_ROOT).as_posix()
+        if path.name in DELIBERATE_FILES:
+            # 整份跳過，但**要算進 `exempted`**：那個計數是呼叫端的正面對照組，
+            # 不算的話「整份豁免」與「這個檔案根本沒被掃到」長得一模一樣。
+            exempted += sum(
+                1 for line in text.splitlines()
+                if any(ch in NOT_TW_STANDARD for ch in outside_code_spans(line)))
+            continue
+        skip = zh_cn_line_ranges(path)
         for lineno, line in enumerate(text.splitlines(), 1):
             found = sorted({ch for ch in outside_code_spans(line)
                             if ch in NOT_TW_STANDARD})
@@ -280,6 +304,34 @@ def stale_rules(used) -> list[tuple[str, str]]:
     """一行都沒對上的豁免規則。"""
     return [(suffix, needle) for suffix, needle, _why in DELIBERATE
             if (suffix, needle) not in used]
+
+
+def stale_file_rules() -> list[str]:
+    """`DELIBERATE_FILES` 裡已經沒有意義的條目。
+
+    兩種都算過期：檔案在掃描範圍裡找不到（改名或刪掉了），以及檔案還在、卻一個
+    非台灣標準字形都沒有（那它根本不需要豁免，而留著會讓下一個真的該被看的檔案
+    被同一筆默默放行）。
+    """
+    by_name = {path.name: path for path in sources()}
+    stale = []
+    for name, reason in DELIBERATE_FILES.items():
+        path = by_name.get(name)
+        if path is None:
+            stale.append(f"{name}（不在掃描範圍裡）")
+            continue
+        if not reason.strip():
+            stale.append(f"{name}（沒寫理由）")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            stale.append(f"{name}（讀不了）")
+            continue
+        if not any(ch in NOT_TW_STANDARD
+                   for line in text.splitlines()
+                   for ch in outside_code_spans(line)):
+            stale.append(f"{name}（整份都是台灣標準字形，不需要豁免）")
+    return stale
 
 
 def main(argv=None) -> int:

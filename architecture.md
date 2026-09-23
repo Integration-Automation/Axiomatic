@@ -7,12 +7,16 @@
 
 ## 1. 目的
 
-影像生成自動化，由兩個長駐行程組成：
+一台**用聊天操作的自動化主機**：從任何一個接上的聊天平台對這台機器下指令，由它執行
+桌面與視窗自動化、主機指令與檔案進出、定時工作、對話問答，以及一條長駐的瀏覽器批次。
+**沒有任何單一平台是這個專案的身分**——聊天表面是介接層，一個平台一個行程。
 
-- **webrunner**（執行層）：以瀏覽器操作出圖服務，依佇列檔批次產圖——登入、填提示詞、
-  按產生、下載圖檔，並把續跑檢查點與事件寫回磁碟。
-- **bot**（意圖層）：對話平台上的 bot，負責接指令、編輯佇列檔、spawn 並監督 webrunner、
-  回報結果；另外附帶單張產圖佇列、桌面控制指令、presence 鏡像與 Dorossi 對話後端（多種後端）。
+兩種長駐行程：
+
+- **平台行程**（意圖層）：接指令、判斷身分、編輯佇列檔、spawn 並監督工作、回報結果。
+  **一個聊天平台一個行程**，各有自己的鎖、記錄檔與狀態，彼此不共用可變狀態。
+- **webrunner**（執行層，出圖這個工作負載）：以瀏覽器操作出圖服務，依佇列檔批次產圖
+  ——登入、填提示詞、按產生、下載圖檔，並把續跑檢查點與事件寫回磁碟。
 
 兩者**只透過磁碟上的檔案溝通**，永遠不互相 `import`，所以任一邊重啟、崩潰或被殺，
 另一邊都不會壞掉。
@@ -20,17 +24,20 @@
 ## 2. 分層與目錄
 
 ```
-使用者（對話平台）
-   │  斜線指令
+使用者（任一個接上的聊天平台）
+   │  指令（斜線或文字，視平台而定）
    ▼
-discord_bot.py ──磁碟檔案（todo_*.md、*_request.json、webrunner.pid/pause、events.ndjson）── webrunner_*.py
-   │                                                                                    │
-   └──────────── 被動共用模組（_batch_config、_webrunner_shared、_queue_consume …）──────┘
+平台行程（一個平台一個；`discord_bot.py` ＋ `_chat_platform` ＋ `_*_transport`）
+   │
+   ├─ 同行程內：桌面／視窗控制、主機指令、對話後端
+   │
+   └─磁碟檔案（todo_*.md、*_request.json、webrunner.pid/pause、events.ndjson）── webrunner_*.py
+        └──────── 被動共用模組（_batch_config、_webrunner_shared、_queue_consume …）────┘
 ```
 
 | 路徑 | 職責 |
 | --- | --- |
-| `axiomatic/discord_bot.py` | 意圖層：斜線指令樹（唯一對外介面）與隱藏的 `!`／`@bot` 相容層、佇列編輯、webrunner 監督、單張產圖佇列、Dorossi 編排、presence 與背景任務 |
+| `axiomatic/discord_bot.py` | 意圖層（模組名是歷史遺留，它不綁任何平台）：指令樹與文字相容層、身分閘、佇列編輯、webrunner 監督、單張產圖佇列、Dorossi 編排、presence 與背景任務 |
 | `axiomatic/webrunner_novelai.py`、`axiomatic/webrunner_je_only.py` | 執行層的兩個變體（Selenium 為正式預設、wrapper 為備援）：瀏覽器生命週期、登入、設定檔快照、`BrowserPort` adapter |
 | `axiomatic/_webrunner_shared.py` | 兩個變體的共用核心，不 import 任何 driver：DOM 操作、佇列 I/O、輸出資料夾分配、產圖迴圈、單圖服務、`run_batch` |
 | `axiomatic/_batch_config.py`、`_bot_config.py`、`_queue_consume.py`、`_run_progress.py`、`_supervisor.py`、`_chrome_slot.py`、`_code_fingerprint.py`、`_warn_dedup.py` | 無狀態的共用模組：設定載入、佇列消耗決策、續跑檢查點、退避與單一實例鎖、跨行程瀏覽器槽鎖、程式碼指紋、警告去重（允許當第三通道的完整清單以 `CLAUDE.md`「Module boundaries」為準） |
@@ -43,7 +50,7 @@ discord_bot.py ──磁碟檔案（todo_*.md、*_request.json、webrunner.pid/p
 | `todo_prompt.md`、`todo_character1.md`、`todo_character2.md`、`todo_undesired.md`；`prompt.md`、`character1.md`、`character2.md`、`undesired.md`；`default_prompt.md` | 四條佇列、各自的 fallback 提示詞、主提示詞範本（bot 寫、webrunner 讀）。全部是**使用者內容**：repo 只帶 `*.example.md` 範本，實際檔案 gitignored |
 | `batch_config.json`（追蹤）、`bot_config.example.json`、`presence_*.example.json`、`bot_prompts/` | 設定檔與外部化 prompt 文字。帶 `.example` 的要先複製成同名的正式檔再填 |
 | `auth.md`、`discord_bot_token.md` | 憑證，**永不追蹤**（`.gitignore`）；範本是 `*.example.md` |
-| `README.md`、`COMMANDS.md`、`commands/`、`docs/` | 使用者文件；`commands/*.md` 由指令樹產生，`docs/` 是 Sphinx 原始碼 |
+| `README.md`、`README.zh-TW.md`、`README.zh-CN.md`、`README.ja.md`、`COMMANDS.md`、`commands/`、`docs/` | 使用者文件。README 是**四種語言的同一份文件**（英文為主，其餘三份由語言切換器互連），章節結構與指令表由 `test/test_readme_parity.py` 兩向對帳；`commands/*.md` 由指令樹產生，`docs/` 是 Sphinx 原始碼 |
 | `CLAUDE.md`、`architecture.md` | 常駐硬規則與本檔 |
 | `state/<平台>/` | **逐平台**的執行期狀態：該行程的工作階段、佇列、事件、稽核、收藏、排程、實例鎖與記錄檔，檔名再帶一次平台名。整個目錄 gitignored（一條規則蓋住所有平台與它們的 `.tmp`） |
 | `output/`、`.chrome_profile*/`、`*.log`、`*.ndjson`、`webrunner.pid`、`.batch_supervisor.lock` 等 | 全機共用的執行期產物（gitignored）。批次那一側**刻意不逐平台**——批次只有一份 |
@@ -110,6 +117,7 @@ discord_bot.py ──磁碟檔案（todo_*.md、*_request.json、webrunner.pid/p
 | 跨行程檔案 | 原子寫入，並同時加進 `CLAUDE.md` 原子寫入清單與 `test/test_atomic_writes.py` 的 `_CROSS_PROCESS_CONSTANTS`；新的根目錄檔案要分類為追蹤的專案資產或 gitignored 的執行期產物（`test/test_gitignore_coverage.py`） |
 | 外部 API | `axiomatic/_external_apis.py`（唯一外送出口 `_http_get_json`）＋ `axiomatic/verify_external_apis.py` |
 | 對話平台 | 新增 `axiomatic/_<平台>_transport.py`，列進 `_chat_platform.TRANSPORT_MODULES`，在 `_bot_config` 的 `_DEFAULT_PLATFORMS` / `_PLATFORM_COERCERS` 各加一列，憑證檔照 `<平台>_bot_token.md` 的約定命名（連同範本與 `.gitignore`、`test_gitignore_coverage._IGNORED_RUNTIME`），並在 `docs/platforms.md` 寫使用說明 |
+| 使用者說明（README） | 四份 README 一起改：章節用 `<!-- section: <key> -->` 標記對齊，指令表四份逐字相同，切換器四份互連；數字引用在 `test_docs_sync._README_NUMBER_PATTERNS` 每種語言各一組。簡體與日文那兩份整份豁免語言守門，名單同時列在 `test_language._NON_TRADITIONAL_MARKDOWN` 與 `audit_simplified_chars.DELIBERATE_FILES`（兩向對帳） |
 | 桌面控制功能 | `axiomatic/_gui_control.py`，錯誤以泛用訊息的 `GuiError` 拋出 |
 | prompt 文字／presence 規則 | `bot_prompts/`（由 `_bot_prompts.py` 載入）；`presence_games.json`、`presence_music.json`、`presence_rpc.json`（各自的 `.example.json` 是範本） |
 
