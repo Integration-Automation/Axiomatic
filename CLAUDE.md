@@ -60,6 +60,31 @@ Every change MUST satisfy these before commit:
    "re-document" the text surface — that is the drift this guard exists to
    stop. The same ban applies to strings the bot sends: never tell a user to
    type `!cmd`.
+
+   **A platform with no slash menu is the exception, and only those
+   platforms.** The ban above was written when the text surface was a hidden
+   compat path on **one** platform — that platform has a native slash menu, so
+   teaching `!cmd` there re-exposes a surface that has already been replaced.
+   The bot now also runs on platforms with **no slash menu** (the first is
+   `_telegram_transport`), and there the text commands are not a compat path,
+   they are the only entry point — leaving them out of the docs means that
+   platform ships with no manual at all.
+   So: **a user doc that belongs to a non-slash platform (today
+   `docs/platforms.md`) may teach text commands; the five slash-platform
+   corpora (three-language help, `README.md`, `COMMANDS.md`,
+   `docs/commands_*.md`, `commands/*.md`) stay banned.**
+   The guard was **narrowed, not removed**:
+   `test_docs_sync.test_hidden_surfaces_are_not_advertised` is untouched over
+   those five corpora, and a new
+   `test_only_the_declared_non_slash_doc_may_teach_text_commands` scans **every**
+   user doc and requires the hits to sit only in the files listed in
+   `_TEXT_SURFACE_DOCS`. That exemption list is reconciled both ways — an entry
+   that no longer teaches a text command is reported as stale, because an
+   exemption that never matches anything fails silently while the guard looks
+   like it is still running. The send-string half
+   (`test_secrecy.test_no_bot_string_teaches_a_hidden_bang_command`) is
+   **unchanged**: it scans `discord_bot.py`'s send sites, i.e. the slash
+   platform's surface.
 4. Any new dependency added to `requirements.txt` MUST be `pip install`-ed
    during the change, so the launcher can actually start the bot afterwards.
    **`requirements.txt` pins nothing but floors what it must.** No `==` — a
@@ -111,6 +136,23 @@ supervisors use to tell a network outage from a crash. (`_external_apis`,
 boundary channels; `_gui_control` is bot-only too — the desktop-automation
 façade over the external library. None of them may import `discord_bot` —
 that would be circular.)
+
+**The chat-platform seam is a bot-only helper too, not a boundary channel.**
+`_chat_platform` is the adapter seam for chat platforms (identity mapping,
+capability flags, outbound-argument normalisation, the transport registry) and
+`_telegram_transport` is the first platform wired onto it; every further
+platform adds one more `_*_transport.py`. `_platform_runtime` is the
+per-platform process identity (which platform this process serves, and where its
+own state, lock and log live). Three things are hard rules: they MUST NOT import
+`discord_bot` ("what to do with a received message" is a callback the bot
+injects — see `_chat_platform.TransportContext`), they MUST NOT import any
+`webrunner_*`, and **every `_*_transport.py` on disk MUST be listed in
+`_chat_platform.TRANSPORT_MODULES`** — a module that is not listed is never
+imported, so its `register_transport` never runs and that platform stays off
+even with the config filled in, with symptoms identical to "not configured".
+`test_platform_transports` reconciles that list in both directions. The day one
+of these becomes a module both sides import, the Permitted-third-channel list
+above and `_SHARED_CHANNELS_IN_USE` must change together.
 
 **The boundary line inside that channel:** the bot imports ONLY the pure
 snapshot primitives its `/gen plan` / `/gen preview` / `/queue` / `/eta`
@@ -270,6 +312,19 @@ set is still there, every test stays green. Nothing checked it until
 2026-09-09; measured then, all 109 host-control tests passed with a
 deliberately stale entry. `_OWNER_ONLY_GROUPS` has the same shape (a renamed
 group), so both are now reconciled against the AST-extracted tree.
+
+**Another platform does not add a fourth gate — it maps identity at the door.**
+`OWNER_USER_ID` is an id **on one particular platform**, so every other platform
+lists its own owners under `bot_config.json`'s
+`platforms.<name>.owner_user_ids`. `_chat_platform.resolve_identity()` is the
+**only** mapping point: a sender listed there maps to `OWNER_USER_ID`, everyone
+else (including a sender whose id cannot be read) maps to a **negative** number.
+The three gates below therefore hold on every platform without a single word
+changing, and fail-closed is structural — a negative number can never equal
+`OWNER_USER_ID`, and can never appear in `user_roles` /
+`path_reveal_channel_ids` (both coercers take `>= 0` only), so a user on another
+platform gets no role and no path-revealing surface. **Never write
+`== OWNER_USER_ID` again inside a transport** — same reason as `_owner_detail()`.
 
 **All three surfaces must be gated, and they use different identifiers:**
 slash (`qualified_name`, in `tree.interaction_check`), `!` (`head` plus every

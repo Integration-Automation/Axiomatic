@@ -348,6 +348,93 @@ def test_hidden_surfaces_are_not_advertised(corpus_name):
 
 
 # --------------------------------------------------------------------------
+# 沒有斜線選單的平台是例外，而且只有那些平台
+# --------------------------------------------------------------------------
+# 上面那支掃的是**斜線平台**的五份語料，一個字都沒改。但那五份不是全部的使用者
+# 文件：`docs/` 底下還有別的頁。bot 也在沒有斜線選單的平台上運作，而文字指令在
+# 那些平台**不是**相容路徑、是唯一的入口，所以那一頁必須教得了它——而「哪一頁
+# 可以教」必須是列舉的，否則 `!` 會一頁一頁爬回文件裡，正是上面那支存在的理由。
+#
+# 名單兩個方向都對帳：列了卻其實沒教文字指令的條目會被報成過期。一個永遠對不上
+# 任何東西的豁免會安靜失效，而守門看起來照常在跑——`_OWNER_ONLY_SLASH` 與
+# `_DELIBERATE` 都是同一個形狀。
+_TEXT_SURFACE_DOCS = {
+    # 沒有斜線選單的平台的使用者說明。那些平台上文字指令不是相容路徑，是入口。
+    "docs/platforms.md",
+}
+
+
+def _user_doc_corpora() -> dict[str, str]:
+    """所有使用者面的 markdown（repo root ＋ `docs/` ＋ `commands/`）。
+
+    **用 glob 而不是寫死清單**：新增一頁文件時寫死的那一份會讓它靜默地不受任何
+    檢查，而這支測試的全部意義就是「每一頁都要選邊站」。`architecture.md`
+    是內部文件、不是使用者文件，所以排除。
+    """
+    skip = {"CLAUDE.md", "architecture.md"}
+    out: dict[str, str] = {}
+    for path in (*sorted(REPO_ROOT.glob("*.md")),
+                 *sorted((REPO_ROOT / "docs").glob("*.md")),
+                 *sorted((REPO_ROOT / "commands").glob("*.md"))):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if path.name in skip:
+            continue
+        out[rel] = path.read_text(encoding="utf-8")
+    return out
+
+
+def _text_commands_taught(text: str) -> list[str]:
+    for phrase in _ALLOWED_MENTION_PHRASES:
+        text = text.replace(phrase, "")
+    known = set(BANG_PRIMARY) | set(BANG_ALIASES)
+    return sorted({token for token in _BANG_TOKEN_RE.findall(text)
+                   if token in known})
+
+
+def test_only_the_declared_non_slash_doc_may_teach_text_commands():
+    """斜線平台的文件不得教文字指令；非斜線平台的那一頁可以，但必須先列冊。"""
+    corpora = _user_doc_corpora()
+    assert len(corpora) >= 10, (
+        f"只掃到 {len(corpora)} 份使用者文件——glob 壞了，這支等於沒在檢查。")
+    offenders = {name: hits for name, text in corpora.items()
+                 if name not in _TEXT_SURFACE_DOCS
+                 and (hits := _text_commands_taught(text))}
+    assert not offenders, (
+        f"這些文件在教文字指令：{offenders}。斜線指令是那個平台唯一的對外介面；"
+        f"只有 {sorted(_TEXT_SURFACE_DOCS)} 這些沒有斜線選單的平台說明可以教，"
+        "而且要先列進 `_TEXT_SURFACE_DOCS` 並寫理由。")
+
+
+def test_the_text_surface_exemption_is_not_stale():
+    """列了卻其實沒教文字指令的豁免 ＝ 一個安靜失效的豁免。
+
+    也順便釘住檔案真的存在：改名之後那一筆會變成一個永遠對不上任何東西的字串，
+    而掃描照樣跑、每一支照樣綠。
+    """
+    corpora = _user_doc_corpora()
+    stale = sorted(name for name in _TEXT_SURFACE_DOCS
+                   if not _text_commands_taught(corpora.get(name, "")))
+    assert not stale, (
+        f"`_TEXT_SURFACE_DOCS` 列著 {stale}，但它們現在沒有教任何文字指令"
+        "（檔案不見了、改名了、或那一段被刪掉了）。把那一筆刪掉。")
+
+
+@pytest.mark.parametrize("text,caught", [
+    ("用 `!status` 看狀態", True),
+    ("用 `/status` 看狀態", False),
+    ("太好了!", False),
+    ("`!definitelynotacommand` 不是指令", False),
+])
+def test_the_text_command_detector_tells_the_shapes_apart(text, caught):
+    """對照組：真的指令名要抓到，普通驚嘆號與不存在的指令不能誤報。
+
+    沒有這一格，把述詞改成「永遠回空清單」上面兩支照樣綠——而一個永遠不叫的守門
+    跟一棵乾淨的樹長得一模一樣。
+    """
+    assert bool(_text_commands_taught(text)) is caught
+
+
+# --------------------------------------------------------------------------
 # 相容面：每個隱藏指令都要有斜線對應
 # --------------------------------------------------------------------------
 def test_every_hidden_command_has_a_slash_equivalent():

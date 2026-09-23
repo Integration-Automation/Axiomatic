@@ -416,6 +416,9 @@ STALE_COMPONENTS = {
         "start_discord_bot.py",
         "axiomatic/_supervisor.py",
         "axiomatic/_process_control.py",
+        # 逐平台的鎖檔與記錄檔路徑由 `_platform_runtime` 算（它是純 stdlib，
+        # 不 import 設定載入器——所以這條邊只有一格）。
+        "axiomatic/_platform_runtime.py",
     )),
     "bot": ("discord_bot.py", (
         "axiomatic/discord_bot.py",
@@ -438,6 +441,12 @@ STALE_COMPONENTS = {
         "axiomatic/_warn_dedup.py",
         "axiomatic/_power_request.py",
         "axiomatic/_connectivity.py",
+        # 對話平台層。`_telegram_transport`（與之後每一個 `_*_transport.py`）**不在
+        # 這裡**，而那不是漏列：它們由 `_chat_platform.import_transport_modules()`
+        # 在執行期動態載入，AST 的傳遞閉包看不到那條邊。改一個 transport 不會被算成
+        # 「bot 陳舊」——這是這張表結構上看不見的一角，不是忘了。
+        "axiomatic/_chat_platform.py",
+        "axiomatic/_platform_runtime.py",
     )),
     "batch supervisor": ("start_webrunner.py", (
         "start_webrunner.py",
@@ -508,7 +517,15 @@ def newest_dependency_mtime(root: Path, rel_paths, *, mtime=None):
 #
 # 所以這裡只做**偵測**：把「鏈路是完整的還是缺一角」講清楚，讓它在 `/sys doctor`
 # 上看得見，而不是等下一次當機才發現。
-_AUTOSTART_TASKS = (r"\Axiomatic\Bot", r"\Axiomatic\Batch")
+# **要查哪些工作是呼叫端說的，本模組不算。** 以前這裡是一個寫死的 tuple，而一個
+# 平台一個行程之後那份名單一定會漂——bot 的工作名帶著平台名，開一個關一個都會變。
+# 讓本模組自己去讀設定檔算一次，等於在批次那幾個元件的 import 閉包裡多一條
+# `_platform_runtime` / `_bot_config` 的邊，於是改那兩個檔會讓健康報告誤報「批次
+# 陳舊」——`STALE_COMPONENTS` 上面那段註解記的就是這種「指著一個無關的檔名說就是
+# 它」。所以 `autostart_recovery_status` 的 `tasks` 是**必填的關鍵字引數**：唯一的
+# 正式呼叫端（bot 的 `/sys doctor`）傳
+# `_platform_runtime.autostart_task_names(BOT_CONFIG)`，也就是 `install_autostart.py`
+# 註冊時用的那一份計算。漏傳會當場 `TypeError`，不會安靜地查一份空名單。
 
 # 「沒有指定」的哨符。**不能用 `None`**：`None` 在這裡是有意義的值（「判斷不出來」），
 # 拿它兼作「沒指定」的話，測試想注入「判斷不出來」就會被當成「請你自己去查」，
@@ -643,7 +660,7 @@ def _auto_end_tasks_enabled() -> bool | None:
         return None
 
 
-def autostart_recovery_status(*, tasks=None, query=None,
+def autostart_recovery_status(*, tasks, query=None,
                               autologon=_UNSET, expiry=_UNSET,
                               auto_end_tasks=_UNSET) -> dict:
     """主機當掉→重開→這一套能不能自己回來。回一個小 dict，永不 raise。
@@ -662,7 +679,7 @@ def autostart_recovery_status(*, tasks=None, query=None,
     `tasks` / `query` / `autologon` / `expiry` / `auto_end_tasks` 都可注入，所以整段
     判定測得起來而不必真的去動工作排程器或登錄檔。
     """
-    names = _AUTOSTART_TASKS if tasks is None else tuple(tasks)
+    names = tuple(tasks)
     if query is None:
         def query(name):                      # noqa: E306
             try:

@@ -88,6 +88,19 @@
     "oneshot_retry_backoff_max_sec": 120.0
   },
 
+  "_platforms_comment": "其他對話平台（Discord 以外）。一個平台一個區段，預設全部關著，關著的平台完全不啟用、連憑證都不會讀。owner_user_ids／allowed_chat_ids 是**那個平台上的**識別字（字串）：前者等同 owner_user_id、空清單＝那個平台上沒有人過得了主機控制閘；後者等同 channel_id、空清單＝只有擁有者用得到。憑證放 <平台>_bot_token.md（範本 telegram_bot_token.example.md）。詳見 docs/platforms.md。",
+  "platforms": {
+    "discord": {
+      "enabled": true
+    },
+    "telegram": {
+      "enabled": false,
+      "owner_user_ids": [],
+      "allowed_chat_ids": [],
+      "poll_timeout_sec": 30
+    }
+  },
+
   "_gui_control_comment": "/launcher start <name> 的兩個來源。launch_whitelist 是 exe 名稱或絕對路徑，比對不分大小寫（含/不含 .exe 以及 basename 都算），走 subprocess.Popen。launch_aliases 是自訂名稱 → 目標，目標可以是路徑或 URI（steam://、epic://…），URI 走 os.startfile。**shell 類（cmd / powershell / wt）刻意不放**：配合 /input type 等於遠端任意程式碼執行。空清單 ＝ /launcher start 全面停用。",
   "gui_control": {
     "launch_whitelist": [

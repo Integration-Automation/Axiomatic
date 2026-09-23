@@ -43,7 +43,15 @@ PKG_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "axiomatic")
 REPO_ROOT = os.path.dirname(PKG_ROOT)
 BOT_SCRIPT = os.path.join(PKG_ROOT, "discord_bot.py")
-BOT_LOCK_FILE = os.path.join(REPO_ROOT, ".discord_bot.lock")
+# bot 本體的實例鎖是**逐平台**的，住在 `state/<平台>/`。這裡照 `_platform_runtime`
+# 算，而不是自己再拼一次路徑：拼錯的話下面那支端對端測試會握到一把沒有人爭的鎖，
+# 於是 bot 正常往下跑、回一個不是 rc=3 的碼，而紅字看起來像「閘門壞了」。
+sys.path.insert(0, PKG_ROOT)
+import _platform_runtime as _pr  # noqa: E402
+
+BOT_LOCK_FILE = str(_pr.platform_file(
+    os.path.join(REPO_ROOT, ".discord_bot.lock"),
+    platform=_pr.DEFAULT_PLATFORM))
 BOT_LAUNCHER = os.path.join(REPO_ROOT, "start_discord_bot.py")
 
 
@@ -231,7 +239,7 @@ def test_the_launcher_actually_consumes_the_fatal_rc():
 
 
 @pytest.mark.repo_write_ok(
-    ".discord_bot.lock",
+    "state", "state/discord", "state/discord/.discord.discord_bot.lock",
     reason="端對端契約本身就是『正式的實例鎖被握著時，直接執行 bot 會以 rc=3 被擋』；"
            "子行程的 bot 讀的是寫死在它自己模組裡的正式鎖路徑，導到暫存區就量不到。"
            "開這個檔只是嘗試上鎖，內容無關緊要，而且它本來就被 git 忽略。")

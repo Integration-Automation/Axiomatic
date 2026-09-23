@@ -107,9 +107,31 @@ def test_the_interpreter_prefers_the_local_venv():
 def test_every_task_name_lives_under_one_folder():
     """全部放在 `\\Axiomatic\\` 底下，`--remove` 才好整組收掉，也不會跟使用者
     自己的排程混在一起。"""
-    for task_name, script in ia.TASKS.values():
+    tasks = [ia.BATCH_TASK, ia.bot_task("discord"), ia.bot_task("telegram")]
+    for task_name, script, _extra in tasks:
         assert task_name.startswith(ia.TASK_FOLDER + "\\"), task_name
         assert (REPO_ROOT / script).exists(), f"{script} 不存在"
+
+
+def test_each_platform_gets_its_own_task_name():
+    """共用一個名字的話，第二次 `/Create /F` 會把第一個平台那筆**覆寫掉**，而症狀
+    是「裝好了，但只有最後一個平台會自己起來」——沒有錯誤訊息，要等下一次重開機。"""
+    names = {ia.bot_task(name)[0] for name in ("discord", "telegram")}
+    assert len(names) == 2, names
+    for name in names:
+        assert name != ia.BATCH_TASK[0]
+
+
+def test_the_bot_task_carries_the_platform_flag():
+    """工作裡的命令必須帶 `--platform`，否則排程器起出來的每一個行程都會是預設
+    平台——好幾筆工作、好幾個行程，最後擠在同一把鎖上只有一個活著。"""
+    for platform in ("discord", "telegram"):
+        _name, script, extra = ia.bot_task(platform)
+        assert script == "start_discord_bot.py"
+        assert extra == ["--platform", platform]
+    xml = ia._task_xml("start_discord_bot.py", "DOMAIN\\user",
+                       ["--platform", "telegram"])
+    assert "--platform telegram" in xml, xml
 
 
 def _unchecked_and_unregistered(registered, checked):
@@ -123,30 +145,100 @@ def _unchecked_and_unregistered(registered, checked):
             sorted(set(checked) - set(registered)))
 
 
-def test_the_doctor_checks_exactly_the_tasks_that_get_registered():
+def _two_platform_config() -> dict:
+    """兩個平台都開著的合成設定。
+
+    用合成設定而不是這台機器上真的 `bot_config.json`：真實設定通常只有一個平台
+    （或一個都沒有，因為憑證檔不在版本庫裡），而**一個平台**的情況下「名字有沒有
+    帶平台」這件事根本問不出來——兩邊都只有一筆，怎麼算都一致。
+    """
+    return {"platforms": {"discord": {"enabled": True},
+                          "telegram": {"enabled": True}}}
+
+
+def test_the_doctor_checks_exactly_the_tasks_that_get_registered(monkeypatch):
     """`install_autostart` 註冊的工作名稱，要跟 `/sys doctor` 查的那份完全一致。
 
-    這兩份名稱是**各自手抄**的：`install_autostart.TASKS` 用
-    `rf"{TASK_FOLDER}\\Bot"` 組出來，`_process_control._AUTOSTART_TASKS` 則是一個
-    寫死的 tuple。中間沒有共用常數，也沒有任何東西比對過。
+    這兩份名稱以前是**各自手抄**的（一個 `rf"{TASK_FOLDER}\\Bot"`、一個寫死的
+    tuple），中間沒有共用常數，也沒有任何東西比對過。一個平台一個行程之後那份名單
+    一定會漂——bot 的工作名帶著平台名，開一個關一個都會變——所以兩邊現在都繞回
+    `_platform_runtime.autostart_task_names()`。
 
     改一邊不改另一邊的症狀是**零**：`schtasks /Query` 對一個不存在的名稱只是回
     非 0，`autostart_recovery_status` 把它算進 `missing`，於是 `/sys doctor` 從此
     每次都說「自動復原鏈路缺一角」——一個永遠為真的警告，看的人第三次就會忽略它。
     反過來（名單漏一筆）更糟：那支工作真的沒註冊也不會有人說話，而這整套機制存在
-    的理由就是 2026-09-02 那次主機重開後停擺 23 小時。
+    的理由就是主機重開之後沒人把東西拉起來。
 
-    **不查真的工作排程器。** 那會讓測試依賴這台機器當下的狀態；這裡只對帳兩份
-    原始碼裡的名單。真的有沒有註冊是 `--status` 的事。
+    **不查真的工作排程器、也不讀真的設定檔。** 兩者都會讓測試依賴這台機器當下的
+    狀態；這裡餵同一份合成設定給兩邊，比它們算出來的名單。
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "axiomatic"))
-    import _process_control as pc      # noqa: E402  (延遲匯入，見上一行)
+    # **一定要拿 `ia` 手上的那個模組物件。** `install_autostart` 走的是套件路徑
+    # （`from axiomatic import _platform_runtime`），而這裡 `import _platform_runtime`
+    # 拿到的是**另一個** `sys.modules` 條目——同一份原始碼、兩個模組物件，於是
+    # monkeypatch 打在一個上、被呼叫的是另一個，測試會以「什麼都沒發生」的方式失敗。
+    pr = ia._platform_runtime
+    config = _two_platform_config()
+    monkeypatch.setattr(ia, "load_bot_config", lambda: config)
+    monkeypatch.setattr(pr, "has_credentials", lambda name=None: True)
 
-    registered = {name for name, _script in ia.TASKS.values()}
-    checked = set(pc._AUTOSTART_TASKS)
+    registered = {name for name, _script, _extra in ia.planned_tasks(
+        ["bot", "batch"])}
+    checked = set(pr.autostart_task_names(config))
+    # 兩個平台＋批次 ＝ 三筆。**名字要真的帶平台名**，否則兩個平台會撞成同一筆，
+    # 而那正是「裝好了，但只有最後一個平台會自己起來」那個沒有症狀的缺陷。
+    assert registered == {r"\Axiomatic\Bot-discord", r"\Axiomatic\Bot-telegram",
+                          r"\Axiomatic\Batch"}, registered
+    _assert_doctor_and_installer_agree(registered, checked)
+
+
+def test_the_doctor_really_asks_that_shared_source_for_its_task_names():
+    """上面那支比的是「同一支函式算出來的兩份」，所以它問不出 doctor 有沒有在用它。
+
+    `/sys doctor` 那一端是 `discord_bot.py` 的呼叫點，它把 `tasks=` 餵給
+    `_process_control.autostart_recovery_status`。有人在那裡改寫成一份手打的 tuple
+    的話，上面那支照樣全綠——兩邊還是「同一支函式算出來的兩份」，只是 doctor 已經
+    不看它了。這裡用 AST 釘住那個呼叫點真的傳的是 `autostart_task_names(...)`。
+
+    順帶釘住 `tasks` 是**必填**的：有預設值的話漏傳會安靜地查一份空名單，
+    `missing` 永遠是空的，而 doctor 會一直說「鏈路完整」。
+    """
+    pkg = Path(__file__).resolve().parent.parent / "axiomatic"
+    tree = ast.parse((pkg / "discord_bot.py").read_text(encoding="utf-8"))
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name)
+             and node.func.id == "autostart_recovery_status"]
+    assert calls, "`discord_bot.py` 裡找不到 `autostart_recovery_status(...)` 的呼叫"
+    for call in calls:
+        tasks = next((kw.value for kw in call.keywords if kw.arg == "tasks"), None)
+        assert tasks is not None, "呼叫點沒有傳 `tasks=`"
+        assert "autostart_task_names" in ast.unparse(tasks), (
+            "doctor 的工作名單不是從 `_platform_runtime.autostart_task_names()` 來的："
+            f"{ast.unparse(tasks)}")
+
+    pc_tree = ast.parse((pkg / "_process_control.py").read_text(encoding="utf-8"))
+    fn = next(node for node in ast.walk(pc_tree)
+              if isinstance(node, ast.FunctionDef)
+              and node.name == "autostart_recovery_status")
+    names = [arg.arg for arg in fn.args.kwonlyargs]
+    index = names.index("tasks")
+    assert fn.args.kw_defaults[index] is None, (
+        "`tasks` 有預設值了——漏傳會變成查一份空名單，`missing` 永遠是空的，"
+        "而 `/sys doctor` 會一直說「鏈路完整」。")
+
+
+def _assert_doctor_and_installer_agree(registered, checked) -> None:
+    """兩份名單的對帳，含它自己的兩道下限。
+
+    **抽成 helper 是為了讓下限問得出來。** 真實資料上兩邊永遠一致，所以把下限放寬
+    成 0 整支照樣綠；而且兩道是**依序**的，一份「兩邊都空」的語料只會讓第一道炸，
+    第二道一次都不會被執行到。`test_each_autostart_floor_fires_on_its_own` 各給一份
+    只違反其中一道的語料。
+    """
     # 正面對照組要兩邊都做：任一邊空掉，下面那句差集會是空的、斷言永遠通過。
-    assert len(registered) >= 2, "`install_autostart.TASKS` 空了或只剩一筆"
-    assert len(checked) >= 2, "`_AUTOSTART_TASKS` 空了或只剩一筆"
+    assert len(registered) >= 3, "`install_autostart.planned_tasks` 空了或太短"
+    assert len(checked) >= 3, "`_expected_autostart_tasks` 空了或太短"
 
     unchecked, unregistered = _unchecked_and_unregistered(registered, checked)
     assert not unchecked, (
@@ -269,6 +361,18 @@ def _done(returncode: int, stdout: str = "", stderr: str = ""):
         args=["schtasks"], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+# `--status` / `--remove` 問的是**排程器裡現在有什麼**，不是設定檔算出來的那份。
+# 理由寫在 `install_autostart.registered_tasks()`：一個剛被關掉的平台，它的工作仍
+# 然留在排程器裡，用「現在開著哪些」去算要刪誰的話，那筆工作會被永遠遺留下來。
+# 測試裡把那一步換掉，才不會依賴這台機器當下的排程內容。
+_REGISTERED = [r"\Axiomatic\Bot-discord"]
+
+
+def _pretend_registered(monkeypatch, names=None):
+    monkeypatch.setattr(ia, "registered_tasks",
+                        lambda: list(_REGISTERED if names is None else names))
+
+
 # --- `status` ---------------------------------------------------------------
 
 # 真實 `/FO LIST` 輸出的形狀（繁中 Windows）。欄位名是這支唯一的判準。
@@ -312,6 +416,7 @@ def test_status_prints_the_fields_that_matter(monkeypatch, capsys):
     """
     fake = _FakeSchtasks(_done(0, _ZH_LIST))
     monkeypatch.setattr(ia, "_schtasks", fake)
+    _pretend_registered(monkeypatch)
     assert ia.status(["bot"]) == 0
     out = capsys.readouterr().out
     for field in ("工作名稱", "狀態", "上次結果", "執行工作", "排程類型"):
@@ -327,6 +432,7 @@ def test_status_shows_the_seventy_two_hour_killer(monkeypatch, capsys):
     """
     fake = _FakeSchtasks(_done(0, _ZH_LIST))
     monkeypatch.setattr(ia, "_schtasks", fake)
+    _pretend_registered(monkeypatch)
     ia.status(["bot"])
     assert "如果執行" in capsys.readouterr().out
 
@@ -335,6 +441,7 @@ def test_status_also_understands_an_english_windows(monkeypatch, capsys):
     """欄位名同時列中英兩套是刻意的——repo 不該綁死在一個地區設定。"""
     fake = _FakeSchtasks(_done(0, _EN_LIST))
     monkeypatch.setattr(ia, "_schtasks", fake)
+    _pretend_registered(monkeypatch)
     ia.status(["bot"])
     out = capsys.readouterr().out
     for field in ("TaskName", "Status", "Last Result", "Task To Run"):
@@ -344,6 +451,7 @@ def test_status_also_understands_an_english_windows(monkeypatch, capsys):
 def test_status_says_not_registered_when_the_query_fails(monkeypatch, capsys):
     fake = _FakeSchtasks(_done(1, "", "ERROR: The system cannot find the file"))
     monkeypatch.setattr(ia, "_schtasks", fake)
+    _pretend_registered(monkeypatch)
     assert ia.status(["bot"]) == 0          # 查不到不是錯誤
     assert "未註冊" in capsys.readouterr().out
 
@@ -352,6 +460,7 @@ def test_status_queries_with_the_verbose_list_format(monkeypatch):
     """`/V /FO LIST` 缺一不可：少了 `/V` 就沒有那些欄位，少了 `/FO LIST` 是表格。"""
     fake = _FakeSchtasks(_done(0, _ZH_LIST))
     monkeypatch.setattr(ia, "_schtasks", fake)
+    _pretend_registered(monkeypatch)
     ia.status(["bot"])
     args = fake.calls[0]
     assert args[0] == "/Query"
@@ -364,6 +473,7 @@ def test_remove_forces_the_delete(monkeypatch, capsys):
     """`/F` 缺了的話 `schtasks` 會互動式問 Y/N，而這支跑在沒有 stdin 的情境。"""
     fake = _FakeSchtasks(_done(0))
     monkeypatch.setattr(ia, "_schtasks", fake)
+    _pretend_registered(monkeypatch)
     assert ia.remove(["bot"]) == 0
     assert fake.calls[0][0] == "/Delete" and "/F" in fake.calls[0]
     assert "已移除" in capsys.readouterr().out
@@ -378,6 +488,7 @@ def test_removing_something_that_was_never_there_is_not_a_failure(
     """「本來就沒有」跟「刪不掉」要分開，否則重複執行這支腳本會回非 0。"""
     fake = _FakeSchtasks(_done(1, stdout, stderr))
     monkeypatch.setattr(ia, "_schtasks", fake)
+    _pretend_registered(monkeypatch)
     assert ia.remove(["bot"]) == 0
     assert "本來就不存在" in capsys.readouterr().out
 
@@ -385,6 +496,7 @@ def test_removing_something_that_was_never_there_is_not_a_failure(
 def test_a_real_removal_failure_is_reported(monkeypatch, capsys):
     fake = _FakeSchtasks(_done(1, "", "ERROR: Access is denied."))
     monkeypatch.setattr(ia, "_schtasks", fake)
+    _pretend_registered(monkeypatch)
     assert ia.remove(["bot"]) == 1
     assert "失敗" in capsys.readouterr().err
 
@@ -408,6 +520,8 @@ def test_install_registers_from_a_utf16_xml(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(ia, "_schtasks", fake)
     monkeypatch.setattr(ia, "_current_user", lambda: "DOMAIN\\user")
 
+    monkeypatch.setattr(
+        ia, "planned_tasks", lambda which: [ia.bot_task("discord")])
     assert ia.install(["bot"]) == 0
     assert seen.get("encoding") == "utf-16", seen.get("encoding")
     args = fake.calls[0]
@@ -430,7 +544,9 @@ def test_install_skips_a_missing_script(monkeypatch, capsys):
     """啟動器不在就跳過並回非 0——註冊一個指向不存在檔案的工作，
     只會在下次開機時安靜地失敗一次。"""
     monkeypatch.setattr(ia, "_current_user", lambda: "DOMAIN\\user")
-    monkeypatch.setattr(ia, "TASKS", {"ghost": ("\\X\\Ghost", "no_such_launcher.py")})
+    monkeypatch.setattr(
+        ia, "planned_tasks",
+        lambda which: [("\\X\\Ghost", "no_such_launcher.py", [])])
     called = _FakeSchtasks()
     monkeypatch.setattr(ia, "_schtasks", called)
     assert ia.install(["ghost"]) == 1
@@ -450,6 +566,8 @@ def test_install_cleans_up_its_temp_xml(monkeypatch):
     monkeypatch.setattr(os, "unlink", _spy_unlink)
     monkeypatch.setattr(ia, "_schtasks", _FakeSchtasks(_done(0)))
     monkeypatch.setattr(ia, "_current_user", lambda: "DOMAIN\\user")
+    monkeypatch.setattr(
+        ia, "planned_tasks", lambda which: [ia.bot_task("discord")])
     ia.install(["bot"])
     assert made and made[0].endswith(".xml"), made
     assert not Path(made[0]).exists()
@@ -609,6 +727,7 @@ def test_status_appends_the_explanation_to_the_real_field(monkeypatch, capsys):
         f"上次結果: {_OPERATOR_REFUSED}\n"
     )
     monkeypatch.setattr(ia, "_schtasks", _FakeSchtasks(_done(0, listing)))
+    _pretend_registered(monkeypatch)
     assert ia.status(["bot"]) == 0
     out = capsys.readouterr().out
     assert str(_OPERATOR_REFUSED) in out, "原始數字不該被吃掉——它是可查的憑據"
@@ -620,16 +739,20 @@ def test_status_survives_a_task_scheduler_that_says_nothing_useful(
     """欄位在、值卻是「不適用」時，狀態輸出照印，不因為解不出來就少一行。"""
     listing = "工作名稱: \\Axiomatic\\Bot\n上次結果: 不適用\n"
     monkeypatch.setattr(ia, "_schtasks", _FakeSchtasks(_done(0, listing)))
+    _pretend_registered(monkeypatch)
     assert ia.status(["bot"]) == 0
     assert "不適用" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("label, patch_target, fake, fragment", [
-    ("註冊端空了", "TASKS", {}, "`install_autostart.TASKS` 空了"),
-    ("檢查端空了", "_AUTOSTART_TASKS", (), "`_AUTOSTART_TASKS` 空了"),
+_THREE = {r"\A\Bot-discord", r"\A\Bot-telegram", r"\A\Batch"}
+
+
+@pytest.mark.parametrize("label, registered, checked, fragment", [
+    ("註冊端空了", set(), _THREE, "planned_tasks` 空了"),
+    ("檢查端空了", _THREE, set(), "_expected_autostart_tasks` 空了"),
 ])
-def test_each_autostart_floor_fires_on_its_own(monkeypatch, label,
-                                               patch_target, fake, fragment):
+def test_each_autostart_floor_fires_on_its_own(label, registered, checked,
+                                               fragment):
     """兩道下限各給一份**剛好只違反它**的語料（§8.8(A4)）。
 
     這一支的原註解已經寫對了一半——「正面對照組要兩邊都做：任一邊空掉，下面那句
@@ -638,13 +761,7 @@ def test_each_autostart_floor_fires_on_its_own(monkeypatch, label,
     道炸——第二道一次都沒被執行過。所以這裡分成兩個案例，各只打壞一邊，並斷言
     **是哪一句在叫**。
     """
-    import _process_control as pc
-
-    if patch_target == "TASKS":
-        monkeypatch.setattr(ia, "TASKS", fake)
-    else:
-        monkeypatch.setattr(pc, "_AUTOSTART_TASKS", fake)
     with pytest.raises(AssertionError) as excinfo:
-        test_the_doctor_checks_exactly_the_tasks_that_get_registered()
+        _assert_doctor_and_installer_agree(registered, checked)
     assert fragment in str(excinfo.value), (
         f"「{label}」紅的不是那一句，而是：{excinfo.value}")

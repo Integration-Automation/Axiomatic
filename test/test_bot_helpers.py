@@ -18711,15 +18711,28 @@ def _redirect_root_state_files(monkeypatch, tmp_path) -> list[str]:
     """`discord_bot`／`dorossi_backend` 裡每一個落在 repo 根目錄的 `Path` 常數都導到 tmp。
 
     檢查失效時 `mcmd_dorossi` 會一路寫到正式的 `dorossi_session.json`（量過：三次，全靠
-    conftest 那道「不准寫進 repo」擋下來）。逐一點名會漏，所以照「在根目錄底下」推導。"""
+    conftest 那道「不准寫進 repo」擋下來）。逐一點名會漏，所以照「在根目錄底下」推導。
+
+    **`state/<平台>/` 也算「根目錄底下」。** bot 自己的狀態檔改成逐平台之後就搬進那個
+    子目錄了，而這支原本的條件是「父目錄剛好等於 repo root」——於是
+    `dorossi_session.json`、`dorossi_queue.ndjson`、`schedules.json` 一夕之間全部落在
+    推導之外，而失敗的方式是**測試自己去寫正式檔案**，不是一句話說不清的紅字。
+    範圍刻意只放寬到 `state/` 這一層，不是「root 底下的任何東西」：`WEBRUNNER_SCRIPT`
+    之類指向套件檔案的常數導去暫存區只會讓下游 spawn 指向一個不存在的檔。"""
     moved = []
     for mod in (b, db):
         root = Path(mod.PROJECT_ROOT).resolve()
+        state_root = root / "state"
         for attr, value in list(vars(mod).items()):
-            if (attr.isupper() and attr != "PROJECT_ROOT" and isinstance(value, Path)
-                    and value.parent.resolve() == root):
-                monkeypatch.setattr(mod, attr, tmp_path / value.name)
-                moved.append(f"{mod.__name__}.{attr}")
+            if not (attr.isupper() and attr != "PROJECT_ROOT"
+                    and isinstance(value, Path)):
+                continue
+            parent = value.parent.resolve()
+            if parent != root and state_root not in parent.parents \
+                    and parent != state_root:
+                continue
+            monkeypatch.setattr(mod, attr, tmp_path / value.name)
+            moved.append(f"{mod.__name__}.{attr}")
     return moved
 
 

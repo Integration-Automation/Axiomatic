@@ -119,6 +119,9 @@ _TRACKED_ASSETS = frozenset({
 _IGNORED_RUNTIME = frozenset({
     "auth.md",                       # 出圖服務帳密（範本：auth.example.md）
     "discord_bot_token.md",          # Discord bot token（範本同上）
+    # 第二個對話平台的 token（範本：telegram_bot_token.example.md）。與上面兩個
+    # 同一個處置：repo 只帶範本，正式檔永不追蹤。
+    "telegram_bot_token.md",
     "bot_config.json",               # 頻道／擁有者 ID、啟動白名單（範本：.example.json）
     "presence_games.json",           # 本機遊戲清單
     "presence_music.json",           # 音樂偵測規則
@@ -136,9 +139,19 @@ _IGNORED_RUNTIME = frozenset({
     ".chrome_profile",               # 登入 session（含 cookie）
     ".chrome_profile_snap",          # 同上，批次用的複本
     ".chrome_profile_verify",        # 同上，驗證腳本用的複本
-    ".discord_bot.lock",             # bot 本體實例鎖
-    ".discord_bot_supervisor.lock",  # bot 監督者實例鎖
+    # bot 本體與 bot 監督者那兩把鎖現在是**逐平台**的，實體檔案住在
+    # `state/<平台>/`（由下面的 `state` 那一筆蓋住）。這兩個名字是它們的**基底
+    # 檔名**，`.gitignore` 照樣留著——分類規則是「repo root 的每個名字都要選邊
+    # 站」，而這兩個名字正是 AST 在 `_platform_state(PROJECT_ROOT / "…")` 裡抽到的。
+    ".discord_bot.lock",             # bot 本體實例鎖（逐平台）
+    ".discord_bot_supervisor.lock",  # bot 監督者實例鎖（逐平台）
     ".webrunner_supervisor.lock",    # 批次監督者實例鎖
+    # 出圖批次的監督權。**全機一把**（批次只有一份），所以刻意不帶平台名：拿到
+    # 的那個行程監督批次，其餘行程對批次控制指令讓位。
+    ".batch_supervisor.lock",
+    # 逐平台的執行期狀態目錄（`state/<平台>/<平台>.<檔名>`）。一條 `state/` 就蓋住
+    # 所有平台、所有狀態檔與它們的 `.tmp`——逐檔列舉會變成第二份會被遺忘的清單。
+    "state",
     ".venv",
     "audit.ndjson",
     "batch_label.txt",
@@ -195,6 +208,45 @@ _ATOMIC_TMP_EXTRA = frozenset({
 })
 
 
+def _literal_leaf(value):
+    """`<root> / "檔名"` 解出那個字面檔名；不是這個形狀就回 `None`。
+
+    **包一層單引數呼叫也算。** 逐平台的狀態檔寫成
+    `_platform_state(PROJECT_ROOT / "x.json")`：實體檔案落在
+    `state/<平台>/<平台>.x.json`（整個 `state/` 被 ignore），但**基底檔名仍然是那個
+    字面值**，而這支守門要的就是它。不認這個形狀的話，常數解不出檔名，
+    `test_every_atomic_write_target_resolves_to_a_filename` 會把它報成漏掉的母檔
+    ——而那是誤報，本 repo 對誤報的判語是「會亂叫的守門會被人關掉」。
+
+    **只認一層、單引數、沒有關鍵字引數的呼叫**是刻意的：再寬就會開始猜，而猜錯的
+    方向是 fail-open（解出一個不存在的檔名 ＝ 一條永遠對不上的 `.gitignore` 規則）。
+    """
+    if (isinstance(value, ast.Call) and len(value.args) == 1
+            and not value.keywords):
+        value = value.args[0]
+    if (isinstance(value, ast.BinOp) and isinstance(value.op, ast.Div)
+            and isinstance(value.right, ast.Constant)
+            and isinstance(value.right.value, str)):
+        return value.right.value
+    return None
+
+
+def test_the_literal_leaf_resolver_sees_both_shapes():
+    """合成對照：裸的接合與包了一層呼叫的接合都要解得出來，別的形狀不得誤解。
+
+    真實語料裡兩種形狀都有，所以「回 `None`」那一半在真實資料上問不出來——把
+    `return None` 改成猜一個名字，上面兩支照樣綠。
+    """
+    def parse(expr):
+        return ast.parse(expr, mode="eval").body
+
+    assert _literal_leaf(parse('PROJECT_ROOT / "a.json"')) == "a.json"
+    assert _literal_leaf(parse('_platform_state(PROJECT_ROOT / "b.json")')) == "b.json"
+    assert _literal_leaf(parse('PROJECT_ROOT / name')) is None
+    assert _literal_leaf(parse('f(PROJECT_ROOT / "c.json", 2)')) is None
+    assert _literal_leaf(parse('f(PROJECT_ROOT / "c.json", k=1)')) is None
+
+
 def _atomic_tmp_parents() -> frozenset:
     """`test_atomic_writes` 認定要原子寫入的那些常數，解成 repo root 的檔名。
 
@@ -212,11 +264,9 @@ def _atomic_tmp_parents() -> frozenset:
                     and isinstance(node.targets[0], ast.Name)
                     and node.targets[0].id in wanted):
                 continue
-            value = node.value
-            if (isinstance(value, ast.BinOp) and isinstance(value.op, ast.Div)
-                    and isinstance(value.right, ast.Constant)
-                    and isinstance(value.right.value, str)):
-                resolved.setdefault(node.targets[0].id, value.right.value)
+            leaf = _literal_leaf(node.value)
+            if leaf is not None:
+                resolved.setdefault(node.targets[0].id, leaf)
     return frozenset(resolved.values()) | _ATOMIC_TMP_EXTRA
 
 

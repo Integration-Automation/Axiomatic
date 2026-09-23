@@ -18,17 +18,25 @@ from pathlib import Path
 try:
     from _bot_config import load_bot_config
     from _process_control import _pid_alive
+    from _platform_runtime import platform_file as _platform_state
 except ImportError:
     from axiomatic._bot_config import load_bot_config  # type: ignore
     from axiomatic._process_control import _pid_alive  # type: ignore
+    from axiomatic._platform_runtime import (  # type: ignore
+        platform_file as _platform_state)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 批次那一側的檔案是**全機共用**的（一份批次、一組佇列），bot 那一側的狀態則是
+# **逐平台**的。儀表板不帶平台旗標時看的是預設平台那一份——它是唯讀的觀測工具，
+# 要看別的平台就用 `--platform` 或 `AXIOMATIC_PLATFORM` 起第二份。
 EVENTS_FILE = PROJECT_ROOT / "events.ndjson"
-DOROSSI_EVENTS_FILE = PROJECT_ROOT / "dorossi_events.ndjson"
-DOROSSI_QUEUE_FILE = PROJECT_ROOT / "dorossi_queue.ndjson"
-DOROSSI_FAILED_QUEUE_FILE = PROJECT_ROOT / "dorossi_queue_failed.ndjson"
-GENERATE_HISTORY_FILE = PROJECT_ROOT / "generate_history.ndjson"
+DOROSSI_EVENTS_FILE = _platform_state(PROJECT_ROOT / "dorossi_events.ndjson")
+DOROSSI_QUEUE_FILE = _platform_state(PROJECT_ROOT / "dorossi_queue.ndjson")
+DOROSSI_FAILED_QUEUE_FILE = _platform_state(
+    PROJECT_ROOT / "dorossi_queue_failed.ndjson")
+GENERATE_HISTORY_FILE = _platform_state(
+    PROJECT_ROOT / "generate_history.ndjson")
 WEBRUNNER_LOG = PROJECT_ROOT / "webrunner.log"
 WEBRUNNER_PID_FILE = PROJECT_ROOT / "webrunner.pid"
 WEBRUNNER_PAUSE_FILE = PROJECT_ROOT / "webrunner.pause"

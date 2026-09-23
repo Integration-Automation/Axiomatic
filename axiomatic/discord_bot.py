@@ -108,6 +108,14 @@ from _external_apis import (
 # nuclear chrome sweep ＋ webrunner spawn 的臨界區之前取得它，讓獨立的瀏覽器驗證器
 # （verify_browser.py）在跑時不會被誤殺、也不會同時開出兩個 Chrome stack。
 import _chrome_slot
+# 對話平台介接層（bot-only helper，**不是**邊界通道）。它不 import `discord_bot`
+# ——「收到一則訊息要做什麼」是由本檔注入的 callback（`TransportContext`），所以
+# 兩邊沒有循環。逐平台的 transport（`_telegram_transport` …）刻意不在這裡直接
+# import：`_chat_platform.TRANSPORT_MODULES` 是註冊的唯一入口。
+import _chat_platform
+# 這個行程的平台身分（服務哪一個平台，以及它自己的狀態／鎖／記錄檔放哪裡）。
+# 同樣是 bot-only helper、純 stdlib、不 import `discord_bot`。
+import _platform_runtime
 # 行程探查／終止原語（P4 重構）。被動共用的 bot 側模組（同 _chrome_slot 等），純
 # stdlib ＋ 選用 psutil，不 import discord_bot（循環）也不 import webrunner 腳本。
 # 真正的 supervisor 迴圈（_watch_for_fallback / _do_webrunner_run / cmd_run /
@@ -337,11 +345,30 @@ _METRICS_ERRORS: int = 0
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# ---------- 這個行程服務哪一個平台 -----------------------------------------
+#
+# **一個平台一個行程。** 這個名字決定三件事，全部經過 `_platform_runtime`：
+# 單一實例鎖、記錄檔、以及**這個行程自己的狀態檔**（工作階段、佇列、事件、稽核、
+# 收藏、排程）。它們住在 `state/<平台>/`，檔名再帶一次平台名，所以兩個平台的行程
+# 之間沒有任何共用的可變狀態——不必跨行程鎖，也不可能互相蓋掉。
+#
+# **批次不在這條規則裡。** 出圖批次全機只有一份（一個瀏覽器、一組佇列檔），由
+# 「誰拿到批次監督鎖」決定誰監督它；沒拿到的行程對批次指令回一句「已經有另一個
+# 行程在監督」而不是另外 spawn 一個。見 `BATCH_SUPERVISOR_LOCK_FILE`。
+ACTIVE_PLATFORM = _platform_runtime.active_platform()
+_platform_state = _platform_runtime.platform_file
+
 TOKEN_FILE = PROJECT_ROOT / "discord_bot_token.md"
 # 單一實例鎖的錨點（內容為空，鎖由 OS 持有）。**跟啟動器的
 # `.discord_bot_supervisor.lock` 是不同檔案**——共用的話啟動器會擋掉自己 spawn 的
 # bot。這一把擋的是「繞過啟動器直接執行本檔」，見 main()。
-BOT_LOCK_FILE = PROJECT_ROOT / ".discord_bot.lock"
+# **逐平台一把**：telegram 那個行程不得被 discord 那個行程的鎖擋掉。
+BOT_LOCK_FILE = _platform_state(PROJECT_ROOT / ".discord_bot.lock")
+# 出圖批次的監督權。全機**一把**（不帶平台名）：批次只有一份，而這把鎖就是
+# 「誰在監督它」的唯一答案。拿不到＝另一個平台的行程正在監督，本行程對批次控制
+# 指令讓位（`batch_supervision_denied_notice()`），而不是 spawn 第二個監督者。
+BATCH_SUPERVISOR_LOCK_FILE = PROJECT_ROOT / ".batch_supervisor.lock"
 PROMPT_FILE = PROJECT_ROOT / "prompt.md"
 DEFAULT_PROMPT_FILE = PROJECT_ROOT / "default_prompt.md"
 CHARACTER1_FILE = PROJECT_ROOT / "character1.md"
@@ -655,10 +682,12 @@ WEBRUNNER_LOG = PROJECT_ROOT / "webrunner.log"
 WEBRUNNER_LOG_PREV = PROJECT_ROOT / "webrunner.prev.log"
 WEBRUNNER_PID_FILE = PROJECT_ROOT / "webrunner.pid"
 EVENTS_FILE = PROJECT_ROOT / "events.ndjson"
-DOROSSI_EVENTS_FILE = PROJECT_ROOT / "dorossi_events.ndjson"
-DOROSSI_QUEUE_FILE = PROJECT_ROOT / "dorossi_queue.ndjson"
-DOROSSI_FAILED_QUEUE_FILE = PROJECT_ROOT / "dorossi_queue_failed.ndjson"
-GENERATE_HISTORY_FILE = PROJECT_ROOT / "generate_history.ndjson"
+DOROSSI_EVENTS_FILE = _platform_state(PROJECT_ROOT / "dorossi_events.ndjson")
+DOROSSI_QUEUE_FILE = _platform_state(PROJECT_ROOT / "dorossi_queue.ndjson")
+DOROSSI_FAILED_QUEUE_FILE = _platform_state(
+    PROJECT_ROOT / "dorossi_queue_failed.ndjson")
+GENERATE_HISTORY_FILE = _platform_state(
+    PROJECT_ROOT / "generate_history.ndjson")
 # `/sys introspect_dom` 寫請求到這個檔；webrunner 在 main loop iteration top
 # 跟 generate_loop 每張圖之間 poll、處理完透過 events.ndjson 用
 # `dom_result` event 回 bot。
@@ -674,7 +703,7 @@ WEBRUNNER_PAUSE_FILE = PROJECT_ROOT / "webrunner.pause"
 BATCH_LABEL_FILE = PROJECT_ROOT / "batch_label.txt"
 # 每個 `!` 指令派發前都會 append 一筆到這裡，給 `/sys audit` 查「誰在何時動了什麼」。
 # 不寫 `@bot` 指令（mention 是給訪客玩的、噪音太多）。
-AUDIT_FILE = PROJECT_ROOT / "audit.ndjson"
+AUDIT_FILE = _platform_state(PROJECT_ROOT / "audit.ndjson")
 OUTPUT_ROOT = PROJECT_ROOT / "output"
 
 # Used by !eta to project how long the queue will take. ETA_SECONDS_PER_IMAGE
@@ -754,7 +783,7 @@ SCHEDULE_HORIZON_SEC = 7 * 24 * 3600
 # 寫入點：`cmd_run` 排好的當下。刪除點：`/run cancel`、立即 `/run`、到點觸發
 # （不論啟動成功與否）、以及還原時判定「錯過了」。**被取消（包含關機時事件迴圈
 # 取消所有工作）不刪**——那正是要留給下一個行程還原的情形。
-SCHEDULED_RUN_FILE = PROJECT_ROOT / "scheduled_run.json"
+SCHEDULED_RUN_FILE = _platform_state(PROJECT_ROOT / "scheduled_run.json")
 # 重啟後發現排定時間已經過了，多久之內還補啟動。
 #
 # 十分鐘＝啟動器重啟退避上限（`start_discord_bot.RESTART_DELAY_MAX`，五分鐘）的兩倍：
@@ -772,7 +801,7 @@ _scheduled_run_restored: bool = False
 # 點：網路回來、開始接續的那一刻；`/stop`；任何一次 `/run`（新的批次取代了等待）；
 # 還原時發現已經有批次在跑。**沒有次數或時間上限**——擁有者裁定只有明確的停止
 # 指令能結束這個等待。
-NETWORK_RESUME_FILE = PROJECT_ROOT / "network_resume.json"
+NETWORK_RESUME_FILE = _platform_state(PROJECT_ROOT / "network_resume.json")
 # 等網路回來時多久探一次。探一次在有網路時是幾十毫秒，斷網時最多幾秒（見
 # `_connectivity.PROBE_TIMEOUT_SEC`），而且丟在執行緒裡，不卡事件迴圈。
 NETWORK_RESUME_POLL_SEC = _connectivity.DEFAULT_POLL_SEC
@@ -1116,11 +1145,12 @@ _UNDO_SENTINEL_ABSENT = "__UNDO_SENTINEL_ABSENT__\n"
 #                   重啟前的圖片訊息按 reaction 不會有反應（可接受）。
 #   ⭐ / 🗑️：加收藏 / 刪檔（連 favorites 一起清）。多圖訊息會對所有附件
 #                   一次作用（batch fav / batch delete）。
-FAVORITES_FILE = PROJECT_ROOT / "favorites.json"
+FAVORITES_FILE = _platform_state(PROJECT_ROOT / "favorites.json")
 # msg_id → [Path,…] 的持久化 cache，bot 重啟後從這個檔讀回，所以重啟前的
 # 圖片訊息仍能用 ⭐ / 🗑️ reaction 控制。**不**走 `_safe_write`，因為每次
 # 圖片上傳都會寫，會把 undo stack 跟 .backup/ 灌爆；只是 runtime cache 性質。
-RECENT_IMAGE_MSGS_FILE = PROJECT_ROOT / "recent_image_msgs.json"
+RECENT_IMAGE_MSGS_FILE = _platform_state(
+    PROJECT_ROOT / "recent_image_msgs.json")
 _RECENT_IMAGE_MSGS: dict[int, list[Path]] = {}
 _RECENT_IMAGE_MSGS_MAX = 500
 FAV_EMOJI = "⭐"
@@ -11444,8 +11474,11 @@ async def _generate_ensure_server() -> None:
     #
     # 掃不成同樣讓位：「掃不成」不等於「沒有」，而兩種猜錯的代價差很多——猜成
     # 「沒有」＝上面那個互打的局面；猜成「有」＝這一筆多等一輪看門狗。
+    # 監督權不在本行程手上時，把它當成「有別人會接手」那一種讓位：請求檔已經寫在
+    # 磁碟上，對方的批次會在產圖之間 in-band 服務它。**不是失敗**，所以走的是同一
+    # 條「先排著」的路，而不是一句錯誤訊息。
     launcher_pids, launcher_scan_ok = await _launcher_scan()
-    if launcher_pids or not launcher_scan_ok:
+    if launcher_pids or not launcher_scan_ok or not batch_supervision_claimed():
         ctx = _single_image_pending.get(_generate_inflight) or {}
         # 收尾一律說得出去向：只寫「不啟動」而不說「誰會接手、沒接手會怎樣」的話，
         # 使用者手上只剩一則停在「產圖中…」的訊息。送出的字串受 Secrecy Layer 1
@@ -11463,6 +11496,11 @@ async def _generate_ensure_server() -> None:
                          f"{tail}"),
                 "🎨 這張先排著：背景程式目前不在執行，但有監督它的程式會把它帶"
                 f"回來，回來後就會處理。這裡不另外啟動，以免互相干擾。{tail}")
+        elif not batch_supervision_claimed():
+            print("generate ensure-server stood aside: another platform "
+                  "process supervises the batch", file=sys.stderr)
+            notice = ("🎨 這張先排著：另一個行程正在監督背景產圖，它回來時就會"
+                      f"處理這一張。這裡不另外啟動，以免互相干擾。{tail}")
         else:
             print("generate ensure-server stood aside: "
                   "launcher scan incomplete", file=sys.stderr)
@@ -14062,6 +14100,12 @@ async def _reattach_adopted_batch_once(pid: int) -> None:
         return
     _batch_reattach_done = True
     try:
+        # 監督權不在本行程手上就不要認領：認領＝掛上看門狗，而那份批次已經有一個
+        # 行程在看它了。這條路完全沒有使用者面的回覆，所以只留一行紀錄。
+        if not batch_supervision_claimed():
+            print("adopt: another platform process supervises the batch; "
+                  "not attaching a second watchdog", file=sys.stderr)
+            return
         launchers, scan_ok = await _launcher_scan()
         if launchers or not scan_ok:
             print("adopt: a standalone supervisor may be watching this batch; "
@@ -14647,6 +14691,12 @@ async def _do_webrunner_run(channel) -> None:
     global _webrunner_proc, _webrunner_pid, _webrunner_variant
     global _low_disk_alerted
     global _webrunner_oneshot, _webrunner_oneshot_reaper_task
+    # -2. 批次的監督權不在本行程手上就讓位。判斷放在**最前面**（連獨立監督者掃描
+    #     都不必跑）：這條路的下一步就是清掃與 spawn，而對面那個行程正在監督同一份
+    #     批次，兩邊會互相終止、互相重生。
+    if not batch_supervision_claimed():
+        await channel.send(BATCH_STAND_ASIDE_NOTICE)
+        return
     # -1. 獨立監督者在跑的話**一律讓位**。硬走下去的下場不只是「兩個批次」：
     #     這裡會先 nuclear sweep 把對方的背景程式與整棵瀏覽器殺掉，對方的監督者
     #     退避幾秒後再生一個，兩邊從此互相終止、互相重生，而兩邊的紀錄看起來都
@@ -15265,6 +15315,12 @@ async def cmd_stop(message: discord.Message) -> None:
     global _webrunner_stop_requested, _webrunner_fallback_task
     global _webrunner_oneshot, _webrunner_oneshot_reaper_task
     global _generate_inflight
+    # 0. 批次的監督權不在本行程手上就讓位。**停止也是監督動作**：這裡會設停止旗標、
+    #    取消看門狗、終止子行程，而那些子行程是**另一個行程**生的——它的看門狗會把
+    #    它們重生回來，於是使用者看到「停了又回來了」，而兩邊的紀錄都正常。
+    if not batch_supervision_claimed():
+        await safe_reply(message, BATCH_STAND_ASIDE_NOTICE)
+        return
     # 1. 先設旗標 — supervisor watchdog 在 backoff sleep 中每 0.5s 會 poll，
     #    看到 True 後就退出（不會再 respawn）。`_spawn_webrunner` 也會拒絕生。
     _webrunner_stop_requested = True
@@ -15382,6 +15438,61 @@ LAUNCHER_POLL_SEC = 1.5
 # 話，那兩種都會被回報成啟動成功。
 LAUNCHER_SETTLE_SEC = 2.5
 LAUNCHER_VARIANTS = ("je", "selenium")
+
+
+# ---------- 批次的監督權：一把鎖，誰拿到誰監督 ------------------------------
+#
+# 出圖批次全機只有**一份**（一個瀏覽器、一組佇列檔、一個輸出目錄），而 bot 現在是
+# 一個平台一個行程。所以「誰監督批次」必須有一個答案，而且那個答案不能是「每個行程
+# 都試試看」：兩套監督者會互相清掃、互相重生，而兩邊的紀錄看起來都正常——
+# `_do_webrunner_run` 開頭對獨立監督者記的是同一條理由，這裡只是把同一件事擴到
+# 「本 repo 自己的另一個平台行程」。
+#
+# 判準用**既有的 OS 級單一實例鎖**，不是另發明一套旗標檔：鎖由作業系統持有，行程一
+# 消失就釋放，所以「監督者當掉了但旗標還在」這個狀態不存在，也就不需要任何清理或
+# 逾時。拿到的行程監督批次；沒拿到的對批次控制指令讓位，其餘功能完全不受影響。
+_batch_supervisor_lock = None
+
+
+def _claim_batch_supervision() -> bool:
+    """開機時試著取得批次監督權。回「拿到了沒有」，**永不 raise**。
+
+    **降級（判斷不出來）算拿到。** `acquire_single_instance_lock` 在拿不到檔案鎖機制
+    時回一把 `degraded=True` 的鎖，而那台機器上**每一個**行程都會拿到同樣的答案——
+    把降級當成「沒拿到」的話，批次會變成誰都不能控制，症狀是「指令送出去了什麼都
+    沒發生」。往「照常啟動」倒與兩支啟動器的立場一致，代價是那種機器上要自己確認只
+    開一個平台。
+    """
+    global _batch_supervisor_lock
+    if _batch_supervisor_lock is not None:
+        return True
+    try:
+        _batch_supervisor_lock = acquire_single_instance_lock(
+            BATCH_SUPERVISOR_LOCK_FILE)
+    except Exception as error:  # pylint: disable=broad-except
+        print(f"batch supervision claim raised {error!r}", file=sys.stderr)
+        _batch_supervisor_lock = None
+    if _batch_supervisor_lock is None:
+        print("batch supervision is held by another platform process; "
+              "batch control commands will stand aside here", file=sys.stderr)
+        return False
+    if _batch_supervisor_lock.degraded:
+        print("batch supervision lock is degraded on this host; "
+              "assuming this process supervises the batch", file=sys.stderr)
+    return True
+
+
+def batch_supervision_claimed() -> bool:
+    """本行程是不是批次的監督者。"""
+    return _batch_supervisor_lock is not None
+
+
+# 讓位時對使用者說的那一句。**一句，單一來源**——散在各處自己寫的話，其中幾處遲早
+# 會變成「失敗了」而不是「有別人在做」，而那兩件事要使用者做的處置完全不同。
+# 受 Secrecy Layer 1 約束：沒有主機路徑、沒有 PID、沒有外部服務名。
+BATCH_STAND_ASIDE_NOTICE = (
+    "另一個行程已經在監督背景產圖，這裡不重複接手（兩套監督會互相終止、互相重生）。"
+    "要改由這裡控制的話，先停掉那一個。正在跑的東西未受影響。")
 
 
 async def _launcher_scan() -> tuple[list[int], bool]:
@@ -19185,7 +19296,7 @@ async def cmd_watch(message: discord.Message, payload: str) -> None:
 # 監看等的是「畫面上發生什麼」，排程等的是「時間到了」。兩者都不需要人在場，但
 # 排程**必須落地**：bot 會被 supervisor 重啟，存在記憶體裡的排程一重啟就消失，
 # 而使用者不會知道——那是靜默失效，比一開始就沒有這個功能更糟。
-SCHEDULE_FILE = PROJECT_ROOT / "schedules.json"
+SCHEDULE_FILE = _platform_state(PROJECT_ROOT / "schedules.json")
 SCHEDULE_MAX = 20
 _SCHEDULE_TICK_SEC = 30.0
 _schedule_task: asyncio.Task | None = None
@@ -20770,7 +20881,13 @@ async def cmd_doctor(message: discord.Message) -> None:
     # 同樣走 `_doctor_probe`（它自己就在執行緒裡跑）。原本 `except` 把值設成
     # `{"gap": None}`，而 `gap: None` 的語意**就是**「鏈路完整」——探測丟例外時
     # 報告會變成一句正向的健康結論，正好是這一格要偵測的那種靜默。
-    ran, recovery = await _doctor_probe("boot recovery", autostart_recovery_status)
+    # 要查哪些排程工作由**這裡**算，用的是 `install_autostart.py` 註冊時同一支
+    # 函式——一個平台一筆，加上批次那一筆。`_process_control` 刻意不自己去讀設定檔
+    # （理由在它那邊：那會讓改設定載入器變成「批次陳舊」的誤報）。
+    ran, recovery = await _doctor_probe(
+        "boot recovery",
+        lambda: autostart_recovery_status(
+            tasks=_platform_runtime.autostart_task_names(BOT_CONFIG)))
     if not ran:
         ok = False
         findings.append(
@@ -23317,6 +23434,12 @@ def _ensure_background_tasks_alive(*, source: str) -> None:
         _parked_watch_task, _dorossi_parked_watch_loop, "parked-watch",
         f"parked-turn watch started ({source}, "
         f"interval={_DOROSSI_PARKED_TICK_SEC:.0f}s)")
+    # 其他對話平台的 transport。它們是同一個事件迴圈裡的長命背景任務，所以復原掛
+    # 在同一個地方：沒設定的平台建不出來、清單是空的，這兩行就什麼都不做。
+    # **不共用上面的 `_revive`**——那一支綁在幾個模組層全域上，而 transport 的數量
+    # 是設定決定的，硬塞進去會讓「加一個平台」變成「加一個全域」。
+    _build_chat_transports()
+    _ensure_chat_transports_alive(source=source)
 
 
 @client.event
@@ -23816,6 +23939,96 @@ async def on_message(message: discord.Message) -> None:
             await safe_reply(message, f"指令發生內部錯誤（{type(error).__name__}），請查看 log。")
         except Exception:  # pylint: disable=broad-except  # nosec B110
             pass
+
+
+# ---------- 其他對話平台的單一入口 ------------------------------------------
+#
+# 其他平台**重用既有的隱藏文字派發器**，不另開一棵指令樹。斜線那棵樹是這個平台
+# 專屬的表面，維持原樣。
+#
+# 所以這裡只做一件事：把一則來自別的平台的訊息，交給**既有的那兩條路**——
+#
+#   * `!` 開頭 → `on_message`，於是頻道閘、`_OWNER_ONLY_BANGS`、角色閘、指令計數、
+#     稽核、code fence 正規化、整個 `except` 收尾全部沿用同一份實作；
+#   * 其餘文字 → `_handle_mention`，也就是 `@bot <文字>` 那條自由提問／控制指令路。
+#
+# **刻意不把派發鏈抄一份出來。** 抄一份的代價不是行數，是那四道閘會分叉：本 repo
+# 對 `_OWNER_ONLY_SLASH` / `_pid_alive` / 原子寫入清單都記過同一個形狀——第二份會
+# 安靜地落後，而且沒有任何症狀。`on_message` 的頻道閘在這裡照樣成立，因為允許清單
+# 裡的對話拿到的 `channel.id` 就是 `CHANNEL_ID`（見 `_chat_platform`
+# `conversation_uid` 的 docstring）。
+async def dispatch_external_message(message) -> None:
+    """別的平台送進來的一則文字訊息。**每個 transport 都走這一支。**
+
+    ※ 對話閘是 transport 的責任（只有它知道自己平台的對話 id 長什麼樣），但這裡
+    再擋一次是縱深防禦：`_handle_mention` 這條路**跑在 `on_message` 的頻道閘之
+    前**（mention 刻意不限頻道），所以少了這一行，任何一個 transport 忘了擋，就
+    等於把自由提問入口對那個平台上的所有人打開。與 `@bot restart` 當年那個缺口
+    同一個形狀。
+    """
+    channel = getattr(message, "channel", None)
+    author = getattr(message, "author", None)
+    if not (getattr(channel, "is_command_chat", False)
+            or getattr(author, "is_owner", False)):
+        return
+    content = getattr(message, "content", "") or ""
+    if content.startswith("!"):
+        await on_message(message)
+        return
+    if not (getattr(author, "is_owner", False)
+            or getattr(channel, "is_direct", False)):
+        # 群組裡的一句普通話不是對 bot 的提問。既有平台要 @ 到 bot 才算，這裡沒有那個
+        # 訊號，照單全收的話群組裡每個非擁有者的每一句話都會換來一句「僅限特定使用者」。
+        return
+    await _handle_mention(message)
+
+
+# 逐平台的 transport 與它們的背景任務。與既有那幾條長命迴圈同一個生命週期：啟動
+# 時建立、`_ensure_background_tasks_alive` 在每次重新連線時救活、死掉時由
+# `_bg_task_done` 留一行**帶名字**的紀錄。
+_chat_transports: list = []
+_chat_transport_tasks: dict = {}
+
+
+def _build_chat_transports() -> None:
+    """第一次 `on_ready` 時建一次。沒設定的平台安靜缺席，整支永不 raise。"""
+    global _chat_transports
+    if _chat_transports:
+        return
+    try:
+        context = _chat_platform.TransportContext(
+            config=BOT_CONFIG.get("platforms") or {},
+            owner_uid=OWNER_USER_ID,
+            command_channel_id=CHANNEL_ID,
+            handle_message=dispatch_external_message,
+            project_root=PROJECT_ROOT,
+        )
+        _chat_transports = _chat_platform.build_transports(context)
+    except Exception as error:  # pylint: disable=broad-except
+        print(f"chat transports could not be built: {error!r}", file=sys.stderr)
+        _chat_transports = []
+
+
+def _ensure_chat_transports_alive(*, source: str) -> None:
+    """每個 transport 各自 try，一個起不來不得拖垮其他平台。
+
+    與 `_ensure_background_tasks_alive._revive` 逐字同一條規則（那支的 docstring
+    記著理由：`on_ready` 呼叫它時外面沒有 try，一次 `create_task` 拋出就會把**後面
+    那幾條迴圈**一起帶走，而函式庫只會記一句 'Ignoring exception in on_ready'）。
+    """
+    for transport in _chat_transports:
+        name = getattr(transport, "name", "chat")
+        existing = _chat_transport_tasks.get(name)
+        if existing is not None and not existing.done():
+            continue
+        try:
+            task = _start_supervised_task(transport.run(), f"chat-{name}")
+        except Exception as error:  # pylint: disable=broad-except
+            print(f"chat transport {name!r} could not be started "
+                  f"({source}): {error!r}", file=sys.stderr)
+            continue
+        _chat_transport_tasks[name] = task
+        print(f"chat transport {name!r} started ({source})")
 
 
 # ---------- slash commands -------------------------------------------------
@@ -27025,6 +27238,9 @@ def main() -> int:
     # 兩個實例同時跑不會有任何明顯徵兆：兩套各自跑 presence 迴圈（互相蓋掉活動
     # 卡片）、各自鏡像佇列預覽、各自消耗 todo 佇列，而且都「看起來正常」。
     # 2026-08-17 實際發生過。
+    # 這個平台的狀態目錄。鎖檔與所有狀態檔都住在裡面，所以第一件事就是建好它
+    # （`platform_file()` 只算路徑，刻意不碰磁碟——理由見 `ensure_state_dir`）。
+    _platform_runtime.ensure_state_dir(ACTIVE_PLATFORM)
     lock = acquire_single_instance_lock(BOT_LOCK_FILE)
     if lock is None:
         print("bot: 已經有另一個實例在執行，這次不啟動。", file=sys.stderr)
@@ -27035,6 +27251,11 @@ def main() -> int:
         return RC_ALREADY_RUNNING
 
     try:
+        # 出圖批次的監督權。**這一把在單一實例閘之後、其他事情之前取**：拿不到
+        # 只代表另一個平台的行程正在監督批次，本行程照常提供其餘功能，只是對批次
+        # 控制指令讓位。取不到**不是**啟動失敗——那會讓「第二個平台」變成「第二個
+        # 平台不能用」。
+        _claim_batch_supervision()
         # import 全部跑完之後才取樣——晚算等於拿磁碟跟磁碟自己比。放在單一實例閘
         # 之後，第二個實例不會多印一行。
         _log_code_fingerprint()

@@ -32,6 +32,7 @@ setup
 workflow
 commands_channel
 commands_mention
+platforms
 config
 troubleshooting
 ```
@@ -42,5 +43,6 @@ troubleshooting
 - 待辦佇列怎麼配對、fallback 規則、`end` 終止標記、排程節奏 → {doc}`workflow`
 - 全部限頻道斜線指令（佇列、批次、維運、桌面自動化） → {doc}`commands_channel`
 - 跨頻道斜線指令（圖庫／工具、Dorossi 問答） → {doc}`commands_mention`
+- 在 Discord 以外的平台上用這個 bot（一個平台一個行程） → {doc}`platforms`
 - `batch_config.json` / `bot_config.json` / presence 設定 → {doc}`config`
 - 跑批卡住、Chrome 崩潰、登入失敗怎麼查 → {doc}`troubleshooting`

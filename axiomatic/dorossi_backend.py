@@ -61,6 +61,10 @@ from _bot_prompts import load_prompt
 # 「同一段文字只往 stderr 印一次」（被動共用模組）。後端 CLI 的環境與啟動形狀的警告
 # 每一輪都會再判一次，不去重的話一個放著沒改的環境變數會用同一句話洗掉整份 log。
 from _warn_dedup import warn_once as _warn_once
+# 這個行程的平台身分。工作階段、用量、模型目錄與工作目錄都是**這個行程自己的**
+# 狀態，所以一律落在 `state/<平台>/` 底下——一個平台一個行程，彼此不共用可變狀態，
+# 也就不需要跨行程鎖。
+from _platform_runtime import platform_file as _platform_state
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Dorossi backend tunables live in bot_config.json (loaded once at import; the
@@ -190,7 +194,7 @@ DOROSSI_BACKENDS_RESOLVING_ALIASES = frozenset({"claude_code"})
 # ---- 執行期模型目錄（每日檢查寫、載入時併回內建表） -------------------------
 # 內建表是**地板**：全新 clone 沒有這個檔也照樣有一組可用的別名。每日檢查發現的
 # 東西只會**新增**別名，永遠不覆寫內建的那幾筆。
-DOROSSI_MODEL_CATALOG_FILE = PROJECT_ROOT / "dorossi_models.json"
+DOROSSI_MODEL_CATALOG_FILE = _platform_state(PROJECT_ROOT / "dorossi_models.json")
 DOROSSI_MODEL_CATALOG_SCHEMA = 1
 # 探測用的族名：裸別名打給 CLI，讀回它**解析成什麼**——那就是「這一族今天最新的
 # 那個」。族名取自內建表裡不帶版號的那幾個 key，不另外手寫一份。
@@ -665,7 +669,7 @@ DOROSSI_CC_HARD_LIMIT_SEC = _dorossi_cc_hard_limit_sec()
 #     訊息（僅擁有者 UID）可在主機無確認執行任意 shell ＋讀寫檔案。
 # 兩種模式都在自己的持久工作目錄內啟動（不納入版本庫）；full 模式下 Bash
 # 仍可 cd 到他處。要改回最安全狀態請維持／改回 dorossi_cc_tools = "off"。
-DOROSSI_CC_WORKDIR = PROJECT_ROOT / "dorossi_workspace"
+DOROSSI_CC_WORKDIR = _platform_state(PROJECT_ROOT / "dorossi_workspace")
 
 
 def dorossi_session_workdir(uid: str, sid: str) -> str:
@@ -853,7 +857,7 @@ def session_prompt_state(sess: dict) -> str:
 # multi-session store below); claude_code stores Claude Code's own `session_id`
 # (resumed with `--resume`, the real history lives in ~/.claude); api stores the
 # message list. Persisted to disk so it survives `!restart`.
-DOROSSI_SESSION_FILE = PROJECT_ROOT / "dorossi_session.json"
+DOROSSI_SESSION_FILE = _platform_state(PROJECT_ROOT / "dorossi_session.json")
 
 # Per-invocation token-usage log (NDJSON, gitignored). One line per Dorossi
 # claude_code call (single-turn AND every autonomous-loop round): a JSON object
@@ -863,7 +867,7 @@ DOROSSI_SESSION_FILE = PROJECT_ROOT / "dorossi_session.json"
 # Discord string. Writes fail-soft (stderr only, never break a turn). Trimmed to
 # the last _DOROSSI_USAGE_MAX_LINES once it crosses _DOROSSI_USAGE_TRIM_AT so the
 # file can't grow without bound.
-DOROSSI_USAGE_FILE = PROJECT_ROOT / "dorossi_usage.ndjson"
+DOROSSI_USAGE_FILE = _platform_state(PROJECT_ROOT / "dorossi_usage.ndjson")
 _DOROSSI_USAGE_MAX_LINES = 5000
 _DOROSSI_USAGE_TRIM_AT = 6000
 DOROSSI_RESET_KEYWORDS = frozenset(

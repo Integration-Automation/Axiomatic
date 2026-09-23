@@ -35,7 +35,8 @@ discord_bot.py ──磁碟檔案（todo_*.md、*_request.json、webrunner.pid/p
 | `axiomatic/_webrunner_shared.py` | 兩個變體的共用核心，不 import 任何 driver：DOM 操作、佇列 I/O、輸出資料夾分配、產圖迴圈、單圖服務、`run_batch` |
 | `axiomatic/_batch_config.py`、`_bot_config.py`、`_queue_consume.py`、`_run_progress.py`、`_supervisor.py`、`_chrome_slot.py`、`_code_fingerprint.py`、`_warn_dedup.py` | 無狀態的共用模組：設定載入、佇列消耗決策、續跑檢查點、退避與單一實例鎖、跨行程瀏覽器槽鎖、程式碼指紋、警告去重（允許當第三通道的完整清單以 `CLAUDE.md`「Module boundaries」為準） |
 | `axiomatic/_process_control.py`、`_gui_control.py`、`_external_apis.py`、`_help_strings.py`、`_bot_prompts.py`、`dorossi_backend.py`、`presence_probe.py`、`discord_rpc.py` | bot 專屬模組：行程探查與終止、桌面自動化門面、外部圖庫／web API、說明文字資料、外部化 prompt 載入、Dorossi 後端與工作階段、本機狀態探測、本機 Rich Presence |
-| `start_discord_bot.py`、`start_webrunner.py`、`run_batch.py`、`install_autostart.py`、`wake_autostart.py` | repo 根目錄的監督啟動器、一鍵批次入口、Windows 工作排程器自動啟動的註冊與手動叫醒 |
+| `axiomatic/_chat_platform.py`、`_telegram_transport.py`、`_platform_runtime.py` | bot 專屬的對話平台層：介接接縫（身分映射、能力旗標、送出引數正規化、transport 註冊表）、逐平台 transport（一個平台一個 `_*_transport.py`）、行程的平台身分與它自己的狀態／鎖／記錄檔位置 |
+| `start_platforms.py`、`start_discord_bot.py`、`start_webrunner.py`、`run_batch.py`、`install_autostart.py`、`wake_autostart.py` | repo 根目錄的啟動器：把每個開著的平台各起一個受監督行程、單一平台的監督迴圈（`--platform`）、批次監督迴圈、一鍵批次入口、Windows 工作排程器自動啟動的註冊與手動叫醒 |
 | `axiomatic/verify_*.py`、`dashboard_server.py` | 手動驗證腳本（瀏覽器、外部 API、額度對話框、後端 CLI）與本機唯讀狀態儀表板 |
 | `axiomatic/gen_command_docs.py`、`audit_dependencies.py`、`audit_simplified_chars.py`、`mutation_harness.py` | 文件產生、相依與字形稽核、變異測試骨架 |
 | `test/test_*.py`、`test/conftest.py`、`test/_test_*.py`；`axiomatic/_browser_killguard.py`；`pytest.ini` | pytest 測試（大量是把硬規則變成靜態守門）、全套共用的守門夾具與兩支手動 e2e；防止測試誤殺正式瀏覽器的執行期防線（留在套件裡，repo 外的探針也要 import 它）；`testpaths = test`、`pythonpath = axiomatic .` 讓測試照舊用頂層名字匯入正式模組 |
@@ -44,16 +45,18 @@ discord_bot.py ──磁碟檔案（todo_*.md、*_request.json、webrunner.pid/p
 | `auth.md`、`discord_bot_token.md` | 憑證，**永不追蹤**（`.gitignore`）；範本是 `*.example.md` |
 | `README.md`、`COMMANDS.md`、`commands/`、`docs/` | 使用者文件；`commands/*.md` 由指令樹產生，`docs/` 是 Sphinx 原始碼 |
 | `CLAUDE.md`、`architecture.md` | 常駐硬規則與本檔 |
-| `output/`、`.chrome_profile*/`、`*.log`、`*.ndjson`、`webrunner.pid` 等 | 執行期產物（gitignored） |
+| `state/<平台>/` | **逐平台**的執行期狀態：該行程的工作階段、佇列、事件、稽核、收藏、排程、實例鎖與記錄檔，檔名再帶一次平台名。整個目錄 gitignored（一條規則蓋住所有平台與它們的 `.tmp`） |
+| `output/`、`.chrome_profile*/`、`*.log`、`*.ndjson`、`webrunner.pid`、`.batch_supervisor.lock` 等 | 全機共用的執行期產物（gitignored）。批次那一側**刻意不逐平台**——批次只有一份 |
 
 ## 3. 進入點與對外介面
 
 | 指令 | 用途 |
 | --- | --- |
-| `py -3 start_discord_bot.py` | bot 監督迴圈（單一實例鎖、致命 rc 不重試、輸出 tee 進 `discord_bot.log`） |
+| `py -3 start_platforms.py [--list]` | 把**每個開著的平台**各起一個受監督行程（一個平台一個行程）；`--list` 只列出哪些會起來與原因 |
+| `py -3 start_discord_bot.py [--platform <名稱>]` | **單一平台**的 bot 監督迴圈（逐平台的單一實例鎖與記錄檔、致命 rc 不重試、輸出 tee 進 `state/<平台>/`） |
 | `py -3 start_webrunner.py [selenium\|je]` | webrunner 監督迴圈（退避、快速失敗放棄、參與瀏覽器槽協定） |
 | `py -3 run_batch.py [selenium\|je] [--clear-pause]` | 本機一鍵批次：前置檢查 → 印 run-plan → 交棒給 `start_webrunner.py` |
-| `py -3 install_autostart.py --install\|--status\|--remove` | 登入時自動拉起兩支監督者（Windows 工作排程器，`\Axiomatic\Bot`／`\Axiomatic\Batch`） |
+| `py -3 install_autostart.py --install\|--status\|--remove` | 登入時自動拉起**開著的每個平台**與批次監督者（Windows 工作排程器，`\Axiomatic\Bot-<平台>`／`\Axiomatic\Batch`；名稱由 `_platform_runtime.autostart_task_names()` 算，`/sys doctor` 查的是同一份） |
 | `py -3 axiomatic/dashboard_server.py` | 本機唯讀狀態儀表板 |
 | `py -3 axiomatic/verify_browser.py [--full] [--variant je]` | 隔離瀏覽器驗證，不碰正式設定檔 |
 | `py -3 -m pytest` | 全部測試（`pytest.ini` 的 `testpaths` 指向 `test/`；單檔 `py -3 -m pytest test/test_x.py`） |
@@ -74,6 +77,15 @@ discord_bot.py ──磁碟檔案（todo_*.md、*_request.json、webrunner.pid/p
 
 ## 4. 主要流程
 
+0. **一個平台一個行程**：`start_platforms.py` 讀 `bot_config.json` → 對每個「開著且填了憑證」
+   的平台各 spawn 一支 `start_discord_bot.py --platform <名稱>` → 那支取**逐平台**的監督者
+   實例鎖、把輸出 tee 進 `state/<平台>/`，再 spawn `discord_bot.py --platform <名稱>` →
+   bot 取逐平台的本體實例鎖，所有自己的狀態檔都落在 `state/<平台>/<平台>.<檔名>`。
+   平台之間沒有共用的可變狀態，所以不需要跨行程鎖；一個平台崩潰或重啟不影響其他平台。
+   **批次是唯一的共用資源**：誰拿到 `.batch_supervisor.lock` 誰監督它，沒拿到的行程對
+   批次控制指令回一句讓位訊息（`BATCH_STAND_ASIDE_NOTICE`），不另外 spawn 監督者。
+   `_chat_platform` 的 transport 則是同一個行程裡的長命背景任務：預設平台走原生函式庫，
+   其餘平台走 `_*_transport.py`，收到的訊息一律交給 `dispatch_external_message`。
 1. **批次產圖（`/run`）**：bot 取瀏覽器槽鎖（`_chrome_slot`）→ 清掃既有實例 → spawn webrunner、
    寫 `webrunner.pid`、放鎖 → `_watch_for_fallback` 監督 → webrunner `main()` →
    `run_preflight` → 建立 driver、登入與設定 → `ws.run_batch`：每個角色重讀四條佇列 →
@@ -97,6 +109,7 @@ discord_bot.py ──磁碟檔案（todo_*.md、*_request.json、webrunner.pid/p
 | DOM／產圖行為 | 共用的放 `axiomatic/_webrunner_shared.py`；driver 專屬的兩個變體都要改 |
 | 跨行程檔案 | 原子寫入，並同時加進 `CLAUDE.md` 原子寫入清單與 `test/test_atomic_writes.py` 的 `_CROSS_PROCESS_CONSTANTS`；新的根目錄檔案要分類為追蹤的專案資產或 gitignored 的執行期產物（`test/test_gitignore_coverage.py`） |
 | 外部 API | `axiomatic/_external_apis.py`（唯一外送出口 `_http_get_json`）＋ `axiomatic/verify_external_apis.py` |
+| 對話平台 | 新增 `axiomatic/_<平台>_transport.py`，列進 `_chat_platform.TRANSPORT_MODULES`，在 `_bot_config` 的 `_DEFAULT_PLATFORMS` / `_PLATFORM_COERCERS` 各加一列，憑證檔照 `<平台>_bot_token.md` 的約定命名（連同範本與 `.gitignore`、`test_gitignore_coverage._IGNORED_RUNTIME`），並在 `docs/platforms.md` 寫使用說明 |
 | 桌面控制功能 | `axiomatic/_gui_control.py`，錯誤以泛用訊息的 `GuiError` 拋出 |
 | prompt 文字／presence 規則 | `bot_prompts/`（由 `_bot_prompts.py` 載入）；`presence_games.json`、`presence_music.json`、`presence_rpc.json`（各自的 `.example.json` 是範本） |
 

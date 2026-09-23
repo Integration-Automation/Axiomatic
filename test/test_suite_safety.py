@@ -2059,6 +2059,8 @@ _NARROW_PY_GLOBS = {
     "test_*.py": "樣式就是規則：這些掃描問的正是「測試檔」這個子集。",
     "_test_*.py": "手動 e2e 腳本的命名慣例（`_test_presence_e2e.py`），刻意不被收集。",
     "webrunner_*.py": "兩個變體的對帳，問的就是「有幾個變體」。",
+    "_*_transport.py": "逐平台 transport 的命名慣例；那支守門問的就是"
+                       "「磁碟上有哪些平台」，要跟 `TRANSPORT_MODULES` 兩向對帳。",
 }
 
 # 掃到的 glob 數下限。空清單跟乾淨的結果長得一模一樣。

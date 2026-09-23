@@ -126,6 +126,39 @@ _DEFAULT_DOROSSI_MODEL_CHECK: dict = {
     "announce_channel_id": 0,
 }
 
+# 其他對話平台。**一個平台一個區段，預設全部關著。**
+#
+# `enabled` 之外的三個鍵都是「這個平台上的」識別字，所以是**字串**而不是整數：
+# 各平台的 id 形狀不一樣（有的是數字、有的是英數字串），統一成字串比對才不會讓
+# 一個合法的 id 在轉型失敗時安靜地變成「不是擁有者」。
+#
+#   owner_user_ids  ── 這個平台上的擁有者。`OWNER_USER_ID` 是**某一個平台上的**
+#                      id，在別的平台上不成立，所以每個平台各自列。**空清單 ＝
+#                      這個平台上沒有人過得了主機控制閘**（fail-closed）。
+#   allowed_chat_ids ─ 這個平台的「設定頻道」。列進去的對話等同既有的 `channel_id`
+#                      ：非擁有者只能在這些對話裡下指令，其餘一律安靜忽略。
+#                      空清單 ＝ 只有擁有者用得到（最保守的預設）。
+#   poll_timeout_sec ─ 長輪詢一次等多久。
+_DEFAULT_PLATFORM_TELEGRAM: dict = {
+    "enabled": False,
+    "owner_user_ids": [],
+    "allowed_chat_ids": [],
+    "poll_timeout_sec": 30.0,
+}
+
+# 預設平台自己的區段只有一個總開關。它的身分設定住在**頂層**（`channel_id`、
+# `owner_user_id`、`discord_bot_token.md`），所以這裡不重複一份；而它**預設是開
+# 著的**——預設關著會讓 fresh clone 的 bot 什麼都不做，症狀跟「設定沒生效」一模
+# 一樣。要關掉它跟關掉其他平台是同一個寫法，「每個平台都能各自關掉」包含它。
+_DEFAULT_PLATFORM_DISCORD: dict = {
+    "enabled": True,
+}
+
+_DEFAULT_PLATFORMS: dict = {
+    "discord": _DEFAULT_PLATFORM_DISCORD,
+    "telegram": _DEFAULT_PLATFORM_TELEGRAM,
+}
+
 
 _DEFAULT_BOT_CONFIG: dict = {
     # 限頻道指令生效的那個頻道 ID。**沒有可用的預設值**：0 ＝還沒設定，bot 在
@@ -312,6 +345,7 @@ _DEFAULT_BOT_CONFIG: dict = {
     "daily_health_report": _DEFAULT_DAILY_HEALTH_REPORT,
     "dashboard": _DEFAULT_DASHBOARD,
     "dorossi_model_check": _DEFAULT_DOROSSI_MODEL_CHECK,
+    "platforms": _DEFAULT_PLATFORMS,
 }
 
 _VALID_HELP_LANGS = frozenset({"en", "zh-tw", "zh-cn"})
@@ -597,6 +631,29 @@ def _coerce_gui_control(raw, default: dict) -> dict:
     return {"launch_whitelist": out_wl, "launch_aliases": out_al}
 
 
+def _coerce_str_list(value, default, *, label: str = "") -> list[str]:
+    """平台識別字的清單（使用者 id、對話 id）。
+
+    整個鍵型別錯 → 走 `_take` 的拒絕那條路（退回預設並出聲）；**部分項目**不可用
+    則逐筆跳過、只說幾筆、不列內容——這幾個鍵裝的是使用者與對話 id，逐筆印出來只
+    是雜訊，而且那是別人的識別字。與 `_take_int_list` 同一個立場，只是這裡的值是
+    字串。
+    """
+    if not isinstance(value, list):
+        return default
+    out: list[str] = []
+    for one in value:
+        if isinstance(one, bool) or not isinstance(one, (str, int)):
+            continue
+        text = str(one).strip()
+        if text:
+            out.append(text)
+    if len(out) != len(value) and label:
+        _warn_once(f"_bot_config: `{label}` 有 {len(value) - len(out)} 筆不是可用"
+                   f"的識別字，已跳過那幾筆、採用其餘 {len(out)} 筆")
+    return out
+
+
 def _coerce_int_list(value) -> list[int]:
     out: list[int] = []
     if not isinstance(value, list):
@@ -647,6 +704,33 @@ def _coerce_dorossi_model_check(raw, default: dict) -> dict:
         return dict(default)
     return _take_section(raw, default, _DOROSSI_MODEL_CHECK_COERCERS,
                          path="dorossi_model_check.")
+
+
+def _coerce_platforms(raw, default: dict) -> dict:
+    """`platforms` 區段：**巢狀兩層**（區段 → 平台 → 欄位），所以自己走一層。
+
+    `_take_section` 只處理一層。多的那一層不是為了好看：下一個接平台的人加的是
+    一個**新的平台區段**，而不是一堆前綴一樣的扁平鍵，這樣「這個平台有哪些設定」
+    在檔案裡看得出來，不認得的平台名也才有地方被抓出來說一聲。
+
+    從 `deepcopy(default)` 出發，所以形狀永遠完整、而且回傳值不會與模組常數共用
+    同一個容器——`_fallback_bot_config` 的 docstring 記著那個缺陷的代價。
+    """
+    out = copy.deepcopy(default)
+    if not isinstance(raw, dict):
+        return out
+    _warn_unknown_keys(raw, default, source="_bot_config.platforms")
+    for name, (table, defaults) in _PLATFORM_COERCERS.items():
+        if name not in raw:
+            continue
+        block = raw[name]
+        if not isinstance(block, dict):
+            _warn_once(f"_bot_config: `platforms.{name}` 不是一個設定區段"
+                       f"（收到 {_shown(block)}），整段已忽略、沿用預設")
+            continue
+        out[name] = _take_section(block, defaults, table,
+                                  path=f"platforms.{name}.")
+    return out
 
 
 def _coerce_supervisor(raw, default: dict) -> dict:
@@ -752,11 +836,35 @@ _DOROSSI_MODEL_CHECK_COERCERS: dict = {
     "announce_channel_id": (_coerce_int, {"min_value": 0}),
 }
 
+_TELEGRAM_COERCERS: dict = {
+    "enabled": (_coerce_bool, {}),
+    "owner_user_ids": (
+        _coerce_str_list, {"label": "platforms.telegram.owner_user_ids"}),
+    "allowed_chat_ids": (
+        _coerce_str_list, {"label": "platforms.telegram.allowed_chat_ids"}),
+    # 正數：0 會變成不等待的熱迴圈（每一輪立刻回來再問一次），那不是「關掉」。
+    # 關掉請用 `enabled`——與 `dorossi_model_check.interval_hours` 同一條理由。
+    "poll_timeout_sec": (_coerce_positive_num, {}),
+}
+
+# 平台名 → （欄位表, 該平台的預設）。**加一個平台就加一列**，而
+# `test_platform_transports` 會把這張表與 `_DEFAULT_PLATFORMS` 兩個方向對帳：
+# 少一列等於那個平台完全不驗證、也不出聲，多一列會在 `_take` 裡變成 `KeyError`。
+_DISCORD_PLATFORM_COERCERS: dict = {
+    "enabled": (_coerce_bool, {}),
+}
+
+_PLATFORM_COERCERS: dict = {
+    "discord": (_DISCORD_PLATFORM_COERCERS, _DEFAULT_PLATFORM_DISCORD),
+    "telegram": (_TELEGRAM_COERCERS, _DEFAULT_PLATFORM_TELEGRAM),
+}
+
 # 巢狀區段（有自己的 coercer）與 int-list 鍵（`_coerce_int_list` 沒有 `default`
 # 參數，sentinel 那一招用不上）。兩者都不在 `_COERCERS` 裡，但都必須被涵蓋——
 # 這兩個 tuple 就是「已經想過了」的紀錄，測試拿它們跟 `_DEFAULT_BOT_CONFIG` 對帳。
 _SECTION_KEYS = ("webrunner_supervisor", "gui_control", "user_roles",
-                 "daily_health_report", "dashboard", "dorossi_model_check")
+                 "daily_health_report", "dashboard", "dorossi_model_check",
+                 "platforms")
 _INT_LIST_KEYS = ("path_reveal_channel_ids",)
 
 
@@ -924,4 +1032,6 @@ def load_bot_config() -> dict:
         _section(raw, "dashboard"), _DEFAULT_DASHBOARD)
     cfg["dorossi_model_check"] = _coerce_dorossi_model_check(
         _section(raw, "dorossi_model_check"), _DEFAULT_DOROSSI_MODEL_CHECK)
+    cfg["platforms"] = _coerce_platforms(
+        _section(raw, "platforms"), _DEFAULT_PLATFORMS)
     return cfg

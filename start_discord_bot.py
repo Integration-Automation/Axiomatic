@@ -1,4 +1,13 @@
-"""Launcher for the axiomatic Discord bot.
+"""Launcher for **one** axiomatic chat-platform process.
+
+One platform, one process. ``--platform <name>`` (default ``discord``) decides
+which platform this supervisor serves; everything this process owns — its
+single-instance lock, its log file and the bot's own state files — is named
+after that platform and lives under ``state/<platform>/``. So a second
+supervisor for a second platform is simply this script again with a different
+``--platform``, and neither can block, overwrite or restart the other.
+``start_platforms.py`` is the convenience wrapper that starts one of these per
+enabled platform.
 
 Runs ``axiomatic/discord_bot.py`` in a supervised loop: if the bot process
 exits for any reason (network outage, unhandled exception, token reload, etc.)
@@ -19,6 +28,7 @@ it. That is expected, not a duplicate launch (the launcher's own
 
 Usage:
     py -3 start_discord_bot.py
+    py -3 start_discord_bot.py --platform telegram
 """
 from __future__ import annotations
 
@@ -28,6 +38,7 @@ import sys
 import time
 from pathlib import Path
 
+from axiomatic import _platform_runtime
 from axiomatic._supervisor import (
     acquire_single_instance_lock,
     child_exit_is_fatal,
@@ -42,10 +53,17 @@ from axiomatic._supervisor import (
 REPO_ROOT = Path(__file__).resolve().parent
 BOT_SCRIPT = REPO_ROOT / "axiomatic" / "discord_bot.py"
 
+# 這支監督者服務哪一個平台。**在模組層決定一次**，底下的鎖檔與記錄檔都掛在它上面。
+PLATFORM = _platform_runtime.active_platform()
+
 # 單一實例鎖。擋的是「這支 launcher 被啟動兩次」——實際發生過：兩個 supervisor
 # 加兩個 bot 同時在跑，各自跑 presence 迴圈、各自鏡像、各自消耗佇列，而且兩套
 # 都「看起來正常」，從外面完全看不出來。鎖由 OS 持有，行程一消失就釋放。
-LOCK_FILE = REPO_ROOT / ".discord_bot_supervisor.lock"
+#
+# **逐平台一把。** 共用一把的話，第二個平台的監督者會被第一個平台的鎖擋掉，而
+# 那個症狀（「啟動了卻說已經有另一個實例」）看起來像重複啟動，不像設計。
+LOCK_FILE = _platform_runtime.platform_file(
+    REPO_ROOT / ".discord_bot_supervisor.lock", platform=PLATFORM)
 
 # 子行程的主控台輸出**同時**落地成檔案。
 #
@@ -61,7 +79,10 @@ LOCK_FILE = REPO_ROOT / ".discord_bot_supervisor.lock"
 # 與 webrunner 那一側的差別：那個檔 bot 每次 spawn 會清空（一次 `/run` 一份），
 # 這個檔只**附加**，成長由 `trim_log` 以尾段保留法封頂。會炸掉的正是「崩潰 →
 # 重生」那條接縫，清掉就等於把要查的東西丟了。
-BOT_LOG = REPO_ROOT / "discord_bot.log"
+# **逐平台一份。** 兩個平台寫同一份記錄檔的話，`trim_log` 的尾段保留會把另一個
+# 平台的崩潰原因一起裁掉，而那正是這個檔存在的理由。
+BOT_LOG = _platform_runtime.platform_file(
+    REPO_ROOT / "discord_bot.log", platform=PLATFORM)
 LOG_MAX_BYTES = 8 * 1024 * 1024     # 超過就修剪
 LOG_KEEP_BYTES = 4 * 1024 * 1024    # 修剪後保留的尾段
 
@@ -101,6 +122,9 @@ def main() -> int:
         print(f"missing {BOT_SCRIPT}", file=sys.stderr)
         return 1
 
+    # 這個平台的狀態目錄。鎖檔與記錄檔都住在裡面，所以要在碰它們之前建好。
+    # 放在 `main()` 而不是模組層：import 一個啟動器不該在版本庫裡建目錄。
+    _platform_runtime.ensure_state_dir(PLATFORM)
     trim_log(BOT_LOG, max_bytes=LOG_MAX_BYTES, keep_bytes=LOG_KEEP_BYTES)
     try:
         log = BOT_LOG.open("a", encoding="utf-8", buffering=1)
@@ -120,12 +144,15 @@ def main() -> int:
         # 鎖就被靜默放掉，第二個監督者當場起得來。
         lock = acquire_single_instance_lock(LOCK_FILE)
         if lock is None:
+            # pid 清單只是診斷，而且**跨平台**：同一支啟動器服務別的平台時也長
+            # 這個名字，所以措辭不說「就是這幾個佔著」，只說「這幾個也在跑這支」。
             others = _other_launcher_pids()
-            detail = f"（既有 pid: {', '.join(map(str, others))}）" if others else ""
-            say(log, f"supervisor: 已經有另一個實例在執行{detail}，這次不啟動。",
-                err=True)
-            say(log, "supervisor: 要改跑這一個的話，先結束既有的那個再重新啟動。",
-                err=True)
+            detail = (f"（同一支啟動器的其他行程 pid: {', '.join(map(str, others))}"
+                      "，其中可能有別的平台的）") if others else ""
+            say(log, f"supervisor[{PLATFORM}]: 這個平台已經有另一個實例在執行"
+                     f"{detail}，這次不啟動。", err=True)
+            say(log, f"supervisor[{PLATFORM}]: 要改跑這一個的話，先結束既有的那個"
+                     "再重新啟動。別的平台不受影響，它們各有自己的鎖。", err=True)
             return 1
         if lock.degraded:
             # 降級不是錯誤，但**一定要講出來**：拿不到互斥保護卻照常啟動是刻意的
@@ -136,8 +163,13 @@ def main() -> int:
                      "這次不會擋掉重複啟動，請自己確認只開了一個。")
 
         try:
-            cmd = python_command() + ["-u", str(BOT_SCRIPT)]
-            say(log, f"supervisor launching: {' '.join(cmd)}")
+            # 平台名走 argv（`_platform_runtime.platform_from_argv`）。**不靠環境
+            # 變數傳**：`stream_child` 自己組子行程的環境，而一個經由環境傳下去的
+            # 身分只要有人在中間清掉環境就會安靜地變回預設平台——那個行程會開始寫
+            # 另一個平台的狀態檔，而且沒有任何地方會講。
+            cmd = python_command() + ["-u", str(BOT_SCRIPT),
+                                      "--platform", PLATFORM]
+            say(log, f"supervisor[{PLATFORM}] launching: {' '.join(cmd)}")
             delay = RESTART_DELAY_MIN
             attempt = 0
             while True:

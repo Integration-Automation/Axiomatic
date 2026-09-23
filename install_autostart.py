@@ -1,4 +1,4 @@
-"""登入時自動把兩支監督者拉起來（Windows 工作排程器）。
+"""登入時自動把每個開著的平台與批次監督者拉起來（Windows 工作排程器）。
 
 **為什麼需要這個。** 監督者能撐住「子行程掛掉」，撐不住「整台機器掛掉」——而長時間
 無人值守的主機就是會重開：顯示驅動 bugcheck、Windows Update、斷電。量過一次真實的
@@ -16,10 +16,18 @@
 還需要在系統層開自動登入——那是主機安全設定，不在這支腳本的範圍內，也不該由它
 偷偷改掉。
 
-**重複啟動由誰擋。** 兩支啟動器各自持有一把單一實例鎖
-（`.discord_bot_supervisor.lock`／`.webrunner_supervisor.lock`），所以「使用者自己
-已經開著、登入工作又開一個」會被乾淨地擋掉並寫進 log。批次那一把就是為了這條路
+**重複啟動由誰擋。** 每一支啟動器各自持有一把單一實例鎖（bot 那一把是**逐平台**
+的，住在 `state/<平台>/`；批次那一把是 `.webrunner_supervisor.lock`），所以「使用者
+自己已經開著、登入工作又開一個」會被乾淨地擋掉並寫進 log。批次那一把就是為了這條路
 才補上的——在那之前，自動啟動等於把偶發的雙開變成常態。
+
+**註冊的是「現在開著的東西」，不是一對寫死的工作。** 一個平台一個行程、一個行程
+一筆排程工作（`\\Axiomatic\\Bot-<平台>`），所以 `--install` 會去讀 `bot_config.json`
+算出哪些平台開著而且填了憑證，替每一個各註冊一筆。**沒開或沒填憑證的平台不會有
+工作**——那是「缺席」，不是「失敗」。反過來，`--remove` 掃的是排程器裡**整個
+`\\Axiomatic\\` 資料夾**，不是同一份計算結果：一個剛被關掉的平台，它的工作仍然
+留在排程器裡，而用「現在開著哪些」去算要刪誰的話，那筆工作會被永遠遺留下來，
+每次登入照常把一個已經關掉的平台拉起來。
 
 用法：
     py -3 install_autostart.py --install     # 註冊（可重複執行，冪等）
@@ -38,15 +46,39 @@ import tempfile
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+from axiomatic import _platform_runtime
+from axiomatic._bot_config import load_bot_config
+
 REPO_ROOT = Path(__file__).resolve().parent
 
 # 工作名稱。放在 `\Axiomatic\` 資料夾底下，`--remove` 才好整組收掉，也不會跟
-# 使用者其他的排程混在一起。
-TASK_FOLDER = r"\Axiomatic"
-TASKS = {
-    "bot": (rf"{TASK_FOLDER}\Bot", "start_discord_bot.py"),
-    "batch": (rf"{TASK_FOLDER}\Batch", "start_webrunner.py"),
-}
+# 使用者其他的排程混在一起。**名字本身由 `_platform_runtime` 算**：`/sys doctor`
+# 的自動復原檢查用的是同一份計算，兩份手抄的名單只要改一邊不改另一邊，症狀就是零。
+TASK_FOLDER = _platform_runtime.AUTOSTART_TASK_FOLDER
+BATCH_TASK = (_platform_runtime.AUTOSTART_BATCH_TASK, "start_webrunner.py", [])
+
+
+def bot_task(platform: str) -> tuple[str, str, list[str]]:
+    """一個平台一筆工作：`\\Axiomatic\\Bot-<平台>` → `start_discord_bot.py --platform`。"""
+    return (_platform_runtime.autostart_bot_task(platform),
+            "start_discord_bot.py", ["--platform", platform])
+
+
+def planned_tasks(which: list[str]) -> list[tuple[str, str, list[str]]]:
+    """`--install` 這一輪要註冊的工作。開著的平台各一筆，批次一筆。
+
+    名稱那一半刻意繞回 `_platform_runtime.autostart_task_names()`（而不是自己把
+    平台清單再跑一次），所以「註冊了什麼」與「doctor 查什麼」在程式碼上就是同一
+    個答案，不必靠一支測試去對帳兩份名單。
+    """
+    tasks: list[tuple[str, str, list[str]]] = []
+    if "bot" in which:
+        config = load_bot_config()
+        tasks += [bot_task(name)
+                  for name in _platform_runtime.enabled_platforms(config)]
+    if "batch" in which:
+        tasks.append(BATCH_TASK)
+    return tasks
 
 
 def python_command() -> list[str]:
@@ -87,7 +119,7 @@ def python_command() -> list[str]:
     return [sys.executable]
 
 
-def _task_xml(script: str, user: str) -> str:
+def _task_xml(script: str, user: str, extra: list[str] | None = None) -> str:
     """工作排程器的 XML 定義。
 
     每一項設定都是刻意的，改之前先讀完：
@@ -107,7 +139,8 @@ def _task_xml(script: str, user: str) -> str:
     """
     cmd = python_command()
     exe = cmd[0]
-    args = " ".join(cmd[1:] + [f'"{REPO_ROOT / script}"']).strip()
+    args = " ".join(cmd[1:] + [f'"{REPO_ROOT / script}"']
+                    + list(extra or [])).strip()
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -193,9 +226,16 @@ def install(which: list[str]) -> int:
         print("找不到目前的使用者名稱（USERNAME 沒設定）；無法註冊。",
               file=sys.stderr)
         return 1
+    tasks = planned_tasks(which)
+    if not tasks:
+        # 一個都算不出來的時候要出聲。「註冊完成、但一筆工作都沒有」跟「註冊成功」
+        # 印起來一模一樣，而症狀要到下一次重開機才出現。
+        print("沒有任何東西要註冊：平台全都關著或沒填憑證。", file=sys.stderr)
+        print("跑 `py -3 start_platforms.py --list` 看逐平台的原因。",
+              file=sys.stderr)
+        return 1
     rc = 0
-    for key in which:
-        task_name, script = TASKS[key]
+    for task_name, script, extra in tasks:
         if not (REPO_ROOT / script).exists():
             print(f"找不到 {script}，跳過 {task_name}", file=sys.stderr)
             rc = 1
@@ -205,7 +245,8 @@ def install(which: list[str]) -> int:
         with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as handle:
             tmp = handle.name
         try:
-            Path(tmp).write_text(_task_xml(script, user), encoding="utf-16")
+            Path(tmp).write_text(_task_xml(script, user, extra),
+                                 encoding="utf-16")
             # `/F` ＝ 已存在就覆寫，讓這支腳本可以重複執行。
             done = _schtasks("/Create", "/TN", task_name, "/XML", tmp, "/F")
         finally:
@@ -214,7 +255,7 @@ def install(which: list[str]) -> int:
             except OSError:
                 pass
         if done.returncode == 0:
-            print(f"已註冊：{task_name} → {script}")
+            print(f"已註冊：{task_name} → {script} {' '.join(extra)}".rstrip())
         else:
             print(f"註冊 {task_name} 失敗：{done.stdout.strip()} "
                   f"{done.stderr.strip()}", file=sys.stderr)
@@ -222,10 +263,49 @@ def install(which: list[str]) -> int:
     return rc
 
 
+def registered_tasks() -> list[str]:
+    """排程器裡 `\\Axiomatic\\` 底下現在真的有哪些工作。
+
+    **`--remove` 與 `--status` 問的是排程器，不是設定檔。** 用「現在開著哪些平台」
+    去算要刪誰的話，一個剛被關掉的平台的工作會永遠留在排程器裡，每次登入照常把它
+    拉起來——而 `--status` 也看不到它，因為那份計算結果裡沒有它。這正是本 repo
+    一再記錄的「兩份平行清單」形狀，差別在這一份的正本在作業系統那邊。
+    """
+    done = _schtasks("/Query", "/FO", "LIST")
+    if done.returncode != 0:
+        return []
+    found: list[str] = []
+    prefix = TASK_FOLDER + chr(92)
+    for line in done.stdout.splitlines():
+        _field, _sep, value = line.partition(":")
+        name = value.strip()
+        if name.startswith(prefix) and name not in found:
+            found.append(name)
+    return sorted(found)
+
+
+def _wanted_task_names(which: list[str]) -> list[str]:
+    """`--remove` / `--status` 要處理哪些**已註冊**的工作名。"""
+    names = registered_tasks()
+    bot_prefix = TASK_FOLDER + chr(92) + "Bot"
+    batch_name = BATCH_TASK[0]
+    out = []
+    for name in names:
+        is_batch = name == batch_name
+        if is_batch and "batch" in which:
+            out.append(name)
+        elif not is_batch and name.startswith(bot_prefix) and "bot" in which:
+            out.append(name)
+    return out
+
+
 def remove(which: list[str]) -> int:
     rc = 0
-    for key in which:
-        task_name, _script = TASKS[key]
+    targets = _wanted_task_names(which)
+    if not targets:
+        print("（`\\Axiomatic\\` 底下沒有符合的工作，本來就不存在）")
+        return 0
+    for task_name in targets:
         done = _schtasks("/Delete", "/TN", task_name, "/F")
         if done.returncode == 0:
             print(f"已移除：{task_name}")
@@ -320,8 +400,12 @@ def _explain_last_result(text: str) -> str:
 
 
 def status(which: list[str]) -> int:
-    for key in which:
-        task_name, _script = TASKS[key]
+    targets = _wanted_task_names(which)
+    if not targets:
+        print("`\\Axiomatic\\` 底下沒有註冊任何工作。")
+        print("要註冊：py -3 install_autostart.py --install")
+        return 0
+    for task_name in targets:
         done = _schtasks("/Query", "/TN", task_name, "/V", "/FO", "LIST")
         if done.returncode != 0:
             print(f"{task_name}: 未註冊")
@@ -351,7 +435,8 @@ def status(which: list[str]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="登入時自動啟動 bot 與批次監督者（Windows 工作排程器）。")
+        description="登入時自動啟動每個開著的平台與批次監督者"
+                    "（Windows 工作排程器）。")
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--install", action="store_true", help="註冊（冪等）")
     action.add_argument("--remove", action="store_true", help="移除")
