@@ -88,7 +88,7 @@ _DEFAULT_GUI_CONTROL: dict = {
     # rungameid URI、任何能被 `os.startfile()` 處理的東西。`!launch
     # <key>` 先比對這個 dict（case-insensitive）再 fall through 到
     # whitelist。讓使用者打 `!launch mygame` 而不用記
-    # `steam://rungameid/394360`。
+    # `steam://rungameid/000000`。
     "launch_aliases": {},
 }
 

@@ -16595,7 +16595,7 @@ async def cmd_kill(message: discord.Message, payload: str) -> None:
 # 缺陷），那兩個缺陷已在函式庫端修掉，所以 `cmd_focus` 現在轉呼叫
 # `_gui.window_focus`，本檔不再有第二份視窗操作。
 
-# RFC 3986 scheme + `://`. 區分「`steam://rungameid/394360`」（走
+# RFC 3986 scheme + `://`. 區分「`steam://rungameid/000000`」（走
 # `os.startfile`）跟「`C:/Path/foo.exe`」（走 `subprocess.Popen`）。
 _URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
 
@@ -16636,7 +16636,7 @@ def _resolve_launch_target(payload: str) -> str | None:
 async def cmd_launch(message: discord.Message, payload: str) -> None:
     """`/proc launch <name>` — 啟動 whitelist / aliases 上的程式。
 
-    Aliases 支援 URI scheme（`steam://rungameid/394360`、`epic://`、
+    Aliases 支援 URI scheme（`steam://rungameid/000000`、`epic://`、
     `http://`…）— 這類 target 走 `os.startfile`（Windows native URI
     handler），不走 `subprocess.Popen`。Whitelist 是 exe 名稱／路徑，
     走 `subprocess.Popen`。兩邊都空時這個指令全面停用，避免 token
