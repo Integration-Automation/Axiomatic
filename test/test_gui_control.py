@@ -4646,12 +4646,36 @@ def test_no_key_alias_shadows_a_real_key_name(real_ac_tables):
     `parse_key_name` 是先查別名再驗表（`KEY_ALIASES.get(key, key)`），所以後端哪
     天新增一顆叫 `enter` 的鍵，這裡的 `enter -> return` 會把它悄悄改道到別的鍵。
     使用者按到的不是他打的那顆，而且完全沒有訊息——比查不到還難查。
+
+    **判準是「改道到別的鍵」，不是「名字撞到」。** 後端可以同時收兩個名字指向**同一
+    個**虛擬鍵碼（實測：`ctrl` 與 `control` 都是 17，`ctrl` 是後端後來才補上的）。
+    那種情況下別名沒有改道任何東西，使用者按到的就是他打的那顆；把它算成違規，等於
+    逼人刪掉一個「後端哪天又拿掉 `ctrl`」就會需要的別名，換來的安全是零。所以比的是
+    **鍵碼**：兩邊碼不同才是遮蔽。
     """
     keys, _ = real_ac_tables
-    shadowed = sorted(name for name in gui.KEY_ALIASES if name in keys)
+    shadowed = sorted(name for name, target in gui.KEY_ALIASES.items()
+                      if name in keys and keys.get(target) != keys[name])
     assert not shadowed, (
-        "這些別名的名字本身就是後端的合法鍵名：%s。`parse_key_name` 先查別名，"
-        "所以那顆真鍵會被**靜默改道**。請把該別名刪掉或改名。" % shadowed)
+        "這些別名的名字本身就是後端的合法鍵名，而且**指向不同的鍵碼**：%s。"
+        "`parse_key_name` 先查別名，所以那顆真鍵會被**靜默改道**。"
+        "請把該別名刪掉或改名。" % shadowed)
+
+
+def test_the_shadowing_check_still_catches_a_real_redirect():
+    """對照組：真實資料今天沒有「改道」的別名，所以上面那句斷言恆真——刪掉也全綠。
+
+    兩種輸入各問一次：碼相同（只是同義字，放行）與碼不同（真的改道，要抓到）。
+    """
+    keys = {"enter": 13, "return": 13, "ctrl": 17, "control": 17, "f1": 112}
+
+    def shadowed(aliases):
+        return sorted(name for name, target in aliases.items()
+                      if name in keys and keys.get(target) != keys[name])
+
+    assert shadowed({"ctrl": "control", "enter": "return"}) == []
+    assert shadowed({"enter": "f1"}) == ["enter"], "真的改道卻沒被抓到"
+    assert shadowed({"nosuchkey": "f1"}) == [], "名字沒撞到就不歸這支管"
 
 
 def test_every_mouse_button_points_at_a_real_backend_button(real_ac_tables):

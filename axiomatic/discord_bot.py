@@ -15452,6 +15452,12 @@ LAUNCHER_VARIANTS = ("je", "selenium")
 # 消失就釋放，所以「監督者當掉了但旗標還在」這個狀態不存在，也就不需要任何清理或
 # 逾時。拿到的行程監督批次；沒拿到的對批次控制指令讓位，其餘功能完全不受影響。
 _batch_supervisor_lock = None
+# **「還沒問過」與「問過、沒拿到」是兩件事。** 只看鎖是不是 `None` 的話，一個
+# 從來沒跑過 `main()` 的行程（測試、把 bot 當模組匯入的工具）會被當成「別人在
+# 監督」而對每一個批次指令讓位——那不是 fail-closed，是把單行程的既有行為整個
+# 關掉，而症狀是「指令送出去了，回一句有別人在做，但根本沒有別人」。
+# 正式路徑上 `main()` 一定會問一次，所以「還沒問過」在那裡不存在。
+_batch_supervision_attempted = False
 
 
 def _claim_batch_supervision() -> bool:
@@ -15463,9 +15469,10 @@ def _claim_batch_supervision() -> bool:
     沒發生」。往「照常啟動」倒與兩支啟動器的立場一致，代價是那種機器上要自己確認只
     開一個平台。
     """
-    global _batch_supervisor_lock
+    global _batch_supervisor_lock, _batch_supervision_attempted
     if _batch_supervisor_lock is not None:
         return True
+    _batch_supervision_attempted = True
     degraded = False
     try:
         _batch_supervisor_lock = acquire_single_instance_lock(
@@ -15488,8 +15495,15 @@ def _claim_batch_supervision() -> bool:
 
 
 def batch_supervision_claimed() -> bool:
-    """本行程是不是批次的監督者。"""
-    return _batch_supervisor_lock is not None
+    """本行程可不可以監督批次。
+
+    三種狀態，兩種答案：**拿到了**→ 可以；**問過而且沒拿到**（別的平台的行程
+    握著）→ 不可以，讓位；**還沒問過**→ 可以。最後那一種只發生在沒跑過
+    `main()` 的行程上（測試、把 bot 當模組匯入的工具），而把它答成「不可以」
+    等於在那裡把每一個批次指令都關掉——那不是保守，是換掉既有行為，而且訊息
+    會說「有別人在監督」，而那句話是假的。
+    """
+    return _batch_supervisor_lock is not None or not _batch_supervision_attempted
 
 
 # 讓位時對使用者說的那一句。**一句，單一來源**——散在各處自己寫的話，其中幾處遲早

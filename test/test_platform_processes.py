@@ -379,6 +379,41 @@ def test_a_non_owning_process_refuses_to_stop_someone_elses_batch(monkeypatch):
         "讓位的路徑改了停止旗標——那會讓**本行程**從此拒絕啟動批次")
 
 
+@pytest.mark.parametrize("lock, attempted, expected", [
+    (object(), True, True),    # 拿到了
+    (None, True, False),       # 問過、別人握著 → 讓位
+    (None, False, True),       # 還沒問過（沒跑過 `main()` 的行程）
+    (object(), False, True),   # 不可能的組合，但不得答成 False
+])
+def test_the_claim_tells_never_asked_apart_from_asked_and_lost(
+        monkeypatch, lock, attempted, expected):
+    """**「還沒問過」與「問過、沒拿到」是兩件事。**
+
+    只看鎖是不是 `None` 的話，沒跑過 `main()` 的行程（測試、把 bot 當模組匯入的
+    工具）會對每一個批次指令讓位，並回一句「有別人在監督」——而那句話是假的。實測
+    過：那一版讓 `test_batch_recovery` 八支一起紅，症狀是 `/stop` 什麼都沒做。
+    """
+    import discord_bot as b  # noqa: PLC0415
+
+    monkeypatch.setattr(b, "_batch_supervisor_lock", lock)
+    monkeypatch.setattr(b, "_batch_supervision_attempted", attempted)
+    assert b.batch_supervision_claimed() is expected
+
+
+def test_the_claim_records_that_it_asked(monkeypatch, tmp_path):
+    """問過就要留下記號，否則下一次呼叫又會被當成「還沒問過」而答 True。"""
+    import discord_bot as b  # noqa: PLC0415
+
+    monkeypatch.setattr(b, "_batch_supervisor_lock", None)
+    monkeypatch.setattr(b, "_batch_supervision_attempted", False)
+    monkeypatch.setattr(b, "BATCH_SUPERVISOR_LOCK_FILE",
+                        tmp_path / ".batch_supervisor.lock")
+    monkeypatch.setattr(b, "acquire_single_instance_lock", lambda _p: None)
+    assert b._claim_batch_supervision() is False
+    assert b._batch_supervision_attempted is True
+    assert b.batch_supervision_claimed() is False
+
+
 def test_the_stand_aside_notice_says_who_is_doing_it_and_what_to_do():
     """讓位的字串必須說「有別人在做」而不是「失敗了」——那兩件事要使用者做的處置
     完全不同。同時它受 Secrecy Layer 1 約束：沒有主機路徑、沒有 PID。"""

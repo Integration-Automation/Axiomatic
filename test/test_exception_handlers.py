@@ -645,9 +645,9 @@ def test_the_scan_actually_finds_something():
 # 範圍本身的釘子（§8.8(A3)：族群乾淨時，寬範圍與窄範圍在輸出上一模一樣）
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT_SCRIPTS = ("start_discord_bot.py", "start_webrunner.py",
-                      "run_batch.py", "install_autostart.py",
-                      "wake_autostart.py")
+_REPO_ROOT_SCRIPTS = ("start_platforms.py", "start_discord_bot.py",
+                      "start_webrunner.py", "run_batch.py",
+                      "install_autostart.py", "wake_autostart.py")
 _REPO_ROOT_HANDLER_FLOOR = 15
 
 
