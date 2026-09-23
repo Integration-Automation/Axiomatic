@@ -27276,7 +27276,11 @@ _TRANSPORT_ONLY_RECHECK_SEC = 30.0
 async def _run_transport_only() -> bool:
     """非預設平台的長命迴圈：建 transport、救活它們，然後一直跑下去。
 
-    回「有沒有東西可跑」。沒有的話呼叫端回 `RC_SETUP_INCOMPLETE`——那是**致命 rc**，
+    **只有一種回傳**：`False` ＝「這個平台沒有東西可跑」。有東西可跑時這支不會回來
+    （迴圈只由取消或行程結束終止），所以不要在下面補一個 `return True` ——那行永遠
+    不會執行，而一個永遠不執行的 return 會讓讀的人以為這裡有第二條正常出口。
+
+    呼叫端收到 `False` 就回 `RC_SETUP_INCOMPLETE`——那是**致命 rc**，
     監督啟動器認得它並直接收工。不這樣做的話，一個沒設定好的平台會讓監督者每 5～300
     秒重生一個註定什麼都不做的行程，而每一輪看起來都像正常啟動。
 
@@ -27295,7 +27299,6 @@ async def _run_transport_only() -> bool:
     while True:
         await asyncio.sleep(_TRANSPORT_ONLY_RECHECK_SEC)
         _ensure_chat_transports_alive(source="watchdog")
-    return True  # pragma: no cover - 迴圈只由取消結束
 
 
 def main() -> int:
