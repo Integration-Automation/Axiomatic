@@ -4590,7 +4590,7 @@ async def mcmd_e621(message: discord.Message, rest: str) -> None:
 # 580 KB 的惡意頁要 112 秒，而它跑在事件迴圈上——心跳會斷。拆成兩條各自線性的樣式、
 # 從上一格的結尾接著找，配對結果與舊寫法逐字相同（`test_iqdb_rows_match_the_old_pattern`）。
 _IQDB_ANCHOR = re.compile(r'<a href="(//[^"]+)"[^>]*><img[^>]*></a>')
-_IQDB_SIMILARITY = re.compile(r'(\d+)%\s*similarity')
+_IQDB_SIMILARITY = re.compile(r'(?<!\d)(\d+)%\s*similarity')  # 同上：不從一串數字的中間起跑
 # 結果頁的上限。正常一頁幾十 KB；超過就不讀——這些位元組不是我們控制的。
 IQDB_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
@@ -5897,7 +5897,31 @@ _REDACT_PID_RE = re.compile(r"\b(pids?)(\s*[:=]\s*|\s+)\[?\d+(?:\s*,\s*\d+)*\]?"
                             re.IGNORECASE)
 
 
-_SCRUB_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+# 信箱刷除。原本是一條 `[\w.+-]+@[\w-]+\.[\w.-]+`：開頭是字元類別，一長串沒有 `@` 的字
+# 每個起點都掃到底——6 萬字 22 秒，跑在事件迴圈上。**不能**用 lookbehind 補：上一筆比對的
+# 網域尾巴停在 `+` 這種字的時候，下一筆正是從那裡（前一字是 `.`）起跑，lookbehind 會把它
+# 擋掉、留下一個沒刷掉的信箱。所以改成以 `@` 起跑（線性）、再往左收使用者名稱，而且不越過
+# 上一筆的結尾——與舊樣式的 `sub` 逐字相同（`test_the_email_scrub_matches_its_old_pattern`）。
+_SCRUB_EMAIL_DOMAIN_RE = re.compile(r"@[\w-]+\.[\w.-]+")
+_SCRUB_EMAIL_LOCAL_RE = re.compile(r"[\w.+-]")
+
+
+def _scrub_emails(text: str, replacement: str = "[account]") -> str:
+    """把信箱換成 `replacement`；線性時間。"""
+    out: list[str] = []
+    last = 0
+    for domain in _SCRUB_EMAIL_DOMAIN_RE.finditer(text):
+        at = domain.start()
+        start = at
+        while start > last and _SCRUB_EMAIL_LOCAL_RE.match(text, start - 1):
+            start -= 1
+        if start == at:
+            continue                      # `@` 前面沒有使用者名稱：不是信箱
+        out.append(text[last:start])
+        out.append(replacement)
+        last = domain.end()
+    out.append(text[last:])
+    return "".join(out)
 # 後端供應商 / 產品名。`_redact_for_discord` 只刷出圖服務品牌，這裡補上對話
 # 後端那一組 —— 外部 CLI 的報表會把自己的產品名寫在標題與方案名稱裡。
 _SCRUB_VENDOR_RE = re.compile(
@@ -5913,7 +5937,7 @@ def _scrub_external_report(text: str) -> str:
     misses would be a hard-requirement violation, so it errs toward scrubbing.
     """
     text = _redact_for_discord(text)
-    text = _SCRUB_EMAIL_RE.sub("[account]", text)
+    text = _scrub_emails(text)
     text = _SCRUB_VENDOR_RE.sub("[backend]", text)
     return text
 

@@ -19291,6 +19291,83 @@ def test_anime_lookup_survives_every_payload_shape(monkeypatch, status, payload,
         assert embed.title == "frieren" and embed.url is None and embed.description == ""
 
 
+# 會被逐一計時的模組：bot 這一側處理外部文字（網站回應、外部 CLI 的報表、使用者輸入）的地方。
+_REGEX_MODULES = ("discord_bot", "_external_apis", "_telegram_transport", "dorossi_backend",
+                  "_chat_platform", "_gui_control", "presence_probe", "discord_rpc")
+
+
+def _hostile_inputs(pattern: str, n: int) -> list[str]:
+    """一般的長串（同一個字、空白、數字、路徑符號）加上從樣式本身抽出的字面片段重複。"""
+    texts = [c * n for c in "a 1/\\`<."] + [s * (n // 2) for s in ("a ", "a\n", "a.", "1.", "a-", "a@")]
+    for fragment in re.findall(r"[A-Za-z0-9_<>/\"'=:.%-]{2,}", pattern)[:6]:
+        texts.append(fragment * max(1, n // len(fragment)))
+        texts.append((fragment + " ") * max(1, n // (len(fragment) + 1)))
+    return texts
+
+
+def _slow_patterns(patterns, n: int, limit: float) -> list[str]:
+    """哪幾條樣式在某一個輸入上 search／findall／sub 超過 `limit` 秒。"""
+    slow = []
+    for label, pattern in patterns:
+        for text in _hostile_inputs(pattern.pattern, n):
+            started = time.perf_counter()
+            pattern.search(text)
+            pattern.findall(text)
+            pattern.sub("", text)
+            if time.perf_counter() - started > limit:
+                slow.append(label)
+                break
+    return slow
+
+
+def test_the_regex_timer_catches_a_quadratic_pattern():
+    """正對照：`[a-z]+@x` 對一長串字母是平方時間，計時器必須抓得到——抓不到的話，下一支
+    一條都不報也只代表計時器壞了。"""
+    assert _slow_patterns([("control", re.compile(r"[a-z]+@x"))], 12_000, 0.25) == ["control"]
+    assert _slow_patterns([("fine", re.compile(r"(?<![a-z])[a-z]+@x"))], 12_000, 0.25) == []
+
+
+def test_no_module_level_regex_is_quadratic_on_hostile_input():
+    """這些樣式跑在事件迴圈上，吃的是外部文字。一條會從每個起點各掃一次的樣式，對一長串
+    連續字就是平方時間——2026-09-24 一次掃出三條（6 萬字：291 秒、27 秒、22 秒）。
+
+    上限 0.25 秒、長度 1.2 萬：線性的樣式在這裡是毫秒級，平方的那三條在這個長度都超過一秒。"""
+    import importlib
+    patterns = []
+    for name in _REGEX_MODULES:
+        module = importlib.import_module(name)
+        patterns += [(f"{name}.{attr}", value) for attr, value in vars(module).items()
+                     if isinstance(value, re.Pattern)]
+    assert len(patterns) >= 30, f"只收到 {len(patterns)} 條樣式——收集本身壞了"
+    assert _slow_patterns(patterns, 12_000, 0.25) == []
+
+
+_OLD_SCRUB_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+def test_the_email_scrub_matches_its_old_pattern():
+    """線性的掃描必須與舊樣式的 `sub` 逐字相同——少刷一個就是把信箱送出去。第一版用
+    lookbehind，這支當場抓到 `x.io.+ü@q.r` 那種：上一筆的網域尾巴停在 `+` 前面，下一筆正要
+    從 `+` 起跑。"""
+    import random as _random
+    rng = _random.Random(924)
+    pieces = ["a", "b.c", "+", "-", "@", "x.io", " ", "é", "__", "1", "@@", ".", "\n", "ü@q.r"]
+    for _ in range(6000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 14)))
+        assert b._scrub_emails(text, "#") == _OLD_SCRUB_EMAIL_RE.sub("#", text), text
+
+
+def test_the_email_scrub_stays_linear_on_hostile_input():
+    """舊樣式對 6 萬個沒有 `@` 的字要 22 秒；`@` 後面接長串也不能變成平方時間。"""
+    # 最後一個是一千多個**真的**信箱：每一筆比對的成本也要是常數，否則少了它，逐筆多掃一次
+    # 全文的版本會通過（前面幾個輸入裡一個有效信箱都沒有，迴圈根本沒跑）。
+    for text in ("a" * 60_000, "a@" * 30_000, "@" + "a" * 60_000, ("a" * 50 + "@b") * 1200,
+                 ("a" * 50 + "@b.c ") * 1200):
+        started = time.perf_counter()
+        b._scrub_emails(text)
+        assert time.perf_counter() - started < 1.0, text[:20]
+
+
 _OLD_IQDB_ROW = re.compile(
     r'<a href="(//[^"]+)"[^>]*><img[^>]*></a>.*?(\d+)%\s*similarity', re.DOTALL)
 

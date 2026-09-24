@@ -2833,8 +2833,10 @@ def _dorossi_cc_usage_limit(result_ev: dict, answer: str,
 _RETRY_AFTER_RE = re.compile(
     r"(?:try\s+again|retry|resets?)\s+(?:again\s+)?in\s+([^\n]{0,60})",
     re.IGNORECASE)
+# 輸入被上一條樣式截在 60 字以內，所以今天不會慢；但它本身對一長串數字是平方時間
+# （6 萬個數字 291 秒），lookbehind 讓它只從一串數字的開頭起跑，結果不變。
 _DURATION_UNIT_RE = re.compile(
-    r"([0-9]+(?:\.[0-9]+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b",
+    r"(?<![0-9])([0-9]+(?:\.[0-9]+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b",
     re.IGNORECASE)
 _UNIT_SECONDS = {"d": 86400.0, "h": 3600.0, "m": 60.0, "s": 1.0}
 
