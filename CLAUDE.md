@@ -41,6 +41,15 @@ exempting a file on one side only leaves the other guard crying wolf about a
 "violation" nobody intends to fix — and the cheapest reaction to that is to
 switch the guard off.
 
+**Standing rule — the README set stays current with the code.** Any
+user-facing change (a feature, a slash command or flag, install / setup,
+configuration, or a requirement) updates `README.md` **and all three
+translations** — `README.zh-TW.md`, `README.zh-CN.md`, `README.ja.md` — in the
+**same commit**, structure and content aligned. Never update one language and
+leave the others stale. `test/test_readme_parity.py` guards the four against
+each other (section sequence, command tokens, switcher), but it cannot tell
+whether all four are *current* with the code — that half is on you.
+
 ## Durable knowledge goes into the tree, not into a reply
 
 A finding that the next person (or a fresh session) would otherwise re-discover
