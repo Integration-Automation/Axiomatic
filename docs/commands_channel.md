@@ -135,6 +135,7 @@
 
 - `/sys audit [n] [grep]` — 最近的操作稽核紀錄
 - `/sys backfill_paths [limit] [apply]` — 把本頻道舊訊息裡的目錄補成完整顯示
+- `/sys churn` — 今日各 repo 的 git 活動（提交數與增刪行數）
 - `/sys cleanup_debug` — 刪除所有除錯截圖
 - `/sys dashboard` — 本機唯讀儀表板的網址
 - `/sys disk` — 輸出與設定檔目錄的磁碟用量

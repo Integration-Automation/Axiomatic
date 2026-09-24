@@ -77,7 +77,7 @@ CHANNEL_HELP_SECTIONS: list[str] = [
     (
         "## `/sys` — Maintenance & diagnostics\n"
         "健檢 / 診斷 / 稽核 / 磁碟 / 更新 / 重啟\n"
-        "- `/sys audit|backfill_paths|cleanup_debug|dashboard|disk|doctor|git_pull|health|introspect_dom|metrics|probe_status|restart|undo|update_check`\n"
+        "- `/sys audit|backfill_paths|churn|cleanup_debug|dashboard|disk|doctor|git_pull|health|introspect_dom|metrics|probe_status|restart|undo|update_check`\n"
     ),
     (
         "## `/proc` — Process control\n"
@@ -205,7 +205,7 @@ CHANNEL_HELP_SECTIONS_ZH_TW: list[str] = [
     (
         "## `/sys` — 維運與診斷\n"
         "健檢 / 診斷 / 稽核 / 磁碟 / 更新 / 重啟\n"
-        "- `/sys audit|backfill_paths|cleanup_debug|dashboard|disk|doctor|git_pull|health|introspect_dom|metrics|probe_status|restart|undo|update_check`\n"
+        "- `/sys audit|backfill_paths|churn|cleanup_debug|dashboard|disk|doctor|git_pull|health|introspect_dom|metrics|probe_status|restart|undo|update_check`\n"
     ),
     (
         "## `/proc` — 行程控制\n"
@@ -333,7 +333,7 @@ CHANNEL_HELP_SECTIONS_ZH_CN: list[str] = [
     (
         "## `/sys` — 运维与诊断\n"
         "健康检查 / 诊断 / 审计 / 磁盘 / 更新 / 重启\n"
-        "- `/sys audit|backfill_paths|cleanup_debug|dashboard|disk|doctor|git_pull|health|introspect_dom|metrics|probe_status|restart|undo|update_check`\n"
+        "- `/sys audit|backfill_paths|churn|cleanup_debug|dashboard|disk|doctor|git_pull|health|introspect_dom|metrics|probe_status|restart|undo|update_check`\n"
     ),
     (
         "## `/proc` — 进程控制\n"
@@ -426,7 +426,7 @@ MENTION_HELP_SECTIONS: list[str] = [
     (
         "## `/dorossi` — Assistant backend\n"
         "對話後端（限擁有者）：提問 / 工作階段 / 佇列 / 狀態\n"
-        "- `/dorossi abort|ai|ask|compact|effort|errors|fullmode|health|logs|model|retry|running|status|tokens|workspace_clean`\n"
+        "- `/dorossi abort|ai|ask|compact|effort|errors|fullmode|health|logs|model|retry|running|status|tokens|workspace_clean|yield`\n"
         "- `/dorossi allowdir add|list|remove`\n"
         "- `/dorossi queue clear|detail|failed_clear|move|remove|retry_failed|show|undo`\n"
         "- `/dorossi session archive|continue|delete|export|list|new|rename|reset|switch`\n"
@@ -480,7 +480,7 @@ MENTION_HELP_SECTIONS_ZH_TW: list[str] = [
     (
         "## `/dorossi` — 對話後端\n"
         "對話後端（限擁有者）：提問 / 工作階段 / 佇列 / 狀態\n"
-        "- `/dorossi abort|ai|ask|compact|effort|errors|fullmode|health|logs|model|retry|running|status|tokens|workspace_clean`\n"
+        "- `/dorossi abort|ai|ask|compact|effort|errors|fullmode|health|logs|model|retry|running|status|tokens|workspace_clean|yield`\n"
         "- `/dorossi allowdir add|list|remove`\n"
         "- `/dorossi queue clear|detail|failed_clear|move|remove|retry_failed|show|undo`\n"
         "- `/dorossi session archive|continue|delete|export|list|new|rename|reset|switch`\n"
@@ -534,7 +534,7 @@ MENTION_HELP_SECTIONS_ZH_CN: list[str] = [
     (
         "## `/dorossi` — 对话后端\n"
         "对话后端（限拥有者）：提问 / 会话 / 队列 / 状态\n"
-        "- `/dorossi abort|ai|ask|compact|effort|errors|fullmode|health|logs|model|retry|running|status|tokens|workspace_clean`\n"
+        "- `/dorossi abort|ai|ask|compact|effort|errors|fullmode|health|logs|model|retry|running|status|tokens|workspace_clean|yield`\n"
         "- `/dorossi allowdir add|list|remove`\n"
         "- `/dorossi queue clear|detail|failed_clear|move|remove|retry_failed|show|undo`\n"
         "- `/dorossi session archive|continue|delete|export|list|new|rename|reset|switch`\n"

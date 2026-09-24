@@ -7,7 +7,7 @@
 > **回覆一律泛用**：不提外部服務名稱、不露出主機路徑或檔名、不回傳原始
 > 錯誤字串，完整細節只進 log。寫新指令時要沿用。
 
-**13 個直接指令 ＋ 25 個指令群 ＝ 38 個頂層指令**（平台上限 100，餘裕 62），底下合計 **269 個斜線子指令**。
+**13 個直接指令 ＋ 25 個指令群 ＝ 38 個頂層指令**（平台上限 100，餘裕 62），底下合計 **271 個斜線子指令**。
 
 指令群只佔一個頂層額度、群內子指令不計——這是唯一能長期擴充的作法。
 
@@ -16,7 +16,7 @@
 | [`_direct.md`](_direct.md) | 🔒🌐 | 不屬於任何群的指令 | 13 |
 | [`clip.md`](clip.md) | 🔒 | 剪貼簿（限擁有者）：讀 / 寫 / 貼上 / 圖片 / 檔案清單 | 7 |
 | [`config.md`](config.md) | 🔒 | 批次參數：顯示 / 修改 / 還原 / 重載 | 4 |
-| [`dorossi.md`](dorossi.md) | 🌐 | 對話後端（限擁有者）：提問 / 工作階段 / 佇列 / 狀態 | 35 |
+| [`dorossi.md`](dorossi.md) | 🌐 | 對話後端（限擁有者）：提問 / 工作階段 / 佇列 / 狀態 | 36 |
 | [`fav.md`](fav.md) | 🔒 | 收藏：總覽 / 移除 / 上傳 / 清空 | 4 |
 | [`fun.md`](fun.md) | 🌐 | 趣味 / 隨機小工具 | 10 |
 | [`gen.md`](gen.md) | 🔒 | 產圖批次：暫停 / 恢復 / 預覽 / 進度 / 單張 | 8 |
@@ -32,7 +32,7 @@
 | [`proc.md`](proc.md) | 🔒 | 行程（限擁有者）：列出 / 結束 / 啟動 / 占用 | 4 |
 | [`schedule.md`](schedule.md) | 🔒 | 定時排程（限擁有者），落盤後撐得過重啟 | 4 |
 | [`screen.md`](screen.md) | 🔒 | 螢幕（限擁有者）：截圖 / 區域 / 動畫 / 取色 / 讀字 | 8 |
-| [`sys.md`](sys.md) | 🔒 | 健檢 / 診斷 / 稽核 / 磁碟 / 更新 / 重啟 | 14 |
+| [`sys.md`](sys.md) | 🔒 | 健檢 / 診斷 / 稽核 / 磁碟 / 更新 / 重啟 | 15 |
 | [`tag.md`](tag.md) | 🌐 | 圖庫 tag 工具：post 數 / wiki / 建議 / 補全 | 4 |
 | [`todo.md`](todo.md) | 🔒 | 產圖佇列：新增 / 列出 / 刪除 / 排序 | 33 |
 | [`tool.md`](tool.md) | 🌐 | 編碼 / 雜項工具 | 8 |
@@ -66,7 +66,7 @@
 受閘的是 `/input`、`/screen`、`/win`、`/clip`、`/locate`、`/macro`、
 `/watch`、`/proc`、`/host`、`/schedule`、
 `/launcher` **整群**（群組制，所以新增子指令會自動受閘），
-加上 `/sys restart|git_pull|undo|audit|cleanup_debug|introspect_dom|dashboard|backfill_paths`、
+加上 `/sys restart|git_pull|undo|audit|cleanup_debug|introspect_dom|dashboard|backfill_paths|churn`、
 `/out debug_show`、`/config set|reset|reload`、`/log clear`、
 `/gen image|image_queue`。各檔標成「限擁有者」的就是這些。
 

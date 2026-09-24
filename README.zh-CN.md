@@ -80,7 +80,7 @@ transport 模块加一段配置；移除一个平台就是一个 `false`。工�
 
 | 文件 | 用途 |
 |---|---|
-| `axiomatic/discord_bot.py` | 13 个顶层 slash 命令 ＋ 25 个命令组（合计 269 个斜杠子命令）、身份闸、桌面与主机控制、批处理监督、对话后端编排、单张出图队列 |
+| `axiomatic/discord_bot.py` | 13 个顶层 slash 命令 ＋ 25 个命令组（合计 271 个斜杠子命令）、身份闸、桌面与主机控制、批处理监督、对话后端编排、单张出图队列 |
 | `axiomatic/_gui_control.py` | 桌面自动化门面（鼠标、键盘、窗口、剪贴板、文字识别、图片定位） |
 | `axiomatic/dorossi_backend.py` | 对话后端与它的会话——多种后端藏在同一个接口后面 |
 
@@ -314,7 +314,7 @@ py -3 install_autostart.py --remove
 在有原生斜杠菜单的平台上，命令就是**斜杠命令**：打 `/` 会自动补全，参数在发送前就
 有类型与取值范围检查。没有斜杠菜单的平台则走文本入口（见下），一份实现、一组权限闸。
 共 **13 个顶层 slash 命令**与 **25 个命令组**（37 个顶层条目，平台上限 100），底下
-合计 **269 个斜杠子命令**。
+合计 **271 个斜杠子命令**。
 
 命令组不管装几个子命令都只占一个顶层名额，所以把低频命令收进组里是唯一能长期扩展的
 做法。逐条说明看 [`COMMANDS.md`](COMMANDS.md)、[`commands/`](commands/README.md)，
@@ -352,7 +352,7 @@ py -3 install_autostart.py --remove
 | **产出查看** | `/out debug_show\|history\|latest_for\|rate\|sample\|stats` |
 | **收藏** | `/fav clear\|list\|remove\|show` |
 | **运行记录** | `/log clear\|errors\|grep\|size\|tail` |
-| **运维与诊断** | `/sys audit\|backfill_paths\|cleanup_debug\|dashboard\|disk\|doctor\|git_pull\|health\|introspect_dom\|metrics\|probe_status\|restart\|undo\|update_check` |
+| **运维与诊断** | `/sys audit\|backfill_paths\|churn\|cleanup_debug\|dashboard\|disk\|doctor\|git_pull\|health\|introspect_dom\|metrics\|probe_status\|restart\|undo\|update_check` |
 | **进程控制** | `/proc kill\|launch\|list\|usage` |
 | **批处理参数** | `/config reload\|reset\|set\|show` |
 | **屏幕** | `/screen all\|gif\|info\|main\|pixel\|region\|text\|window` |
@@ -380,7 +380,7 @@ py -3 install_autostart.py --remove
 
 | 家族 | 子命令 |
 |---|---|
-| **对话后端**（🔑 限所有者） | `/dorossi abort\|ai\|ask\|compact\|effort\|errors\|fullmode\|health\|logs\|model\|retry\|running\|status\|tokens\|workspace_clean`<br>`/dorossi allowdir add\|list\|remove`<br>`/dorossi queue clear\|detail\|failed_clear\|move\|remove\|retry_failed\|show\|undo`<br>`/dorossi session archive\|continue\|delete\|export\|list\|new\|rename\|reset\|switch` |
+| **对话后端**（🔑 限所有者） | `/dorossi abort\|ai\|ask\|compact\|effort\|errors\|fullmode\|health\|logs\|model\|retry\|running\|status\|tokens\|workspace_clean\|yield`<br>`/dorossi allowdir add\|list\|remove`<br>`/dorossi queue clear\|detail\|failed_clear\|move\|remove\|retry_failed\|show\|undo`<br>`/dorossi session archive\|continue\|delete\|export\|list\|new\|rename\|reset\|switch` |
 | **图库 tag 工具** | `/tag autocomplete\|count\|suggest\|wiki` |
 | **趣味／随机** | `/fun 8ball\|ascii\|calc\|choose\|coinflip\|rand\|reverse\|roll\|rps\|timer` |
 | **编码与小工具** | `/tool base64\|color\|hash\|qr\|say\|unbase64\|urldecode\|urlencode` |

@@ -123,7 +123,7 @@ bot runtime 設定，**啟動時讀一次**，改了要 `/sys restart` 才生效
 | 受閘範圍 | 內容 |
 |---|---|
 | 整群（新增子指令自動受閘） | `/input`、`/screen`、`/win`、`/clip`、`/locate`、`/macro`、`/watch`、`/proc`、`/host` |
-| 零散指令 | `/sys restart`、`/sys git_pull`、`/sys undo`、`/sys audit`、`/sys cleanup_debug`、`/sys introspect_dom`、`/sys dashboard`、`/config set`、`/config reset`、`/config reload`、`/log clear`、`/schedule add`、`/schedule list`、`/schedule remove`、`/schedule run`、`/gen image`、`/gen image_queue` |
+| 零散指令 | `/sys restart`、`/sys git_pull`、`/sys undo`、`/sys audit`、`/sys cleanup_debug`、`/sys introspect_dom`、`/sys dashboard`、`/sys churn`、`/config set`、`/config reset`、`/config reload`、`/log clear`、`/schedule add`、`/schedule list`、`/schedule remove`、`/schedule run`、`/gen image`、`/gen image_queue` |
 
 不在此列的（產圖佇列、批次控制、唯讀診斷、跨頻道工具）仍走頻道＋角色閘。
 

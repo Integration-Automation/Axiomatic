@@ -151,6 +151,7 @@
 
 - `/sys audit [n] [grep]` — 最近的操作稽核紀錄
 - `/sys backfill_paths [limit] [apply]` — 把本頻道舊訊息裡的目錄補成完整顯示
+- `/sys churn` — 今日各 repo 的 git 活動（提交數與增刪行數）
 - `/sys cleanup_debug` — 刪除所有除錯截圖
 - `/sys dashboard` — 本機唯讀儀表板的網址
 - `/sys disk` — 輸出與設定檔目錄的磁碟用量
@@ -409,6 +410,7 @@ token 不接問題就只是改設定，不會送出一輪。
 - `/dorossi status` — 執行期狀態
 - `/dorossi tokens` — 查詢帳號用量
 - `/dorossi workspace_clean [dry] [days]` — 清理舊的工作目錄
+- `/dorossi yield [target]` — 讓自走任務提交手上的進度後暫停、交出編輯權（另一位編輯者接手改同一批檔案時用；之後 `/dorossi session continue` 接回來）
 
 **`/dorossi allowdir`** — 工作階段可額外存取的目錄
 

@@ -2258,7 +2258,8 @@ def _dorossi_mark_loop_pending(sess: dict, task: str, *,
 
 # 自走迴圈停下來的原因（`loop_pending["stop"]`，由迴圈的 `finally` 寫）。只有
 # 「網路斷了」與「被取消」（bot 關機／重連時 task 被取消）算**不是自己要停的**，
-# 會被自動接續；abort 永遠不會（擁有者明確表達過的意圖，不能被自動化推翻）。
+# 會被**自動**接續；abort 與 paused 永遠不會自動接（都是擁有者明確表達過的意圖，
+# 不能被自動化推翻——差別是 paused 仍可用 `/dorossi session continue` 手動接回來）。
 # 舊標記沒有這個鍵：`live` 為假就當成原因不明，自動接續照舊不接。
 DOROSSI_LOOP_STOP_REASONS = frozenset({
     "abort",        # 擁有者 `/dorossi abort`
@@ -2269,7 +2270,11 @@ DOROSSI_LOOP_STOP_REASONS = frozenset({
     "transient",    # 暫時性故障重試用完
     "error",        # 其他錯誤（含致命錯誤）
     "deleted",      # slot 被刪了（標記跟著不在，寫不進去，留著只為完整）
+    "paused",       # 擁有者 `/dorossi yield`：提交後讓出編輯權暫停，等人接手
 })
+# 只有這兩種算「不是自己要停的」，重連／重啟時**自動**接回去。`paused` 刻意不在
+# 內：讓出的整個用意是「另一位編輯者正在改同一批檔案」，重啟時自動把迴圈叫回來
+# 又動同一批檔案正是它要避免的事——所以 paused 一律等擁有者親手 `continue`。
 _DOROSSI_AUTORESUMABLE_STOPS = frozenset({"network", "interrupted"})
 
 
@@ -3670,6 +3675,74 @@ def _dorossi_read_usage(limit: int) -> list[dict]:
         if isinstance(rec, dict):
             records.append(rec)
     return records[-limit:] if limit > 0 else records
+
+
+def dorossi_local_usage_totals(now: float, path=DOROSSI_USAGE_FILE) -> dict:
+    """本機 Dorossi 帳本（`DOROSSI_USAGE_FILE`）的用量小計，給 owner-only 的
+    `/dorossi tokens` 拿去組第一段。回傳三格，每格是 `{"tokens": int, "usd": float}`：
+
+    * `today`    —— 與 `now` 同一個**本地日曆日**（依主機時區的當天 00:00 起）。
+    * `last7d`   —— 滾動近 7 日（`ts >= now - 7*86400`）。
+    * `lifetime` —— 帳本裡全部有效列的累計。
+
+    `now` 是「現在」的 epoch 秒（外部注入以利測試）。`tokens` 只算 `in`＋`out`
+    （與舊圖表對 `in`／`out` 的定義一致，不含 cache）；`usd` 直接加總每列
+    `cost_usd`（＝後端 CLI 回報的 `total_cost_usd`，不自建價目表）。
+
+    **永不 raise、逐行串流**：檔案缺席／讀不到、以及任何壞 JSON／不是 dict／
+    `ts` 缺席或非有限數的列，一律跳過（不算進任何一格），逐行讀不把整份帳本
+    載進記憶體（append-only NDJSON 可能很大）。"""
+    def _blank():
+        return {"tokens": 0, "usd": 0.0}
+
+    def _num(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    today, last7d, lifetime = _blank(), _blank(), _blank()
+    try:
+        lt = time.localtime(now)
+        day_start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                 0, 0, 0, 0, 0, -1))
+    except (ValueError, OverflowError, OSError):
+        day_start = now
+    week_start = now - 7 * 86400
+
+    try:
+        p = path if isinstance(path, Path) else Path(path)
+        if not p.exists():
+            return {"today": today, "last7d": last7d, "lifetime": lifetime}
+        with open(p, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = _json.loads(raw)
+                except Exception:  # pylint: disable=broad-except
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                ts = _num(rec.get("ts"))
+                if ts is None:
+                    continue
+                tok = (int(_num(rec.get("in")) or 0)
+                       + int(_num(rec.get("out")) or 0))
+                cost = float(_num(rec.get("cost_usd")) or 0.0)
+                lifetime["tokens"] += tok
+                lifetime["usd"] += cost
+                if ts >= week_start:
+                    last7d["tokens"] += tok
+                    last7d["usd"] += cost
+                if ts >= day_start:
+                    today["tokens"] += tok
+                    today["usd"] += cost
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[dorossi] local usage totals failed: {exc!r}", file=sys.stderr)
+    return {"today": today, "last7d": last7d, "lifetime": lifetime}
 
 
 def _dorossi_context_tokens(info: dict) -> int:

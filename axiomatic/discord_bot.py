@@ -56,7 +56,7 @@ import sys
 import time
 import traceback
 import urllib.parse
-from collections import deque
+from collections import deque, namedtuple
 from pathlib import Path, PurePath, PureWindowsPath
 
 import aiohttp
@@ -275,6 +275,9 @@ from dorossi_backend import (
     _dorossi_loop_compaction_due,
     _dorossi_context_tokens,
     _dorossi_context_compaction_due,
+    # 本機帳本用量小計（今日／近 7 日／累計 ＋ 美元估算）——owner-only
+    # `/dorossi tokens` 第一段的資料來源。
+    dorossi_local_usage_totals,
     # --- multi-session store --------------------------------------------------
     _dorossi_load_state,
     _dorossi_save_state,
@@ -553,6 +556,8 @@ _OWNER_ONLY_SLASH = frozenset({
     "sys restart", "sys git_pull", "sys undo", "sys audit",
     "sys cleanup_debug", "sys introspect_dom", "sys dashboard",
     "sys backfill_paths",
+    # `/sys churn`（2026-09-24）：明細裡有 repo 名稱與行數，都是主機細節——限擁有者。
+    "sys churn",
     # 除錯截圖（2026-09-24）：清單印的是專案根目錄的檔名，上傳的是外部服務網頁的畫面
     # ——兩樣都是 Layer 1 對非擁有者禁止的東西，而這個指令原本在「檢視」那一級，
     # `user_roles` 沒設定時等於頻道裡任何人都拿得到。
@@ -562,7 +567,7 @@ _OWNER_ONLY_SLASH = frozenset({
     "gen image", "gen image_queue",
 })
 _OWNER_ONLY_BANGS = frozenset({
-    "!audit", "!cfg_reset", "!cfg_set", "!cleanup_debug", "!click",
+    "!audit", "!cfg_reset", "!cfg_set", "!churn", "!cleanup_debug", "!click",
     "!click_image", "!click_text", "!clip", "!config_reload", "!config_reset",
     "!config_set", "!dashboard", "!debug_show", "!find_image", "!find_text", "!focus",
     "!get", "!git_pull", "!hotkey", "!introspect_dom", "!job", "!key",
@@ -4987,6 +4992,12 @@ class _DorossiLoopState:
     """一個進行中自走迴圈的 per-session 狀態（取代舊的全域旗標組）。
 
     * `abort`：`/dorossi abort` 對這個迴圈要求停止（迴圈在回合間／例外路徑檢查）。
+    * `paused`：`/dorossi yield` 對這個迴圈要求「提交後暫停、讓出編輯權」。與 `abort`
+      的差別是**不 kill 後端**：讓出的動作是先把一則固定的提交指示注入緩衝當作最後
+      一輪跑掉（把手上的改動依 repo 規則提交），等那一輪跑完、注入清空之後才在回合
+      邊界停住並保留 `loop_pending`（stop 記成 `paused`）。所以它一定在「當前回合＋
+      提交輪」都跑完之後才生效，中途不會把提交弄丟；擁有者之後用
+      `/dorossi session continue` 接回來。abort 與 paused 同時被設時 abort 優先。
     * `proc`：這個迴圈目前回合的後端子行程（abort 用來即時 kill）。
     * `injections`：這個迴圈的中途注入緩衝——自走進行中，擁有者對「同一個
       session」新打的 `@bot <提問>` 收進來，於下一輪邊界 drain 折進 prompt。
@@ -5004,14 +5015,16 @@ class _DorossiLoopState:
       在它的 `finally` 清）——等的是對話平台還是後端，從什麼時候開始等。
     所有欄位只在 event loop 內同步讀寫，不需鎖。"""
 
-    __slots__ = ("uid", "sid", "abort", "proc", "injections", "started_ts",
-                 "usage_waiting", "usage_reset_at", "round_no", "compacting",
-                 "backend", "wait_deadline", "offline_since", "offline_target")
+    __slots__ = ("uid", "sid", "abort", "paused", "proc", "injections",
+                 "started_ts", "usage_waiting", "usage_reset_at", "round_no",
+                 "compacting", "backend", "wait_deadline", "offline_since",
+                 "offline_target")
 
     def __init__(self, uid: str, sid: str) -> None:
         self.uid = uid
         self.sid = sid
         self.abort = False
+        self.paused = False
         self.proc = None
         self.injections: list = []
         self.started_ts = time.time()
@@ -5045,6 +5058,18 @@ class _DorossiLoopState:
                 pass
             except Exception:  # pylint: disable=broad-except  # nosec B110
                 pass
+
+    def request_pause(self, commit_instruction: str) -> None:
+        """要求這個迴圈「提交後暫停、讓出編輯權」（`/dorossi yield`）。
+
+        與 `request_abort` 相反，**絕不 kill 後端**——當前回合要完整跑完（不然手上的
+        改動會連同被砍死的行程一起丟掉）。做兩件事：把 `commit_instruction` 塞進注入
+        緩衝當成最後一輪的指示（走既有的中途注入路徑，下一輪邊界 drain、折進 prompt，
+        叫後端把改動依 repo 規則提交、然後停手回報），並設 `paused` 旗標——迴圈在
+        提交輪跑完、注入清空之後的回合邊界看到它就保留 `loop_pending` 停住。同步、
+        event-loop 內執行，不需鎖。"""
+        self.paused = True
+        self.injections.append(commit_instruction)
 
 
 # --- 進行中的單輪回合（`/dorossi running` 讀這一份）-------------------------------
@@ -5238,6 +5263,19 @@ _DEFAULT_DOROSSI_INJECTION_PREAMBLE = (
 )
 DOROSSI_INJECTION_PREAMBLE = load_prompt(
     "dorossi_injection_preamble.md", _DEFAULT_DOROSSI_INJECTION_PREAMBLE)
+
+
+# `/dorossi yield` 注入的「提交後停手」指示（自走中途注入的一種，走同一條路徑折進
+# 下一輪 prompt）。**這是內部後端 prompt，永不對外送出**（Secrecy Layer 1）：它只是
+# 叫後端把手上的改動依這個 repo 的提交規則提交、然後停手，不啟用任何新工具、也不
+# 提升權限——提交是後端在既有工具模式下本來就能做的事。逐檔 `git add`、不要
+# `git add -A`、遵守提交規範、不加 AI 署名、**不要 push**，是這個 repo 的既有規則。
+_DOROSSI_YIELD_COMMIT_INSTRUCTION = (
+    "【立即讓出編輯權】另一位編輯者要接手改同一批檔案了。請**現在**就把目前所有"
+    "未提交的變更提交掉：逐個檔案 `git add`（不要用 `git add -A`），依這個 repo 的"
+    "提交規則寫清楚的提交訊息、不要加任何 AI 署名、**不要 push**。提交完成後就"
+    "停止任何進一步的編輯，簡短回報你停在哪裡、還有什麼沒做完，讓接手的人知道。"
+    "如果目前沒有任何未提交的變更，就直接說明並停手。")
 
 
 def _dorossi_build_injection_prompt(injected: list) -> str:
@@ -6661,6 +6699,8 @@ def _dorossi_running_report(state: dict, source, *,
         clause = _dorossi_usage_wait_clause(st, now=now)
         if st.abort:
             bits.append("中止中")
+        elif st.paused:
+            bits.append("⏸️ 已讓出（等你接手）")
         elif st.offline_since is not None:
             bits.append(_offline_text(st.offline_since, st.offline_target))
         elif clause:
@@ -9617,7 +9657,15 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
         對話平台連不上（每一個送訊息的動作都走 `_dorossi_loop_platform`）都是「停下來
         等網路回來、做同一件事」，不計重試次數、沒有上限，只有 abort 能結束。
       * 停下來的原因寫進標記（`_dorossi_mark_loop_stopped(s, reason)`，仍然只在
-        `finally`）：`network`／`interrupted` 會被自動接續，`abort` 永遠不會。
+        `finally`）：`network`／`interrupted` 會被**自動**接續，`abort` 與 `paused`
+        永遠不會自動接（都是擁有者親手表達的意圖）——差別是 `paused` 仍可用
+        `/dorossi session continue [all]` 手動接回來，`abort` 一樣可以但語意是「我後悔
+        了」。
+      * **讓出／暫停（`/dorossi yield`）與 abort 協同、但不 kill**：`request_pause` 設
+        `st.paused` 並把固定的提交指示注入緩衝。迴圈把它當最後一輪的中途注入跑掉
+        （提交手上的改動），下一輪邊界看到 `paused`（且注入已空）就保留 loop_pending、
+        以 `paused` 收尾、return。提交輪一定先跑完才停，中途不砍後端所以提交不會掉；
+        `finally` 照常釋放鎖與後端空位，與 abort 同一個 lock-safe 保證。
     """
     key = _dorossi_session_key(uid, sid)
     # 對外訊息的 session 標記：多迴圈並行時，讓擁有者分得出哪則訊息屬於哪個任務。
@@ -10091,6 +10139,23 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
                     await live.finalize(note)
                 prompt = _dorossi_build_injection_prompt(injected)
                 continue
+            # 讓出／暫停（`/dorossi yield`）：注入緩衝已空（表示上面那輪就是被注入的
+            # 提交輪、已經把手上的改動提交掉並貼出回報），現在停在回合邊界、**保留**
+            # loop_pending（stop 記成 paused，不清）讓 `/dorossi session continue` 可接
+            # 續，釋放 per-session 鎖與後端空位讓另一位編輯者接手。放在 drain 之後、
+            # idle/exhaustion 判定之前：這樣提交輪一定先跑完（提交指示是最後一則注入），
+            # 而提交輪本身算不算 idle 都不影響——看到 paused 就停。不 kill 後端（那會
+            # 把提交弄丟），純協同：`finally` 照樣清狀態、釋放鎖，與 abort 同一個保證。
+            if st.paused:
+                stop_reason = "paused"
+                stop_msg = (f"{tag}⏸️ 已提交手上的進度並讓出編輯權，先停在這裡。"
+                            f"換手改完後用 `/dorossi session continue {sid}` 接續。")
+                if chunks:
+                    await _dorossi_loop_platform(st, lambda: message.channel.send(
+                        stop_msg, allowed_mentions=discord.AllowedMentions.none()))
+                else:
+                    await live.finalize(stop_msg)
+                return
             # 無注入：照現有 exhausted/continue 邏輯。「沒有進展」＝後端自報完成（done）
             # 或這一輪根本沒產出（避免空轉黑洞）。連續達 DOROSSI_LOOP_EXHAUSTION_ROUNDS
             # 輪才真正停止；單次自報完成會被推回再找一輪（見 prompt 選擇）。
@@ -12707,14 +12772,37 @@ def _render_token_usage_png(records: list[dict]) -> bytes:
     return buf.getvalue()
 
 
-async def mcmd_tokens(message: discord.Message, rest: str) -> None:
-    """`/dorossi tokens` — query the real Claude and Codex account usage surfaces.
+def _render_dorossi_local_usage() -> str:
+    """`/dorossi tokens` 第一段：**這支 bot 自己**的 Dorossi 用量（今日／近 7 日／
+    累計）與美元估算，讀自本機帳本 `DOROSSI_USAGE_FILE`。
 
-    Claude Code exposes `/usage` in print mode. Codex's `/usage` is TUI-only;
-    its exact machine-facing implementation is the local app-server's
-    `account/usage/read` + `account/rateLimits/read` methods. Unlike the old
-    implementation, this does not estimate account usage from Dorossi's local
-    NDJSON call log.
+    這一段是本程式自己算出來的數字（token 數與金額），不含主機路徑、也不是外部
+    CLI 的逐字輸出，所以**不**經 `_scrub_external_report`。金額是後端 CLI 每一輪
+    回報的 `total_cost_usd` 直接加總（公開／list API 費率的估算）；訂閱方案下並不會
+    另外扣這筆錢。"""
+    totals = dorossi_local_usage_totals(time.time())
+
+    def _line(label: str, bucket: dict) -> str:
+        return (f"{label}：{bucket['tokens']:,} tokens"
+                f"（≈ US${bucket['usd']:,.2f}）")
+
+    return (
+        _line("今日", totals["today"]) + "\n"
+        + _line("近 7 日", totals["last7d"]) + "\n"
+        + _line("累計", totals["lifetime"]) + "\n"
+        "註：金額是後端 CLI 每輪回報的 total_cost_usd 加總（公開費率估算）；"
+        "訂閱方案下不另計費。")
+
+
+async def mcmd_tokens(message: discord.Message, rest: str) -> None:
+    """`/dorossi tokens`（限擁有者）— 兩段用量：這支 bot 自己的 Dorossi 花費
+    （含美元估算），加上 Codex 的帳號額度。
+
+    **帳號整體用量拿不到**：Claude 那邊的整體用量只有互動式的 `/usage` 指令看得
+    到，非互動的 CLI（`-p` 印出模式）會把 `/usage` 當成給模型的話、根本沒有
+    `claude usage` 子指令，所以這裡改成顯示本機帳本算出來的自身用量。Codex 的
+    帳號額度走本機 app-server 的 `account/usage/read` ＋ `account/rateLimits/read`，
+    照舊查得到。
     """
     if message.author.id != OWNER_USER_ID:
         await safe_reply(message, "此指令僅限擁有者使用。")
@@ -12723,14 +12811,27 @@ async def mcmd_tokens(message: discord.Message, rest: str) -> None:
         await safe_reply(message, "用法：`/dorossi tokens`")
         return
 
-    claude_result, codex_result = await asyncio.gather(
-        _query_claude_account_usage(), _query_codex_account_usage())
-    # 後端 A 回的是外部 CLI 的**逐字輸出**（不受本程式控制，可能夾帶帳號信箱、
-    # 組織名、主機路徑），所以送出前必須先過濾 —— 與 `/log tail` / `/log grep` 對
-    # 原始 log 的處理同一個範式。後端 B 走 `_format_codex_account_usage`，
-    # 每個欄位都是本程式自己組出來的受控數值，不需要過濾。
-    text = ("**用量（後端 A）**\n" + _scrub_external_report(claude_result)
-            + "\n\n**用量（後端 B）**\n" + codex_result)
+    codex_result = await _query_codex_account_usage()
+    # 第一段是本程式自算的本機數字（見 `_render_dorossi_local_usage`），不是外部
+    # CLI 的逐字輸出，所以不過濾。第二段走 `_format_codex_account_usage`，每個欄位
+    # 也都是本程式自己組出來的受控數值，同樣不需要過濾。
+    #
+    # 供應商產品名（Claude／Codex）只在**擁有者**面前現形——包進 `_owner_detail` 的
+    # `raw` 引數（秘密掃描器對這個位置的唯一豁免點）。指令開頭已擋掉非擁有者，這裡
+    # 的泛用分支是 fail-closed 的第二道保險，仍給泛用說法（後端／後端帳號額度）。
+    claude_note = _owner_detail(
+        message,
+        "備註：Claude 帳號整體用量只有互動式 /usage 指令看得到，非互動 CLI 取不到，"
+        "所以上面改列本機自身用量。",
+        "備註：後端帳號整體用量只有互動式 /usage 指令看得到，非互動 CLI 取不到，"
+        "所以上面改列本機自身用量。")
+    codex_heading = _owner_detail(
+        message, "**Codex 帳號額度**", "**後端帳號額度**")
+    text = (
+        "**本機用量（本 bot 自身花費 · 估算美元）**\n"
+        + _render_dorossi_local_usage()
+        + "\n\n" + claude_note
+        + "\n\n" + codex_heading + "\n" + codex_result)
     await safe_reply(message, text[:2000])
 
 
@@ -12789,27 +12890,11 @@ async def _reap_usage_query_proc(proc) -> None:
     await _dorossi_reap_proc(proc)
 
 
-async def _query_claude_account_usage() -> str:
-    """Execute Claude Code's real `/usage` command and return its report."""
-    exe = _shutil.which("claude")
-    if not exe:
-        return "查詢失敗：找不到 Claude CLI。"
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            exe, "-p", "/usage", "--output-format", "json", "--tools", "",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            cwd=str(PROJECT_ROOT))
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
-        if proc.returncode != 0:
-            raise RuntimeError(stderr.decode("utf-8", errors="replace")[:300])
-        payload = _json.loads(stdout.decode("utf-8", errors="replace"))
-        report = str(payload.get("result") or "").strip()
-        return report or "查詢成功，但沒有用量資料。"
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"[tokens] claude /usage failed: {exc!r}", file=sys.stderr)
-        await _reap_usage_query_proc(proc)
-        return "查詢失敗，請確認 Claude CLI 已登入。"
+# `_query_claude_account_usage` 已移除：Claude 帳號整體用量只有互動式 `/usage`
+# 看得到——非互動的 `-p` 印出模式會把 `/usage` 當成給模型的話（模型回「印出模式
+# 下我無法執行 /usage」），而且沒有 `claude usage` 子指令。任何 CLI 都取不到，所以
+# `mcmd_tokens` 改列本機自身用量（`_render_dorossi_local_usage`）。收尾原語
+# `_reap_usage_query_proc` 留著給下面的 Codex 查詢用。
 
 
 def _format_codex_account_usage(usage: dict, limits: dict) -> str:
@@ -13166,6 +13251,75 @@ async def mcmd_abort(message: discord.Message, rest: str = "") -> None:
     else:
         await safe_reply(
             message, "已中止目前進行中的工作，佇列中已無其他項目。")
+
+
+async def mcmd_yield(message: discord.Message, rest: str = "") -> None:
+    """`/dorossi yield [<session id>|all]` — 讓一個（或全部）正在跑的自走迴圈**先把手上
+    的改動提交、然後暫停**，把 per-session 鎖與後端空位讓給另一位編輯者，之後可用
+    `/dorossi session continue [all]` 接回來。
+
+    與 `/dorossi abort` 的差別：abort **kill 掉**後端、停下來就不會自動接（stop=abort）；
+    yield **不 kill**，而是往目標迴圈注入一則固定的「提交後停手」指示（`request_pause`），
+    讓它把那當成最後一輪跑掉（依 repo 規則逐檔提交、不 push、不加署名），提交輪跑完、
+    注入清空之後才在回合邊界停住、保留 `loop_pending`（stop=paused）。所以：
+      * `/dorossi yield`      → 讓出 active session 的迴圈；active 沒有迴圈而只有一個
+                              迴圈時就是它；有多個且 active 沒有 → 泛用提示請指定。
+      * `/dorossi yield <id>` → 讓出該 session 的迴圈。
+      * `/dorossi yield all`  → 讓出所有進行中的迴圈（`全部` 同義）。
+
+    停在中間（沒有正在跑的後端呼叫）的迴圈一樣有效：提交指示會當成最後一輪跑起來，
+    然後才停住。目標選擇沿用 `_dorossi_select_abort_target`（與 abort 同一支純函式）。
+
+    Owner-only（與 `/dorossi abort` 同 gating）：非擁有者一律泛用拒絕、不做任何事、
+    也就動不了任何人的迴圈。注入的提交指示是**內部後端 prompt，永不對外送出**，且在
+    迴圈既有的工具模式／權限下執行——它不會啟用任何原本沒開的工具、也不會提權。
+    """
+    # Owner gate — 與 `/dorossi abort` 一致（同樣操作正在跑的無人值守任務）。
+    if message.author.id != OWNER_USER_ID:
+        await safe_reply(message, "此指令僅限擁有者使用。")
+        return
+
+    arg = rest.strip().lower()
+    running = list(_dorossi_loops)
+    if not running:
+        await safe_reply(message, "目前沒有正在進行的自走任務可以讓出。")
+        return
+
+    uid = str(message.author.id)
+    state = _dorossi_load_state()   # read-only（容忍瞬間 stale）
+    active = (state.get(uid) or {}).get("active")
+    active_key = _dorossi_session_key(uid, active) if active else None
+    kind, payload = _dorossi_select_abort_target(running, arg, active_key)
+    if kind == "all":
+        for k in payload:
+            target = _dorossi_loops.get(k)
+            if target is not None:
+                target.request_pause(_DOROSSI_YIELD_COMMIT_INSTRUCTION)
+        _dorossi_event("yield", uid=uid, scope="all", count=len(payload))
+        await safe_reply(
+            message,
+            f"已請所有進行中的任務（{len(payload)} 個）提交手上的進度後暫停、"
+            "讓出編輯權。提交完成才會停，之後用 `/dorossi session continue all` 接回來。")
+        return
+    if kind == "one":
+        target = _dorossi_loops.get(payload)
+        if target is not None:
+            target.request_pause(_DOROSSI_YIELD_COMMIT_INSTRUCTION)
+        _dorossi_event("yield", uid=uid, scope="one", sid=payload[1])
+        await safe_reply(
+            message,
+            f"已請〔{payload[1]}〕提交手上的進度後暫停、讓出編輯權。提交完成才會停，"
+            f"之後用 `/dorossi session continue {payload[1]}` 接回來。")
+        return
+    if kind == "ask":
+        ids = "、".join(f"`{k[1]}`" for k in payload)
+        await safe_reply(
+            message,
+            f"有多個任務進行中（{ids}）。用 `/dorossi yield <id>` 指定，"
+            "或 `/dorossi yield all` 全部讓出。")
+        return
+    # kind == "none"：指名的 id 沒有在跑。
+    await safe_reply(message, "該對話沒有進行中的自走任務。")
 
 
 async def _handle_mention(message: discord.Message) -> None:
@@ -21609,15 +21763,17 @@ def _failure_diagnostic_summary(kind: str = "runtime") -> str:
     return "\n".join(bits[:6])
 
 
-def _git(args: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
-    """執行 `git <args>` 並回 (rc, stdout, stderr)。`git` 沒裝 / timeout
-    回 (-1, '', error message)。Cwd 鎖死 PROJECT_ROOT。"""
+def _git_in(repo_dir, args: list[str],
+            timeout: float = 15.0) -> tuple[int, str, str]:
+    """在 `repo_dir` 執行 `git <args>` 並回 (rc, stdout, stderr)。`git` 沒裝 /
+    timeout 回 (-1, '', error message)。`_git()` 是把 cwd 鎖死 PROJECT_ROOT 的
+    薄包裝；`/sys churn` 要對別的 repo 目錄跑，所以 cwd 在這裡是參數。"""
     if not _shutil.which("git"):
         return -1, "", "git not on PATH"
     try:
         result = subprocess.run(
             ["git", *args],
-            cwd=str(PROJECT_ROOT),
+            cwd=str(repo_dir),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -21629,6 +21785,207 @@ def _git(args: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
         return -1, "", f"git timed out after {timeout}s"
     except Exception as error:  # pylint: disable=broad-except
         return -1, "", repr(error)
+
+
+def _git(args: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
+    """執行 `git <args>` 並回 (rc, stdout, stderr)。Cwd 鎖死 PROJECT_ROOT。"""
+    return _git_in(PROJECT_ROOT, args, timeout)
+
+
+# ---------- `/sys churn`：今日 git 活動彙總 --------------------------------
+# 純函式（`_parse_repo_churn` / `_build_churn_report` / `_render_churn_report`）
+# **不碰機器**，只吃字串，所以彙總邏輯可以用合成的 git 輸出單測；掃描與呼叫 git
+# 的部分（`_scan_workspace_churn`）才碰磁碟，由指令 handler 丟 `asyncio.to_thread`
+# 跑，不擋 gateway 心跳。
+_CHURN_PER_REPO_TIMEOUT = 10.0
+
+# 每個 repo 一筆（只保留今天真的有提交的）。
+_RepoChurn = namedtuple("_RepoChurn", "name commits added deleted")
+# 一次彙總結果。`authors` 是**人數**（數字），名字本身不外流。
+_ChurnReport = namedtuple(
+    "_ChurnReport",
+    "repos total_commits total_added total_deleted scanned skipped authors")
+
+
+def _local_midnight_since() -> str:
+    """本機當地零點的 `git log --since` 字串。git 以當地時區解讀，所以「今天」
+    等於主機的日曆日（`CLAUDE.md` 指定）。"""
+    lt = time.localtime()
+    return f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d} 00:00:00"
+
+
+def _churn_workspace_root() -> Path:
+    """要掃的工作區根目錄。預設是 PROJECT_ROOT.parent——bot 住在 PROJECT_ROOT，
+    自走迴圈改的是同一個工作區資料夾底下的**別的** repo。獨立成一支是為了日後要
+    換成設定項時只改這裡（現在刻意不接設定：`_bot_config` 的載入器只認固定 schema，
+    多一個鍵得連 coercer 與對帳測試一起加，不划算——預設就夠了）。"""
+    return PROJECT_ROOT.parent
+
+
+def _parse_repo_churn(output: str) -> tuple[int, int, int, set]:
+    """解析單一 repo 的 `git log --format=%x1f%an --numstat` 輸出。
+    回 (commits, added, deleted, authors)。純函式，不碰機器。
+
+    每個 commit 由一行 `\\x1f<作者>` 開頭（`%x1f` 是 git 印出的單元分隔符
+    U+001F），後面接零到多行 numstat（`<新增>\\t<刪除>\\t<路徑>`）。merge commit
+    的 numstat 是空的，所以只計一筆提交、零行——這是對的。二進位檔的欄位是 `-`，
+    當 0。**只看數字**，從不解析路徑，所以不會外洩檔名。"""
+    commits = added = deleted = 0
+    authors: set = set()
+    for line in output.splitlines():
+        if not line:
+            continue
+        if line[0] == "\x1f":
+            commits += 1
+            name = line[1:].strip()
+            if name:
+                authors.add(name)
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            a, d = parts[0], parts[1]
+            # 二進位檔的欄位是 `-`（`isdecimal()` 為 False）→ 當 0。用
+            # `isdecimal()` 而非 `isdigit()`：後者對 `²` 之類回 True 而 `int()`
+            # 會炸；numstat 的行數欄一律是非負十進位數。
+            if a.isdecimal():
+                added += int(a)
+            if d.isdecimal():
+                deleted += int(d)
+    return commits, added, deleted, authors
+
+
+def _build_churn_report(scan_rows) -> "_ChurnReport":
+    """把掃描結果彙總成一份 `_ChurnReport`。純函式，不碰機器——測試餵合成資料。
+
+    `scan_rows`：可迭代的 `(repo_name, output_or_None)`。`output_or_None` 是那個
+    repo 的 git 原始輸出；**None 代表這個資料夾讀不到**（不是 repo／git 出錯／
+    逾時），計入 `skipped` 而不是當成零提交。只有今天真的有提交（commits >= 1）的
+    repo 會進 `.repos`，依提交數（再依總增刪、再依名稱）由多到少排序。"""
+    repos: list = []
+    total_commits = total_added = total_deleted = 0
+    scanned = skipped = 0
+    all_authors: set = set()
+    for name, output in scan_rows:
+        scanned += 1
+        if output is None:
+            skipped += 1
+            continue
+        commits, added, deleted, authors = _parse_repo_churn(output)
+        if commits <= 0:
+            continue
+        total_commits += commits
+        total_added += added
+        total_deleted += deleted
+        all_authors |= authors
+        repos.append(_RepoChurn(name, commits, added, deleted))
+    repos.sort(key=lambda r: (-r.commits, -(r.added + r.deleted), r.name))
+    return _ChurnReport(
+        repos=tuple(repos),
+        total_commits=total_commits,
+        total_added=total_added,
+        total_deleted=total_deleted,
+        scanned=scanned,
+        skipped=skipped,
+        authors=len(all_authors),
+    )
+
+
+def _render_churn_report(report: "_ChurnReport") -> str:
+    """把 `_ChurnReport` 算成要回覆的字串。純函式。
+
+    這個指令限擁有者（在 `_OWNER_ONLY_SLASH` 裡），單一決策點是那道派發前的閘，
+    所以這裡可以直接顯示 repo 名稱與行數——跟 `/sys update_check` 對能呼叫它的人
+    直接列 short SHA 是同一個道理。但**絕不**列 commit 主旨（主旨可能夾帶品牌或
+    路徑）。整段壓在對話平台 2000 字上限內：repo 太多就截尾、只保頭部總計。"""
+    if report.total_commits == 0:
+        if report.skipped:
+            return (f"今日還沒有任何 git 提交"
+                    f"（{report.skipped} 個資料夾讀不到，已略過）。")
+        return "今日還沒有任何 git 提交。"
+    head = (f"**今日 git 活動**（掃了 {report.scanned} 個資料夾）\n"
+            f"提交 **{report.total_commits}**"
+            f" · +{report.total_added} / -{report.total_deleted} 行")
+    if report.authors:
+        head += f" · {report.authors} 位作者"
+    tail = (f"\n（另有 {report.skipped} 個資料夾讀不到，已略過）"
+            if report.skipped else "")
+    lines = [head, ""]
+    shown = 0
+    for r in report.repos:
+        row = (f"- `{r.name}`：{r.commits} 提交，"
+               f"+{r.added} / -{r.deleted} 行")
+        # 預留截尾字與 tail 的空間，整體壓在 1900 以內（<2000 上限）。
+        projected = len("\n".join(lines)) + 1 + len(row) + 60 + len(tail)
+        if projected > 1900 and shown:
+            lines.append(f"…另有 {len(report.repos) - shown} 個 repo（已省略）")
+            break
+        lines.append(row)
+        shown += 1
+    return "\n".join(lines) + tail
+
+
+def _churn_git_output(repo_dir, since: str) -> str | None:
+    """對一個 repo 目錄跑今天的 `git log`。成功回原始輸出字串，任何失敗回 None
+    （交給 `_build_churn_report` 計入 skipped）——degrade，不 raise、不把錯誤字串
+    當成事實回報。"""
+    rc, out, err = _git_in(
+        repo_dir,
+        ["log", "--since", since, "--format=%x1f%an", "--numstat"],
+        timeout=_CHURN_PER_REPO_TIMEOUT,
+    )
+    if rc != 0:
+        print(f"churn: git log rc={rc} in {repo_dir}: {err.strip()!r}",
+              file=sys.stderr)
+        return None
+    return out
+
+
+def _scan_workspace_churn(since: str, runner=None) -> list:
+    """掃工作區根目錄底下**每個是 git repo（含 `.git`）的直屬子目錄**，外加
+    PROJECT_ROOT 自己，收集各 repo 今天的 git 輸出。回
+    `[(repo_name, output_or_None), ...]` 給 `_build_churn_report`。
+
+    碰磁碟＋跑 git，所以由 handler 丟 `asyncio.to_thread`。`runner(repo_dir) ->
+    str | None` 可注入（測試用）；預設對每個 repo 跑 `_churn_git_output`。整段
+    bounded：每個 repo 各自有 `_CHURN_PER_REPO_TIMEOUT` 逾時上限。
+    **不特別對待任何具名 repo**——工作區當成一般資料夾掃，沒活動的自然不列。"""
+    run = runner or (lambda d: _churn_git_output(d, since))
+    root = _churn_workspace_root()
+    candidates = [PROJECT_ROOT]
+    try:
+        for child in sorted(root.iterdir()):
+            if child != PROJECT_ROOT:
+                candidates.append(child)
+    except OSError as error:
+        print(f"churn scan: 列不出 {root}: {error!r}", file=sys.stderr)
+    rows: list = []
+    seen: set = set()
+    for d in candidates:
+        try:
+            if not d.is_dir() or not (d / ".git").exists():
+                continue
+        except OSError:
+            continue
+        name = d.name
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            rows.append((name, run(d)))
+        except Exception as error:  # pylint: disable=broad-except
+            print(f"churn scan: {d} 出錯: {error!r}", file=sys.stderr)
+            rows.append((name, None))
+    return rows
+
+
+async def cmd_churn(message: discord.Message) -> None:
+    """`/sys churn` — 今日（本機當地零點起）各 repo 的 git 活動：提交數與增刪
+    行數，含各 repo 明細與總計。只列今天有提交的 repo。限擁有者。掃描丟
+    `asyncio.to_thread`，不擋心跳。"""
+    since = _local_midnight_since()
+    scan_rows = await asyncio.to_thread(_scan_workspace_churn, since)
+    report = _build_churn_report(scan_rows)
+    await safe_reply(message, _render_churn_report(report))
 
 
 async def cmd_update_check(message: discord.Message) -> None:
@@ -24349,6 +24706,8 @@ async def on_message(message: discord.Message) -> None:
             await cmd_dashboard(message)
         elif head == "!update_check":
             await cmd_update_check(message)
+        elif head == "!churn":
+            await cmd_churn(message)
         elif head == "!git_pull":
             await cmd_git_pull(message, rest)
         elif head == "!fav":
@@ -25031,6 +25390,14 @@ async def slash_dorossi_abort(interaction: discord.Interaction,
     await _slash_run(interaction, mcmd_abort, target)
 
 
+@dorossi_group.command(name="yield", description="讓自走任務提交後暫停、交出編輯權",
+                       extras={"public": True})
+@discord.app_commands.describe(target="工作階段代號，或 all 全部（可省略）")
+async def slash_dorossi_yield(interaction: discord.Interaction,
+                             target: str = "") -> None:
+    await _slash_run(interaction, mcmd_yield, target)
+
+
 @dorossi_group.command(name="ai", description="顯示或切換這個工作階段的後端",
                        extras={"public": True, "mention": "ai"})
 @discord.app_commands.describe(provider="留空 = 只顯示目前設定")
@@ -25109,7 +25476,8 @@ async def slash_dorossi_effort(interaction: discord.Interaction,
     await _slash_run(interaction, mcmd_effort, effort)
 
 
-@dorossi_group.command(name="tokens", description="查詢帳號用量",
+@dorossi_group.command(name="tokens",
+                       description="本機用量（估算美元）與後端帳號額度",
                        extras={"public": True, "mention": "tokens"})
 async def slash_dorossi_tokens(interaction: discord.Interaction) -> None:
     await _slash_run(interaction, mcmd_tokens, "",
@@ -26052,6 +26420,13 @@ async def slash_sys_backfill_paths(
         limit: discord.app_commands.Range[int, 1, 500] = 200,
         apply: bool = False) -> None:
     await _slash_run(interaction, cmd_backfill_paths, limit, apply)
+
+
+@sys_group.command(name="churn",
+                   description="今日各 repo 的 git 活動（提交數與增刪行數）",
+                   extras={"bang": "!churn"})
+async def slash_sys_churn(interaction: discord.Interaction) -> None:
+    await _slash_run(interaction, cmd_churn)
 
 
 @sys_group.command(name="undo", description="撤回最近一次破壞性寫入",
