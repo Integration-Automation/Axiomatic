@@ -3544,8 +3544,10 @@ def _normalise_tag_input(text: str) -> str:
     `_(`. 必須是 `\s+\(`（至少一個空白），否則本來就是 canonical 的
     `rossi_(arknights)` 會被多塞一個底線變成 `rossi__(arknights)`。"""
     s = text.strip()
-    s = re.sub(r"\s+\(\s*", "_(", s)
-    s = re.sub(r"\s+\)", ")", s)
+    # lookbehind：只從一段空白的開頭起跑，否則一長串空白每個起點都掃到底。上一筆比對一定
+    # 停在非空白上（`\(\s*` 把後面的空白吃完、`\)` 本身不是空白），所以結果不變。
+    s = re.sub(r"(?<!\s)\s+\(\s*", "_(", s)
+    s = re.sub(r"(?<!\s)\s+\)", ")", s)
     return s
 
 

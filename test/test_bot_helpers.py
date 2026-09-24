@@ -19327,6 +19327,23 @@ def test_the_regex_timer_catches_a_quadratic_pattern():
     assert _slow_patterns([("fine", re.compile(r"(?<![a-z])[a-z]+@x"))], 12_000, 0.25) == []
 
 
+def _inline_patterns(module) -> list:
+    """`re.search(r"…", …)` 這種寫在函式裡的字面值樣式——模組層那份清單看不到它們。"""
+    import ast
+    found = []
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "re"
+                and node.args and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            try:
+                found.append((f"{module.__name__}:{node.lineno}", re.compile(node.args[0].value)))
+            except re.error:
+                continue
+    return found
+
+
 def test_no_module_level_regex_is_quadratic_on_hostile_input():
     """這些樣式跑在事件迴圈上，吃的是外部文字。一條會從每個起點各掃一次的樣式，對一長串
     連續字就是平方時間——2026-09-24 一次掃出三條（6 萬字：291 秒、27 秒、22 秒）。
@@ -19338,11 +19355,23 @@ def test_no_module_level_regex_is_quadratic_on_hostile_input():
         module = importlib.import_module(name)
         patterns += [(f"{name}.{attr}", value) for attr, value in vars(module).items()
                      if isinstance(value, re.Pattern)]
-    assert len(patterns) >= 30, f"只收到 {len(patterns)} 條樣式——收集本身壞了"
+        patterns += _inline_patterns(module)
+    assert len(patterns) >= 80, f"只收到 {len(patterns)} 條樣式——收集本身壞了"
     assert _slow_patterns(patterns, 12_000, 0.25) == []
 
 
 _OLD_SCRUB_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+def test_tag_input_normalisation_matches_its_old_patterns():
+    """加上 lookbehind 只是不讓比對從一段空白的中間起跑；結果必須與舊樣式逐字相同。"""
+    import random as _random
+    rng = _random.Random(2409)
+    pieces = [" ", "  ", "(", ")", "a", "_", "\t", "rossi", " (", ") ", "\n"]
+    for _ in range(4000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 14)))
+        old = re.sub(r"\s+\)", ")", re.sub(r"\s+\(\s*", "_(", text.strip()))
+        assert b._normalise_tag_input(text) == old, repr(text)
 
 
 def test_the_email_scrub_matches_its_old_pattern():
