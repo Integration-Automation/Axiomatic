@@ -81,8 +81,8 @@ CHANNEL_HELP_SECTIONS: list[str] = [
     ),
     (
         "## `/proc` — Process control\n"
-        "行程（限擁有者）：列出 / 結束 / 啟動\n"
-        "- `/proc kill|launch|list`\n"
+        "行程（限擁有者）：列出 / 結束 / 啟動 / 占用\n"
+        "- `/proc kill|launch|list|usage`\n"
     ),
     (
         "## `/config` — Batch settings\n"
@@ -209,8 +209,8 @@ CHANNEL_HELP_SECTIONS_ZH_TW: list[str] = [
     ),
     (
         "## `/proc` — 行程控制\n"
-        "行程（限擁有者）：列出 / 結束 / 啟動\n"
-        "- `/proc kill|launch|list`\n"
+        "行程（限擁有者）：列出 / 結束 / 啟動 / 占用\n"
+        "- `/proc kill|launch|list|usage`\n"
     ),
     (
         "## `/config` — 批次參數\n"
@@ -337,8 +337,8 @@ CHANNEL_HELP_SECTIONS_ZH_CN: list[str] = [
     ),
     (
         "## `/proc` — 进程控制\n"
-        "进程（限拥有者）：列出 / 结束 / 启动\n"
-        "- `/proc kill|launch|list`\n"
+        "进程（限拥有者）：列出 / 结束 / 启动 / 占用\n"
+        "- `/proc kill|launch|list|usage`\n"
     ),
     (
         "## `/config` — 批次参数\n"

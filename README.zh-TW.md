@@ -79,7 +79,7 @@ transport 模組加一段設定；移除一個平台是一個 `false`。工作�
 
 | 檔案 | 用途 |
 |---|---|
-| `axiomatic/discord_bot.py` | 13 個頂層 slash 指令 ＋ 25 個指令群（合計 268 個斜線子指令）、身分閘、桌面與主機控制、批次監督、對話後端編排、單張產圖佇列 |
+| `axiomatic/discord_bot.py` | 13 個頂層 slash 指令 ＋ 25 個指令群（合計 269 個斜線子指令）、身分閘、桌面與主機控制、批次監督、對話後端編排、單張產圖佇列 |
 | `axiomatic/_gui_control.py` | 桌面自動化門面（滑鼠、鍵盤、視窗、剪貼簿、文字辨識、圖片定位） |
 | `axiomatic/dorossi_backend.py` | 對話後端與它的工作階段——多種後端藏在同一個介面後面 |
 
@@ -313,7 +313,7 @@ py -3 install_autostart.py --remove
 在有原生斜線選單的平台上，指令就是**斜線指令**：打 `/` 會自動補全，參數在送出前就
 有型別與值域檢查。沒有斜線選單的平台則走文字表面（見下），一份實作、一組權限閘。
 共 **13 個頂層 slash 指令**與 **25 個指令群**（37 個頂層項目，平台上限 100），底下
-合計 **268 個斜線子指令**。
+合計 **269 個斜線子指令**。
 
 指令群不管裝幾個子指令都只佔一個頂層額度，所以把低頻指令收進群裡是唯一能長期擴充的
 作法。逐指令說明看 [`COMMANDS.md`](COMMANDS.md)、[`commands/`](commands/README.md)，
@@ -352,7 +352,7 @@ py -3 install_autostart.py --remove
 | **收藏** | `/fav clear\|list\|remove\|show` |
 | **執行紀錄** | `/log clear\|errors\|grep\|size\|tail` |
 | **維運與診斷** | `/sys audit\|backfill_paths\|cleanup_debug\|dashboard\|disk\|doctor\|git_pull\|health\|introspect_dom\|metrics\|probe_status\|restart\|undo\|update_check` |
-| **行程控制** | `/proc kill\|launch\|list` |
+| **行程控制** | `/proc kill\|launch\|list\|usage` |
 | **批次參數** | `/config reload\|reset\|set\|show` |
 | **螢幕** | `/screen all\|gif\|info\|main\|pixel\|region\|text\|window` |
 | **視窗** | `/win focus\|grid\|list\|move\|pos\|snap\|state\|wait`<br>`/win layout list\|remove\|restore\|save` |

@@ -41,7 +41,7 @@
 | `axiomatic/webrunner_novelai.py`、`axiomatic/webrunner_je_only.py` | 執行層的兩個變體（Selenium 為正式預設、wrapper 為備援）：瀏覽器生命週期、登入、設定檔快照、`BrowserPort` adapter |
 | `axiomatic/_webrunner_shared.py` | 兩個變體的共用核心，不 import 任何 driver：DOM 操作、佇列 I/O、輸出資料夾分配、產圖迴圈、單圖服務、`run_batch` |
 | `axiomatic/_batch_config.py`、`_bot_config.py`、`_queue_consume.py`、`_run_progress.py`、`_supervisor.py`、`_chrome_slot.py`、`_code_fingerprint.py`、`_warn_dedup.py` | 無狀態的共用模組：設定載入、佇列消耗決策、續跑檢查點、退避與單一實例鎖、跨行程瀏覽器槽鎖、程式碼指紋、警告去重（允許當第三通道的完整清單以 `CLAUDE.md`「Module boundaries」為準） |
-| `axiomatic/_process_control.py`、`_gui_control.py`、`_external_apis.py`、`_help_strings.py`、`_bot_prompts.py`、`dorossi_backend.py`、`presence_probe.py`、`discord_rpc.py` | bot 專屬模組：行程探查與終止、桌面自動化門面、外部圖庫／web API、說明文字資料、外部化 prompt 載入、Dorossi 後端與工作階段、本機狀態探測、本機 Rich Presence |
+| `axiomatic/_process_control.py`、`_gui_control.py`、`_external_apis.py`、`_help_strings.py`、`_bot_prompts.py`、`dorossi_backend.py`、`presence_probe.py`、`discord_rpc.py`、`_resource_report.py` | bot 專屬模組：行程探查與終止、桌面自動化門面、外部圖庫／web API、說明文字資料、外部化 prompt 載入、Dorossi 後端與工作階段、本機狀態探測、本機 Rich Presence、依角色分組的行程數與資源占用（`/proc usage`，只讀作業系統行程表，只回數字與角色代號、不組送出字串） |
 | `axiomatic/_chat_platform.py`、`_telegram_transport.py`、`_platform_runtime.py` | bot 專屬的對話平台層：介接接縫（身分映射、能力旗標、送出引數正規化、transport 註冊表）、逐平台 transport（一個平台一個 `_*_transport.py`）、行程的平台身分與它自己的狀態／鎖／記錄檔位置 |
 | `start_platforms.py`、`start_discord_bot.py`、`start_webrunner.py`、`run_batch.py`、`install_autostart.py`、`wake_autostart.py` | repo 根目錄的啟動器：把每個開著的平台各起一個受監督行程、單一平台的監督迴圈（`--platform`）、批次監督迴圈、一鍵批次入口、Windows 工作排程器自動啟動的註冊與手動叫醒 |
 | `axiomatic/verify_*.py`、`dashboard_server.py` | 手動驗證腳本（瀏覽器、外部 API、額度對話框、後端 CLI）與本機唯讀狀態儀表板 |

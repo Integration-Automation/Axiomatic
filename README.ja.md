@@ -89,7 +89,7 @@
 
 | ファイル | 役割 |
 |---|---|
-| `axiomatic/discord_bot.py` | トップレベル 13 個のスラッシュコマンドと 25 個のコマンドグループ（合計 268 個のサブコマンド）、ID ゲート、デスクトップとホストの制御、バッチ監視、応答バックエンドの調停、単発生成キュー |
+| `axiomatic/discord_bot.py` | トップレベル 13 個のスラッシュコマンドと 25 個のコマンドグループ（合計 269 個のサブコマンド）、ID ゲート、デスクトップとホストの制御、バッチ監視、応答バックエンドの調停、単発生成キュー |
 | `axiomatic/_gui_control.py` | デスクトップ自動化のファサード（マウス、キーボード、ウィンドウ、クリップボード、文字認識、画像位置検出） |
 | `axiomatic/dorossi_backend.py` | 応答バックエンドとそのセッション——複数のバックエンドを 1 つのインターフェースの裏に |
 
@@ -339,7 +339,7 @@ py -3 install_autostart.py --remove
 テキスト面から使います（後述）。実装も権限ゲートも 1 組だけです。
 **13 個のトップレベルスラッシュコマンド**と **25 個のコマンドグループ**
 （トップレベル 37 枠、プラットフォームの上限は 100）があり、その下に
-**268 個のスラッシュサブコマンド**があります。
+**269 個のスラッシュサブコマンド**があります。
 
 グループはサブコマンドをいくつ抱えてもトップレベル 1 枠しか使わないので、使用頻度の
 低いコマンドをグループにまとめるのが長く拡張し続ける唯一の方法です。コマンドごとの
@@ -382,7 +382,7 @@ py -3 install_autostart.py --remove
 | **お気に入り** | `/fav clear\|list\|remove\|show` |
 | **実行ログ** | `/log clear\|errors\|grep\|size\|tail` |
 | **運用と診断** | `/sys audit\|backfill_paths\|cleanup_debug\|dashboard\|disk\|doctor\|git_pull\|health\|introspect_dom\|metrics\|probe_status\|restart\|undo\|update_check` |
-| **プロセス制御** | `/proc kill\|launch\|list` |
+| **プロセス制御** | `/proc kill\|launch\|list\|usage` |
 | **バッチのパラメータ** | `/config reload\|reset\|set\|show` |
 | **画面** | `/screen all\|gif\|info\|main\|pixel\|region\|text\|window` |
 | **ウィンドウ** | `/win focus\|grid\|list\|move\|pos\|snap\|state\|wait`<br>`/win layout list\|remove\|restore\|save` |

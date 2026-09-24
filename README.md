@@ -90,7 +90,7 @@ import those, because they are standalone, stateless, driver-agnostic code.
 
 | File | Purpose |
 |---|---|
-| `axiomatic/discord_bot.py` | 13 top-level slash commands and 25 command groups (268 slash sub-commands in total), the identity gates, desktop and host control, batch supervision, answering-backend orchestration, the single-image queue |
+| `axiomatic/discord_bot.py` | 13 top-level slash commands and 25 command groups (269 slash sub-commands in total), the identity gates, desktop and host control, batch supervision, answering-backend orchestration, the single-image queue |
 | `axiomatic/_gui_control.py` | The desktop-automation façade (mouse, keyboard, windows, clipboard, OCR, image location) |
 | `axiomatic/dorossi_backend.py` | The answering backend and its sessions — several backends behind one interface |
 
@@ -342,7 +342,7 @@ typing `/` autocompletes them and arguments are type- and range-checked before
 they are sent. On a platform without one, the same commands are reached through
 the text surface (see below) — one implementation, one set of permission gates. There are
 **13 top-level slash commands** and **25 command groups** (37 top-level
-entries; the platform limit is 100) holding **268 slash sub-commands**.
+entries; the platform limit is 100) holding **269 slash sub-commands**.
 
 A group costs one top-level slot no matter how many sub-commands it has, so
 folding low-traffic commands into groups is the only way to keep growing. Per
@@ -386,7 +386,7 @@ command detail is in [`COMMANDS.md`](COMMANDS.md), in
 | **Favourites** | `/fav clear\|list\|remove\|show` |
 | **Run log** | `/log clear\|errors\|grep\|size\|tail` |
 | **Operations and diagnostics** | `/sys audit\|backfill_paths\|cleanup_debug\|dashboard\|disk\|doctor\|git_pull\|health\|introspect_dom\|metrics\|probe_status\|restart\|undo\|update_check` |
-| **Process control** | `/proc kill\|launch\|list` |
+| **Process control** | `/proc kill\|launch\|list\|usage` |
 | **Batch parameters** | `/config reload\|reset\|set\|show` |
 | **Screen** | `/screen all\|gif\|info\|main\|pixel\|region\|text\|window` |
 | **Windows** | `/win focus\|grid\|list\|move\|pos\|snap\|state\|wait`<br>`/win layout list\|remove\|restore\|save` |

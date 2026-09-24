@@ -134,6 +134,11 @@ from _process_control import (
     looks_like_python_process,
     python_script_argument,
 )
+# 「這一套現在花掉這台主機多少」——`/proc usage` 的資料來源。bot 側專屬模組，只讀
+# `_process_control` 的判定述詞（不改它：那支在批次的 import 閉包裡）。它回的是
+# 數字與角色代號，**不組送出的句子**——PID 與主機路徑露不露由本檔的
+# `_owner_detail()` 決定，與 `/dorossi running` 同一個分工。
+import _resource_report
 # 佇列配對／end sentinel 的純快照原語單一來源（P7 收斂）。_queue_consume 與
 # _webrunner_shared 的純函式是 driver-agnostic、stdlib-only 的被動共用模組，屬
 # CLAUDE.md 允許的第三管道（非 bot↔webrunner 直接 import）。bot 的 !plan / !preview
@@ -16705,6 +16710,217 @@ async def cmd_kill(message: discord.Message, payload: str) -> None:
     await safe_reply(message, "\n".join(lines) if lines else "沒有任何行程被關閉")
 
 
+# ---------- `/proc usage`：這一套花掉這台主機多少 ---------------------------
+#
+# **與既有那兩份報告的分工，刻意不重疊。** `/gen current`／`/gen progress` 講的是
+# 批次做到哪一對、還差幾張；`/dorossi running` 講的是對話助理此刻有哪幾輪在跑、
+# 在等空位還是真的在跑。那兩份讀的都是**進度與工作佇列**，也就是這一套自己記下來
+# 的狀態。這一支讀的是**作業系統的行程表**——開了幾個行程、吃掉多少記憶體與 CPU、
+# 最久的那個跑了多久、整台機器還剩多少。
+#
+# 分界之所以要寫下來，是因為「順手把批次進度也印在這裡」是每一份狀態報告都會長出
+# 來的東西，而長出來之後兩邊就開始各講一半、各自漂移。所以這裡一個進度數字都不
+# 印，回覆最後一行直接指過去。反過來也成立：那兩份看不到瀏覽器吃了 4 GB、看不到
+# 批次已經連續跑了很久、也看不到這台機器的記憶體只剩幾 MB。
+
+# note 鍵 → 一句泛用說明。**鍵由 `_resource_report` 產生、句子由本檔寫**，理由同
+# 該模組的 docstring：那邊不組要送出去的字串。
+_RESOURCE_NOTE_TEXT = {
+    "psutil_missing": "⚠️ 這台主機上取不到行程資料，只剩整機那幾行",
+    "scan_incomplete": "⚠️ 行程清單沒有掃完整——下面的數字只會偏低，不會偏高",
+    "gone": "{n} 個行程在掃描途中結束，沒有算進去",
+    "denied": "{n} 個行程沒有權限讀，它們的用量沒有算進去",
+    "cpu_unavailable": "⚠️ 這一趟量不到 CPU",
+    "memory_unavailable": "⚠️ 這一趟讀不到整機記憶體",
+    "disk_unavailable": "⚠️ 這一趟讀不到磁碟剩餘空間",
+}
+
+
+def _dorossi_backend_pids() -> list[int]:
+    """對話助理此刻**真的還活著**的後端子行程 pid。
+
+    來源就是 `/dorossi running` 讀的那兩份登記（`_dorossi_turns`／`_dorossi_loops`），
+    唯讀、不取鎖。用登記而不是去猜行程名：後端 CLI 在主機上叫什麼名字會隨安裝方式
+    變，猜寬了會把使用者自己的工具算進來，猜窄了會讓那一格永遠是 0——而 0 跟「現在
+    沒有在跑」長得一模一樣。
+
+    `returncode is not None` 的一律不要：那個行程已經結束，pid 可能已經被回收再發給
+    別人，而把別人的行程算成我們的比少算一筆難看得多。"""
+    pids: list[int] = []
+    holders = [getattr(t, "proc", None) for t in list(_dorossi_turns)]
+    holders += [getattr(st, "proc", None)
+                for st in list(_dorossi_loops.values())]
+    for proc in holders:
+        pid = getattr(proc, "pid", None)
+        if (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+                and getattr(proc, "returncode", None) is None):
+            pids.append(pid)
+    return sorted(set(pids))
+
+
+def _resource_pct(part: float | None, whole: float | None) -> str:
+    """`part` 佔 `whole` 的百分比；任一邊缺就回空字串（不要用 0 冒充）。
+
+    **註記是承重的，不是裝飾。** `test_bot_helpers.test_a_parameter_used_as_a_path_declares_itself_one`
+    要求「被拿去當 `/` 左運算元的參數」必須講清楚自己是什麼——接合守門的根過濾器
+    認的是 `Path` 註記，沒有註記的參數對那道守門是隱形的：既不會被列成站點，也不會
+    出現在任何例外清單裡。這兩個是數字，所以註記成數字，過濾器會正確地略過。"""
+    if not isinstance(part, (int, float)) or isinstance(part, bool):
+        return ""
+    if not isinstance(whole, (int, float)) or isinstance(whole, bool) or not whole:
+        return ""
+    return f"{part / whole * 100:.1f}%"
+
+
+def _resource_cpu_text(cpu: float | None, cores: int | None) -> str:
+    """把 psutil 的「一顆核心 ＝ 100%」換算成「占整機多少」。
+
+    參數的註記同樣是承重的，理由見 `_resource_pct`。
+
+    兩個口徑一定要講清楚是哪一個：一個吃滿三顆核心的後端在 psutil 眼中是 300%，
+    照抄出去會被讀成「這台機器炸了」。核心數問不到時退回原始數字並標成 `/核`，
+    **不要**猜一個核心數去除——猜錯的那個百分比看起來跟真的一樣。"""
+    if not isinstance(cpu, (int, float)) or isinstance(cpu, bool):
+        return "?"
+    if isinstance(cores, int) and not isinstance(cores, bool) and cores > 0:
+        return f"{cpu / cores:.1f}%"
+    return f"{cpu:.1f}%/核"
+
+
+def _resource_generic_name(row) -> str:
+    """非擁有者看到的行程名：泛用角色字，不是真的執行檔名。"""
+    name = (getattr(row, "name", "") or "").strip().lower()
+    if name in _resource_report.BROWSER_NAMES:
+        return "瀏覽器"
+    if getattr(row, "script", None):
+        return _resource_report.ROLE_LABELS.get(
+            _resource_report.SCRIPT_ROLES.get(row.script), "本專案的行程")
+    return "子行程"
+
+
+def _resource_report_text(snap, source, *, now: float | None = None) -> str:
+    """`/proc usage` 的內容。`snap` 是 `_resource_report.collect()` 的結果。
+
+    秘密分層 1 的單一決策點照舊是 `_owner_detail()`：PID 與產出磁碟的真實路徑只給
+    擁有者，其他人拿泛用標籤。這個指令本身已經在 `_OWNER_ONLY_GROUPS` 的 `proc` 群
+    底下（非擁有者根本叫不動），這裡仍然走那道閘不是多此一舉——`/dorossi running`
+    也是這樣寫的，而把「這條路現在碰不到」當成「不必判斷」正是閘門日後靜靜消失的
+    方式。"""
+    # 預設用**量測當下**的時刻，不是渲染當下的：中間隔著 CPU 取樣與整趟掃描（約一
+    # 秒），拿現在的時鐘去減啟動時刻，每一個「已執行多久」都會多算那一秒。
+    now = (snap.taken_at or time.time()) if now is None else now
+    rr = _resource_report
+    lines: list[str] = ["**主機占用 📊**"]
+
+    roles = snap.roles or {}
+    total_rss, _miss = rr._sum_or_none(
+        [u.rss for u in roles.values()])
+    total_cpu, _miss_cpu = rr._sum_or_none([u.cpu for u in roles.values()])
+    share = _resource_pct(total_rss, snap.mem_total)
+    head = f"本專案此刻有 **{snap.total_procs}** 個行程"
+    if total_rss is not None:
+        head += f"，合計記憶體 `{_fmt_size(total_rss)}`"
+        if share:
+            head += f"（整機的 {share}）"
+    head += f"、CPU `{_resource_cpu_text(total_cpu, snap.cpu_count)}`（占整機）"
+    lines.append(head)
+
+    for role in rr.ROLE_ORDER:
+        usage = roles.get(role)
+        if usage is None:
+            continue
+        label = rr.ROLE_LABELS.get(role, role)
+        bits = [f"{usage.logical} 個"]
+        stubs = usage.procs - usage.logical
+        if stubs > 0:
+            # 轉接殼不是多出來的實例，但它真的佔記憶體，所以兩個數字都要講。
+            bits[0] += f"（另有 {stubs} 個轉接殼）"
+        bits.append("記憶體 " + (f"`{_fmt_size(usage.rss)}`"
+                                 if usage.rss is not None else "`?`"))
+        bits.append(f"CPU `{_resource_cpu_text(usage.cpu, snap.cpu_count)}`")
+        if usage.oldest_started:
+            bits.append("已執行 "
+                        f"`{_format_duration(max(0.0, now - usage.oldest_started))}`")
+        if usage.missing_rss or usage.missing_cpu:
+            bits.append(f"（{max(usage.missing_rss, usage.missing_cpu)} 個讀不到）")
+        lines.append(f"- **{label}**：" + " · ".join(bits))
+
+    if not roles:
+        lines.append("- 掃不到任何屬於本專案的行程。")
+
+    # --- 整機 ---
+    if snap.mem_total:
+        used = (snap.mem_total - snap.mem_available
+                if snap.mem_available is not None else None)
+        mem = (f"已用 `{_fmt_size(used)}` / `{_fmt_size(snap.mem_total)}`"
+               if used is not None else f"總共 `{_fmt_size(snap.mem_total)}`")
+        if snap.mem_available is not None:
+            mem += f"（剩 `{_fmt_size(snap.mem_available)}`）"
+        lines.append(f"- **整機記憶體**：{mem}")
+    if snap.cpu_percent is not None:
+        cores = (f"（{snap.cpu_count} 核心）"
+                 if isinstance(snap.cpu_count, int) else "")
+        lines.append(f"- **整機 CPU**：`{snap.cpu_percent:.1f}%`{cores}")
+    if snap.disk_total:
+        # 路徑是主機路徑，所以走 `_owner_detail`；標籤本身對誰都一樣。
+        where = _owner_detail(source, lambda: f"（`{snap.disk_path}`）", "")
+        lines.append(
+            f"- **產出的那顆磁碟**{where}：剩 `{_fmt_size(snap.disk_free)}` / "
+            f"`{_fmt_size(snap.disk_total)}`"
+            if snap.disk_free is not None else
+            f"- **產出的那顆磁碟**{where}：總共 `{_fmt_size(snap.disk_total)}`")
+
+    # --- 最吃記憶體的幾個（PID 只給擁有者）---
+    heavy = sorted(
+        (row for usage in roles.values() for row in usage.top),
+        key=lambda row: row.rss or 0, reverse=True)[:3]
+    if heavy:
+        bits = []
+        for row in heavy:
+            pid = _owner_detail(source, f"（PID {row.pid}）", "")
+            name = _owner_detail(source, row.name, _resource_generic_name(row))
+            bits.append(f"`{name}` `{_fmt_size(row.rss)}`{pid}")
+        lines.append("- **最吃記憶體**：" + "、".join(bits))
+
+    for key, detail in snap.notes or ():
+        text = _RESOURCE_NOTE_TEXT.get(key)
+        if text:
+            lines.append("- " + text.format(n=detail))
+
+    lines.append(
+        f"取樣 {snap.cpu_interval:.1f} 秒，整趟 {snap.elapsed:.1f} 秒。"
+        "所有瀏覽器行程都算進「瀏覽器與驅動程式」——清理流程用的也是這個判準，"
+        "兩邊對不起來的話下一次清理會比這裡說的多殺一些。")
+    lines.append(
+        "這裡只講主機這一側：批次做到哪一對看 `/gen current`，"
+        "對話助理有哪幾輪在跑看 `/dorossi running`。")
+    return "\n".join(lines)
+
+
+async def cmd_proc_usage(message: discord.Message, payload: str = "") -> None:
+    """`/proc usage` — 這一套此刻在這台主機上開了幾個行程、吃掉多少資源。
+
+    **整段丟執行緒**：CPU 百分比是兩次取樣的差，中間一定要有一段真實的牆鐘時間
+    （見 `_resource_report.DEFAULT_CPU_INTERVAL_SEC`），加上一趟行程表列舉，合計
+    本機實測約 0.6–1.0 秒。那段時間直接壓在事件迴圈上就會擋住 heartbeat，而
+    heartbeat 送不出去的下場是斷線重連（同一條規則寫在
+    `_process_control._terminate_all_webrunner_instances` 的 docstring 裡）。"""
+    del payload
+    try:
+        snap = await asyncio.to_thread(
+            _resource_report.collect,
+            disk_path=OUTPUT_ROOT if OUTPUT_ROOT.exists() else PROJECT_ROOT,
+            assistant_pids=_dorossi_backend_pids())
+    except Exception as error:  # pylint: disable=broad-except
+        print(f"cmd_proc_usage failed: {error!r}", file=sys.stderr)
+        await safe_reply(message,
+                         _owner_error(message, error, "取不到主機占用資料"))
+        return
+    for chunk in _chunk_for_discord(_resource_report_text(snap, message)):
+        await safe_reply(message, chunk,
+                         allowed_mentions=discord.AllowedMentions.none())
+
+
 # ---------- GUI control (je_auto_control) ----------------------------------
 #
 # 這 6 個 `!` 指令把 je_auto_control 的 keyboard / mouse / screen API
@@ -25597,7 +25813,7 @@ async def slash_sys_restart(interaction: discord.Interaction) -> None:
 
 # ---------- 行程控制：/proc -------------------------------------------------
 proc_group = discord.app_commands.Group(
-    name="proc", description="行程（限擁有者）：列出 / 結束 / 啟動")
+    name="proc", description="行程（限擁有者）：列出 / 結束 / 啟動 / 占用")
 
 
 @proc_group.command(name="list", description="列出正在執行的程式",
@@ -25614,6 +25830,29 @@ async def slash_proc_list(interaction: discord.Interaction,
 async def slash_proc_kill(interaction: discord.Interaction,
                           name: str) -> None:
     await _slash_run(interaction, cmd_kill, name)
+
+
+@proc_group.command(
+    name="usage",
+    description="本專案占用的資源與行程數（依角色分組）",
+    extras={"public": True})
+async def slash_proc_usage(interaction: discord.Interaction) -> None:
+    # **刻意沒有 `!` 相容路徑。** 隱藏的文字面只為「手機打字、多行貼上、引用脈絡」
+    # 保留（DoD #3），而這支沒有參數也沒有多行輸入，多一個 `!` 只是多一條要各自
+    # 對帳擁有者閘的派發路徑。
+    #
+    # `extras` 因此標 `public`，與 `/dorossi running`（同樣是限擁有者的唯讀狀態
+    # 指令）一模一樣。**這裡的 `public` 在行為上是惰性的**，不是在開放權限：
+    # `_tree_check` 的頻道閘本來就對 `OWNER_USER_ID` 放行，而非擁有者在更前面的
+    # 群組閘就被擋掉了，所以兩條路徑都跟有沒有標 `public` 無關。標它的唯一理由是
+    # `test_docs_sync.test_slash_permission_keys_are_complete` 要求每個斜線指令明確
+    # 表態——而三個合法的表態裡，另外兩個都要求真的存在一條文字面派發路徑。
+    #
+    # 也**刻意沒有 `detach_ack`**：那是給有機會跑超過互動權杖 15 分鐘壽命的指令用
+    # 的（`/sys git_pull`、`/sys update_check`），而這支本機實測 0.6–1.0 秒，
+    # `_slash_run` 一開頭的 `defer(thinking=True)` 已經足夠。用了反而把每一則回覆
+    # 變成不會消失的頻道訊息，對一支每天會被問好幾次的狀態指令是雜訊。
+    await _slash_run(interaction, cmd_proc_usage)
 
 
 @proc_group.command(name="launch", description="啟動白名單或別名上的程式",

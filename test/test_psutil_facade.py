@@ -107,6 +107,12 @@ def _module_level_uses() -> dict[str, list[str]]:
 _PROCESS_MEMBERS = [
     "pid", "ppid", "name", "cmdline",
     "memory_info", "terminate", "kill", "wait",
+    # `/proc usage` 的資源報告（`_resource_report._psutil_rows`）用的四個。
+    # `cpu_percent` 沒有 `interval` 引數時回的是「距離上一次呼叫」的平均，所以那
+    # 支要呼叫兩次；`children(recursive=True)` 在 Windows 上只重建一次全系統的
+    # 父子對照表，是本專案唯一負擔得起的家譜查法（逐行程問 `ppid` 是 O(N) 次
+    # 重建，實測每次約 21 毫秒）。
+    "cpu_percent", "create_time", "children",
 ]
 
 

@@ -163,6 +163,9 @@ _READ_ONLY_SCANS = {
         "診斷用的行程列表，端給人看，沒有任何呼叫端拿它去殺東西。",
     ("presence_probe.py", "probe_claude_code"):
         "presence 用，偵測開發工具。",
+    ("_resource_report.py", "_psutil_rows"):
+        "`/proc usage` 的資源報告：只讀名稱／記憶體／CPU／啟動時間端給人看，"
+        "整個模組一個終止呼叫都沒有，也沒有任何呼叫端拿這份名單去殺東西。",
 }
 
 _CLASSIFIED = set(_KILLS_WHAT_IT_FINDS) | set(_READ_ONLY_SCANS)
