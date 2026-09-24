@@ -575,6 +575,23 @@ def test_the_stdout_tail_is_bounded_and_keeps_the_last_lines():
     assert "noise-0" not in state.failure_reason("")
 
 
+def test_token_deltas_do_not_push_the_diagnosis_out_of_the_tail():
+    """`stream_event` 一輪有上百行。記進尾巴的話，25 行一下子就被它們塞滿，真正說明失敗的
+    那一行（這裡是一行非 JSON 的錯誤，後面又跟著一串 delta）被擠出去，印進 log 的只剩對話
+    內容的碎片。"""
+    state = db._ClaudeStreamState(None)
+    delta = json.dumps({"type": "stream_event", "event": {
+        "type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": "secret"}}})
+    feed_all(state, [claude_system("sess-abc"), "panic: backend lost its session"]
+             + [delta] * 60)
+    reason = state.failure_reason("")
+    assert "panic: backend lost its session" in reason
+    assert "stream_event" not in reason and "secret" not in reason
+    assert any("sess-abc" in str(line) for line in state.stdout_tail), (
+        "其他事件仍要進尾巴，只有逐 token 的那種不進")
+
+
 def test_an_empty_line_is_not_kept_in_the_tail():
     state = db._ClaudeStreamState(None)
     feed_all(state, ["", "", "real"])

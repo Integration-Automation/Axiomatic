@@ -4938,6 +4938,13 @@ class _ClaudeStreamState:
                 ids.add(task_id)
         return ids
 
+    def _keep_in_tail(self, raw_line) -> None:
+        """把一行記進有界的 stdout 尾巴（`failure_reason` 的第二順位來源）。空行不記。"""
+        if raw_line:
+            self.stdout_tail.append(raw_line)
+            if len(self.stdout_tail) > self._STDOUT_TAIL_LINES:
+                del self.stdout_tail[0]
+
     def feed(self, raw_line: str, on_text=None) -> None:
         """把一行原始 stdout 折疊進狀態。**永遠不 raise**，也不做任何 I/O。
 
@@ -4945,17 +4952,19 @@ class _ClaudeStreamState:
         （CLI 的警告、被截斷的半行）是常態，而為了一行雜訊丟掉整輪已經跑完的工作
         代價高得多。真正的失敗訊號是 rc 與 `result` 事件，不是某一行解不開。
         """
-        if raw_line:
-            self.stdout_tail.append(raw_line)
-            if len(self.stdout_tail) > self._STDOUT_TAIL_LINES:
-                del self.stdout_tail[0]
         try:
             ev = _json.loads(raw_line)
         except (ValueError, TypeError):
             # ValueError = 非 JSON 雜訊（含空行、被截斷的半行）。
             # TypeError  = `raw_line` 根本不是 str/bytes（機制 C）：`json.loads(None)`
             #              丟的是 TypeError，只收 ValueError 會讓它逸出。
+            self._keep_in_tail(raw_line)
             return
+        # 逐 token 的 `stream_event` 不進診斷尾巴。它們一輪有上百行，25 行的尾巴會被
+        # 它們塞滿，把真正說明失敗的那幾行（非 JSON 的錯誤、`system`／`assistant` 事件）
+        # 擠出去；而 `failure_reason` 在沒有 `result` 時印的就是這條尾巴。
+        if not (isinstance(ev, dict) and ev.get("type") == "stream_event"):
+            self._keep_in_tail(raw_line)
         if not isinstance(ev, dict):
             # 合法 JSON 但不是物件（`null` / 數字 / 陣列）。舊版直接 `ev.get(...)`，
             # 那會丟 AttributeError，而 claude 這一側的讀取迴圈**沒有** try/finally
