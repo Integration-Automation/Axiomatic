@@ -10357,16 +10357,18 @@ def _dorossi_resume_all_plan(state: dict, uid: str, *, busy: set,
 
     * `"resume"`  ── 接續；
     * `"running"` ── 已經在跑或已經排定（`busy`）；
-    * `"aborted"` ── 擁有者 abort 過的（標記的 `stop`）——**要接回去得用
-      `/dorossi session continue <id>` 指名**，全部接續不替擁有者推翻那個決定；
     * `"archived"`── 已封存的工作階段；
     * `"cap"`     ── 超過 `DOROSSI_MAX_PARALLEL_LOOPS` 的名額（`room` 是還剩幾個，
       None ＝不設限）。
 
-    沒有可接續任務（`_dorossi_loop_resume_plan` 為 None）的工作階段不列。**舊標記**
-    （沒有 `stop`、`live` 為假：停下來的原因不明，可能是 2026-09-22 斷網、也可能是
-    更早的 abort）照接——這是擁有者親手下的指令，而且結果逐一列出來，接錯的當場就能
-    abort；自動接續則照舊不碰它們。"""
+    沒有可接續任務（`_dorossi_loop_resume_plan` 為 None）的工作階段不列。
+
+    **`all` 連 abort 過的也接**：以前 abort 過的（標記 `stop == "abort"`）要指名才
+    接，`all` 會跳過它們、不替擁有者推翻那個決定。擁有者要的是「一次全部接回來，包含
+    自己停過的」，所以 `all` 現在不再區分停下的原因——只要那個工作階段還有可接續的任務
+    就接。要**永久**擋掉某個任務，改用 `/dorossi session delete <id>`（封存），封存的
+    仍然不接。結果逐一列出來，接錯的當場就能再 abort。**自動接續**（重連／重啟時的掃描）
+    照舊只碰 network／interrupted，不受這裡影響——這條規則只改擁有者親手下的 `all`。"""
     rec = state.get(uid) if isinstance(state, dict) else None
     sessions = rec.get("sessions") if isinstance(rec, dict) else None
     if not isinstance(sessions, dict):
@@ -10384,8 +10386,6 @@ def _dorossi_resume_all_plan(state: dict, uid: str, *, busy: set,
         label = sess.get("label") if isinstance(sess.get("label"), str) else ""
         if _dorossi_session_key(uid, sid) in busy:
             verdict = "running"
-        elif marker.get("stop") == "abort":
-            verdict = "aborted"
         elif sess.get("archived"):
             verdict = "archived"
         elif room is not None and room <= 0:
@@ -10401,7 +10401,6 @@ def _dorossi_resume_all_plan(state: dict, uid: str, *, busy: set,
 _DOROSSI_RESUME_ALL_TEXT = {
     "resume": "✅ 已接續",
     "running": "⏭️ 已在進行中",
-    "aborted": "⏭️ 略過：你中止過（要接回去請用 `/dorossi session continue {sid}` 指名）",
     "archived": "⏭️ 略過：已封存",
     "cap": "⏭️ 略過：同時進行的任務已達上限",
     "busy": "⏭️ 略過：這個工作階段正在處理別的提問，稍後再試",
@@ -10456,7 +10455,7 @@ async def _dorossi_resume_all(message: discord.Message) -> None:
     counts = {}
     for _sid, _label, verdict in results:
         counts[verdict] = counts.get(verdict, 0) + 1
-    skipped = sum(counts.get(v, 0) for v in ("aborted", "archived", "cap", "busy"))
+    skipped = sum(counts.get(v, 0) for v in ("archived", "cap", "busy"))
     failed = sum(counts.get(v, 0) for v in ("gate", "failed"))
     lines = [f"接續中斷的自走任務：已接續 {counts.get('resume', 0)} 個、"
              f"已在進行中 {counts.get('running', 0)} 個、略過 {skipped} 個、"

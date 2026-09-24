@@ -564,8 +564,18 @@ def test_the_plan_sorts_freshest_first_and_names_every_outcome():
     plan = b._dorossi_resume_all_plan(_state_for_all(), UID, busy={(UID, "s5")},
                                       room=None)
     assert [(sid, verdict) for sid, _l, verdict in plan] == [
-        ("s1", "resume"), ("s2", "aborted"), ("s3", "resume"), ("s4", "archived"),
+        ("s1", "resume"), ("s2", "resume"), ("s3", "resume"), ("s4", "archived"),
         ("s5", "running")]
+
+
+def test_the_plan_resumes_even_an_aborted_session():
+    """`all` 連自己 abort 過的也接。s2 的標記 `stop == "abort"`，以前是 "aborted"
+    （略過），現在是 "resume"。只有封存（s4）仍然不接。"""
+    plan = b._dorossi_resume_all_plan(_state_for_all(), UID, busy=set(), room=None)
+    verdicts = {sid: v for sid, _l, v in plan}
+    assert verdicts["s2"] == "resume"
+    assert verdicts["s4"] == "archived"
+    assert "aborted" not in verdicts.values()
 
 
 def test_the_plan_respects_the_loop_cap():
@@ -629,18 +639,19 @@ def test_continue_all_resumes_what_it_should_and_reports_the_rest(cont, rest):
         await _settle()
 
     asyncio.run(scenario())
-    assert sorted(sid for sid, _ack in cont.resumed) == ["s1", "s3", "s5"]
+    # s2 是 abort 過的——`all` 也接它（擁有者裁定）。
+    assert sorted(sid for sid, _ack in cont.resumed) == ["s1", "s2", "s3", "s5"]
     text = "\n".join(cont.replies)
-    assert "已接續 3 個" in text and "略過 2 個" in text, text
-    assert "`s2`" in text and "你中止過" in text and "/dorossi session continue s2" in text
+    assert "已接續 4 個" in text and "略過 1 個" in text, text
+    assert "`s2`" in text and "已接續" in text
     assert "`s4`" in text and "已封存" in text
     assert "`s6`" not in text, "沒有任務的工作階段不列"
 
 
 def test_continue_all_skips_running_busy_and_capped_ones(cont, monkeypatch):
-    """上限 3、s5 在跑 → 還剩兩個名額：s1 接續、s3 這個工作階段的鎖有人拿著（略過，
-    名額照樣算掉）、之後的都是「已達上限」——這裡沒有，因為只剩 s2／s4 本來就略過。"""
-    monkeypatch.setattr(b, "DOROSSI_MAX_PARALLEL_LOOPS", 3)
+    """上限 4、s5 在跑 → 還剩三個名額：s1、s2（abort 過的也接了）接續，s3 這個工作
+    階段的鎖有人拿著（略過）。s4 已封存。"""
+    monkeypatch.setattr(b, "DOROSSI_MAX_PARALLEL_LOOPS", 4)
     cont.state[UID]["sessions"]["s1"]["loop_pending"]["stop"] = "network"
     b._dorossi_loops[(UID, "s5")] = object()
     lock = asyncio.Lock()
@@ -652,7 +663,7 @@ def test_continue_all_skips_running_busy_and_capped_ones(cont, monkeypatch):
         await _settle()
 
     asyncio.run(scenario())
-    assert [sid for sid, _ack in cont.resumed] == ["s1"]
+    assert sorted(sid for sid, _ack in cont.resumed) == ["s1", "s2"]
     text = "\n".join(cont.replies)
     assert "`s5`" in text and "已在進行中" in text
     assert "`s3`" in text and "正在處理別的提問" in text
@@ -662,7 +673,8 @@ def test_continue_all_fails_cleanly_when_the_mode_cannot_loop(cont, monkeypatch)
     monkeypatch.setattr(b, "DOROSSI_CC_TOOLS", "off")
     asyncio.run(b.mcmd_session(_owner_msg(), "all continue"))
     assert cont.resumed == []
-    assert "失敗 3 個" in "\n".join(cont.replies)
+    # s1／s2（abort 過的）／s3／s5 四個都是可接續候選，模式不能自走 → 全部失敗。
+    assert "失敗 4 個" in "\n".join(cont.replies)
 
 
 def test_continue_all_with_nothing_pending_says_so(cont):

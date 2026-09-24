@@ -429,7 +429,7 @@ token 不接問題就只是改設定，不會送出一輪。
 **`/dorossi session`** — 多工作階段管理
 
 - `/dorossi session archive <id>` — 封存工作階段
-- `/dorossi session continue [id]` — 接續未完成的自走任務（沒有回合上限）；`id` 填 all 一次接回所有中斷的任務（略過正在跑的、你中止過的與超過同時上限的，逐一回報）
+- `/dorossi session continue [id]` — 接續未完成的自走任務（沒有回合上限）；`id` 填 all 一次接回所有中斷的任務（你中止過的也會接回；略過正在跑的、已封存的與超過同時上限的，逐一回報）
 - `/dorossi session delete <id>` — 刪除工作階段
 - `/dorossi session export <id>` — 把工作階段匯出成檔案
 - `/dorossi session list` — 列出所有工作階段
