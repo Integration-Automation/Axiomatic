@@ -1,55 +1,77 @@
 #!/usr/bin/env python3
-"""verify_external_apis.py — 獨立的「外部 API 還活著嗎」驗證腳本。
+"""verify_external_apis.py -- a standalone "are the external APIs still alive?" verification script.
 
     py -3 axiomatic/verify_external_apis.py
     py -3 axiomatic/verify_external_apis.py --only danbooru wiki
     py -3 axiomatic/verify_external_apis.py --json
 
-**為什麼需要這支（2026-08-30 的兩次事故）。** 這個 bot 打十幾個第三方端點，而每
-一個進入點的失敗路徑都是「回 None／回空 list」，`mcmd_*` 再把它組成一句「找不
-到」。所以站方一改規則，功能就整個消失，而使用者以為是自己輸入錯，log 裡也可能
-一個字都沒有。同一天抓到兩個：
+**Why this is needed (the two 2026-08-30 incidents).** This bot hits a dozen-odd
+third-party endpoints, and every entry point's failure path is "return None /
+return empty list", which `mcmd_*` then turns into a "not found". So the moment a
+site changes its rules, the feature vanishes entirely, while the user assumes
+they mistyped and the log may not have a single word. Two were caught on the
+same day:
 
-* 最大的圖庫站移到 CDN 防護後面，拒絕**沒有 User-Agent** 的請求（aiohttp 的預設就
-  是沒有）→ 六個進入點全滅，包含圖片下載。
-* 百科站要求 UA 裡帶得到人的**聯絡方式**（URL 或 email），只自報名稱一樣 403。
+* The biggest image board moved behind a CDN protection and refused requests
+  **with no User-Agent** (which is aiohttp's default) -> six entry points wiped
+  out, including image download.
+* An encyclopedia site required the UA to carry a reachable **contact** (URL or
+  email); merely naming yourself still gets a 403.
 
-兩個都不是程式邏輯錯，是**外部契約漂移**——沒有任何靜態分析看得到，只有真的打一次
-才知道。單元測試裡放了兩支實測（那兩個已知會漂的站台），但把十幾個端點全部塞進
-`pytest` 不對：每個人每次跑測試都去敲第三方站台，慢、吵、而且正是會招來限流的行
-為。所以照這個 repo 既有的慣例（`verify_browser.py` / `verify_quota_dialog.py`），
-把完整掃描做成一支**手動驗證入口**。
+Neither is a program-logic bug, both are **external-contract drift** -- no
+static analysis can see it, only actually hitting the endpoint once. The unit
+tests include two live checks (the two known-to-drift sites), but stuffing all
+dozen endpoints into `pytest` is wrong: everyone hammering third-party sites on
+every test run is slow, noisy, and exactly the behaviour that invites rate
+limiting. So, following this repo's existing convention (`verify_browser.py` /
+`verify_quota_dialog.py`), the full scan is a **manual verification entry
+point**.
 
-**設計上的幾條硬性條件：**
+**Some hard design constraints:**
 
-* **走 bot 真正在用的那條路。** 每個 JSON 端點都透過
-  `_external_apis._http_get_json` 發出，所以 User-Agent、`api_contact`、逾時、
-  例外處理全部跟正式執行一模一樣。自己另外寫一份 HTTP 呼叫就驗不到今天這兩個
-  bug——它們**就是**出在標頭上。
-* **唯讀、無副作用。** 只發 GET（動畫資料庫是 GraphQL，只收 POST，所以送一個最小
-  的唯讀查詢）。不寫任何檔案、不碰正式登入態、不需要憑證。
-* **端點清單是這支的資料，不是註解。** `test_external_apis.py` 會比對這份清單與
-  `discord_bot.py` 裡實際出現的網址，漏登記就紅——否則下次有人加一個新端點，這支
-  掃描會安靜地漏掉它，而那正是我們要防的失敗模式。
-* **診斷要能直接行動，而且不准亂猜。** 403 不只印狀態碼。但順序是「上游自己說了
-  什麼」優先、猜測其次——2026-09-07 實測到動畫資料庫回 403 的原因寫在回應主體裡
-  （上游自行停用服務），跟 UA 無關，而當時的診斷把它報成「User-Agent 問題」並要人
-  去設 `api_contact`。**會誤報的驗證工具跟會狼來了的守門下場一樣：沒有人再看它。**
+* **Walk the path the bot actually uses.** Every JSON endpoint goes out through
+  `_external_apis._http_get_json`, so User-Agent, `api_contact`, timeout, and
+  exception handling are all identical to production. Writing your own HTTP call
+  would not verify either of today's bugs -- they **were** in the headers.
+* **Read-only, no side effects.** GET only (the anime database is GraphQL,
+  POST-only, so it gets a minimal read-only query). Writes no files, does not
+  touch the production login state, needs no credentials.
+* **The endpoint list is this script's data, not a comment.**
+  `test_external_apis.py` reconciles this list against the URLs that actually
+  appear in `discord_bot.py`, and goes red on an unregistered one -- otherwise
+  the next time someone adds an endpoint, this scan silently misses it, which is
+  exactly the failure mode we are guarding against.
+* **Diagnostics must be directly actionable, and must never guess.** A 403 does
+  not just print a status code. But the order is "what the upstream itself said"
+  first, guess second -- on 2026-09-07 the anime database returned 403 for a
+  reason written in the response body (upstream disabled the service itself),
+  unrelated to the UA, and the diagnosis at the time reported it as a
+  "User-Agent problem" and told the user to set `api_contact`. **A verifier that
+  misreports ends up like a gatekeeper who cries wolf: nobody looks at it any
+  more.**
 
-**結束碼三分**，跟 `verify_browser.py` 同一套語意：`0`＝選到的每一項都驗過而且正常；
-`1`＝有站方真的拒絕（4xx/5xx 之類的 `FAIL`）；`3`＝沒有 FAIL，但有端點**沒驗到**
-（`UNREACHABLE` 連不上，或 `SKIP` 缺前置條件）。離線時整支會是一片 `UNREACHABLE`，
-那不算失敗（所以不是 1），但也**不得回報成功**：2026-09-20 以前這種情況是 exit 0，
-只看結束碼的呼叫端（自走迴圈、排程）會把「一項都沒驗到」讀成「全部正常」。用 3 不用
-2，是因為 argparse 打錯參數時自己用 2。
+**Three-way exit code**, same semantics as `verify_browser.py`: `0` = every
+selected item was verified and healthy; `1` = a site really refused (a `FAIL`
+like 4xx/5xx); `3` = no FAIL, but some endpoint was **not verified**
+(`UNREACHABLE` cannot connect, or `SKIP` missing a precondition). Offline, the
+whole run is a sea of `UNREACHABLE`, which is not a failure (so not 1), but must
+**not be reported as success** either: before 2026-09-20 this case was exit 0,
+and a caller that only reads the exit code (self-driving loops, schedulers) would
+read "verified nothing" as "all fine". 3 not 2, because argparse uses 2 itself on
+a bad argument.
 
-**`SKIP` 跟 `UNREACHABLE` 同一邊——這一格是同一天稍晚才補上的。** 三分剛做好時
-`SKIP` 算 0，寫下的理由是「刻意跳過的不算沒驗到」；但這支裡根本沒有「刻意跳過」的
-東西：唯二兩個 `SKIP` 都出自 CDN 那一筆拿不到樣本圖（上游 API 沒回，或回來的 post
-沒有圖片網址），意思正是**沒驗到**。實測 `--only cdn`（`cdn` 自成一組，選它不會連帶
-選到圖庫 API）在拿不到樣本時印的是「1 ok, 0 failed, 0 unreachable」、exit 0——一項都
-沒驗到，而結束碼說全部正常，正是三分要消滅的那個形狀。`verify_browser.py` 的 `SKIP`
-本來就是 exit 3；兩支既然宣稱同一套語意，就不該在這一格分岔。
+**`SKIP` is on the same side as `UNREACHABLE` -- this cell was added later the
+same day.** When the three-way split was first built, `SKIP` counted as 0, with
+the stated reason "a deliberate skip is not the same as unverified"; but there is
+nothing "deliberately skipped" in this script: the only two `SKIP`s both come
+from the CDN entry failing to get a sample image (the upstream API did not
+answer, or the post that came back had no image URL), which means exactly **not
+verified**. Measured `--only cdn` (`cdn` is its own group, selecting it does not
+also select the image-board APIs) with no sample printed "1 ok, 0 failed, 0
+unreachable", exit 0 -- verified nothing, while the exit code says all fine,
+exactly the shape the three-way split exists to kill. `verify_browser.py`'s
+`SKIP` is exit 3; since the two claim the same semantics, they should not diverge
+on this cell.
 """
 from __future__ import annotations
 
@@ -66,28 +88,29 @@ import _external_apis as ex  # noqa: E402
 
 
 def _fresh_probe_word() -> str:
-    """每次執行都不一樣、不可能是真字的查詢字。見 `_ENDPOINTS` 字典那一筆的註解。"""
+    """A query word that is different every run and could not be a real word. See the comment on that entry in the `_ENDPOINTS` dict."""
     return "zzverify" + secrets.token_hex(4)
 
 
 _DICT_PROBE_WORD = _fresh_probe_word()
 
 # --------------------------------------------------------------------------
-# 端點清單
+# Endpoint list
 # --------------------------------------------------------------------------
-# 每一筆：(群組, 說明, 方法, 網址, params, 額外標頭)
-# 群組名給 `--only` 用。網址要跟 `discord_bot.py` / `_external_apis.py` 裡的字面值
-# 對得起來——守門測試會比對，漏登記就紅。
+# Each entry: (group, description, method, URL, params, extra headers)
+# The group name is for `--only`. The URL must match the literal in
+# `discord_bot.py` / `_external_apis.py` -- the guard test reconciles them, and
+# an unregistered one goes red.
 _ENDPOINTS: list[dict] = [
-    {"group": "danbooru", "what": "圖庫 posts（隨機圖／grid／latest 都走這條）",
+    {"group": "danbooru", "what": "image-board posts (random image / grid / latest all go through this)",
      "url": ex.DANBOORU_API,
      "params": {"tags": "rossi_(arknights)", "limit": 1}},
-    {"group": "danbooru", "what": "圖庫 tags（模糊 tag 解析器）",
+    {"group": "danbooru", "what": "image-board tags (the fuzzy tag resolver)",
      "url": ex.DANBOORU_TAGS_API, "params": {"search[name]": "yuri", "limit": 1}},
-    {"group": "danbooru", "what": "圖庫 post 計數",
+    {"group": "danbooru", "what": "image-board post count",
      "url": "https://danbooru.donmai.us/counts/posts.json",
      "params": {"tags": "yuri"}},
-    {"group": "danbooru", "what": "圖庫 wiki 條目",
+    {"group": "danbooru", "what": "image-board wiki entry",
      "url": "https://danbooru.donmai.us/wiki_pages/yuri.json", "params": None},
     {"group": "e621", "what": "e621 posts",
      "url": ex._E621_API, "params": {"tags": "canine", "limit": 1},
@@ -100,127 +123,153 @@ _ENDPOINTS: list[dict] = [
      "params": {"page": "dapi", "s": "post", "q": "index", "json": 1,
                 "tags": "sort:random", "limit": 1},
      "headers": {"User-Agent": ex._BROWSER_UA}},
-    {"group": "wiki", "what": "百科摘要（需要 UA 裡有聯絡方式）",
+    {"group": "wiki", "what": "encyclopedia summary (needs a contact in the UA)",
      "url": "https://en.wikipedia.org/api/rest_v1/page/summary/"
             "Python_(programming_language)", "params": None},
-    # 字典這一筆**每次查一個不存在、每次都不同的字，健康的原站回 404**。2026-09-19 實測：
-    # 原站連不上時，前面的 CDN 會對「查過的字」回幾十天前的過期快取（200，約 20 秒後），
-    # 只有沒快取過的字才會露出 522。舊寫法固定查 `serendipity`，把逾時對齊 bot 之後就會
-    # 在服務其實壞著的時候報 ok。每次換一個字，請求就一定得打到原站。
-    # `timeout` 是 bot 那一側這個呼叫**自己**用的逾時（`bot_timeout` 是那個常數的名字），
-    # 兩者由 `test_external_apis.test_a_per_call_timeout_in_the_bot_is_mirrored_here` 對帳。
-    {"group": "dict", "what": "英文字典（查一個不存在的字，健康的原站回 404）",
+    # This dict entry **queries a nonexistent, different word every run, and a
+    # healthy origin returns 404**. Measured 2026-09-19: when the origin is
+    # unreachable, the fronting CDN returns a weeks-old stale cache (200, after
+    # ~20s) for "words already queried"; only a never-cached word exposes the
+    # 522. The old code fixed the word to `serendipity`, so once the timeout was
+    # aligned to the bot it would report ok while the service was actually
+    # broken. A new word each time forces the request all the way to the origin.
+    # `timeout` is the timeout the bot's own call uses for this (`bot_timeout` is
+    # the name of that constant), reconciled by
+    # `test_external_apis.test_a_per_call_timeout_in_the_bot_is_mirrored_here`.
+    {"group": "dict", "what": "English dictionary (query a nonexistent word; a healthy origin returns 404)",
      "url": "https://api.dictionaryapi.dev/api/v2/entries/en/" + _DICT_PROBE_WORD,
      "params": None, "ok_statuses": (404,),
      "timeout": 30.0, "bot_timeout": "DICT_TIMEOUT_SEC"},
-    {"group": "xkcd", "what": "xkcd 最新一則",
+    {"group": "xkcd", "what": "latest xkcd",
      "url": "https://xkcd.com/info.0.json", "params": None},
-    {"group": "quote", "what": "名言",
+    {"group": "quote", "what": "quotation",
      "url": "https://zenquotes.io/api/random", "params": None},
-    {"group": "fact", "what": "冷知識",
+    {"group": "fact", "what": "trivia",
      "url": "https://uselessfacts.jsph.pl/random.json?language=en",
      "params": None},
-    {"group": "joke", "what": "笑話",
+    {"group": "joke", "what": "joke",
      "url": "https://icanhazdadjoke.com/", "params": None,
      "headers": {"Accept": "application/json"}},
-    {"group": "dog", "what": "狗圖",
+    {"group": "dog", "what": "dog image",
      "url": "https://dog.ceo/api/breeds/image/random", "params": None},
-    {"group": "crypto", "what": "幣種搜尋",
+    {"group": "crypto", "what": "coin search",
      "url": "https://api.coingecko.com/api/v3/search", "params": {"query": "btc"}},
-    {"group": "crypto", "what": "幣價",
+    {"group": "crypto", "what": "coin price",
      "url": "https://api.coingecko.com/api/v3/simple/price",
      "params": {"ids": "bitcoin", "vs_currencies": "usd"}},
-    {"group": "github", "what": "版本庫查詢",
+    {"group": "github", "what": "repository lookup",
      "url": "https://api.github.com/repos/python/cpython", "params": None},
-    # 以下不是 JSON API，只驗「連得到、回得出東西」。
+    # Below are not JSON APIs; only "can we reach it, does it return something"
+    # is verified.
     #
-    # `embed_only` 的三筆特別說明：bot **自己不抓**它們，只是把網址貼進訊息／embed，
-    # 由對話平台自己去取圖。所以原始碼裡沒有任何抓取呼叫，靜態掃描也看不到它們——
-    # 但站台掛掉的症狀對使用者是一樣的（一張破圖），而且更難查，因為連我們的 log
-    # 都不會有一行。所以它們留在這份掃描裡，只是不參與「原始碼有抓才准列」的比對。
-    {"group": "cat", "what": "貓圖（貼網址，平台自己取）", "raw": True,
+    # The three `embed_only` entries need special note: the bot **does not fetch
+    # them itself**, it just pastes the URL into a message / embed and lets the
+    # chat platform fetch the image. So there is no fetch call in the source, and
+    # a static scan cannot see them -- but the symptom of a site being down is
+    # the same to the user (a broken image), and harder to investigate because
+    # there is not even a line in our log. So they stay in this scan, they just
+    # do not take part in the "only listed if the source fetches it" comparison.
+    {"group": "cat", "what": "cat image (URL pasted, platform fetches it)", "raw": True,
      "embed_only": True,
      "url": "https://cataas.com/cat?ts=1", "params": None},
-    {"group": "color", "what": "純色圖（embed，平台自己取）", "raw": True,
+    {"group": "color", "what": "solid-color image (embed, platform fetches it)", "raw": True,
      "embed_only": True,
      "url": "https://singlecolorimage.com/get/ff0000/200x200", "params": None},
-    {"group": "qr", "what": "QR 產生器（embed，平台自己取）", "raw": True,
+    {"group": "qr", "what": "QR generator (embed, platform fetches it)", "raw": True,
      "embed_only": True,
      "url": "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=hi",
      "params": None},
-    {"group": "iqdb", "what": "反查圖（HTML，需要瀏覽器風格 UA）", "raw": True,
+    {"group": "iqdb", "what": "reverse image search (HTML, needs a browser-style UA)", "raw": True,
      "url": "https://iqdb.org/", "params": None,
      "headers": {"User-Agent": ex._BROWSER_UA},
      "timeout": 20.0, "bot_timeout": "IQDB_TIMEOUT_SEC"},
-    {"group": "anime", "what": "動畫資料庫（GraphQL，只收 POST）",
+    {"group": "anime", "what": "anime database (GraphQL, POST only)",
      "url": "https://graphql.anilist.co", "params": None, "method": "POST",
      "json_body": {"query": "query{Media(search:\"Frieren\",type:ANIME)"
                             "{id title{romaji}}}"},
      "timeout": 15.0, "bot_timeout": "ANIME_TIMEOUT_SEC"},
-    {"group": "cdn", "what": "圖庫的圖片 CDN（`--grid` 下載走這條）",
+    {"group": "cdn", "what": "the image board's image CDN (`--grid` download goes through this)",
      "raw": True, "cdn": True, "url": None, "params": None,
      "timeout": 30.0, "bot_timeout": "GRID_DOWNLOAD_TIMEOUT_SEC"},
 ]
 
 _GROUPS = sorted({e["group"] for e in _ENDPOINTS})
 
-# `_check_raw`／`_check_post` 在那一筆**沒有** `timeout` 時用的逾時。會用到它的只有
-# `embed_only` 的三筆（貓圖、純色圖、QR）：那些網址是**對話平台自己去取**的，bot 這一側
-# 根本沒有發出請求，所以沒有「bot 的逾時」可以照抄——這裡只是給掃描一個有限的上限。
-# bot 自己會抓的非 JSON 端點一律帶 `timeout`／`bot_timeout`（由
-# `test_external_apis.test_a_per_call_timeout_in_the_bot_is_mirrored_here` 要求），
-# 所以這個值不會套到任何 bot 真的在打的端點上。
+# The timeout `_check_raw` / `_check_post` use when an entry has **no** `timeout`.
+# The only entries that reach it are the three `embed_only` ones (cat, color,
+# QR): those URLs are fetched **by the chat platform itself**, the bot side never
+# issues a request, so there is no "bot timeout" to copy -- this is just a finite
+# cap for the scan. Non-JSON endpoints the bot does fetch always carry
+# `timeout` / `bot_timeout` (required by
+# `test_external_apis.test_a_per_call_timeout_in_the_bot_is_mirrored_here`), so
+# this value never applies to any endpoint the bot really hits.
 _EMBED_ONLY_TIMEOUT_SEC = 20.0
 
-# `_error_body` 那一次「已經失敗之後再打一次、只為了撈上游說明」的逾時。它不決定任何
-# 判定（判定在第一次請求就定了），只影響能不能多印一句原因，所以不跟 bot 對帳；
-# 有名字是為了讓「驗證腳本裡沒有寫死的逾時數字」這條守門成立。
+# The timeout for `_error_body`'s "hit it once more after already failing, only
+# to grab the upstream's explanation" request. It decides no verdict (the verdict
+# was fixed by the first request), it only affects whether one more reason line
+# can be printed, so it is not reconciled against the bot; it has a name so the
+# "no hardcoded timeout numbers in the verifier" guard holds.
 _ERROR_BODY_TIMEOUT_SEC = ex._HTTP_TIMEOUT_SEC
 
 
 def _unreachable(timeout: float, error: Exception | None = None
                  ) -> tuple[str, str]:
-    """「沒有回應」的統一說法。**一定要把逾時上限印出來。**
+    """The one phrasing for "no response". **Always print the timeout cap.**
 
-    「連不上」與「比我們的逾時慢」是兩個完全不同的問題，而原本 `_check_json` 那一句
-    （「連不上（離線？逾時？）」）把讀的人指向網路故障。2026-09-08 實測 `dict` 這一
-    筆就是後者：端點回的是 **HTTP 200，只是要花約 20 秒**，而預設逾時是 15 秒——於是
-    它每次都失敗，而 log 說它「連不上」。把逾時值印出來，讓人可以直接拿去比。
+    "Cannot connect" and "slower than our timeout" are two completely different
+    problems, and the original `_check_json` line ("cannot connect (offline?
+    timeout?)") pointed the reader at a network fault. Measured 2026-09-08 the
+    `dict` entry was the latter: the endpoint returned **HTTP 200, it just took
+    ~20 seconds**, while the default timeout was 15 -- so it failed every time,
+    and the log said it "cannot connect". Print the timeout value so it can be
+    compared directly.
 
-    **三支檢查函式共用這一份，是因為原本只有一支學到這件事。** `_check_raw` 與
-    `_check_post` 在 2026-09-20 以前回的是光禿禿一個 `TimeoutError`——同一個誤導，
-    而它們那兩筆的逾時（iqdb 20 秒、CDN 30 秒）恰恰是最可能「活著但比上限慢」的。
-    有例外物件時連名字一起報：連線根本沒成立（DNS／被擋）跟等不到回應要分得開。
+    **The three check functions share this one because originally only one had
+    learned it.** Before 2026-09-20 `_check_raw` and `_check_post` returned a
+    bare `TimeoutError` -- the same misdirection, and their two entries' timeouts
+    (iqdb 20s, CDN 30s) are exactly the ones most likely to be "alive but slower
+    than the cap". When there is an exception object, report its name too:
+    "the connection never even opened" (DNS / blocked) must be told apart from
+    "no reply arrived".
     """
     if error is not None and not isinstance(error, TimeoutError):
         return "UNREACHABLE", (
-            f"{type(error).__name__}（逾時上限 {timeout:g} 秒）——連線本身沒有成立，"
-            "多半是離線／DNS／被擋，不是對方回得慢。")
-    named = f"{type(error).__name__}：" if error is not None else ""
+            f"{type(error).__name__} (timeout cap {timeout:g}s) -- the "
+            "connection itself never opened, most likely offline / DNS / "
+            "blocked, not the other end replying slowly.")
+    named = f"{type(error).__name__}: " if error is not None else ""
     return "UNREACHABLE", (
-        f"{named}沒有回應（逾時上限 {timeout:g} 秒）。兩種成因要分開查："
-        "**真的連不上**（離線／DNS／被擋），或是**端點活著但比這個上限慢**。"
-        "分辨法：用瀏覽器或 curl 打同一個網址並計時——回得出 200 就是後者，"
-        "那要修的是 bot 那一側該呼叫的逾時，不是網路。")
+        f"{named}no response (timeout cap {timeout:g}s). Two causes to check "
+        "separately: **truly unreachable** (offline / DNS / blocked), or "
+        "**the endpoint is alive but slower than this cap**. To tell them "
+        "apart: hit the same URL with a browser or curl and time it -- a 200 "
+        "means the latter, and then the fix is the timeout of that call on the "
+        "bot side, not the network.")
 
 
 def _expected_status(status: int) -> tuple[str, str]:
-    """那一筆自己宣告「健康時就是回這個碼」的非 200。三支共用同一句。"""
-    return "OK", f"HTTP {status}（這個端點健康時就是這樣回）"
+    """A non-200 that the entry itself declares "is what a healthy origin returns". Shared by all three checks."""
+    return "OK", f"HTTP {status} (this is what this endpoint returns when healthy)"
 
 
 async def _check_json(entry: dict) -> tuple[str, str]:
-    """走 bot 真正在用的那條路。回 (verdict, detail)。
+    """Walk the path the bot actually uses. Returns (verdict, detail).
 
-    **逾時一律等於 bot 那一側同一個呼叫的逾時，不准比它寬。** 這支的價值全在「跟
-    bot 用同一條路、同一個逾時」——只要在這裡把逾時放寬，這支就會在 bot 明明壞著的
-    時候報 OK，那比沒有這支還糟。端點慢到超過 `_http_get_json` 的預設，正確的處理是
-    **去修 bot 那一側的呼叫**（給那個呼叫一個夠長的逾時），然後在這裡照抄那個值。
-    2026-09-08 bot 的字典呼叫放寬到 `DICT_TIMEOUT_SEC` 之後，這支一直用 15 秒，直到
-    2026-09-19 才對齊——同一個形狀，反方向：比 bot **窄**的逾時會在 bot 好好的時候報
-    連不上。所以現在兩邊由測試對帳，而不是靠人記得。
+    **The timeout is always equal to the bot's timeout for the same call, never
+    looser.** This script's whole value is "same path and same timeout as the
+    bot" -- loosen the timeout here and this script reports OK while the bot is
+    plainly broken, which is worse than not having it. When an endpoint is slower
+    than `_http_get_json`'s default, the correct fix is **to fix the call on the
+    bot side** (give that call a long enough timeout), then copy that value here.
+    After the bot's dictionary call was loosened to `DICT_TIMEOUT_SEC` on
+    2026-09-08, this script stayed at 15s until it was aligned on 2026-09-19 --
+    the same shape in reverse: a timeout **narrower** than the bot reports
+    unreachable while the bot is fine. So the two sides are now reconciled by a
+    test, rather than relying on someone remembering.
 
-    `ok_statuses` 是「這個端點健康時本來就會回的非 200」（字典查不存在的字回 404）。
+    `ok_statuses` are "the non-200 an endpoint returns when healthy" (the
+    dictionary returns 404 for a nonexistent word).
     """
     timeout = entry.get("timeout", ex._HTTP_TIMEOUT_SEC)
     ok_statuses = tuple(entry.get("ok_statuses", ()))
@@ -237,33 +286,36 @@ async def _check_json(entry: dict) -> tuple[str, str]:
                                  headers=entry.get("headers"))
         return "FAIL", f"HTTP {status}{_diagnose(status, body=body)}"
     if data is None:
-        return "FAIL", "HTTP 200 但回應不是 JSON"
+        return "FAIL", "HTTP 200 but the response is not JSON"
     size = len(data) if isinstance(data, (list, dict)) else "?"
     return "OK", f"HTTP 200, {type(data).__name__}[{size}]"
 
 
 async def _check_raw(entry: dict) -> tuple[str, str]:
-    """非 JSON 的端點：只確認連得到、狀態碼正常、回得出內容型別。"""
+    """A non-JSON endpoint: only confirm it is reachable, the status code is fine, and it returns a content type."""
     import aiohttp
 
     url = entry["url"]
     if entry.get("cdn"):
-        # CDN 沒有固定網址可以打——先跟 API 要一張現有的圖再抓它。這樣驗到的才是
-        # 真正的下載路徑（`--grid` 就是這樣做的）。
+        # The CDN has no fixed URL to hit -- first ask the API for an existing
+        # image, then fetch it. This verifies the real download path (which is
+        # what `--grid` does).
         post = await ex._fetch_danbooru_post("rating:general")
         if not post:
-            return "SKIP", "拿不到樣本 post（上游 API 已經是 FAIL 了）"
+            return "SKIP", "cannot get a sample post (the upstream API is already a FAIL)"
         url = (post.get("large_file_url") or post.get("file_url")
                or post.get("preview_file_url"))
         if not url:
-            return "SKIP", "樣本 post 沒有圖片網址"
+            return "SKIP", "the sample post has no image URL"
     headers = dict(entry.get("headers") or {})
     headers.setdefault("User-Agent", ex._user_agent())
-    # 逾時照抄 bot 那一側（`timeout`／`bot_timeout` 對帳過）；沒有的只有 embed_only。
+    # Copy the timeout from the bot side (`timeout` / `bot_timeout` reconciled);
+    # only embed_only entries have none.
     timeout = entry.get("timeout", _EMBED_ONLY_TIMEOUT_SEC)
-    # `ok_statuses` 三支都認得。它原本只有 `_check_json` 看——一個**宣告了但沒有人
-    # 讀**的鍵沒有任何症狀（跟 `_OWNER_ONLY_SLASH` 那個過期字串同一個形狀），而它
-    # 失敗的方向是狼來了：那一筆會永遠報 FAIL。
+    # `ok_statuses` is recognised by all three checks. Originally only
+    # `_check_json` read it -- a key that is **declared but nobody reads** has no
+    # symptom (same shape as that stale `_OWNER_ONLY_SLASH` string), and its
+    # failure direction is crying wolf: that entry would forever report FAIL.
     ok_statuses = tuple(entry.get("ok_statuses", ()))
     try:
         async with aiohttp.ClientSession(
@@ -285,8 +337,9 @@ async def _check_post(entry: dict) -> tuple[str, str]:
 
     headers = {"User-Agent": ex._user_agent()}
     headers.update(entry.get("headers") or {})
-    # 同 `_check_raw`：逾時照抄 bot 那一側。2026-09-19 前這裡寫死 20 秒，而 bot 的
-    # 那次 POST 是 15 秒——驗證腳本比 bot 寬，會在 bot 逾時的時候報 ok。
+    # Same as `_check_raw`: copy the timeout from the bot side. Before 2026-09-19
+    # this hardcoded 20s, while the bot's POST was 15s -- the verifier looser
+    # than the bot, reporting ok when the bot would time out.
     timeout = entry.get("timeout", _EMBED_ONLY_TIMEOUT_SEC)
     ok_statuses = tuple(entry.get("ok_statuses", ()))
     try:
@@ -302,23 +355,25 @@ async def _check_post(entry: dict) -> tuple[str, str]:
                     return "FAIL", f"HTTP {resp.status}{why}"
                 body = await resp.json()
                 if not isinstance(body, dict) or "data" not in body:
-                    return "FAIL", "HTTP 200 但回應形狀不對"
+                    return "FAIL", "HTTP 200 but the response shape is wrong"
                 return "OK", "HTTP 200, data"
     except Exception as error:  # pylint: disable=broad-except
         return _unreachable(timeout, error)
 
 
-# 診斷用的主體讀取上限。失敗頁通常只有幾百位元組，但主體是第三方送來的，不設限就
-# 等於「錯誤處理路徑上有一個沒有上限的讀取」。
+# Read cap for the diagnostic body. A failure page is usually only a few hundred
+# bytes, but the body is sent by a third party, and no cap means "there is an
+# unbounded read on the error-handling path".
 _DIAG_BODY_CAP = 64 * 1024
 
 
 async def _read_body_text(resp) -> str:
-    """把失敗回應的主體讀成文字。讀不到就回空字串——診斷不該讓驗證本身炸掉。
+    """Read a failure response's body as text. Return an empty string if it cannot be read -- a diagnostic must not blow up the verification itself.
 
-    走 `read_capped_body` 而不是 `resp.text()`：後者無上限，而且 `read(n)` 單次呼
-    叫會截斷 chunked 回應（那正是 2026-09-07 修掉的缺陷）。編碼明寫、`errors=
-    "replace"`——這些位元組不是我們控制的內容（CLAUDE.md 硬規則）。
+    Goes through `read_capped_body` rather than `resp.text()`: the latter is
+    unbounded, and a single `read(n)` call truncates a chunked response (the very
+    defect fixed 2026-09-07). Encoding explicit, `errors="replace"` -- these
+    bytes are not content we control (CLAUDE.md hard rule).
     """
     try:
         raw = await ex.read_capped_body(resp.content, _DIAG_BODY_CAP)
@@ -330,11 +385,12 @@ async def _read_body_text(resp) -> str:
 
 
 async def _error_body(url, *, params=None, headers=None) -> str:
-    """失敗之後再打一次，只為了把上游的說明撈出來。唯讀，且只在已經失敗時發生。
+    """Hit it once more after failing, only to extract the upstream's explanation. Read-only, and only happens after already failing.
 
-    `_http_get_json` 只回 `(status, data)`，拿不到主體——而 4xx 的原因十之八九就
-    寫在主體裡。多打這一次的代價只有在**已經壞掉**的時候才付得出去，換到的是不用
-    再靠猜。
+    `_http_get_json` returns only `(status, data)` and cannot hand back the
+    body -- and nine times out of ten a 4xx's reason is written in the body. The
+    cost of one extra request is only paid when things are **already broken**,
+    and buys not having to guess.
     """
     import aiohttp
 
@@ -351,12 +407,14 @@ async def _error_body(url, *, params=None, headers=None) -> str:
 
 
 def _upstream_message(body: str | None, *, limit: int = 240) -> str:
-    """從回應主體裡撈出**上游自己寫的**那句說明；撈不到回空字串。
+    """Extract the **upstream's own** explanation from the response body; return an empty string if none.
 
-    只讀 JSON。HTML 的失敗頁（CDN 的挑戰頁那種）撈不出東西，那時候退回下面的猜測
-    才是對的——挑戰頁確實就是 UA／防護的問題。
+    Reads JSON only. An HTML failure page (a CDN challenge page) yields nothing,
+    and then falling back to the guess below is the right thing -- a challenge
+    page really is a UA / protection problem.
 
-    主體是第三方位元組，所以一律壓成單行並截短，不要讓一整頁噴進主控台。
+    The body is third-party bytes, so always squash to a single line and
+    truncate; do not let a whole page spew into the console.
     """
     if not body:
         return ""
@@ -382,51 +440,65 @@ def _upstream_message(body: str | None, *, limit: int = 240) -> str:
 
 def _diagnose(status: int, *, body: str | None = None,
               method: str = "GET") -> str:
-    """把狀態碼翻成「接下來該做什麼」。403 光看碼是查不出原因的。
+    """Translate a status code into "what to do next". A 403 is not diagnosable from the code alone.
 
-    **兩種 403 要分開，否則這支工具會把人帶去錯的方向。** 2026-09-07 的反例：動畫
-    資料庫那一筆回 403，而原因就寫在回應主體裡——上游自己把 API 停用了
-    （"temporarily disabled due to severe stability issues"）。跟 UA 一點關係都沒
-    有：實測無 UA、瀏覽器 UA、我們的 UA，三者都是 403。可是當時這支函式無條件套
-    「這一類幾乎都是 User-Agent 的問題」＋「`api_contact` 沒設定」，於是一個「上游
-    停用中」被報成「你的標頭有問題」，而那個方向再怎麼查都查不出來。
+    **Two kinds of 403 must be told apart, or this tool sends people the wrong
+    way.** The 2026-09-07 counterexample: the anime database entry returned 403,
+    and the reason was right there in the response body -- upstream had disabled
+    the API itself ("temporarily disabled due to severe stability issues"). It
+    had nothing to do with the UA: no UA, browser UA, and our UA were all
+    measured returning 403. But the function at the time unconditionally applied
+    "this kind is almost always a User-Agent problem" plus "`api_contact` not
+    set", so an "upstream is disabled" got reported as "your headers are wrong",
+    a direction no amount of investigation could resolve.
 
-    所以順序是：
+    So the order is:
 
-    1. **上游自己說了什麼**優先——那是事實，不是猜測；
-    2. 猜測只留給「走共用 UA 的那條 GET 路徑」。非 GET 的端點標頭本來就跟
-       `_http_get_json` 不同（GraphQL 那一筆只收 POST），對它套 UA 那套說法沒有
-       任何根據。
+    1. **What the upstream itself said** first -- that is fact, not a guess;
+    2. A guess is only for "the shared-UA GET path". A non-GET endpoint's headers
+       differ from `_http_get_json`'s anyway (the GraphQL entry is POST-only), so
+       applying the UA story to it has no basis at all.
     """
     if not (500 <= status <= 599 or status in (401, 403, 429)):
         return ""
-    # 「上游自己說了什麼」優先，**5xx 也不例外——這一格 2026-09-20 才補**。原本 5xx
-    # 直接回下面那句猜測，於是一個帶著 JSON 說明的 503（「維護到某日」那種）會被這支
-    # 工具改寫成「52x 通常是前面的 CDN 連不到原站」，正好違反上面立的規矩：猜測蓋掉
-    # 事實。同一個形狀在 403 上已經害過一次（2026-09-07 動畫資料庫）。
+    # "What the upstream itself said" first, **5xx included -- this cell was
+    # added 2026-09-20**. Originally 5xx returned the guess below directly, so a
+    # 503 carrying a JSON explanation ("maintenance until X") would be rewritten
+    # by this tool into "52x usually means the fronting CDN cannot reach the
+    # origin", exactly violating the rule set above: the guess overwriting the
+    # fact. The same shape already hurt once on a 403 (2026-09-07 anime
+    # database).
     upstream = _upstream_message(body)
     if upstream:
-        return f"  ← 上游自己說：{upstream}"
+        return f"  <- upstream said: {upstream}"
     if 500 <= status <= 599:
-        # 2026-09-19 字典那一筆的 522：CDN 連不到原站。這一類跟我們的請求無關，
-        # 別讓人去查標頭或 `api_contact`——那兩個方向在這裡查不出任何東西。
-        return ("  ← 上游那一側出錯（52x 通常是前面的 CDN 連不到原站），不是我們的"
-                "請求有問題；等對方恢復，或考慮換來源")
+        # The dictionary entry's 522 on 2026-09-19: the CDN cannot reach the
+        # origin. This kind has nothing to do with our request, so do not send
+        # people to check the headers or `api_contact` -- neither direction
+        # turns up anything here.
+        return ("  <- the upstream side errored (52x usually means the fronting "
+                "CDN cannot reach the origin), not a problem with our request; "
+                "wait for them to recover, or consider another source")
     if method != "GET":
-        return ("  ← 非 GET 端點，標頭跟共用的 GET 路徑不同；先看回應主體怎麼說，"
-                "不要預設是 User-Agent")
-    hints = ["這一類幾乎都是 User-Agent 的問題，不是網址錯"]
+        return ("  <- a non-GET endpoint, its headers differ from the shared "
+                "GET path; read the response body first, do not assume it is "
+                "the User-Agent")
+    hints = ["this kind is almost always a User-Agent problem, not a wrong URL"]
     if not ex._configured_contact():
-        hints.append(f"`{ex._UA_CONTACT_KEY}` 目前沒設定——有站台（例如百科站）"
-                     "要求 UA 裡帶得到人的聯絡方式，只自報名稱不夠")
-    hints.append("不要改成假裝瀏覽器：實測過，那樣一樣被擋")
-    return "  ← " + "；".join(hints)
+        hints.append(f"`{ex._UA_CONTACT_KEY}` is not set -- some sites (e.g. the "
+                     "encyclopedia) require the UA to carry a reachable contact, "
+                     "and just naming yourself is not enough")
+    hints.append("do not pretend to be a browser: measured, that gets blocked too")
+    return "  <- " + "; ".join(hints)
 
 
-# 每一種判定在主控台上的樣子。抬成模組常數是為了**能被對帳**：判定字串散在三支檢查
-# 函式的 `return` 裡，多一種而忘了登記，`_run` 會在掃到一半時 KeyError；而更安靜的一
-# 半是 `_exit_code` ——沒被列進 `_UNVERIFIED_VERDICTS` 的新判定會自動算成「驗過而且
-# 正常」。兩邊都由 `test_external_apis` 從原始碼推出的判定集合反查。
+# What each verdict looks like on the console. Lifted to module constants so it
+# **can be reconciled**: the verdict strings are scattered across the three check
+# functions' `return`s, and adding one but forgetting to register it makes `_run`
+# KeyError mid-scan; the quieter half is `_exit_code` -- a new verdict not in
+# `_UNVERIFIED_VERDICTS` is automatically counted as "verified and healthy". Both
+# sides are reconciled by `test_external_apis` against the verdict set derived
+# from the source.
 _VERDICT_MARKS = {
     "OK": "  ok  ",
     "FAIL": " FAIL ",
@@ -461,15 +533,17 @@ _QUIET = False
 
 EXIT_OK = 0
 EXIT_FAIL = 1
-EXIT_UNVERIFIED = 3     # 見模組 docstring：沒有 FAIL，但有端點沒驗到
+EXIT_UNVERIFIED = 3     # see module docstring: no FAIL, but some endpoint not verified
 
-# 「沒驗到」的判定。見模組 docstring：`SKIP` 跟 `UNREACHABLE` 同一邊，因為這支裡
-# 沒有任何「刻意跳過」的端點——`SKIP` 的兩個來源都是「前置條件拿不到，所以沒驗」。
+# The "not verified" verdicts. See module docstring: `SKIP` is on the same side
+# as `UNREACHABLE`, because this script has no "deliberately skipped" endpoint --
+# both sources of `SKIP` are "a precondition could not be met, so nothing was
+# verified".
 _UNVERIFIED_VERDICTS = frozenset({"UNREACHABLE", "SKIP"})
 
 
 def _exit_code(results: list[dict]) -> int:
-    """三分結論。純函式：FAIL 優先，其次「有沒驗到的」，都沒有才是 0。"""
+    """The three-way conclusion. A pure function: FAIL first, then "any unverified", and only otherwise 0."""
     verdicts = {r["verdict"] for r in results}
     if "FAIL" in verdicts:
         return EXIT_FAIL
@@ -481,31 +555,33 @@ def _exit_code(results: list[dict]) -> int:
 def main(argv: list[str] | None = None) -> int:
     global _QUIET
     parser = argparse.ArgumentParser(
-        description="驗證 bot 用到的每一個外部 API 還活著。唯讀、無副作用。")
+        description="Verify every external API the bot uses is still alive. Read-only, no side effects.")
     parser.add_argument("--only", nargs="+", metavar="GROUP",
                         choices=_GROUPS,
-                        help=f"只驗這幾組（可選：{' '.join(_GROUPS)}）")
+                        help=f"only verify these groups (choices: {' '.join(_GROUPS)})")
     parser.add_argument("--json", action="store_true",
-                        help="輸出 JSON，給程式讀")
-    # `argv or []`：`None` 一律當成沒有旗標，不去讀 `sys.argv`（在 pytest 底下那是
-    # pytest 自己的命令列）。約定與守門見 `test_suite_safety.py`。
+                        help="output JSON, for a program to read")
+    # `argv or []`: `None` always means no flags, do not read `sys.argv` (under
+    # pytest that is pytest's own command line). Convention and guard in
+    # `test_suite_safety.py`.
     args = parser.parse_args(argv or [])
     _QUIET = args.json
 
     if not _QUIET:
         print(f"User-Agent: {ex._user_agent()}")
         if not ex._configured_contact():
-            print(f"（`{ex._UA_CONTACT_KEY}` 未設定——需要聯絡方式的站台會 403）")
+            print(f"(`{ex._UA_CONTACT_KEY}` is not set -- sites that need a contact will 403)")
         print()
 
     results = asyncio.run(_run(args.only))
     failed = [r for r in results if r["verdict"] == "FAIL"]
     unreachable = [r for r in results if r["verdict"] == "UNREACHABLE"]
     skipped = [r for r in results if r["verdict"] == "SKIP"]
-    # **「ok」是數出來的，不是減出來的。** 原本寫的是「總數 − failed −
-    # unreachable」，於是 `SKIP` 被算進 ok：`--only cdn` 拿不到樣本圖時印的是
-    # 「1 ok, 0 failed, 0 unreachable」。減法把每一種沒列到的判定都默默歸成好的，
-    # 而那正是這幾個數字唯一該講清楚的事。
+    # **"ok" is counted, not subtracted.** It originally read "total - failed -
+    # unreachable", so `SKIP` was counted into ok: `--only cdn` with no sample
+    # image printed "1 ok, 0 failed, 0 unreachable". Subtraction silently folds
+    # every unlisted verdict into the good ones, which is the one thing these
+    # numbers should make clear.
     ok = [r for r in results if r["verdict"] == "OK"]
 
     code = _exit_code(results)
@@ -519,12 +595,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{len(ok)} ok, {len(failed)} failed, "
               f"{len(unreachable)} unreachable, {len(skipped)} skipped")
         if unreachable and not failed:
-            print("（全部連不上通常代表沒有網路，不是站方拒絕）")
+            print("(everything unreachable usually means no network, not the site refusing)")
         for r in failed:
-            print(f"  FAIL  {r['group']:<10} {r['what']} — {r['detail']}")
+            print(f"  FAIL  {r['group']:<10} {r['what']} -- {r['detail']}")
         if code == EXIT_UNVERIFIED:
-            print(f"exit {EXIT_UNVERIFIED}：有端點沒驗到（連不上，或缺前置條件而"
-                  "跳過）——不是失敗，但也不能當成全部正常。晚點再跑一次。")
+            print(f"exit {EXIT_UNVERIFIED}: some endpoint was not verified "
+                  "(unreachable, or skipped for a missing precondition) -- not a "
+                  "failure, but cannot be taken as all-fine either. Try again "
+                  "later.")
     return code
 
 

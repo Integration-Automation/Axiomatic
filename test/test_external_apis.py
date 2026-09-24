@@ -1,22 +1,28 @@
-"""`_external_apis.py` 的守門測試。
+"""Guard tests for `_external_apis.py`.
 
-這個模組原本一支測試都沒有——366 行、六個對外站台的進入點、全部只在真的被使用者
-呼叫時才會執行，而失敗路徑一律是「回 None／回空 list」。於是 2026-08-30 發現時，
-**所有 Danbooru 功能已經整個壞掉**（HTTP 403），而 repo 裡沒有任何東西會紅。
+This module originally had not a single test -- 366 lines, six entry points to
+external sites, all of them running only when a user actually invokes them, with
+a failure path that is always "return None / return empty list". So when it was
+found on 2026-08-30, **all Danbooru features were completely broken** (HTTP 403),
+and nothing in the repo went red.
 
-壞掉的原因是 Danbooru 整站移到 Cloudflare 後面，開始拒絕沒有 `User-Agent` 的請求，
-而本專案的 Danbooru 呼叫剛好都沒帶——模組裡甚至有一行註解寫著「Danbooru accepts
-aiohttp's default」，那句話曾經是對的。
+The cause was that the whole Danbooru site moved behind Cloudflare and began
+refusing requests without a `User-Agent`, and this project's Danbooru calls all
+happened to carry none -- the module even had a comment reading "Danbooru accepts
+aiohttp's default", a sentence that was once true.
 
-所以這支檔案分成兩層：
+So this file has two layers:
 
-* **結構層**（不碰網路）：外送出口只能有一個、每個請求都一定帶 UA、UA 不得假裝成
-  瀏覽器。這一層擋的是「下次有人再繞過去」。
-* **實測層**（要網路，連不上就 skip）：真的打一次端點，確認我們現在的 UA 沒有被擋。
-  這一層擋的是「站方哪天又改規則」——那是靜態分析永遠看不到的。
+* **The structural layer** (no network): there may be only one outbound exit,
+  every request must carry a UA, and the UA must not pretend to be a browser.
+  This layer stops "someone bypassing it again next time".
+* **The live layer** (needs network, skips when unreachable): actually hit an
+  endpoint once to confirm our current UA is not being blocked. This layer stops
+  "the site changes its rules some day" -- which static analysis can never see.
 
-實測層刻意**只在被擋時紅、連不上時 skip**：沒網路的環境不該有紅字，但「連得上而且
-被拒絕」是真的壞了，必須吵。
+The live layer deliberately **only goes red when blocked, and skips when
+unreachable**: an offline environment should have no red, but "reachable and
+refused" really is broken and must be loud.
 """
 from __future__ import annotations
 
@@ -40,25 +46,32 @@ _BOT_SOURCE = _MODULE.parent / "discord_bot.py"
 
 
 # ---------------------------------------------------------------------------
-# 假的 aiohttp：記下每一個請求真正送出的標頭
+# Fake aiohttp: record the headers each request actually sends
 # ---------------------------------------------------------------------------
 
 class _FakeBody:
-    """`r.content` 的替身：一個**會記位置**的最小串流。
+    """A stand-in for `r.content`: a minimal stream that **tracks position**.
 
-    刻意回**位元組**而不是已解析的物件：正式程式碼從 2026-09-06 起是自己
-    `json.loads` 位元組（為了套用大小上限），所以替身如果還停在「`json()` 直接回
-    Python 物件」，就會測不到解析與上限那一段——那正是這個替身存在的意義。
+    Deliberately returns **bytes** rather than an already-parsed object: since
+    2026-09-06 the production code does its own `json.loads` on the bytes (to
+    apply the size cap), so a stand-in still stuck on "`json()` returns a Python
+    object directly" would not test the parse-and-cap step -- which is the whole
+    reason this stand-in exists.
 
-    **`self._pos` 是承重的，別把它當成整理。** 2026-09-07 之前這個類別沒有位置，
-    `read(n)` 每次都回 `self._raw[:n]`——也就是同一段位元組的無限自動販賣機，永遠
-    不會回 `b""`（EOF）。它之所以能長期是對的，只因為當時正式程式碼**剛好只呼叫
-    一次** `read()`；替身的正確性其實是被受測程式的一個實作細節撐著的。等到那行
-    改成迴圈讀到 EOF（它本來就該是），整組上限測試會集體變紅，而**受測程式是對
-    的、壞的是替身**——這種紅字最容易被誤讀成「新寫法有問題」而把修好的東西改回去。
+    **`self._pos` is load-bearing, do not mistake it for tidiness.** Before
+    2026-09-07 this class had no position, and `read(n)` returned `self._raw[:n]`
+    every time -- an infinite vending machine of the same bytes that never
+    returned `b""` (EOF). It was correct for a long time only because the
+    production code at the time **happened to call `read()` exactly once**; the
+    stand-in's correctness was actually propped up by an implementation detail of
+    the code under test. Once that line became a loop to EOF (as it should have
+    been), the whole set of cap tests would go red together, and **the code under
+    test is right, the stand-in is wrong** -- that kind of red is the easiest to
+    misread as "the new code has a problem" and to revert the fix.
 
-    一般化的判準：**替身要照著被模仿的那個東西的契約寫，不要照著目前呼叫端剛好會
-    怎麼用來寫。** 沒有 EOF 的串流不是串流。
+    The general principle: **a stand-in should follow the contract of the thing
+    it imitates, not how the current caller happens to use it.** A stream with no
+    EOF is not a stream.
     """
 
     def __init__(self, raw: bytes):
@@ -78,8 +91,9 @@ class _FakeResponse:
     def __init__(self, status, payload, *, content_length=None, raw=None):
         self.status = status
         self._payload = payload
-        # `raw` 讓測試直接指定位元組（測上限、測壞掉的 JSON）；沒給就把 payload
-        # 序列化成正常的 JSON，跟真的回應一樣。
+        # `raw` lets a test specify bytes directly (to test the cap, or broken
+        # JSON); if not given, serialise the payload into normal JSON like a real
+        # response.
         self._raw = (raw if raw is not None
                      else json.dumps(payload).encode("utf-8"))
         self.content_length = content_length
@@ -99,7 +113,7 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    """記錄用的 `ClientSession` 替身。`calls` 是類別層的，方便測試取用。"""
+    """A recording stand-in for `ClientSession`. `calls` is class-level for easy test access."""
 
     calls: list[dict] = []
     replies: list = []
@@ -133,10 +147,11 @@ class _FakeSession:
 
 @pytest.fixture
 def fake_http(monkeypatch):
-    """把 `_external_apis` 用的 `aiohttp.ClientSession` 換成記錄器。
+    """Replace the `aiohttp.ClientSession` used by `_external_apis` with a recorder.
 
-    換的是 `ex.aiohttp.ClientSession`，也就是模組真正會呼叫到的那一個——如果哪天
-    有人在本模組裡改用別的 HTTP 函式庫，這裡會整批壞掉，那正是我們要知道的事。
+    It replaces `ex.aiohttp.ClientSession`, the one the module actually calls --
+    so if someone ever switches this module to a different HTTP library, this all
+    breaks at once, which is exactly what we want to know.
     """
     _FakeSession.calls = []
     _FakeSession.replies = []
@@ -148,8 +163,9 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-# 每個對外抓取函式 → 一個「怎麼呼叫它」的 thunk。新增 fetcher 就加一行，
-# 下面所有的標頭／計數守門會自動涵蓋到它。
+# Each outbound fetch function -> one "how to call it" thunk. Add a fetcher by
+# adding a line, and all the header / counting guards below cover it
+# automatically.
 _FETCHERS = {
     "danbooru_post": lambda: ex._fetch_danbooru_post("tag"),
     "danbooru_bulk": lambda: ex._fetch_danbooru_posts_bulk("tag"),
@@ -165,21 +181,23 @@ _FETCHERS = {
 
 
 # ---------------------------------------------------------------------------
-# 結構層：外送出口只能有一個
+# Structural layer: there may be only one outbound exit
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 回應大小上限
+# Response size cap
 #
-# 圖片下載那條路早就有上限（`discord_bot.GRID_MAX_IMAGE_BYTES`），連理由都寫在註解
-# 裡：「這條路徑的位元組不是我們控制的內容」。JSON 這條走的是**同樣的來源、同樣的
-# 威脅**，卻一直沒有上限——`await r.json()` 會把整個回應吃進記憶體。
-# `ClientTimeout(total=…)` 擋不住：它管的是傳輸時間，不是大小，一個持續穩定送資料
-# 的巨大回應會在逾時之內就把行程的記憶體吃光。2026-09-06 補上。
+# The image-download path had a cap long ago (`discord_bot.GRID_MAX_IMAGE_BYTES`),
+# with the reasoning right in the comment: "the bytes on this path are not
+# content we control". The JSON path goes through **the same source, the same
+# threat**, yet had no cap for a long time -- `await r.json()` slurps the whole
+# response into memory. `ClientTimeout(total=...)` does not stop it: it governs
+# transfer time, not size, and a huge response that keeps streaming steadily will
+# exhaust the process's memory within the timeout. Added 2026-09-06.
 # ---------------------------------------------------------------------------
 
 class _SizedSession(_FakeSession):
-    """可以指定回應位元組與 `content_length` 的 session 替身。"""
+    """A session stand-in that can specify the response bytes and `content_length`."""
 
     raw: bytes = b"[]"
     declared = None
@@ -203,8 +221,9 @@ def sized_http(monkeypatch):
 
 
 def test_a_post_goes_through_the_same_exit_as_a_get(sized_http, monkeypatch):
-    """POST 與 GET 共用出口：同樣帶預設 User-Agent、同樣算一次呼叫、同樣有大小上限。
-    本體要真的以 JSON 送出去——只看回傳值的話，一個把本體丟掉的版本也會通過。"""
+    """POST shares the exit with GET: same default User-Agent, same one-call
+    count, same size cap. The body must really be sent as JSON -- looking only at
+    the return value, a version that throws the body away would also pass."""
     bodies: list = []
 
     class _Recording(sized_http):
@@ -233,10 +252,12 @@ def test_a_normal_response_still_parses(sized_http):
 
 
 def test_json_served_as_plain_text_still_parses(sized_http):
-    """原本靠 `ContentTypeError` → `r.text()` → `loads` 那條退路處理。
+    """Originally handled by the `ContentTypeError` -> `r.text()` -> `loads` fallback.
 
-    改成直接對位元組 `loads` 之後那條退路併掉了，但**行為必須一樣**——站方把 JSON
-    標成 `text/plain` 是常見的事，退化成解析失敗會讓整個功能安靜地回空。
+    After switching to `loads` on the bytes directly, that fallback was folded
+    in, but **the behaviour must be identical** -- sites labelling JSON as
+    `text/plain` is common, and degrading into a parse failure would make the
+    whole feature silently return empty.
     """
     sized_http.raw = b'{"ok": true}'
     status, data = _run(ex._http_get_json("https://example.invalid/x"))
@@ -244,34 +265,36 @@ def test_json_served_as_plain_text_still_parses(sized_http):
 
 
 def test_an_oversized_response_is_dropped(sized_http):
-    """超過上限就整份丟掉，不解析。
+    """Over the cap, drop the whole thing, do not parse.
 
-    斷言的是 `data is None`——不是「有沒有例外」。上限失效的症狀不是崩潰，
-    是記憶體被吃光，那在測試裡看不出來，所以只能從「有沒有拒收」這一側驗。
+    The assertion is `data is None` -- not "was there an exception". The symptom
+    of the cap failing is not a crash, it is memory being exhausted, which a test
+    cannot see, so it can only be verified from the "was it refused" side.
     """
     sized_http.raw = b"[" + b"0," * (ex._MAX_RESPONSE_BYTES // 2) + b"0]"
     assert len(sized_http.raw) > ex._MAX_RESPONSE_BYTES
     status, data = _run(ex._http_get_json("https://example.invalid/x"))
     assert status == 200
-    assert data is None, "超過上限的回應仍然被解析了"
+    assert data is None, "an over-cap response was still parsed"
 
 
 def test_a_declared_oversize_is_refused_before_reading(sized_http):
-    """`Content-Length` 就已經超標時，連讀都不要讀。
+    """When `Content-Length` alone is already over the cap, do not even read.
 
-    這一道是省下白讀好幾 MB；真正的防線是下面那個實際讀取的上限（標頭可以說謊）。
+    This one saves pointlessly reading several MB; the real defence is the
+    actual-read cap below (a header can lie).
     """
     sized_http.declared = ex._MAX_RESPONSE_BYTES + 1
-    sized_http.raw = b"[1]"          # 內容其實很小，但宣稱很大
+    sized_http.raw = b"[1]"          # content is actually tiny but declares huge
     status, data = _run(ex._http_get_json("https://example.invalid/x"))
     assert (status, data) == (200, None)
 
 
 def test_exactly_at_the_cap_is_still_accepted(sized_http):
-    """邊界：剛好等於上限要收，不是拒收。
+    """Boundary: exactly at the cap must be accepted, not refused.
 
-    `read(cap + 1)` 那個 +1 就是為了分辨「剛好」與「超過」；少了它，剛好到上限的
-    回應會被誤判成超標而丟掉。
+    The +1 in `read(cap + 1)` was there to tell "exactly" from "over"; without
+    it, a response exactly at the cap is misjudged as over and dropped.
     """
     payload = b"[" + b"1," * ((ex._MAX_RESPONSE_BYTES - 3) // 2) + b"1]"
     payload += b" " * (ex._MAX_RESPONSE_BYTES - len(payload))
@@ -279,28 +302,32 @@ def test_exactly_at_the_cap_is_still_accepted(sized_http):
     sized_http.raw = payload
     status, data = _run(ex._http_get_json("https://example.invalid/x"))
     assert status == 200
-    assert isinstance(data, list), "剛好等於上限的回應被誤判成超標"
+    assert isinstance(data, list), "a response exactly at the cap was misjudged as over"
 
 
 def test_one_bad_byte_does_not_throw_away_the_whole_response(sized_http):
-    """回應位元組不是我們控制的：一個壞位元組不該讓整份資料報廢。
+    """The response bytes are not ours: one bad byte should not scrap all the data.
 
-    這一支要驗的是 `errors="replace"` 真的套在這條路上，而**驗法有陷阱**：拿一段
-    「既不是合法 UTF-8、也不是合法 JSON」的位元組是驗不出來的——嚴格解碼會丟
-    `UnicodeDecodeError`、容錯解碼會丟 `JSONDecodeError`，兩者都被外層的
-    `except Exception` 接住、都回 `(-1, None)`，**觀察不到差別**。（變異測試當場
-    抓到這一點：改成嚴格解碼時，原本的寫法照樣是綠的。）
+    This test verifies that `errors="replace"` is really applied on this path,
+    and **the verification has a trap**: bytes that are "neither valid UTF-8 nor
+    valid JSON" cannot verify it -- strict decoding throws `UnicodeDecodeError`,
+    lenient decoding throws `JSONDecodeError`, and both are caught by the outer
+    `except Exception` and both return `(-1, None)`, so **the difference is not
+    observable**. (Mutation testing caught this on the spot: switched to strict
+    decoding, the original code was still green.)
 
-    所以這裡用的是「JSON 結構完好、只有字串值裡夾了一個壞位元組」——容錯解碼會把
-    它換成 U+FFFD 然後正常解析出資料，嚴格解碼則會整份丟掉。這也正是真實情況：
-    站方回的標籤名稱夾了一個編碼壞掉的字元，不該讓整個搜尋回空。
+    So this uses "JSON structure intact, only one bad byte embedded in a string
+    value" -- lenient decoding replaces it with U+FFFD and parses the data
+    normally, while strict decoding drops the whole thing. This is also exactly
+    the real situation: a tag name returned by the site with one encoding-broken
+    character should not make the whole search return empty.
     """
-    # \xe9 是 latin-1 的 é，在 UTF-8 裡是非法的孤立位元組。
+    # \xe9 is latin-1 é, an illegal lone byte in UTF-8.
     sized_http.raw = b'{"name": "caf\xe9", "id": 7}'
     status, data = _run(ex._http_get_json("https://example.invalid/x"))
     assert status == 200
     assert data is not None, (
-        "一個壞位元組讓整份回應被丟掉了——解碼應該用 errors='replace'")
+        "one bad byte threw away the whole response -- decode should use errors='replace'")
     assert data["id"] == 7
     assert data["name"].startswith("caf")
 
@@ -311,19 +338,22 @@ def test_the_cap_is_a_real_positive_number():
 
 
 # ---------------------------------------------------------------------------
-# 分塊送達（chunked）：`read(n)` 是 read-up-to，不是「讀滿 n」
+# Chunked delivery: `read(n)` is read-up-to, not "read a full n"
 #
-# 2026-09-07 實測到的活躍缺陷。上面那些上限測試**全部是綠的**，因為 `_FakeBody`
-# 一次就把整份主體交出來——於是 `read(n)` 在測試裡永遠讀得完，而真實世界不是這樣。
-# 這一段的替身刻意分多次交付，那才是 `aiohttp.StreamReader` 真正的行為。
+# An active defect measured 2026-09-07. The cap tests above were **all green**,
+# because `_FakeBody` hands over the whole body at once -- so `read(n)` always
+# finishes in the test, and the real world is not like that. The stand-in in this
+# section deliberately delivers in several pieces, which is what
+# `aiohttp.StreamReader` really does.
 # ---------------------------------------------------------------------------
 
 class _ChunkedBody:
-    """`r.content` 的替身，**分多次**把主體交出來。
+    """A stand-in for `r.content` that hands over the body **in several pieces**.
 
-    這是 `aiohttp.StreamReader.read(n)` 真正的語意：*read up to n*——回傳不超過 n
-    個位元組，但**也可能少於 n**，即使後面還有資料。`_FakeBody` 一次全給，所以它
-    永遠測不到這件事；那正是截斷缺陷躲過整套測試的原因。
+    This is the real semantics of `aiohttp.StreamReader.read(n)`: *read up to n*
+    -- return no more than n bytes, but **possibly fewer than n**, even when more
+    data follows. `_FakeBody` gives it all at once, so it can never test this;
+    that is why the truncation defect slipped past the whole suite.
     """
 
     def __init__(self, chunks):
@@ -337,12 +367,12 @@ class _ChunkedBody:
         head = self._chunks[0]
         if n is None or n < 0 or n >= len(head):
             return self._chunks.pop(0)
-        self._chunks[0] = head[n:]           # 只給前 n 個，剩下的下次再拿
+        self._chunks[0] = head[n:]           # give only the first n, keep the rest for next time
         return head[:n]
 
 
 class _ChunkedSession(_FakeSession):
-    """回應主體分塊送達的 session 替身。"""
+    """A session stand-in that delivers the response body in chunks."""
 
     chunks: list = [b"[]"]
     declared = None
@@ -368,37 +398,39 @@ def chunked_http(monkeypatch):
 
 
 def _split(raw: bytes, first: int = 100) -> list[bytes]:
-    """切成「第一塊 + 其餘」，模擬真實的分塊送達。"""
+    """Split into "first chunk + the rest", simulating real chunked delivery."""
     return [raw[:first], raw[first:]] if len(raw) > first else [raw]
 
 
 def test_a_chunked_response_is_read_to_the_end(chunked_http):
-    """分塊送達的合法 JSON 要能完整解析。
+    """A chunked, valid JSON response must parse in full.
 
-    **修好之前這一支是紅的**，而且紅的理由就是使用者實測到的那一個：舊寫法是單次
-    `await r.content.read(cap + 1)`，`read(n)` 只回「目前緩衝的那一段」，所以它只
-    拿到第一塊 100 個位元組，`json.loads` 丟 `Unterminated string`，被外層的
-    `except Exception` 接住變成 `(-1, None)`——呼叫端看到的是「找不到」。
+    **Before the fix this test was red**, and red for the exact reason the user
+    measured: the old code was a single `await r.content.read(cap + 1)`, `read(n)`
+    returns only "the currently buffered piece", so it got only the first 100-byte
+    chunk, `json.loads` threw `Unterminated string`, caught by the outer
+    `except Exception` and turned into `(-1, None)` -- the caller saw "not found".
     """
     payload = [{"id": i, "tag": "rossi_(arknights)"} for i in range(30)]
     raw = json.dumps(payload).encode("utf-8")
-    assert len(raw) > 100, "測資要大到跨越至少兩塊，否則什麼都驗不到"
+    assert len(raw) > 100, "the fixture must be big enough to span at least two chunks, or nothing is verified"
     chunked_http.chunks = _split(raw)
 
     status, data = _run(ex._http_get_json("https://example.invalid/x"))
 
     assert data is not None, (
-        "分塊送達的回應被截斷了——`read(n)` 是 read-up-to，必須迴圈讀到 EOF")
+        "the chunked response was truncated -- `read(n)` is read-up-to, must loop to EOF")
     assert status == 200
-    assert len(data) == 30, f"只讀到 {len(data)} 筆，主體被腰斬了"
+    assert len(data) == 30, f"only read {len(data)} entries, the body was cut in half"
 
 
 def test_a_chunked_response_that_exceeds_the_cap_is_still_dropped(chunked_http):
-    """上限不得因為改成迴圈而失效。
+    """The cap must not stop working because of the switch to a loop.
 
-    `status == 200` 那一半是重點：光看 `data is None` 分不出是「上限擋下的」還是
-    「解析炸了被外層 except 接住」——後者回的是 `-1`。少了這一半，把上限整段刪掉
-    也能讓這支測試維持綠色，那就變成兩道防護互相遮蔽。
+    The `status == 200` half is the point: `data is None` alone cannot tell "the
+    cap stopped it" from "parsing blew up and got caught by the outer except" --
+    the latter returns `-1`. Without this half, deleting the whole cap would keep
+    this test green, and then the two defences mask each other.
     """
     over = b"[" + b"0," * (ex._MAX_RESPONSE_BYTES // 2) + b"0]"
     assert len(over) > ex._MAX_RESPONSE_BYTES
@@ -406,15 +438,16 @@ def test_a_chunked_response_that_exceeds_the_cap_is_still_dropped(chunked_http):
 
     status, data = _run(ex._http_get_json("https://example.invalid/x"))
 
-    assert status == 200, "應該是上限擋下的（回 r.status），不是解析失敗（回 -1）"
-    assert data is None, "超過上限的回應仍然被解析了"
+    assert status == 200, "should be the cap stopping it (returns r.status), not a parse failure (returns -1)"
+    assert data is None, "an over-cap response was still parsed"
 
 
 # ---------------------------------------------------------------------------
-# 共用的讀取原語本身
+# The shared reading primitive itself
 #
-# 圖片下載（`discord_bot._send_danbooru_grid`）走的是同一支，所以在這裡驗過就等於
-# 兩側都驗過——前提是「兩側真的都走這一支」，那由下面的 AST 守門盯著。
+# Image download (`discord_bot._send_danbooru_grid`) goes through the same
+# function, so verifying it here verifies both sides -- provided "both sides
+# really go through this one", which the AST guard below watches.
 # ---------------------------------------------------------------------------
 
 def _read(chunks, cap):
@@ -422,12 +455,13 @@ def _read(chunks, cap):
 
 
 def test_the_shared_reader_returns_the_whole_body():
-    """分塊送達的完整位元組要拿得到——圖片那一側要的就是這個。
+    """The complete bytes of a chunked delivery must come back -- that is what the image side needs.
 
-    圖片被截斷的症狀跟 JSON 不一樣但一樣安靜：Pillow 開不起來，那一格就從拼圖裡
-    消失，使用者只看到「圖少了幾張」。
+    A truncated image has a different but equally silent symptom: Pillow cannot
+    open it, that cell drops out of the grid, and the user just sees "a few images
+    are missing".
     """
-    body = bytes(range(256)) * 400              # 102400 bytes，跨好幾塊
+    body = bytes(range(256)) * 400              # 102400 bytes, spans several chunks
     chunks = [body[i:i + 1000] for i in range(0, len(body), 1000)]
     assert len(chunks) > 1
     assert _read(chunks, 20 * 1024 * 1024) == body
@@ -438,45 +472,50 @@ def test_the_shared_reader_drops_an_oversized_body():
 
 
 def test_the_shared_reader_accepts_exactly_the_cap():
-    """邊界：剛好等於上限要收下，不是拒收。
+    """Boundary: exactly at the cap must be accepted, not refused.
 
-    舊寫法用 `read(cap + 1)` 的那個 +1 就是為了分辨「剛好」與「超過」；改成迴圈
-    之後這個界線由 `total > cap` 維持，語意不變。
+    The +1 in the old code's `read(cap + 1)` was there to tell "exactly" from
+    "over"; after the switch to a loop, that line is maintained by `total > cap`,
+    with unchanged semantics.
     """
     assert _read([b"x" * 60, b"y" * 40], 100) == b"x" * 60 + b"y" * 40
 
 
 def test_an_empty_body_is_not_confused_with_an_oversized_one():
-    """空主體回 `b""`，超標回 `None`——呼叫端必須用 `is None` 分辨。
+    """An empty body returns `b""`, over the cap returns `None` -- the caller must tell them apart with `is None`.
 
-    寫成 `if not raw:` 會把「站方回了空的 200」誤判成「超過 8 MB 上限」，然後印一
-    行完全誤導的 stderr。
+    Writing `if not raw:` would misjudge "the site returned an empty 200" as
+    "over the 8 MB cap", then print a completely misleading stderr line.
     """
     assert _read([], 100) == b""
     assert _read([b""], 100) == b""
 
 
 def test_the_shared_reader_stops_reading_once_over_the_cap():
-    """超標就別再讀了。
+    """Once over the cap, stop reading.
 
-    上限的目的是不要把巨大的第三方回應吃進記憶體；如果為了算出「到底多大」而把整
-    份拉完，那上限就只剩下「不解析」的效果，記憶體照樣被吃掉。
+    The cap's purpose is not to slurp a huge third-party response into memory; if
+    it pulls the whole thing just to compute "how big", the cap only has the "do
+    not parse" effect and the memory is consumed anyway.
     """
     body = _ChunkedBody([b"z" * 10] * 100)
     assert _run(ex.read_capped_body(body, 25)) is None
     assert body.reads < 10, (
-        f"超標之後還在讀（讀了 {body.reads} 次）——上限應該一確定超過就停手")
+        f"still reading after over the cap (read {body.reads} times) -- the cap should stop the moment it is sure it is over")
 
 
 def test_no_response_body_is_read_with_a_single_capped_read():
-    """`<回應>.content.read(...)` 不准再直接出現在任何呼叫端。
+    """`<response>.content.read(...)` must not appear directly in any caller again.
 
-    這是這次缺陷的**形狀**，不是某一行的筆誤：`read(cap + 1)` 看起來完全合理，
-    而且在「一次就把整份給出來」的測試替身底下永遠是對的。同一個形狀當時同時存在
-    於兩個檔案（JSON 一處、圖片一處），也就是說 code review 沒擋下來過。
+    This is the **shape** of the defect, not a typo on one line: `read(cap + 1)`
+    looks entirely reasonable, and under a test stand-in that "hands over the
+    whole thing at once" it is always right. The same shape existed at the time in
+    two files (one for JSON, one for images), which means code review never caught
+    it.
 
-    無上限的 `.content.read()`（讀到 EOF）一樣擋——那是另一個方向的錯：把大小上限
-    整個拿掉。兩者都應該改用 `read_capped_body`。
+    Unbounded `.content.read()` (to EOF) is blocked too -- that is the mistake in
+    the other direction: removing the size cap entirely. Both should use
+    `read_capped_body`.
     """
     offenders = []
     for path in (_MODULE, _BOT_SOURCE):
@@ -491,18 +530,20 @@ def test_no_response_body_is_read_with_a_single_capped_read():
             if isinstance(owner, ast.Attribute) and owner.attr == "content":
                 offenders.append(f"{path.name}:{node.lineno}")
     assert not offenders, (
-        f"這些地方直接從回應主體讀：{offenders}。`StreamReader.read(n)` 是 "
-        "read-up-to，單次呼叫會把 chunked 回應截斷成合法但不完整的位元組"
-        "（2026-09-07 實測：38043 / 91898 bytes），而症狀是功能安靜地回不出東西。"
-        "改用 `_external_apis.read_capped_body(r.content, <上限>)`。")
+        f"these places read directly from the response body: {offenders}. "
+        "`StreamReader.read(n)` is read-up-to, and a single call truncates a "
+        "chunked response into valid-but-incomplete bytes (measured 2026-09-07: "
+        "38043 / 91898 bytes), with the symptom being the feature silently "
+        "returning nothing. Use `_external_apis.read_capped_body(r.content, <cap>)`.")
 
 
 def test_both_response_readers_go_through_the_shared_helper():
-    """反過來盯：兩個呼叫端**都**還在用共用的那一支。
+    """The reverse watch: both callers **still** use the shared function.
 
-    只驗上面那條「不准直接 read」是不夠的——把整段讀取刪掉、或改成別的自己手寫
-    一份迴圈，那條照樣是綠的。一個豁免（或一次重構）必須有人證明它還在做原本那
-    件事，否則它會活得比它的理由久。
+    Verifying only the "no direct read" rule above is not enough -- deleting the
+    whole read, or replacing it with a hand-written loop of one's own, keeps that
+    rule green. An exemption (or a refactor) must have someone prove it still does
+    the original thing, or it will outlive its reason.
     """
     wanted = {
         "_external_apis.py": "_http_json",
@@ -514,24 +555,26 @@ def test_both_response_readers_go_through_the_shared_helper():
         found = [n for n in ast.walk(tree)
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                  and n.name == target]
-        assert found, f"{path.name} 裡找不到 {target}（改名了？）"
+        assert found, f"{target} not found in {path.name} (renamed?)"
         names = {c.func.id for c in ast.walk(found[0])
                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
         assert "read_capped_body" in names, (
-            f"{path.name}:{target} 沒有走 `read_capped_body`。兩個呼叫端讀的都是"
-            "第三方送來的 chunked 位元組，共用那一支才是單一事實來源——"
-            "2026-09-07 之前同一個截斷缺陷就是同時存在於兩邊。")
+            f"{path.name}:{target} does not go through `read_capped_body`. Both "
+            "callers read chunked bytes sent by a third party, and the shared "
+            "function is the single source of truth -- before 2026-09-07 the same "
+            "truncation defect existed on both sides at once.")
 
 
 def test_only_http_get_json_opens_a_session():
-    """本模組裡**只有** `_http_json`（`_http_get_json`／`_http_post_json` 底下那一支）
-    可以開 `aiohttp.ClientSession`。
+    """In this module **only** `_http_json` (the one under `_http_get_json` /
+    `_http_post_json`) may open an `aiohttp.ClientSession`.
 
-    這是這次事故的結構性成因，不是風格問題。原本三個 Danbooru fetcher 各自
-    inline 一份 `async with aiohttp.ClientSession(...)`，於是三份**都**繞過了
-    `_http_get_json` 補上的 User-Agent、也**都**繞過了 `_METRICS_API_CALLS`。
-    「另外開一條連線」與「少帶標頭、少算一次」在這個模組裡是同一個錯誤的兩面，
-    所以直接擋住前者。
+    This is the structural cause of the incident, not a style question. The three
+    Danbooru fetchers each used to inline an `async with
+    aiohttp.ClientSession(...)`, so all three **bypassed** the User-Agent that
+    `_http_get_json` fills in, and all three **bypassed** `_METRICS_API_CALLS`.
+    "Open another connection" and "omit the header, skip the count" are two sides
+    of the same mistake in this module, so the former is blocked directly.
     """
     tree = ast.parse(_MODULE.read_text(encoding="utf-8"))
     offenders = []
@@ -547,52 +590,58 @@ def test_only_http_get_json_opens_a_session():
             if name == "ClientSession" and node.name != "_http_json":
                 offenders.append(f"{node.name}:{inner.lineno}")
     assert not offenders, (
-        f"這些函式自己開了 ClientSession：{offenders}。本模組的外送出口只能是 "
-        "`_http_json`——繞過去就等於繞過 User-Agent 與 API 計數，而那正是 "
-        "2026-08-30 那次 Danbooru 全站 403 沒被任何人發現的原因。")
+        f"these functions open a ClientSession of their own: {offenders}. The "
+        "outbound exit of this module can only be `_http_json` -- bypassing it "
+        "bypasses the User-Agent and the API count, which is exactly why the "
+        "2026-08-30 site-wide Danbooru 403 went unnoticed by everyone.")
 
 
 def test_every_outbound_request_carries_a_user_agent(fake_http):
-    """每一個 fetcher 送出的請求都要有非空的 `User-Agent`。
+    """Every request a fetcher sends must have a non-empty `User-Agent`.
 
-    行為層的複驗：就算有人繞過上一支測試的 AST 掃描（換個寫法開 session），
-    只要請求少了 UA，這裡就會紅。
+    A behavioural re-check: even if someone bypasses the previous test's AST scan
+    (opening a session a different way), this goes red as soon as a request is
+    missing its UA.
     """
     for label, thunk in _FETCHERS.items():
         fake_http.calls = []
         _run(thunk())
-        assert fake_http.calls, f"{label} 一個請求都沒送出"
+        assert fake_http.calls, f"{label} sent no request at all"
         for call in fake_http.calls:
             ua = call["headers"].get("User-Agent")
-            assert ua, f"{label} 送出的請求沒有 User-Agent：{call['headers']}"
+            assert ua, f"{label} sent a request with no User-Agent: {call['headers']}"
 
 
 def test_the_user_agent_does_not_pretend_to_be_a_browser():
-    """UA 必須是「說明自己是誰」，不得假裝成瀏覽器。
+    """The UA must "explain who you are" and must not pretend to be a browser.
 
-    這不只是站規（Danbooru 的 Help:Api 明文寫「Don't impersonate browsers or use
-    the default header of your library」），實務上也更糟：2026-08-30 三種都實測過，
-    沒有 UA 是 403，**完整的 Chrome 140 UA 也是 403**，只有說明式的 UA 拿到 200。
-    挑戰頁預期真瀏覽器會去解 JS，我們解不了，於是被判定為冒充。
+    This is not only a site rule (Danbooru's Help:Api states in writing "Don't
+    impersonate browsers or use the default header of your library"), in practice
+    it is also worse: on 2026-08-30 all three were measured -- no UA is 403, **a
+    full Chrome 140 UA is also 403**, and only the explanatory UA got 200. The
+    challenge page expects a real browser to solve the JS, we cannot, so we are
+    judged to be impersonating.
 
-    `_BROWSER_UA` 不在此限：那是給 Safebooru／IQDB 用的，而且它用的是
-    `Mozilla/5.0 (compatible; <自己的名字>)` 這種「相容格式但仍然自報身分」的寫法，
-    不是冒充某個真實瀏覽器版本。
+    `_BROWSER_UA` is not subject to this: it is for Safebooru / IQDB, and it uses
+    the `Mozilla/5.0 (compatible; <own name>)` form -- "compatible format but
+    still self-identifying" -- not impersonating a specific real browser version.
     """
     assert not ex._BOT_UA.lower().startswith("mozilla"), (
-        f"_BOT_UA={ex._BOT_UA!r} 長得像瀏覽器。實測過：假裝成瀏覽器一樣被 403。")
+        f"_BOT_UA={ex._BOT_UA!r} looks like a browser. Measured: pretending to be a browser gets blocked too.")
     assert "axiomatic" in ex._BOT_UA, (
-        f"_BOT_UA={ex._BOT_UA!r} 沒有自報身分；站方要的是出事時找得到人。")
+        f"_BOT_UA={ex._BOT_UA!r} does not identify itself; the site wants someone reachable when things go wrong.")
     assert "compatible;" in ex._BROWSER_UA and "axiomatic" in ex._BROWSER_UA, (
-        f"_BROWSER_UA={ex._BROWSER_UA!r} 應該維持「相容格式但仍自報身分」的寫法；"
-        "改成冒充某個真實瀏覽器版本會同時違反站規並且更容易被擋。")
+        f"_BROWSER_UA={ex._BROWSER_UA!r} should keep the \"compatible format but "
+        "still self-identifying\" form; impersonating a specific real browser "
+        "version both breaks the site rules and is more likely to be blocked.")
 
 
 def test_caller_headers_win_over_the_default(fake_http):
-    """呼叫端明講的標頭覆寫預設值，而不是反過來。
+    """A header the caller states explicitly overrides the default, not the other way round.
 
-    e621 有自己的 UA 規範，`_query_tags_json(_E621_TAGS, ...)` 會帶 `_E621_UA`；
-    如果預設值反過來蓋掉呼叫端，那個規範就永遠套不上。
+    e621 has its own UA rule, and `_query_tags_json(_E621_TAGS, ...)` carries
+    `_E621_UA`; if the default overrode the caller instead, that rule could never
+    apply.
     """
     fake_http.calls = []
     _run(ex._http_get_json("https://example.invalid/x",
@@ -603,52 +652,55 @@ def test_caller_headers_win_over_the_default(fake_http):
     _run(ex._http_get_json("https://example.invalid/x",
                            headers={"Accept": "application/json"}))
     sent = fake_http.calls[0]["headers"]
-    assert sent["Accept"] == "application/json", "呼叫端的其他標頭要留著"
-    assert sent["User-Agent"] == ex._BOT_UA, "沒指定 UA 時要補上預設值"
+    assert sent["Accept"] == "application/json", "the caller's other headers must be kept"
+    assert sent["User-Agent"] == ex._BOT_UA, "the default must be filled in when no UA is specified"
 
 
 def test_every_fetcher_is_counted(fake_http):
-    """每一個 fetcher 都要被 `_METRICS_API_CALLS` 數到。
+    """Every fetcher must be counted by `_METRICS_API_CALLS`.
 
-    `/health` 的「api calls」與 `!metrics` 讀的就是它。2026-08-30 之前三個
-    Danbooru fetcher 完全沒被算到，那個數字對「我到底打了多少外部 API」這個問題
-    是錯的答案。
+    `/health`'s "api calls" and `!metrics` read it. Before 2026-08-30 the three
+    Danbooru fetchers were not counted at all, making that number a wrong answer
+    to "how many external APIs did I actually hit".
     """
     for label, thunk in _FETCHERS.items():
         before = ex.api_call_count()
         _run(thunk())
         assert ex.api_call_count() > before, (
-            f"{label} 沒有被 api_call_count() 數到——它八成沒走 _http_get_json。")
+            f"{label} was not counted by api_call_count() -- it probably did not go through _http_get_json.")
 
 
 # ---------------------------------------------------------------------------
-# 行為層：合併三份 `_attempt` 之後，原本的語意要一模一樣
+# Behavioural layer: after merging the three `_attempt`s, the semantics must be identical
 # ---------------------------------------------------------------------------
 
 def test_the_anonymous_two_tag_random_limit_still_falls_back(fake_http):
-    """匿名 Danbooru 對 `random=true` 有 2-tag 上限，撞到會回 422。
+    """Anonymous Danbooru has a 2-tag limit on `random=true`; hitting it returns 422.
 
-    422 之後要**拿掉 `random`** 再打一次（改抓最新 N 筆，由 client 端自己挑），
-    不是直接放棄。三份 `_attempt` 合併成 `_danbooru_posts` 時最容易掉的就是這條。
+    After a 422, **drop `random`** and retry (fetch the latest N, pick
+    client-side), not give up. This is the easiest thing to lose when merging the
+    three `_attempt`s into `_danbooru_posts`.
     """
     fake_http.replies = [(422, None), (200, [{"id": 1}, {"id": 2}])]
     posts = _run(ex._fetch_danbooru_posts_bulk("a b c"))
-    assert len(fake_http.calls) == 2, "422 之後應該要再試一次"
+    assert len(fake_http.calls) == 2, "should retry once after a 422"
     assert fake_http.calls[0]["params"].get("random") == "true"
     assert "random" not in fake_http.calls[1]["params"], (
-        "退路必須拿掉 random，否則會再撞一次同樣的 422")
+        "the fallback must drop random, or it will hit the same 422 again")
     assert [p["id"] for p in posts] == [1, 2]
 
 
 def test_a_non_200_is_never_silent(fake_http, capsys):
-    """**每一個** fetcher 在非 200 時都要留一行 stderr。
+    """**Every** fetcher must leave one stderr line on a non-200.
 
-    這是事故能藏這麼久的直接原因。原本靜默的路徑不只 Danbooru 的 post 抓取：
-    `/tags.json`（整條 fuzzy tag resolver）與「最新 N 筆」同樣是非 200 就回空、
-    一個字都不留。所以三個症狀——隨機圖找不到、模糊 tag 解析不出來、`--latest`
-    沒東西——沒有任何一個在 log 裡留下線索。
+    This is the direct reason the incident stayed hidden so long. The originally
+    silent path was not just Danbooru's post fetch: `/tags.json` (the whole fuzzy
+    tag resolver) and "latest N" also returned empty on a non-200 without a word.
+    So all three symptoms -- random image not found, fuzzy tag not resolved,
+    `--latest` empty -- left no clue in the log at all.
 
-    這支測試涵蓋 `_FETCHERS` 的**全部**條目，新增站台會自動被納入。
+    This test covers **all** entries of `_FETCHERS`, so a new site is included
+    automatically.
     """
     for label, thunk in _FETCHERS.items():
         fake_http.calls = []
@@ -656,25 +708,26 @@ def test_a_non_200_is_never_silent(fake_http, capsys):
         capsys.readouterr()
         _run(thunk())
         err = capsys.readouterr().err
-        assert "403" in err, f"{label} 在 HTTP 403 時什麼都沒說：{err!r}"
+        assert "403" in err, f"{label} said nothing on HTTP 403: {err!r}"
 
 
 def test_the_expected_422_stays_quiet(fake_http, capsys):
-    """反面：預期中的 422 不得吵。
+    """The reverse: an expected 422 must not be noisy.
 
-    匿名 Danbooru 對多 tag `random=true` 一定回 422，而我們本來就準備好要退一步
-    再打一次——那不是故障。每次搜尋都印一行的話，這條診斷會變成雜訊，然後就沒有
-    人會再看它，於是又回到「靜默失敗」的原點。
+    Anonymous Danbooru always returns 422 for a multi-tag `random=true`, and we
+    are already prepared to step back and retry -- that is not a fault. Printing a
+    line on every search would turn this diagnostic into noise, then nobody would
+    look at it any more, and we are back to "silent failure".
     """
     fake_http.replies = [(422, None), (200, [{"id": 1}])]
     capsys.readouterr()
     _run(ex._fetch_danbooru_posts_bulk("a b c"))
     err = capsys.readouterr().err
-    assert "422" not in err, f"預期中的 422 吵了：{err!r}"
+    assert "422" not in err, f"an expected 422 was noisy: {err!r}"
 
 
 def test_an_unexpected_status_on_the_first_try_still_talks(fake_http, capsys):
-    """`quiet_statuses` 只該蓋掉 422，不是把第一次嘗試整個靜音。"""
+    """`quiet_statuses` should only silence 422, not silence the whole first attempt."""
     fake_http.replies = [(500, None)]
     capsys.readouterr()
     _run(ex._fetch_danbooru_posts_bulk("a b c"))
@@ -682,71 +735,74 @@ def test_an_unexpected_status_on_the_first_try_still_talks(fake_http, capsys):
 
 
 def test_a_422_that_is_not_a_random_query_is_not_retried(fake_http):
-    """沒帶 `random` 的查詢收到 422 時不該重試——退路和原本的請求會一模一樣。"""
+    """A query without `random` that gets a 422 should not retry -- the fallback would be identical to the original request."""
     fake_http.replies = [(422, None), (200, [{"id": 9}])]
     _run(ex._danbooru_posts("tag", limit=3, random_order=False))
     assert len(fake_http.calls) == 1, (
-        "沒有 random 可以拿掉，重試只是把同一個請求再送一次")
+        "there is no random to drop, so a retry just sends the same request again")
 
 
 def test_take_unseen_prefers_fresh_ids_then_reuses_the_pool():
-    """去重佇列滿了就整池重用，不要回空。
+    """When the dedup queue is full, reuse the whole pool, do not return empty.
 
-    `_danbooru_recent` 只有 `DANBOORU_HISTORY_SIZE` 筆；池子裡剛好全都送過時，
-    寧可重複一張也不要讓使用者看到「找不到」。
+    `_danbooru_recent` holds only `DANBOORU_HISTORY_SIZE` entries; when the pool
+    has all been sent, better to repeat an image than to show the user "not
+    found".
     """
     ex._danbooru_recent.clear()
     posts = [{"id": n} for n in range(5)]
     first = ex._take_unseen(posts, 2)
     assert len(first) == 2
     assert all(p["id"] in ex._danbooru_recent for p in first), (
-        "挑過的要記進去重佇列，否則下一次還會挑到同一張")
+        "picked ones must be recorded in the dedup queue, or the next call picks the same image again")
 
     ex._danbooru_recent.clear()
     ex._danbooru_recent.extend(p["id"] for p in posts)
     again = ex._take_unseen(posts, 2)
-    assert len(again) == 2, "全部都送過時要整池重用，不是回空"
+    assert len(again) == 2, "when all have been sent, reuse the whole pool, not return empty"
 
 
 def test_take_unseen_handles_a_short_pool():
-    """池子比要求的張數少就回多少給多少（`--grid` 靠這個補格子）。"""
+    """When the pool is smaller than requested, return however many there are (`--grid` fills cells with this)."""
     ex._danbooru_recent.clear()
     assert ex._take_unseen([], 4) == []
     assert len(ex._take_unseen([{"id": 1}, {"id": 2}], 4)) == 2
 
 
 def test_single_post_fetch_returns_none_when_there_is_nothing(fake_http):
-    """空結果要回 None，不是丟 IndexError。"""
+    """An empty result must return None, not throw IndexError."""
     fake_http.replies = [(200, [])]
     assert _run(ex._fetch_danbooru_post("tag")) is None
 
 
 def test_tags_json_drops_non_dict_entries(fake_http):
-    """站方限流／出錯時 `/tags.json` 會回一個裡面不是 dict 的 list。"""
+    """When the site rate-limits / errors, `/tags.json` returns a list with non-dicts inside."""
     fake_http.replies = [(200, ["oops", {"name": "ok", "post_count": 3}, None])]
     hits = _run(ex._query_tags_json(ex._DANBOORU_TAGS, name="x"))
     assert hits == [{"name": "ok", "post_count": 3}]
 
 
 def test_fuzzy_resolver_skips_search_modifiers(fake_http):
-    """`rating:general` 這種修飾詞不是 tag 名，不得送去 `/tags.json` 解析。"""
+    """A modifier like `rating:general` is not a tag name and must not be sent to `/tags.json` to resolve."""
     fake_http.replies = [(200, [])] * 20
     _run(ex._resolve_fuzzy_tags(ex._DANBOORU_TAGS, "rating:general score:>=5"))
     assert not fake_http.calls, (
-        f"修飾詞被拿去查 tag 了：{fake_http.calls}")
+        f"a modifier was taken to look up a tag: {fake_http.calls}")
 
 
 # ---------------------------------------------------------------------------
-# 結構層：bot 自己開的 session 也要帶 UA
+# Structural layer: sessions the bot opens itself must also carry a UA
 # ---------------------------------------------------------------------------
 
 def test_the_bots_own_sessions_pass_headers():
-    """`discord_bot.py` 手工開的 `ClientSession` 也要在請求上帶標頭。
+    """A `ClientSession` opened by hand in `discord_bot.py` must also carry headers on the request.
 
-    圖片 CDN 跟 API 掛在同一套防護後面——2026-08-30 實測 `cdn.donmai.us` 對沒有
-    UA 的請求同樣回 403。也就是說 `--grid` 是**兩處**都壞：API 拿不到清單，就算
-    拿到了每一張圖也下載不了。修好一邊而漏掉另一邊，症狀會從「找不到」變成
-    「一張都貼不出來」，一樣難查。
+    The image CDN sits behind the same protection as the API -- measured
+    2026-08-30, `cdn.donmai.us` also returns 403 to requests with no UA. That is,
+    `--grid` is broken in **both** places: the API cannot get the list, and even
+    with the list every image fails to download. Fix one and miss the other, and
+    the symptom shifts from "not found" to "nothing can be posted", equally hard
+    to investigate.
     """
     tree = ast.parse(_BOT_SOURCE.read_text(encoding="utf-8"))
     offenders = []
@@ -777,17 +833,18 @@ def test_the_bots_own_sessions_pass_headers():
                 if not any(kw.arg == "headers" for kw in inner.keywords):
                     offenders.append(f"line {inner.lineno}: .{func.attr}()")
     assert not offenders, (
-        f"這些請求沒帶 headers：{offenders}。bot 手工開的 session 不會經過 "
-        "`_external_apis._http_get_json`，所以 User-Agent 要在呼叫點自己帶——"
-        "少了它，圖片 CDN 一樣回 403。")
+        f"these requests carry no headers: {offenders}. A session the bot opens "
+        "by hand does not go through `_external_apis._http_get_json`, so the "
+        "User-Agent must be carried at the call site -- without it, the image CDN "
+        "returns 403 too.")
 
 
 # ---------------------------------------------------------------------------
-# 端點清單的完整性：新增一個外部端點，不得漏掉驗證入口
+# Completeness of the endpoint list: adding an external endpoint must not skip the verification entry
 # ---------------------------------------------------------------------------
 
 def _literal_url(node, consts):
-    """從一個 AST 節點盡量還原出網址字面值的開頭；還原不出來回 None。"""
+    """Recover the start of a URL literal from an AST node as best as possible; return None if it cannot."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.Name):
@@ -805,15 +862,18 @@ def _literal_url(node, consts):
 
 
 def _string_bindings(scope, module_level_only=False, seed=None):
-    """`NAME = "https://…"` 與 `NAME = f"https://…{x}"` 的對應表。
+    """A map of `NAME = "https://..."` and `NAME = f"https://...{x}"`.
 
-    要跟著**區域**變數走，不能只看模組層常數：這個版本庫最常見的寫法就是
-    `url = f"https://…/{x}"` 然後 `_http_get_json(url)`，第一版只查模組層，於是
-    有一半的端點掃不到——而掃不到的那些，正好是這條規則最該保護的。
+    It must follow **local** variables, not just module-level constants: the most
+    common form in this repo is `url = f"https://.../{x}"` then
+    `_http_get_json(url)`, and the first version only looked at the module level,
+    so half the endpoints were not seen -- and the unseen ones were exactly those
+    this rule should most protect.
     """
-    # `seed` 是模組層常數。BinOp 那一支要靠它才解得開
-    # `target = _IQDB_URL + "?" + urlencode(...)` 這種寫法——區域表格一開始是空的，
-    # 沒有 seed 就查不到 `_IQDB_URL`，那個端點會靜默掃不到。
+    # `seed` is the module-level constants. The BinOp branch needs it to resolve
+    # `target = _IQDB_URL + "?" + urlencode(...)` -- the local table starts empty,
+    # and without the seed `_IQDB_URL` cannot be found and that endpoint is
+    # silently unseen.
     out = dict(seed or {})
     nodes = scope.body if module_level_only else ast.walk(scope)
     for node in nodes:
@@ -838,18 +898,20 @@ def _string_bindings(scope, module_level_only=False, seed=None):
 
 
 def _fetched_hosts(path):
-    """這個檔案實際會去「抓」的外部主機名。
+    """The external hostnames this file actually "fetches".
 
-    只看真的發出請求的呼叫（`_http_get_json` / session 的 `.get` / `.post`），
-    所以貼給人看的連結（例如 post 頁面網址）不會被算進來——那些壞了也只是連結
-    失效，不是功能消失。
+    Only the calls that really issue a request (`_http_get_json` / a session's
+    `.get` / `.post`), so links pasted for people (e.g. a post page URL) are not
+    counted -- if those break it only breaks the link, not the feature.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     module_bindings = _string_bindings(tree, module_level_only=True)
     hosts = set()
-    # **一個函式一張表。** 這個版本庫裡幾十個 handler 都把區域變數叫 `url`，
-    # 用一張全模組的表只會留下最後一個賦值，於是絕大多數端點靜默掃不到——第一版
-    # 就是這樣漏掉了百科站與字典站，而百科站正好是今天壞掉的那一個。
+    # **One table per function.** Dozens of handlers in this repo name a local
+    # variable `url`, and a single module-wide table would keep only the last
+    # assignment, so the vast majority of endpoints go silently unseen -- the
+    # first version missed the encyclopedia and dictionary sites this way, and the
+    # encyclopedia was exactly the one that broke that day.
     for scope in ast.walk(tree):
         if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
             hosts |= _hosts_fetched_in(scope, _function_bindings(scope,
@@ -859,14 +921,14 @@ def _fetched_hosts(path):
 
 
 def _function_bindings(scope, module_bindings):
-    """一個函式看得到的網址字面值：模組層常數，再疊上它自己的區域指派。"""
+    """The URL literals a function can see: module-level constants, plus its own local assignments on top."""
     local = dict(module_bindings)
     local.update(_string_bindings(scope, seed=module_bindings))
     return local
 
 
 def _request_url(node):
-    """`node` 是發出請求的呼叫（`_http_get_json` / `.get` / `.post`）就回它的網址節點。"""
+    """If `node` is a request-issuing call (`_http_get_json` / `.get` / `.post`), return its URL node."""
     if not isinstance(node, ast.Call) or not node.args:
         return None
     func = node.func
@@ -884,7 +946,7 @@ def _host_of(url_node, bindings):
 
 
 def _hosts_fetched_in(scope, bindings):
-    """`scope` 裡（含巢狀）真的發出請求的呼叫打到的主機。"""
+    """The hosts hit by request-issuing calls in `scope` (nested included)."""
     hosts = set()
     for node in ast.walk(scope):
         url_node = _request_url(node)
@@ -896,25 +958,30 @@ def _hosts_fetched_in(scope, bindings):
 
 
 def test_every_fetched_host_is_in_the_verifier():
-    """bot 會去抓的每一個外部主機，都要出現在 `verify_external_apis` 的清單裡。
+    """Every external host the bot fetches must appear in `verify_external_apis`'s list.
 
-    這條規則是今天兩次事故的**通則**。兩個 bug 都不是程式邏輯錯，是外部契約漂移：
-    站方改了規則，我們的請求開始被拒，而失敗路徑全是靜默回空。靜態分析永遠看不到
-    這種事，只有真的打一次才知道——所以有 `verify_external_apis.py`。
+    This rule is the **generalisation** of both incidents that day. Neither bug
+    was a program-logic error, both were external-contract drift: the site changed
+    its rules, our requests began to be refused, and the failure path always
+    returned empty silently. Static analysis can never see this, only actually
+    hitting it once can -- which is why `verify_external_apis.py` exists.
 
-    但那支掃描是**手寫的清單**，而手寫清單會過期：下次有人加一個新端點，掃描會安靜
-    地漏掉它，於是那個端點回到「沒有任何東西會發現它壞了」的狀態，也就是今天的起點。
-    所以這裡反過來從原始碼推出「實際會抓哪些主機」，強迫兩邊對得上。
+    But that scan is a **hand-written list**, and a hand-written list goes stale:
+    the next time someone adds an endpoint, the scan silently misses it, and that
+    endpoint returns to "nothing will notice it broke", which is where this all
+    started. So here we go the other way and derive "which hosts are actually
+    fetched" from the source, forcing the two sides to match.
 
-    只看真的發出請求的呼叫；貼給人看的連結不算——那些壞掉只是連結失效，不是功能
-    整個消失。
+    Only calls that really issue a request; links pasted for people do not count
+    -- those breaking is only a dead link, not the whole feature vanishing.
     """
     covered = set()
     for entry in vx._ENDPOINTS:
         url = entry.get("url")
         if url:
             covered.add(urllib.parse.urlparse(url).netloc.lower())
-    # CDN 那一筆沒有固定網址（要先跟 API 要一張圖），在清單裡以 `cdn` 群組表示。
+    # The CDN entry has no fixed URL (it must first ask the API for an image); it
+    # is represented in the list by the `cdn` group.
     covered.add("cdn.donmai.us")
 
     fetched = set()
@@ -923,72 +990,80 @@ def test_every_fetched_host_is_in_the_verifier():
 
     missing = sorted(fetched - covered)
     assert not missing, (
-        f"這些主機 bot 會去抓，但不在 verify_external_apis.py 的清單裡：{missing}。"
-        "加進 `_ENDPOINTS`，否則它壞掉時不會有任何東西發現——那正是 2026-08-30 "
-        "兩次事故的共同成因。")
+        f"these hosts the bot fetches but are not in verify_external_apis.py's "
+        f"list: {missing}. Add them to `_ENDPOINTS`, or nothing will notice when "
+        "they break -- which is exactly the common cause of the two 2026-08-30 "
+        "incidents.")
 
 
 def test_the_verifier_does_not_list_hosts_nobody_fetches():
-    """反方向：清單裡不該有已經沒人在打的主機。
+    """The reverse direction: the list should not contain hosts nobody hits any more.
 
-    留著一筆過期的端點，掃描結果就會出現一個沒有人在乎的紅字；紅字一旦習以為常，
-    整支掃描就沒用了。這跟 `test_language.py` 記過的教訓是同一條——會亂叫的守門，
-    最後會被人關掉。
+    Keeping a stale endpoint means the scan shows a red nobody cares about; once
+    red is normal, the whole scan is useless. This is the same lesson
+    `test_language.py` recorded -- a guard that cries wolf ends up switched off.
     """
     fetched = set()
     for path in (_BOT_SOURCE, _MODULE):
         fetched |= _fetched_hosts(path)
-    fetched.add("cdn.donmai.us")   # 從 post 的 file_url 動態取得，掃不到字面值
+    fetched.add("cdn.donmai.us")   # taken dynamically from a post's file_url, no literal to scan
 
-    # `embed_only` 的端點不參與這個比對：bot 自己不抓它們，只是把網址貼出去讓
-    # 平台自己取圖，所以原始碼裡本來就不會有抓取呼叫。
+    # `embed_only` endpoints do not take part in this comparison: the bot does not
+    # fetch them, it just pastes the URL for the platform to fetch, so there is no
+    # fetch call in the source to begin with.
     listed = {urllib.parse.urlparse(e["url"]).netloc.lower()
               for e in vx._ENDPOINTS
               if e.get("url") and not e.get("embed_only")}
-    # `embed_only` 是一個豁免，所以它必須是**窄的**：標成 embed_only 卻其實有在抓
-    # 的端點，等於拿豁免把守門關掉。實測過——沒有這一段的話，把任何一個真的 API
-    # 標成 embed_only 就能讓它從此不受檢查，而且沒有任何東西會抱怨。
+    # `embed_only` is an exemption, so it must be **narrow**: an endpoint marked
+    # embed_only that is actually fetched uses the exemption to switch the guard
+    # off. Measured -- without this block, marking any real API embed_only would
+    # exempt it from all checking, and nothing would complain.
     mislabelled = sorted(
         urllib.parse.urlparse(e["url"]).netloc.lower()
         for e in vx._ENDPOINTS
         if e.get("embed_only") and e.get("url")
         and urllib.parse.urlparse(e["url"]).netloc.lower() in fetched)
     assert not mislabelled, (
-        f"這些端點標了 embed_only，但原始碼其實有在抓它們：{mislabelled}。"
-        "embed_only 的意思是「bot 自己不抓，只是把網址貼出去讓平台取」——用它來"
-        "豁免一個真的會抓的端點，就是把這道守門關掉。")
+        f"these endpoints are marked embed_only, but the source actually fetches "
+        f"them: {mislabelled}. embed_only means \"the bot does not fetch it, it "
+        "just pastes the URL for the platform to fetch\" -- using it to exempt an "
+        "endpoint that really is fetched switches this guard off.")
 
     stale = sorted(listed - fetched)
     assert not stale, (
-        f"清單裡這些主機原始碼已經沒有在打了：{stale}。移掉它們，不然掃描會報一個"
-        "沒有人在乎的紅字。")
+        f"the source no longer hits these listed hosts: {stale}. Remove them, or "
+        "the scan shows a red nobody cares about.")
 
 
 def test_the_verifier_reuses_the_real_request_path():
-    """驗證腳本必須走 `_http_get_json`，不可以自己另外寫一份 HTTP 呼叫。
+    """The verifier must go through `_http_get_json`, not write its own HTTP call.
 
-    今天兩個 bug **都**出在標頭上。一支自己組請求的驗證腳本會帶著自己的標頭，於是
-    永遠是綠的，而正式路徑照樣壞——那比沒有驗證更糟，因為它給人一種已經驗過的錯覺。
+    Both of today's bugs were in the headers. A verifier that assembles its own
+    request carries its own headers, so it is always green while the production
+    path stays broken -- which is worse than no verification, because it gives a
+    false sense that things were checked.
     """
     source = inspect.getsource(vx._check_json)
     assert "_http_get_json" in source, (
-        "`_check_json` 不再走 `_http_get_json` 了——那它驗的就不是 bot 真正發出的"
-        "請求（標頭會不一樣），今天這兩個 bug 它一個都抓不到。")
+        "`_check_json` no longer goes through `_http_get_json` -- then it does not "
+        "verify the request the bot actually sends (the headers differ), and it "
+        "would catch neither of today's two bugs.")
     raw = inspect.getsource(vx._check_raw)
     assert "_user_agent()" in raw, (
-        "`_check_raw` 沒有用 `_user_agent()`，驗到的 UA 跟正式路徑不同。")
+        "`_check_raw` does not use `_user_agent()`, so the UA it verifies differs from the production path.")
 
 
 def test_a_post_only_endpoint_is_never_checked_with_a_get():
-    """只收 POST 的端點必須走 POST checker。
+    """A POST-only endpoint must go through the POST checker.
 
-    `_check_json` 底下是 `_http_get_json`，而那支**只發 GET**。拿它去驗一個只收
-    POST 的 GraphQL 端點，驗到的是一條 bot 從來不會走的路——2026-09-07 實測那樣
-    會拿到 404「Use POST request to access graphql subdomain」，跟正式路徑的結果
-    毫無關係。
+    Under `_check_json` is `_http_get_json`, which sends **GET only**. Using it to
+    verify a POST-only GraphQL endpoint verifies a path the bot never walks --
+    measured 2026-09-07, that gets a 404 "Use POST request to access graphql
+    subdomain", entirely unrelated to the production path's result.
 
-    這條之所以要有守門：`_run` 的分派是一個 `if entry.get("method") == "POST"`，
-    刪掉它不會有任何錯誤，只會讓那一筆安靜地換一條路去驗。
+    Why this needs a guard: `_run`'s dispatch is a single
+    `if entry.get("method") == "POST"`, and deleting it raises no error, it just
+    silently sends that entry down a different path to verify.
     """
     routed = []
 
@@ -1015,31 +1090,36 @@ def test_a_post_only_endpoint_is_never_checked_with_a_get():
 
     post_groups = {e["group"] for e in vx._ENDPOINTS
                    if e.get("method") == "POST"}
-    assert post_groups, "清單裡已經沒有 POST 端點了？那這條守門要重新想過"
+    assert post_groups, "no POST endpoints in the list any more? then this guard needs rethinking"
     for group in post_groups:
         assert ("POST", group) in routed, (
-            f"`{group}` 宣告了 method=POST，卻沒有走 POST checker")
+            f"`{group}` declares method=POST but did not go through the POST checker")
         assert ("JSON", group) not in routed, (
-            f"`{group}` 只收 POST，卻被 `_check_json`（GET-only）驗了——"
-            "驗到的是 bot 從來不會走的路")
+            f"`{group}` is POST-only but was verified by `_check_json` (GET-only) -- "
+            "verifying a path the bot never walks")
 
 
 def _per_call_timeout_sites(path):
-    """這個檔案裡每一個「有自己逾時」的外部呼叫：`[(NAME, 值, 主機集合, 行號), …]`。
+    """Every "has its own timeout" external call in this file: `[(NAME, value, host set, lineno), ...]`.
 
-    兩種形狀：
-    * `_http_get_json(url, timeout=NAME)`——主機就是那個呼叫自己的網址；
-    * `aiohttp.ClientTimeout(total=NAME)`（bot 自己開 session 的那幾條：動畫資料庫、
-      拼圖下載、反查圖）——主機取**同一個函式裡**真的發出請求的呼叫，跟
-      `_fetched_hosts` 同一種一個函式一張表的範圍。網址是執行期才決定的（拼圖下載
-      的網址來自 API 回應）就是空集合，由對帳那一側另外處理。
+    Two shapes:
+    * `_http_get_json(url, timeout=NAME)` -- the host is that call's own URL;
+    * `aiohttp.ClientTimeout(total=NAME)` (the few sessions the bot opens itself:
+      anime database, grid download, reverse image search) -- the host is taken
+      from the request-issuing call **in the same function**, the same one-table-
+      per-function scope as `_fetched_hosts`. When the URL is decided at runtime
+      (the grid download URL comes from an API response) it is an empty set,
+      handled separately by the reconciliation side.
 
-    `ClientTimeout(total=參數)` 是轉手（`_http_get_json` 自己把呼叫端的逾時交給
-    session 就是這樣），不算一個逾時來源，略過。
+    `ClientTimeout(total=parameter)` is a pass-through (this is how
+    `_http_get_json` hands the caller's timeout to the session) and is not counted
+    as a timeout source; skip it.
 
-    逾時寫成字面數字直接判錯：驗證腳本要照抄的是**那個名字的值**，一個沒有名字的
-    數字沒有辦法對帳，只能靠人記得——那正是這支要拿掉的東西。值解不出來（不是字面
-    常數）記成 None，讓對帳那一側說清楚是哪一個。
+    A timeout written as a literal number is a straight failure: what the verifier
+    copies is **the value of that name**, and an unnamed number cannot be
+    reconciled, only remembered by a person -- which is exactly what this exists to
+    remove. A value that cannot be resolved (not a literal constant) is recorded as
+    None, so the reconciliation side can say which one.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     consts = {}
@@ -1058,8 +1138,8 @@ def _per_call_timeout_sites(path):
 
     def named(value, lineno, what):
         assert isinstance(value, ast.Name), (
-            f"{path.name}:{lineno} 的 {what} 用了沒有名字的逾時 "
-            f"`{ast.unparse(value)}`——給它一個模組層常數，驗證腳本才能照抄並對帳。")
+            f"{what} at {path.name}:{lineno} uses an unnamed timeout "
+            f"`{ast.unparse(value)}` -- give it a module-level constant so the verifier can copy and reconcile it.")
         return value.id
 
     def visit(node, func):
@@ -1099,62 +1179,73 @@ def _per_call_timeout_sites(path):
 
 
 def _per_call_timeouts(path):
-    """`_per_call_timeout_sites` 收成 `NAME → 模組層常數值`。"""
+    """`_per_call_timeout_sites` collapsed to `NAME -> module-level constant value`."""
     return {name: value for name, value, _hosts, _line
             in _per_call_timeout_sites(path)}
 
 
-# 網址在執行期才決定、所以靜態掃不出主機的逾時 → 驗證腳本裡代表它的那一群組。
-# 跟 `_fetched_hosts` 的消費端手動補 `cdn.donmai.us` 同一個理由：拼圖下載的網址來自
-# API 回應裡每一張圖的 `file_url`。這張表跟掃描結果兩個方向對帳，不會過期而不自知。
+# A timeout whose URL is decided at runtime, so its host cannot be statically
+# scanned -> the group that represents it in the verifier. Same reason as the
+# `_fetched_hosts` consumer manually adding `cdn.donmai.us`: the grid download URL
+# comes from each image's `file_url` in the API response. This table is reconciled
+# against the scan result in both directions, so it cannot go stale unnoticed.
 _DYNAMIC_HOST_TIMEOUTS = {"GRID_DOWNLOAD_TIMEOUT_SEC": "cdn"}
 
 
 def test_a_per_call_timeout_in_the_bot_is_mirrored_here():
-    """bot 某個外部呼叫自己放寬的逾時，驗證腳本那一筆必須照抄同一個值，兩個方向都對帳。
+    """A timeout the bot loosened for some external call, the verifier entry must copy the same value, reconciled both ways.
 
-    2026-09-08 字典呼叫放寬到 `DICT_TIMEOUT_SEC`（端點穩定要約 20 秒），而驗證腳本那一筆
-    一直停在預設的 15 秒，直到 2026-09-19 才發現——於是它在 bot 好好的時候報「連不上」。
-    反方向（驗證腳本比 bot 寬）更糟：bot 壞著、這支報 ok。所以兩邊都要對上，而且
-    驗證腳本不准有一筆「自己放寬、卻對不到 bot 任何一個常數」的逾時。
+    On 2026-09-08 the dictionary call was loosened to `DICT_TIMEOUT_SEC` (the
+    endpoint stably takes ~20s), while the verifier entry stayed at the default
+    15s until noticed on 2026-09-19 -- so it reported "unreachable" while the bot
+    was fine. The reverse (verifier looser than the bot) is worse: the bot is
+    broken, this reports ok. So both sides must match, and the verifier may not
+    have an entry "loosened on its own but matching no bot constant".
     """
     bot = {}
     for path in (_BOT_SOURCE, _MODULE):
         bot.update(_per_call_timeouts(path))
-    # 正對照：掃描真的掃得到東西。空的掃描結果跟「兩邊一致」長得一模一樣。
+    # Positive control: the scan really finds something. An empty scan result
+    # looks identical to "the two sides agree".
     assert "DICT_TIMEOUT_SEC" in bot, (
-        f"掃不到字典那個呼叫的逾時了（掃到的是 {sorted(bot)}）——掃描本身壞了，"
-        "或是那個呼叫改名；先修掃描，不要讓這支變成空轉。")
+        f"the dictionary call's timeout can no longer be scanned (scanned: {sorted(bot)}) -- "
+        "the scan itself is broken, or that call was renamed; fix the scan first, "
+        "do not let this spin idle.")
     unresolved = sorted(name for name, value in bot.items() if value is None)
-    assert not unresolved, f"這些逾時常數解不出值：{unresolved}"
+    assert not unresolved, f"these timeout constants cannot be resolved to a value: {unresolved}"
 
     mirrored = {e["bot_timeout"]: e.get("timeout")
                 for e in vx._ENDPOINTS if e.get("bot_timeout")}
     missing = sorted(set(bot) - set(mirrored))
     assert not missing, (
-        f"bot 這些呼叫有自己的逾時，但驗證腳本沒有照抄：{missing}。在 `_ENDPOINTS` 對應"
-        "那一筆加上 `timeout` 與 `bot_timeout`。")
+        f"the bot has its own timeout for these calls but the verifier does not "
+        f"copy it: {missing}. Add `timeout` and `bot_timeout` to the matching "
+        "`_ENDPOINTS` entry.")
     stale = sorted(set(mirrored) - set(bot))
-    assert not stale, f"驗證腳本照抄的這些逾時，bot 那一側已經沒有了：{stale}"
+    assert not stale, f"the verifier copies these timeouts, but the bot side no longer has them: {stale}"
     wrong = {name: (mirrored[name], bot[name]) for name in bot
              if mirrored[name] != bot[name]}
-    assert not wrong, f"驗證腳本的逾時跟 bot 不一樣（驗證腳本, bot）：{wrong}"
+    assert not wrong, f"the verifier's timeout differs from the bot's (verifier, bot): {wrong}"
     loose = sorted(e["group"] for e in vx._ENDPOINTS
                    if "timeout" in e and not e.get("bot_timeout"))
     assert not loose, (
-        f"這幾筆自己改了逾時、卻沒有對應到 bot 的任何常數：{loose}——那就是「驗證腳本"
-        "比 bot 寬」，會在 bot 壞著的時候報 ok。")
+        f"these entries changed their timeout but match no bot constant: {loose} -- "
+        "that is \"the verifier looser than the bot\", reporting ok while the bot "
+        "is broken.")
 
-    # 2026-09-19 補：bot 自己開 session 的三條（`ClientTimeout(total=NAME)`）也在上面
-    # 的名字集合裡。**名字對得上還不夠，要對到正確的那一筆**：把動畫資料庫的逾時掛到
-    # 反查圖那一筆上，名字與值都照樣對得上，驗的卻是另一個端點。所以再以「同一個函式
-    # 打到的主機」對帳一次，兩個方向。
+    # Added 2026-09-19: the three sessions the bot opens itself
+    # (`ClientTimeout(total=NAME)`) are also in the name set above. **Matching
+    # names is not enough, it must match the right entry**: hang the anime
+    # database's timeout on the reverse-image entry and both name and value still
+    # match, but it verifies a different endpoint. So reconcile once more by "the
+    # host hit in the same function", both directions.
     sites = [site for path in (_BOT_SOURCE, _MODULE)
              for site in _per_call_timeout_sites(path)]
     assert {"ANIME_TIMEOUT_SEC", "IQDB_TIMEOUT_SEC",
             "GRID_DOWNLOAD_TIMEOUT_SEC"} <= {name for name, *_ in sites}, (
-        "掃不到 bot 自己開 session 的那幾個逾時了——`ClientTimeout(total=…)` 那一半"
-        f"的掃描壞了（掃到的是 {sorted({name for name, *_ in sites})}）")
+        "the timeouts of the sessions the bot opens itself can no longer be "
+        "scanned -- the `ClientTimeout(total=...)` half of the scan is broken "
+        f"(scanned: {sorted({name for name, *_ in sites})})")
     hosts_of = {}
     for name, _value, hosts, _line in sites:
         hosts_of.setdefault(name, set()).update(hosts)
@@ -1164,54 +1255,58 @@ def test_a_per_call_timeout_in_the_bot_is_mirrored_here():
 
     dynamic = sorted(name for name, hosts in hosts_of.items() if not hosts)
     assert dynamic == sorted(_DYNAMIC_HOST_TIMEOUTS), (
-        f"主機掃不出來的逾時是 {dynamic}，`_DYNAMIC_HOST_TIMEOUTS` 列的是 "
-        f"{sorted(_DYNAMIC_HOST_TIMEOUTS)}——新的一條要說清楚它對到哪一群組，"
-        "舊的一條已經不是動態網址就該拿掉。")
+        f"the timeouts whose host cannot be scanned are {dynamic}, "
+        f"`_DYNAMIC_HOST_TIMEOUTS` lists {sorted(_DYNAMIC_HOST_TIMEOUTS)} -- a new "
+        "one must say which group it maps to, and an old one that is no longer a "
+        "dynamic URL should be removed.")
     wrong_home = []
     for name, hosts in hosts_of.items():
         carriers = [e for e in vx._ENDPOINTS if e.get("bot_timeout") == name]
         if hosts:
-            wrong_home += [f"{name} 掛在 {e['group']}（主機 {entry_host(e)}）"
+            wrong_home += [f"{name} is hung on {e['group']} (host {entry_host(e)})"
                            for e in carriers if entry_host(e) not in hosts]
-            wrong_home += [f"{e['group']}（{entry_host(e)}）沒有掛 {name}"
+            wrong_home += [f"{e['group']} ({entry_host(e)}) has no {name} hung on it"
                            for e in vx._ENDPOINTS
                            if entry_host(e) in hosts and e.get("bot_timeout") != name]
         else:
             groups = sorted(e["group"] for e in carriers)
             if groups != [_DYNAMIC_HOST_TIMEOUTS[name]]:
-                wrong_home.append(f"{name} 掛在 {groups}，應該是 "
+                wrong_home.append(f"{name} is hung on {groups}, should be "
                                   f"{[_DYNAMIC_HOST_TIMEOUTS[name]]}")
     assert not wrong_home, (
-        f"逾時照抄到錯的那一筆了：{wrong_home}。值一樣也沒用——驗到的是另一個端點。")
+        f"a timeout was copied onto the wrong entry: {wrong_home}. Same value does not help -- it verifies a different endpoint.")
 
-    # 非 JSON／POST 的檢查函式在沒有 `timeout` 時退回 `_EMBED_ONLY_TIMEOUT_SEC`，那個
-    # 預設只准給對話平台自己去取的 embed_only 那幾筆用（bot 那一側沒有逾時可以照抄）。
+    # The non-JSON / POST check functions fall back to `_EMBED_ONLY_TIMEOUT_SEC`
+    # when there is no `timeout`, and that default is only allowed for the
+    # embed_only entries the chat platform fetches itself (the bot side has no
+    # timeout to copy).
     defaulted = sorted(e["group"] for e in vx._ENDPOINTS
                        if (e.get("raw") or e.get("method") == "POST")
                        and "timeout" not in e and not e.get("embed_only"))
     assert not defaulted, (
-        f"這幾筆 bot 自己會抓，卻用驗證腳本自己的預設逾時：{defaulted}。")
+        f"these entries the bot fetches itself, yet use the verifier's own default timeout: {defaulted}.")
 
 
 def test_the_dictionary_probe_cannot_be_answered_from_a_cache():
-    """字典那一筆每次執行都要查一個**新的**字，否則 CDN 的過期快取會讓它報 ok。
+    """The dictionary entry must query a **new** word every run, or the CDN's stale cache lets it report ok.
 
-    2026-09-19 實測：原站連不上時，查過的字（例如舊寫法固定的 `serendipity`）拿到的是
-    幾十天前的快取（HTTP 200），沒查過的字才露出 522。
+    Measured 2026-09-19: when the origin is unreachable, a word already queried
+    (e.g. the old code's fixed `serendipity`) gets a weeks-old cache (HTTP 200),
+    and only a never-queried word exposes the 522.
     """
     words = {vx._fresh_probe_word() for _ in range(50)}
-    assert len(words) == 50, "查詢字沒有每次都換，快取會替壞掉的原站擋下來"
+    assert len(words) == 50, "the query word does not change each time; the cache would cover for the broken origin"
     entry = next(e for e in vx._ENDPOINTS if e["group"] == "dict")
     assert entry["url"].rsplit("/", 1)[1] == vx._DICT_PROBE_WORD, (
-        f"字典那一筆沒有用每次執行才產生的查詢字：{entry['url']}")
+        f"the dictionary entry does not use a per-run generated query word: {entry['url']}")
     assert 404 in entry.get("ok_statuses", ()), (
-        "查一個不存在的字，健康的原站回 404——沒把 404 當健康，這一筆永遠是紅的")
+        "querying a nonexistent word, a healthy origin returns 404 -- without treating 404 as healthy, this entry is forever red")
 
 
 @pytest.mark.parametrize("group,status,expected", [
-    ("dict", 404, "OK"),     # 宣告過的「健康時的非 200」
-    ("dict", 522, "FAIL"),   # 2026-09-19 真的收到的那個
-    ("xkcd", 404, "FAIL"),   # near-miss：沒宣告的端點，404 就是壞了
+    ("dict", 404, "OK"),     # a declared "non-200 when healthy"
+    ("dict", 522, "FAIL"),   # the one actually received 2026-09-19
+    ("xkcd", 404, "FAIL"),   # near-miss: an undeclared endpoint, 404 means broken
     ("dict", 200, "OK"),
 ])
 def test_an_expected_non_200_is_healthy_only_where_declared(monkeypatch, group,
@@ -1232,60 +1327,65 @@ def test_an_expected_non_200_is_healthy_only_where_declared(monkeypatch, group,
     verdict, _detail = asyncio.run(vx._check_json(entry))
     assert verdict == expected
     assert len(calls) == 1
-    # 逾時與安靜狀態碼要真的傳下去，不只是寫在清單裡。
+    # The timeout and quiet statuses must really be passed down, not just written in the list.
     assert calls[0]["timeout"] == entry.get("timeout", ex._HTTP_TIMEOUT_SEC)
     assert calls[0]["quiet"] == tuple(entry.get("ok_statuses", ()))
 
 
 def test_a_5xx_is_blamed_on_the_upstream_not_our_headers():
-    """522 這種是上游自己出錯，不要把人帶去查 User-Agent 或 `api_contact`。"""
+    """A 522 is the upstream erroring itself; do not send people to check the User-Agent or `api_contact`."""
     out = vx._diagnose(522, body="error code: 522")
-    assert "上游" in out, f"5xx 沒有說是上游的問題：{out!r}"
+    assert "upstream" in out, f"5xx did not say it is the upstream's problem: {out!r}"
     assert "User-Agent" not in out and ex._UA_CONTACT_KEY not in out, (
-        f"5xx 被說成標頭的問題：{out!r}")
-    # near-miss：沒列在任何分支裡的 4xx 照舊不亂給建議。
+        f"5xx was blamed on the headers: {out!r}")
+    # near-miss: a 4xx not listed in any branch still gives no advice.
     assert vx._diagnose(404, body=None) == ""
 
 
 def test_the_diagnosis_quotes_the_upstream_instead_of_guessing():
-    """上游自己講了原因，就不要再猜 User-Agent。
+    """When the upstream gives the reason, stop guessing User-Agent.
 
-    測資是 2026-09-07 從動畫資料庫真的收到的 403 主體。當時的診斷把它報成
-    「這一類幾乎都是 User-Agent 的問題」並要人去設 `api_contact`——而實測無 UA、
-    瀏覽器 UA、我們的 UA 三者都是 403，UA 根本不是變因。
+    The fixture is the 403 body actually received from the anime database on
+    2026-09-07. The diagnosis at the time reported it as "this kind is almost
+    always a User-Agent problem" and told the user to set `api_contact` -- while
+    no UA, browser UA, and our UA were all measured as 403, so UA was not a
+    variable at all.
 
-    **刻意用 GET** 來驗這一條：這樣它只會被「引用上游」那一段影響，跟下面那條
-    「非 GET 不套 UA 說法」互不遮蔽。兩支測試各自瞄準一個分支。
+    **Deliberately GET** to verify this one: that way it is affected only by the
+    "quote the upstream" branch, and does not mask the "non-GET does not apply the
+    UA story" test below. The two tests each target one branch.
     """
     body = json.dumps({"errors": [{
         "message": "The AniList API has been temporarily disabled due to "
                    "severe stability issues.",
         "status": 403}]})
     out = vx._diagnose(403, body=body, method="GET")
-    assert "temporarily disabled" in out, f"沒有引用上游的說明：{out!r}"
+    assert "temporarily disabled" in out, f"did not quote the upstream's explanation: {out!r}"
     assert "User-Agent" not in out, (
-        f"上游已經說了原因，卻還在猜 User-Agent：{out!r}")
+        f"the upstream already gave the reason, yet it is still guessing User-Agent: {out!r}")
     assert ex._UA_CONTACT_KEY not in out, (
-        f"上游已經說了原因，卻還在叫人去設聯絡方式：{out!r}")
+        f"the upstream already gave the reason, yet it is still telling the user to set a contact: {out!r}")
 
 
 def test_a_non_get_failure_does_not_blame_the_user_agent():
-    """非 GET 端點的 4xx 不套 UA 那套說法。
+    """A non-GET endpoint's 4xx does not apply the UA story.
 
-    **刻意不給主體**：這樣它只會被「method != GET」那一段影響，與上面那支隔離。
+    **Deliberately no body**: that way it is affected only by the "method != GET"
+    branch, isolated from the test above.
     """
     out = vx._diagnose(403, body=None, method="POST")
-    assert "User-Agent" not in out or "不要預設是 User-Agent" in out, (
-        f"對 POST 端點硬套 UA 說法：{out!r}")
+    assert "User-Agent" not in out or "do not assume it is the User-Agent" in out, (
+        f"forced the UA story onto a POST endpoint: {out!r}")
     assert ex._UA_CONTACT_KEY not in out, (
-        f"對 POST 端點叫人去設聯絡方式，那個鍵只影響共用的 GET 路徑：{out!r}")
+        f"told the user to set a contact for a POST endpoint; that key only affects the shared GET path: {out!r}")
 
 
 def test_a_plain_get_403_still_gets_the_actionable_ua_hint():
-    """反向守門：原本**正確**的那一半不可以在收斂誤報時被一起弄掉。
+    """A reverse guard: the originally **correct** half must not be lost while narrowing the misreport.
 
-    百科站的 403 就是真的 UA／聯絡方式問題，而且它的失敗頁撈不出 JSON 訊息。
-    這支確保「不要亂猜」沒有被做成「什麼都不說」。
+    The encyclopedia's 403 really is a UA / contact problem, and its failure page
+    yields no JSON message. This ensures "do not guess" was not turned into "say
+    nothing".
     """
     out = vx._diagnose(403, body="<html>just a moment</html>", method="GET")
     assert "User-Agent" in out
@@ -1293,7 +1393,7 @@ def test_a_plain_get_403_still_gets_the_actionable_ua_hint():
 
 
 def test_the_upstream_extractor_never_invents_a_message():
-    """撈不到就回空字串，不要硬掰。"""
+    """When nothing can be extracted, return an empty string, do not make it up."""
     assert vx._upstream_message(None) == ""
     assert vx._upstream_message("") == ""
     assert vx._upstream_message("<html>Just a moment...</html>") == ""
@@ -1303,7 +1403,7 @@ def test_the_upstream_extractor_never_invents_a_message():
 
 
 def test_the_upstream_message_is_bounded_and_single_line():
-    """主體是第三方位元組：截短、壓成一行，不要讓一整頁噴進主控台。"""
+    """The body is third-party bytes: truncate, squash to one line, do not let a whole page spew into the console."""
     long_msg = ("x" * 5000) + "\n" + ("y" * 5000)
     out = vx._upstream_message(json.dumps({"message": long_msg}), limit=100)
     assert len(out) <= 100
@@ -1311,11 +1411,11 @@ def test_the_upstream_message_is_bounded_and_single_line():
 
 
 # ---------------------------------------------------------------------------
-# 實測層：真的打一次，確認我們現在沒有被擋
+# Live layer: actually hit it once, to confirm we are not currently blocked
 # ---------------------------------------------------------------------------
 
 def _live_status(url, params, headers):
-    """打一次真的請求，回 HTTP 狀態碼；連不上回 None（→ skip，不是紅字）。"""
+    """Make one real request, return the HTTP status code; None if unreachable (-> skip, not red)."""
     import aiohttp
 
     async def go():
@@ -1336,52 +1436,56 @@ def _live_status(url, params, headers):
     ("tags", ex.DANBOORU_TAGS_API, {"search[name]": "yuri", "limit": 1}),
 ])
 def test_our_user_agent_is_still_accepted(label, url, params):
-    """站方現在還吃我們的 UA 嗎？
+    """Does the site still accept our UA?
 
-    這是整支檔案裡唯一能抓到「站方改規則」的測試——那種變化沒有任何靜態分析看得
-    見，而失敗路徑全是靜默的回空。2026-08-30 這一題的答案是 403，而且已經 403 了
-    一段時間，沒有任何東西紅過。
+    This is the only test in the whole file that catches "the site changed its
+    rules" -- a change no static analysis can see, with a failure path that always
+    returns empty silently. On 2026-08-30 the answer was 403, and had been 403 for
+    a while, with nothing ever going red.
 
-    連不上網路 → skip（離線環境不該有紅字）。連得上但被拒絕 → 紅字，因為那就是
-    真的壞了。
+    Unreachable network -> skip (an offline environment should have no red).
+    Reachable but refused -> red, because that really is broken.
     """
     status = _live_status(url, params, {"User-Agent": ex._BOT_UA})
     if status is None:
-        pytest.skip("連不到外部站台（離線？）——這一題只在連得上時才有意義")
+        pytest.skip("cannot reach the external site (offline?) -- this only means anything when reachable")
     assert status == 200, (
-        f"Danbooru /{label} 用我們的 UA 回了 HTTP {status}。403 代表站方的防護又"
-        f"把我們擋掉了（UA={ex._BOT_UA!r}）；照 Help:Api 的規定調整 UA，不要改成"
-        "假裝瀏覽器——實測過那樣一樣被擋。")
+        f"Danbooru /{label} returned HTTP {status} with our UA. A 403 means the "
+        f"site's protection is blocking us again (UA={ex._BOT_UA!r}); adjust the "
+        "UA per Help:Api, do not switch to pretending to be a browser -- measured, "
+        "that gets blocked too.")
 
 
 # ---------------------------------------------------------------------------
-# 聯絡方式：有站台不吃「只自報名稱」的 UA
+# Contact: some sites do not accept a "name only" UA
 # ---------------------------------------------------------------------------
 
 def test_the_contact_is_folded_into_the_user_agent(fake_http, monkeypatch):
-    """設了 `api_contact` 就要照站方要的格式帶上去。
+    """When `api_contact` is set, carry it in the site's required format.
 
-    2026-08-30 實測維基媒體的 REST API，三種 UA 三種結果：
-        完全沒有 UA          -> 403「Please set a user-agent…」
-        只自報名稱的 UA      -> 403「…Contact bot-traffic@wikimedia.org…」
-        UA 裡有 URL 或 email -> 200
-    第二則不是在說我們沒自報身分，是在說**沒留下聯絡方式**。這兩件事不一樣，而
-    這支測試釘的就是那個差別有被實作出來。
+    Measured 2026-08-30 on Wikimedia's REST API, three UAs and three results:
+        no UA at all          -> 403 "Please set a user-agent..."
+        name-only UA          -> 403 "...Contact bot-traffic@wikimedia.org..."
+        UA with a URL or email -> 200
+    The second is not saying we did not identify ourselves, it is saying we
+    **left no contact**. These are two different things, and this test pins that
+    the difference is actually implemented.
     """
     monkeypatch.setattr(ex, "_configured_contact", lambda: "https://example.test/bot")
     fake_http.calls = []
     _run(ex._http_get_json("https://example.invalid/x"))
     ua = fake_http.calls[0]["headers"]["User-Agent"]
-    assert "https://example.test/bot" in ua, f"聯絡方式沒進 UA：{ua!r}"
-    assert "axiomatic" in ua, f"帶了聯絡方式就不自報名稱了：{ua!r}"
+    assert "https://example.test/bot" in ua, f"the contact did not make it into the UA: {ua!r}"
+    assert "axiomatic" in ua, f"carrying a contact dropped the self-identification: {ua!r}"
 
 
 def test_no_contact_configured_still_sends_a_usable_user_agent(fake_http,
                                                                monkeypatch):
-    """沒設定聯絡方式時**仍然**要有 UA。
+    """With no contact configured there must **still** be a UA.
 
-    這是預設狀態，而大部分站台（圖庫那幾個）只要求自報名稱就夠了。要是「沒設定
-    聯絡方式」被實作成「那就不要帶 UA 了」，就會把已經修好的 403 整組打回去。
+    This is the default state, and most sites (the image boards) are satisfied by
+    self-identification alone. If "no contact configured" were implemented as
+    "then send no UA", it would undo the whole already-fixed 403.
     """
     monkeypatch.setattr(ex, "_configured_contact", lambda: "")
     fake_http.calls = []
@@ -1390,7 +1494,7 @@ def test_no_contact_configured_still_sends_a_usable_user_agent(fake_http,
 
 
 def test_a_broken_config_does_not_take_the_user_agent_down(monkeypatch):
-    """設定檔壞掉／讀不到時要退回空字串，不是讓每個外部請求都爆掉。"""
+    """When the config is broken / unreadable, fall back to an empty string, not blow up every external request."""
     def boom():
         raise OSError("config gone")
     monkeypatch.setattr(ex, "load_bot_config", boom)
@@ -1401,42 +1505,44 @@ def test_a_broken_config_does_not_take_the_user_agent_down(monkeypatch):
 def test_a_403_without_a_contact_says_which_config_key_to_set(fake_http,
                                                               capsys,
                                                               monkeypatch):
-    """403 ＋ 沒設聯絡方式 → 診斷要指名那個鍵。
+    """403 + no contact set -> the diagnosis must name that key.
 
-    光看「HTTP 403」查不出這一題：我們**有**帶 UA，狀態碼也不會說「你缺的是聯絡
-    方式」。少了這一行，下一個人得重跑一次今天這整套實驗才知道要改哪裡。
+    "HTTP 403" alone does not reveal this: we **do** carry a UA, and the status
+    code will not say "what you lack is a contact". Without this line, the next
+    person has to re-run today's whole experiment to learn what to change.
     """
     monkeypatch.setattr(ex, "_configured_contact", lambda: "")
     fake_http.replies = [(403, None)]
     capsys.readouterr()
     _run(ex._http_get_json("https://example.invalid/x"))
     err = capsys.readouterr().err
-    assert ex._UA_CONTACT_KEY in err, f"沒說要設哪個鍵：{err!r}"
+    assert ex._UA_CONTACT_KEY in err, f"did not say which key to set: {err!r}"
 
 
 def test_the_contact_hint_stays_quiet_once_it_is_configured(fake_http, capsys,
                                                             monkeypatch):
-    """反面：設好之後 403 就不該再叫人去設它了——那會變成誤導。"""
+    """The reverse: once it is set, a 403 should not keep telling the user to set it -- that becomes misleading."""
     monkeypatch.setattr(ex, "_configured_contact", lambda: "https://example.test/bot")
     fake_http.replies = [(403, None)]
     capsys.readouterr()
     _run(ex._http_get_json("https://example.invalid/x"))
     err = capsys.readouterr().err
-    assert "403" in err, "403 本身還是要留一行"
-    assert ex._UA_CONTACT_KEY not in err, f"已經設定了還在叫人設：{err!r}"
+    assert "403" in err, "the 403 itself must still leave a line"
+    assert ex._UA_CONTACT_KEY not in err, f"already set, yet still telling the user to set it: {err!r}"
 
 
 def test_the_config_key_exists_and_defaults_to_empty():
-    """`api_contact` 要真的是設定檔的一個鍵，而且預設為空。
+    """`api_contact` must really be a config key, and default to empty.
 
-    預設空是刻意的：這個字串會被送到第三方站台，放什麼上去是擁有者的決定。程式
-    不該替他挑一個，尤其不該把他的 email 直接寫死進原始碼。
+    Defaulting to empty is deliberate: this string is sent to third-party sites,
+    and what to put there is the owner's decision. The code should not pick one
+    for them, and above all should not hardcode their email into the source.
     """
     from _bot_config import load_bot_config as real_load
     cfg = real_load()
     assert ex._UA_CONTACT_KEY in cfg, (
-        f"`{ex._UA_CONTACT_KEY}` 不在 bot_config 的輸出裡——`_coerce` 那一段漏了它，"
-        "於是設定檔怎麼填都不會生效。")
+        f"`{ex._UA_CONTACT_KEY}` is not in bot_config's output -- the `_coerce` "
+        "section missed it, so no config value ever takes effect.")
     assert isinstance(cfg[ex._UA_CONTACT_KEY], str)
 
 
@@ -1447,83 +1553,95 @@ def test_the_config_key_exists_and_defaults_to_empty():
 ])
 def test_a_blank_contact_counts_as_unset(contact, expected, monkeypatch,
                                          fake_http):
-    """只有空白的設定值等同沒設定——否則 UA 會變成 `axiomatic-bot/1.0 (   )`。"""
+    """A config value that is only whitespace counts as unset -- otherwise the UA becomes `axiomatic-bot/1.0 (   )`."""
     monkeypatch.setattr(ex, "load_bot_config", lambda: {ex._UA_CONTACT_KEY: contact})
     assert bool(ex._configured_contact()) is expected
 
 
 def test_wikimedia_really_does_want_a_contact_not_just_a_name():
-    """實測層：對維基媒體來說，只自報名稱的 UA 真的還是不夠嗎？
+    """Live layer: for Wikimedia, is a name-only UA really still not enough?
 
-    這一題釘的是「為什麼要有 `api_contact` 這個設定」本身。哪天站方放寬了，這支
-    會紅，那就是去把這個設定與它的說明文字重寫的信號——留著一個已經沒必要的設定
-    鍵，比沒有它更糟。
+    This pins "why `api_contact` as a setting exists at all". The day the site
+    loosens, this goes red, which is the signal to rewrite this setting and its
+    documentation -- keeping a no-longer-needed config key is worse than not
+    having it.
 
-    連不上網路 → skip。
+    Unreachable network -> skip.
     """
     url = ("https://en.wikipedia.org/api/rest_v1/page/summary/"
            "Python_(programming_language)")
     bare = _live_status(url, None, {"User-Agent": ex._BOT_UA})
     if bare is None:
-        pytest.skip("連不到外部站台（離線？）")
+        pytest.skip("cannot reach the external site (offline?)")
     withc = _live_status(url, None, {
         "User-Agent": "axiomatic-bot/1.0 (https://example.test/bot)"})
     assert withc == 200, (
-        f"連帶了聯絡方式的 UA 都拿不到 200（HTTP {withc}）——站方的規則又變了，"
-        "重新實測一次再改 `_user_agent` 的格式。")
+        f"even a UA with a contact does not get 200 (HTTP {withc}) -- the site's "
+        "rules changed again, re-measure before changing `_user_agent`'s format.")
     assert bare != 200, (
-        "只自報名稱的 UA 現在也通過了。站方放寬了規則——請重寫 `api_contact` 的"
-        "說明（或整個拿掉它），不要留著一個已經沒有理由的設定鍵。")
+        "a name-only UA now passes too. The site loosened its rules -- rewrite "
+        "`api_contact`'s documentation (or drop it entirely), do not keep a config "
+        "key that no longer has a reason.")
 
 
 def test_the_default_user_agent_is_applied_in_the_one_place_it_can_be():
-    """預設 UA 必須就補在 `_http_get_json` 裡，不能散在各個呼叫點。
+    """The default UA must be filled in inside `_http_get_json`, not scattered across call sites.
 
-    寫成「每個呼叫點自己記得帶」的版本正是壞掉的那一版：漏掉一個就是靜默 403，
-    而漏掉是常態。補在唯一出口才是結構上補得起來的做法。
+    The version written as "each call site remembers to carry it" is exactly the
+    one that broke: miss one and it is a silent 403, and missing one is the norm.
+    Filling it at the single exit is the structurally sound way.
 
-    （原本這裡還有一條「模組裡不得再出現『某某站可以不帶 UA』這種會過期的註解」
-    的字串比對。刪掉了——這支檔案自己的說明就會引用那句話，於是它會永遠紅。
-    禁用詞清單本來就容易誤傷；`test_language.py` 早就記過同一個教訓：會亂叫的
-    守門，最後會被人關掉。真正要釘住的是下面這條不變式。）
+    (This used to also have a string comparison for "the module must not contain
+    an expiring comment like 'site X does not need a UA'". Removed -- this file's
+    own docstrings would quote that sentence, so it would be forever red. A
+    banned-word list is prone to false positives; `test_language.py` already
+    recorded the same lesson: a guard that cries wolf ends up switched off. What
+    to really pin is the invariant below.)
     """
-    # 看**呼叫**，不看字串：這裡原本問的是 `"_BOT_UA" in 原始碼`，而命中的是 docstring 裡
-    # 那句「見 `_BOT_UA`」——程式真正呼叫的是 `_user_agent()`，把那一行刪掉照樣是綠的。
+    # Look at the **call**, not a string: this used to ask `"_BOT_UA" in source`,
+    # and matched the docstring line "see `_BOT_UA`" -- the code actually calls
+    # `_user_agent()`, so deleting that line kept it green.
     exit_tree = ast.parse(inspect.getsource(ex._http_json))
     called = {c.func.id for c in ast.walk(exit_tree)
               if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
     assert "_user_agent" in called, (
-        "`_http_json` 不再補預設 UA 了——那是所有站台的唯一保障。")
+        "`_http_json` no longer fills in the default UA -- that is the one safeguard for every site.")
     for name in ("_danbooru_posts", "_fetch_danbooru_posts_latest",
                  "_query_tags_json"):
         body = inspect.getsource(getattr(ex, name))
-        # 找的是**當成 dict key 的字串字面值**（帶引號），不是註解／docstring
-        # 裡提到這四個字——第一版就是這樣誤傷了自己的說明文字。
+        # Look for the **quoted string literal used as a dict key**, not a mention
+        # of these words in a comment / docstring -- the first version mistakenly
+        # hit its own documentation this way.
         assert chr(34) + 'User-Agent' + chr(34) not in body, (
-            f"{name} 自己塞了 User-Agent。預設值屬於 `_http_get_json`；散回呼叫點"
-            "就會回到「漏一個就靜默 403」的老路。站台真的有自己的規範時，走 "
-            "`_TagsAPI.headers` 那種明講的資料結構。")
+            f"{name} stuffed in a User-Agent itself. The default belongs to "
+            "`_http_get_json`; scattering it back to call sites returns to the "
+            "\"miss one and get a silent 403\" road. When a site really has its own "
+            "rule, go through an explicit data structure like `_TagsAPI.headers`.")
 
 
 # ---------------------------------------------------------------------------
-# tag 解析：`_best_tag_for_window`
+# Tag resolution: `_best_tag_for_window`
 #
-# 2026-09-01 用覆蓋率掃出來——這是所有共用／支援模組裡**唯一**一支超過 8 個
-# statement 卻一行都沒跑過的函式。它決定使用者打的自由文字要對到哪個 tag，錯了就是
-# 「搜出完全無關的圖」或「明明有卻說找不到」，而且兩種都不會留下任何錯誤訊息。
+# Found by coverage on 2026-09-01 -- this was the **only** function across all
+# shared / support modules with more than 8 statements and not a single line ever
+# run. It decides which tag the user's free text maps to, and getting it wrong
+# means "search returns completely unrelated images" or "it exists but says not
+# found", with neither leaving any error message.
 #
-# 它的 docstring 記著三個**用實際站台資料換來的**決定：`post_count > 0`（站上有大量
-# 零張的 stale tag）、單 token 用 prefix `tok*` 而不是 substring `*tok*`
-# （`*rossi*` 會把 `animal_crossing` 拉到第一名）、以及 `.get("name")` 而不是
-# `["name"]`（站方少回一個欄位時，KeyError 會一路冒到 mention dispatcher，
-# 把「找不到 tag」變成一則錯誤回覆）。三個決定原本都沒有守門。
+# Its docstring records three decisions **bought with real site data**:
+# `post_count > 0` (the site has many stale zero-post tags), a single token using
+# prefix `tok*` not substring `*tok*` (`*rossi*` pulls `animal_crossing` to the
+# top), and `.get("name")` rather than `["name"]` (when the site omits a field,
+# KeyError bubbles all the way up to the mention dispatcher and turns "tag not
+# found" into an error reply). None of the three had a guard originally.
 # ---------------------------------------------------------------------------
 
 def _stub_tags(monkeypatch, *replies):
-    """把 `_query_tags_json` 換掉，回傳「每一次呼叫收到的關鍵字」清單。
+    """Replace `_query_tags_json`, returning a list of "the keywords each call received".
 
-    斷言的是**送出去的查詢長什麼樣**，不只是回傳值——上面那三個決定裡有兩個
-    （prefix vs substring、短 token 不做 fuzzy）只看得出來在查詢字串上。
+    The assertion is on **what the sent query looks like**, not just the return
+    value -- two of the three decisions above (prefix vs substring, short token
+    skips fuzzy) are only visible in the query string.
     """
     calls = []
     queued = list(replies)
@@ -1542,11 +1660,12 @@ def _best(window):
 
 
 def test_a_tag_object_without_a_name_is_not_a_hit(monkeypatch):
-    """站方少回 `name` 欄位時要當成沒命中，不能讓 KeyError 冒出去。
+    """When the site omits the `name` field, treat it as a miss, do not let KeyError bubble out.
 
-    這是 `.get("name")` 那行註解記載的真實故障：例外會一路冒到 mention dispatcher
-    的 catch-all，於是使用者看到的不是「找不到這個 tag」而是一則泛用錯誤訊息——
-    同一個症狀，完全不同的原因，最難查的那種。
+    This is the real fault recorded in the `.get("name")` comment: the exception
+    bubbles all the way up to the mention dispatcher's catch-all, so the user sees
+    not "this tag is not found" but a generic error message -- same symptom,
+    completely different cause, the hardest kind to investigate.
     """
     _stub_tags(monkeypatch, [{"post_count": 500}])
     assert _best(["surtr"]) is None
@@ -1560,69 +1679,72 @@ def test_a_non_string_name_is_not_a_hit(monkeypatch, name):
 
 @pytest.mark.parametrize("count", [0, None, -1])
 def test_a_zero_post_tag_is_never_returned(monkeypatch, count):
-    """站上有大量 post_count 為 0 的 stale tag。配到它們等於搜出空結果。"""
+    """The site has many stale tags with post_count 0. Matching them means searching for an empty result."""
     _stub_tags(monkeypatch, [{"name": "stale_tag", "post_count": count}],
                [{"name": "stale_tag", "post_count": count}])
     assert _best(["surtr"]) is None
 
 
 def test_an_exact_hit_never_runs_the_fuzzy_query(monkeypatch):
-    """exact 命中就收工——多打一次 fuzzy 是白花一次對外請求。"""
+    """An exact hit finishes the job -- an extra fuzzy call wastes an outbound request."""
     calls = _stub_tags(monkeypatch, [{"name": "surtr_(arknights)",
                                       "post_count": 900}])
     assert _best(["surtr"]) == "surtr_(arknights)"
-    assert len(calls) == 1, f"exact 命中之後還多查了一次：{calls}"
+    assert len(calls) == 1, f"queried again after an exact hit: {calls}"
     assert calls[0].get("name") == "surtr", calls[0]
 
 
 def test_a_short_single_token_never_runs_the_fuzzy_query(monkeypatch):
-    """`cp` / `bb` / `ru` 這種 ≤2 字元的 token，`cp*` 最熱門的是
-    `cpu_(hexivision)` 之類完全無關的東西，幾乎必錯。exact 仍然照試。"""
+    """For a <=2-char token like `cp` / `bb` / `ru`, the most popular match for
+    `cp*` is something completely unrelated like `cpu_(hexivision)`, almost always
+    wrong. Exact is still attempted."""
     short = "x" * (ex._FUZZY_MIN_TOKEN_LEN - 1)
-    calls = _stub_tags(monkeypatch, [])          # exact 沒命中
+    calls = _stub_tags(monkeypatch, [])          # exact misses
     assert _best([short]) is None
-    assert len(calls) == 1, f"短 token 還是跑了 fuzzy：{calls}"
+    assert len(calls) == 1, f"a short token still ran fuzzy: {calls}"
 
 
 def test_a_long_single_token_falls_back_to_a_prefix_not_a_substring(monkeypatch):
-    """fuzzy 用 `tok*` 而**不是** `*tok*`。
+    """Fuzzy uses `tok*`, **not** `*tok*`.
 
-    中間 substring 會撈到無關的 tag——docstring 記的實例是 `*rossi*` 把
-    `animal_crossing` 拉到第一名。這條只看得出來在送出去的查詢字串上，所以這裡
-    斷言的是 `name_matches` 的形狀，不是回傳值。
+    A middle substring drags in unrelated tags -- the docstring's example is
+    `*rossi*` pulling `animal_crossing` to the top. This is only visible in the
+    sent query string, so the assertion here is on the shape of `name_matches`,
+    not the return value.
     """
-    calls = _stub_tags(monkeypatch, [],          # exact 沒命中
+    calls = _stub_tags(monkeypatch, [],          # exact misses
                        [{"name": "surtr_(arknights)", "post_count": 900}])
     assert _best(["surtr"]) == "surtr_(arknights)"
     assert len(calls) == 2, calls
     pattern = calls[1].get("name_matches")
-    assert pattern == "surtr*", f"fuzzy 用了 {pattern!r}，不是 prefix"
+    assert pattern == "surtr*", f"fuzzy used {pattern!r}, not a prefix"
     assert not pattern.startswith("*"), (
-        "前面多了 `*` 就變成中間 substring 配對——`*rossi*` 會配到 "
-        "`animal_crossing`，而它的 post_count 遠高於使用者真正要的那個")
+        "a leading `*` makes it a middle-substring match -- `*rossi*` matches "
+        "`animal_crossing`, whose post_count is far higher than the one the user actually wants")
 
 
 def test_multiple_tokens_use_an_ordered_substring_pattern(monkeypatch):
-    """多 token 才用 `*a*b*`：多個 substring 配 ＋ 順序限制已經夠精確。"""
+    """Only multiple tokens use `*a*b*`: several ordered substrings are precise enough."""
     calls = _stub_tags(monkeypatch,
                        [{"name": "surtr_(arknights)", "post_count": 900}])
     assert _best(["surtr", "arknights"]) == "surtr_(arknights)"
-    assert len(calls) == 1, "多 token 不該先打一次 exact"
+    assert len(calls) == 1, "multiple tokens should not run an exact query first"
     assert calls[0].get("name_matches") == "*surtr*arknights*", calls[0]
 
 
 def test_an_empty_window_asks_nothing(monkeypatch):
     calls = _stub_tags(monkeypatch)
     assert _best([]) is None
-    assert not calls, "空 window 還是送出了請求"
+    assert not calls, "an empty window still sent a request"
 
 
 def test_the_public_contact_predicate_matches_the_configured_value(monkeypatch):
-    """`contact_configured()` 是 bot 那一側用來決定「要不要多講一句」的依據。
+    """`contact_configured()` is what the bot side uses to decide "should it say one more sentence".
 
-    它是 `_configured_contact()` 的薄包裝，所以很容易被當成不用測——但把它寫反
-    （`not`）不會讓任何呼叫端的測試變紅：那些測試多半直接把這支換掉。實測過，
-    這個變異在補這一筆之前是存活的。
+    It is a thin wrapper over `_configured_contact()`, so it is easy to treat as
+    not worth testing -- but inverting it (`not`) makes no caller's test go red:
+    those tests mostly replace it directly. Measured, this mutant survived until
+    this test was added.
     """
     for raw, expected in (("", False), ("   ", False), (None, False),
                           ("https://example.test/bot", True),
@@ -1633,7 +1755,7 @@ def test_the_public_contact_predicate_matches_the_configured_value(monkeypatch):
 
 
 def test_the_contact_predicate_never_raises(monkeypatch):
-    """設定讀不到時要回 False（fail-closed：寧可少講一句，也不要因此炸掉呼叫端）。"""
+    """When config cannot be read, return False (fail-closed: better to say one sentence less than to blow up the caller)."""
     def boom():
         raise OSError("config unreadable")
 
@@ -1642,19 +1764,21 @@ def test_the_contact_predicate_never_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# `_resolve_fuzzy_tags` 的貪婪最長配對
+# `_resolve_fuzzy_tags`'s greedy longest match
 #
-# 上面那一段驗的是「單一個 window 該配到哪個 tag」；這一段驗的是**怎麼切 window**。
-# 2026-09-06 量覆蓋率時發現這 29 行裡有 18 行沒被跑過，而它做的事是**改寫使用者
-# 打進來的查詢**——切錯的症狀不是「找不到」，是「安靜地找到別的東西」，因為畫面上
-# 看不出查詢被動過手腳。
+# The section above verifies "which tag a single window matches"; this section
+# verifies **how the windows are cut**. Measuring coverage on 2026-09-06 found 18
+# of these 29 lines never run, and what it does is **rewrite the query the user
+# typed** -- the symptom of a wrong cut is not "not found" but "silently find
+# something else", because the screen does not show the query was tampered with.
 #
-# 這裡的假 `_query_tags_json` 用表格回答（鍵是送出去的 `name` 或 `name_matches`），
-# 這樣才驗得到「哪些 window 被試過、順序如何」。
+# The fake `_query_tags_json` here answers from a table (keyed by the sent `name`
+# or `name_matches`), so that "which windows were tried, in what order" can be
+# verified.
 # ---------------------------------------------------------------------------
 
 def _resolve_with(monkeypatch, table: dict, raw: str):
-    """回 `(結果, 送出去的查詢清單)`。`table` 的鍵是 `name` 或 `name_matches`。"""
+    """Return `(result, list of sent queries)`. `table`'s keys are `name` or `name_matches`."""
     calls = []
 
     async def _fake(api, *, name=None, name_matches=None, order=None, limit=5):
@@ -1672,10 +1796,11 @@ def _tag_hit(name: str, count: int = 100) -> list:
 
 
 def test_nothing_resolved_returns_none(monkeypatch):
-    """一個 token 都沒被改寫時要回 None。
+    """When not a single token was rewritten, return None.
 
-    回一個跟輸入相同的字串的話，呼叫端會以為解析成功、再打一次同樣的查詢，然後
-    使用者看到的是同一句「找不到」——只是多花了一輪 API 額度。
+    Returning a string identical to the input would make the caller think
+    resolution succeeded, run the same query again, and the user sees the same
+    "not found" -- just after spending one more round of API quota.
     """
     out, _ = _resolve_with(monkeypatch, {}, "aaa bbb")
     assert out is None
@@ -1688,16 +1813,18 @@ def test_an_empty_query_never_touches_the_api(monkeypatch):
 
 
 def test_a_token_that_resolves_to_itself_is_not_a_rewrite(monkeypatch):
-    """exact 命中但名字沒變 → 沒有改寫，照樣回 None。"""
+    """An exact hit whose name did not change -> no rewrite, still return None."""
     out, _ = _resolve_with(monkeypatch, {"yuri": _tag_hit("yuri")}, "yuri")
     assert out is None
 
 
 def test_the_longest_window_wins(monkeypatch):
-    """`lappland decadenza` 要被當成**一個** tag，不是各配各的。
+    """`lappland decadenza` must be treated as **one** tag, not matched separately.
 
-    由最長 window 往最短試就是為了這件事：分開配會得到兩個各自存在、合起來卻完全
-    不是使用者要的東西的 tag，而搜尋結果看起來「有東西」，所以不會有人發現配錯了。
+    Trying from the longest window down to the shortest is exactly for this:
+    matching separately would give two tags that each exist but together are not
+    at all what the user wanted, and the search result looks like "there is
+    something", so nobody notices the mismatch.
     """
     table = {
         "*lappland*decadenza*": _tag_hit("lappland_the_decadenza_(arknights)"),
@@ -1707,11 +1834,11 @@ def test_the_longest_window_wins(monkeypatch):
     out, calls = _resolve_with(monkeypatch, table, "lappland decadenza")
     assert out == "lappland_the_decadenza_(arknights)"
     assert calls[0] == "*lappland*decadenza*", (
-        f"沒有從最長的 window 開始試：{calls}")
+        f"did not start from the longest window: {calls}")
 
 
 def test_tokens_after_a_matched_window_are_still_resolved(monkeypatch):
-    """配到一個 window 之後，游標要跳到它的結尾繼續，不是重頭來也不是停下。"""
+    """After matching a window, the cursor must jump to its end and continue, not restart and not stop."""
     table = {
         "*lappland*decadenza*": _tag_hit("lappland_the_decadenza_(arknights)"),
         "yuri": _tag_hit("yuri_tag"),
@@ -1721,17 +1848,18 @@ def test_tokens_after_a_matched_window_are_still_resolved(monkeypatch):
 
 
 def test_an_unmatched_token_is_kept_verbatim(monkeypatch):
-    """配不到就原樣留著。丟掉它等於安靜地放寬使用者的搜尋條件。"""
+    """An unmatched token is kept as-is. Dropping it silently loosens the user's search."""
     table = {"lappl*": _tag_hit("lappland_(arknights)")}
     out, _ = _resolve_with(monkeypatch, table, "lappl zzzz")
     assert out == "lappland_(arknights) zzzz"
 
 
 def test_a_window_that_spans_a_modifier_is_never_tried(monkeypatch):
-    """含修飾詞的 window 整段跳過——不能把 `rating:general` 拼進 `*a*b*` 裡。
+    """A window containing a modifier is skipped entirely -- `rating:general` must not be spliced into `*a*b*`.
 
-    既有的那一支驗的是「只有修飾詞時不查」；這一支驗的是「修飾詞夾在中間時，
-    跨過它的那些 window 也不能查」，那是不同的一條路。
+    The existing test verifies "do not query when there is only a modifier"; this
+    one verifies "when a modifier sits in the middle, the windows spanning it must
+    not be queried either", which is a different path.
     """
     table = {"aaa": _tag_hit("aaa_tag")}
     out, calls = _resolve_with(monkeypatch, table, "aaa rating:general bbb")
@@ -1740,46 +1868,52 @@ def test_a_window_that_spans_a_modifier_is_never_tried(monkeypatch):
 
 
 def test_a_modifier_keeps_its_position(monkeypatch):
-    """修飾詞要留在原位。搬動它會改變它作用的範圍。"""
+    """A modifier must stay in place. Moving it changes the scope it applies to."""
     table = {"aaa": _tag_hit("aaa_tag")}
     out, _ = _resolve_with(monkeypatch, table, "score:>=5 aaa")
     assert out == "score:>=5 aaa_tag"
 
 
-# 明顯超過 `_FUZZY_MAX_TOKENS` 的 token 數，用來確認上限真的有截斷。
+# A token count clearly over `_FUZZY_MAX_TOKENS`, to confirm the cap really truncates.
 _FUZZY_OVERFLOW = 40
 
 
 def test_a_very_long_query_is_capped(monkeypatch):
-    """上限存在是為了不讓一個長輸入連發數十次 API 呼叫，每一次都可能被限流。"""
+    """The cap exists so a long input does not fire off dozens of API calls, each of which could be rate-limited."""
     raw = " ".join(f"tok{i}" for i in range(_FUZZY_OVERFLOW))
     out, calls = _resolve_with(monkeypatch, {}, raw)
     assert out is None
     joined = " ".join(str(c) for c in calls)
     assert f"tok{ex._FUZZY_MAX_TOKENS}" not in joined, (
-        f"處理到了上限之後的 token（上限 {ex._FUZZY_MAX_TOKENS}）")
+        f"processed a token past the cap (cap {ex._FUZZY_MAX_TOKENS})")
 
 
 
 # ---------------------------------------------------------------------------
-# 驗證腳本不得比 bot 寬鬆
+# The verifier must not be looser than the bot
 # ---------------------------------------------------------------------------
-# 驗證腳本裡**有名字、但不是從 `_ENDPOINTS` 那一格來**的逾時，只准出現在指定的函式：
-# `_error_body` 是「已經失敗之後再打一次、只為了撈上游說明」，不決定任何判定。
+# A timeout in the verifier that **has a name but does not come from the
+# `_ENDPOINTS` cell** is only allowed in a designated function: `_error_body` is
+# "hit it once more after already failing, only to grab the upstream explanation",
+# and decides no verdict.
 _VERIFIER_NAMED_TIMEOUT_HOMES = {"_ERROR_BODY_TIMEOUT_SEC": "_error_body"}
-# `entry.get("timeout", 預設)` 的預設值只准是這兩個：JSON 那條跟 bot 共用的預設，以及
-# 只給 embed_only（bot 自己不抓、沒有逾時可照抄）用的那一個。
+# The default in `entry.get("timeout", default)` may only be one of these two: the
+# default JSON shares with the bot, and the one used only for embed_only (the bot
+# does not fetch it, there is no timeout to copy).
 _VERIFIER_TABLE_DEFAULTS = {"_HTTP_TIMEOUT_SEC", "_EMBED_ONLY_TIMEOUT_SEC"}
 
 
 def _verifier_timeout_offenders(tree):
-    """驗證腳本裡**不是從對帳過的表來**的逾時：回 `(違規清單, _http_get_json 呼叫數,
-    ClientTimeout 呼叫數)`。
+    """Timeouts in the verifier that **do not come from the reconciled table**:
+    return `(offender list, _http_get_json call count, ClientTimeout call count)`.
 
-    看兩種形狀：`_http_get_json(..., timeout=X)` 與 `ClientTimeout(total=X)`。X 必須是
-    `entry.get("timeout", 預設)`（直接寫、或先指派給一個名字再傳），預設值只准是
-    `_VERIFIER_TABLE_DEFAULTS` 裡的名字；或是 `_VERIFIER_NAMED_TIMEOUT_HOMES` 列的名字、
-    而且只在它指定的那個函式裡。寫死的數字一律算違規——那就繞過了跟 bot 的對帳。
+    Looks at two shapes: `_http_get_json(..., timeout=X)` and
+    `ClientTimeout(total=X)`. X must be `entry.get("timeout", default)` (written
+    directly, or assigned to a name first then passed), with the default only a
+    name in `_VERIFIER_TABLE_DEFAULTS`; or a name listed in
+    `_VERIFIER_NAMED_TIMEOUT_HOMES`, and only in the function it designates. A
+    hardcoded number is always an offence -- that bypasses the reconciliation with
+    the bot.
     """
     def default_ok(node):
         ident = (node.attr if isinstance(node, ast.Attribute)
@@ -1827,22 +1961,22 @@ def _verifier_timeout_offenders(tree):
 
 
 def test_the_verifier_timeout_scan_sees_what_it_should():
-    """上面那支的判準自己要有對照組：驗證腳本乾淨的時候，「沒有違規」會空轉通過。"""
+    """The check above needs its own control: when the verifier is clean, "no offenders" passes idly."""
     def scan(src):
         return _verifier_timeout_offenders(ast.parse(src))[0]
 
     assert scan("async def f(entry):\n"
-                "    ClientTimeout(total=20)\n") == ["2: 20"], "寫死的數字沒被抓"
+                "    ClientTimeout(total=20)\n") == ["2: 20"], "a hardcoded number was not caught"
     assert scan("async def f(entry):\n"
-                "    ClientTimeout(20)\n") == ["2: 20"], "位置引數的寫法沒被抓"
+                "    ClientTimeout(20)\n") == ["2: 20"], "the positional-argument form was not caught"
     assert scan("async def f(entry):\n"
                 "    _http_get_json(u, timeout=30.0)\n") == ["2: 30.0"]
     assert scan("async def f(entry):\n"
                 "    t = entry.get('timeout', 99)\n"
-                "    ClientTimeout(total=t)\n") == ["3: t"], "預設值不在允許清單沒被抓"
+                "    ClientTimeout(total=t)\n") == ["3: t"], "a default not on the allowlist was not caught"
     assert scan("async def _check_raw(entry):\n"
                 "    ClientTimeout(total=_ERROR_BODY_TIMEOUT_SEC)\n") == [
-        "2: _ERROR_BODY_TIMEOUT_SEC"], "診斷用的逾時跑到別的函式沒被抓"
+        "2: _ERROR_BODY_TIMEOUT_SEC"], "the diagnostic timeout in the wrong function was not caught"
     assert scan("async def f(entry):\n"
                 "    t = entry.get('timeout', _EMBED_ONLY_TIMEOUT_SEC)\n"
                 "    ClientTimeout(total=t)\n"
@@ -1852,59 +1986,75 @@ def test_the_verifier_timeout_scan_sees_what_it_should():
 
 
 def test_the_verifier_takes_its_timeouts_only_from_the_reconciled_table():
-    """驗證腳本裡**沒有寫死的逾時**：唯一的來源是 `_ENDPOINTS` 那一格，而那一格由
-    `test_a_per_call_timeout_in_the_bot_is_mirrored_here` 跟 bot 對帳。
+    """The verifier has **no hardcoded timeout**: the only source is the
+    `_ENDPOINTS` cell, and that cell is reconciled against the bot by
+    `test_a_per_call_timeout_in_the_bot_is_mirrored_here`.
 
-    2026-09-19 前這支叫 `test_the_verifier_never_gives_an_endpoint_its_own_timeout`，
-    規則是「驗證腳本一律不准指定逾時」。它防的事是對的——2026-09-08 `/web dict` 的端點
-    要約 20 秒，最順手的「修法」是在驗證腳本裡把逾時調大讓它變綠，那會把一個真的壞掉
-    的使用者面指令蓋起來。**但同一天 bot 那一側照規則放寬了呼叫端**（`DICT_TIMEOUT_SEC`），
-    從那時起「一律用預設」就等於「比 bot **窄**」：bot 好好的，這支報連不上——規則寫的是
-    「不准比 bot 寬」，實作量的卻是「不准指定」，兩者在 bot 自己放寬之後就分岔了。
-    現在的等價寫法是「只准照抄 bot 的值」，照抄由對帳測試守；這支守的是「沒有第二個
-    來源」——在呼叫處寫死一個數字，就繞過了那張對帳過的表。
+    Before 2026-09-19 this was called
+    `test_the_verifier_never_gives_an_endpoint_its_own_timeout`, with the rule
+    "the verifier may never specify a timeout". What it prevented was right -- on
+    2026-09-08 `/web dict`'s endpoint took ~20s, and the handiest "fix" is to raise
+    the timeout in the verifier to make it green, which hides a genuinely broken
+    user-facing command. **But that same day the bot side loosened the caller per
+    the rule** (`DICT_TIMEOUT_SEC`), and from then "always use the default" meant
+    "**narrower** than the bot": the bot fine, this reports unreachable -- the rule
+    says "not looser than the bot", but the implementation measured "may not
+    specify", and the two diverged once the bot loosened itself. The equivalent
+    rule now is "may only copy the bot's value", copying guarded by the
+    reconciliation test; this test guards "no second source" -- hardcoding a number
+    at a call site bypasses that reconciled table.
 
-    用 AST 而不是字串比對：這條規則的理由寫在 `_check_json` 的 docstring 裡，掃字串會
-    掃到那段說明然後自己通過。
+    AST rather than string comparison: the reasoning for this rule is written in
+    `_check_json`'s docstring, and a string scan would hit that explanation and
+    pass itself.
 
-    2026-09-19 補上 `ClientTimeout(total=…)` 那一半：非 JSON 與 POST 的兩支檢查原本
-    寫死 `total=20`，而 bot 的動畫資料庫 POST 是 15 秒——驗證腳本比 bot 寬，會在 bot
-    逾時的時候報 ok。原本的掃描只看 `_http_get_json` 的 `timeout=`，所以看不到它們。
+    Added 2026-09-19: the `ClientTimeout(total=...)` half. The non-JSON and POST
+    checks originally hardcoded `total=20`, while the bot's anime database POST is
+    15s -- the verifier looser than the bot, reporting ok when the bot would time
+    out. The original scan only looked at `_http_get_json`'s `timeout=`, so it did
+    not see them.
     """
     source = (Path(__file__).resolve().parent.parent / "axiomatic"
               / "verify_external_apis.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
 
     offenders, calls, sessions = _verifier_timeout_offenders(tree)
-    assert calls, "驗證腳本裡一個 `_http_get_json` 呼叫都掃不到——掃描壞了，這支會空轉"
+    assert calls, "not a single `_http_get_json` call can be scanned in the verifier -- the scan is broken, this spins idle"
     assert sessions >= 3, (
-        f"驗證腳本裡的 `ClientTimeout` 只掃到 {sessions} 個（`_check_raw`、`_check_post`、"
-        "`_error_body` 各一個）——那一半的掃描壞了，這支會空轉")
+        f"only {sessions} `ClientTimeout` scanned in the verifier (`_check_raw`, "
+        "`_check_post`, `_error_body`, one each) -- that half of the scan is "
+        "broken, this spins idle")
     assert not offenders, (
-        f"verify_external_apis.py 這些呼叫的逾時不是從 `_ENDPOINTS` 那一格來的：{offenders}。"
-        "寫死的逾時繞過了跟 bot 的對帳——要改逾時，改 bot 那一側的常數，再把 `_ENDPOINTS`"
-        "對應那一筆的 `timeout`／`bot_timeout` 照抄過來。")
+        f"these calls' timeouts in verify_external_apis.py do not come from the "
+        f"`_ENDPOINTS` cell: {offenders}. A hardcoded timeout bypasses the "
+        "reconciliation with the bot -- to change a timeout, change the bot-side "
+        "constant, then copy the matching `_ENDPOINTS` entry's `timeout` / "
+        "`bot_timeout`.")
 
 
 def test_the_default_timeout_is_a_named_constant():
-    """預設逾時要有名字，因為**別的模組要印它**。
+    """The default timeout must have a name, because **another module prints it**.
 
-    `verify_external_apis` 回報「沒有回應」時會把這個秒數印出來——沒有它，讀的人
-    分不出「連不上」與「端點活著但比這個上限慢」，而那兩者的處置完全相反。
+    `verify_external_apis` prints this number of seconds when it reports "no
+    response" -- without it, the reader cannot tell "cannot connect" from
+    "endpoint is alive but slower than this cap", and the two need opposite
+    handling.
     """
-    # `timeout` 是 keyword-only（簽名裡在 `*` 之後），所以預設值住在
-    # `__kwdefaults__` 而不是 `__defaults__`——用 `signature` 就不必分辨。
+    # `timeout` is keyword-only (after `*` in the signature), so the default lives
+    # in `__kwdefaults__` not `__defaults__` -- using `signature` avoids the
+    # distinction.
     default = inspect.signature(ex._http_get_json).parameters["timeout"].default
     assert default == ex._HTTP_TIMEOUT_SEC, (
-        f"簽名的預設值 {default} 與 `_HTTP_TIMEOUT_SEC` "
-        f"({ex._HTTP_TIMEOUT_SEC}) 不一致——寫死回字面值了？")
+        f"the signature default {default} disagrees with `_HTTP_TIMEOUT_SEC` "
+        f"({ex._HTTP_TIMEOUT_SEC}) -- hardcoded back to a literal?")
 
 
 # ---------------------------------------------------------------------------
-# 驗證工具的結束碼三分（2026-09-20）
+# The verifier's three-way exit code (2026-09-20)
 # ---------------------------------------------------------------------------
-# 原本「全部連不上」是 exit 0：一項都沒驗到，只看結束碼的呼叫端卻讀成全部正常。
-# 現在跟 `verify_browser.py` 同一套：0 全部驗過且正常、1 有 FAIL、3 有沒驗到的。
+# "Everything unreachable" was originally exit 0: verified nothing, but a caller
+# that only reads the exit code read it as all-fine. Now the same scheme as
+# `verify_browser.py`: 0 all verified and healthy, 1 has a FAIL, 3 has unverified.
 
 def _r(verdict: str) -> dict:
     return {"group": "g", "what": "w", "verdict": verdict, "detail": ""}
@@ -1913,15 +2063,17 @@ def _r(verdict: str) -> dict:
 @pytest.mark.parametrize("verdicts, expected", [
     (["OK", "OK"], 0),
     ([], 0),
-    # **`SKIP` 同一天稍晚換到「沒驗到」那一邊。** 原本這一格是 0，註解寫「刻意跳過的
-    # 不算沒驗到」——可是這支腳本裡沒有任何「刻意跳過」的端點：`SKIP` 的兩個來源都
-    # 是 CDN 那一筆拿不到樣本圖。實測 `--only cdn`（`cdn` 自成一組）在拿不到樣本時
-    # 印「1 ok, 0 failed, 0 unreachable」、exit 0，正是三分要消滅的那個形狀。
+    # **`SKIP` moved to the "unverified" side later the same day.** This cell was
+    # originally 0, with the comment "a deliberate skip is not unverified" -- but
+    # this script has no "deliberately skipped" endpoint: both sources of `SKIP`
+    # are the CDN entry failing to get a sample image. Measured `--only cdn` (`cdn`
+    # is its own group) with no sample printed "1 ok, 0 failed, 0 unreachable",
+    # exit 0, exactly the shape the three-way split exists to kill.
     (["OK", "SKIP"], 3),
     (["SKIP"], 3),
-    (["UNREACHABLE", "UNREACHABLE"], 3),       # 離線：一項都沒驗到
-    (["OK", "UNREACHABLE"], 3),                # 部分沒驗到也不得回報成功
-    (["FAIL", "UNREACHABLE"], 1),              # 真的被拒絕優先於沒驗到
+    (["UNREACHABLE", "UNREACHABLE"], 3),       # offline: verified nothing
+    (["OK", "UNREACHABLE"], 3),                # partially unverified must not report success
+    (["FAIL", "UNREACHABLE"], 1),              # a real refusal takes priority over unverified
     (["OK", "FAIL"], 1),
 ])
 def test_the_verifier_exit_code_is_three_way(verdicts, expected):
@@ -1929,7 +2081,7 @@ def test_the_verifier_exit_code_is_three_way(verdicts, expected):
 
 
 def test_the_unverified_exit_code_is_not_argparses_usage_error():
-    """argparse 打錯參數時用 2；沒驗到必須跟它分得開，也跟 FAIL（1）分得開。"""
+    """argparse uses 2 on a bad argument; unverified must be told apart from it, and from FAIL (1)."""
     assert vx.EXIT_UNVERIFIED not in (0, 1, 2)
     assert (vx.EXIT_OK, vx.EXIT_FAIL) == (0, 1)
 
@@ -1937,10 +2089,11 @@ def test_the_unverified_exit_code_is_not_argparses_usage_error():
 @pytest.mark.parametrize("as_json", [False, True])
 def test_main_reports_unverified_end_to_end_without_touching_the_network(
         monkeypatch, capsys, as_json):
-    """從 `main()` 一路進去：結束碼來自 `_exit_code`，JSON 也帶得出同一個數字。
+    """All the way in from `main()`: the exit code comes from `_exit_code`, and JSON carries the same number.
 
-    `_run` 換成合成結果，所以不打任何網路；`argv=[]` 也順便釘住 `main()` 不去讀
-    pytest 自己的命令列（那會變成 argparse 的 exit 2）。
+    `_run` is replaced with synthetic results, so no network is hit; `argv=[]` also
+    pins `main()` not to read pytest's own command line (which would become
+    argparse's exit 2).
     """
     async def fake_run(only):
         return [_r("OK"), _r("UNREACHABLE")]
@@ -1959,25 +2112,27 @@ def test_main_reports_unverified_end_to_end_without_touching_the_network(
 
 
 # ---------------------------------------------------------------------------
-# 驗證腳本自己那一層：三支檢查函式從來沒有被任何測試執行過（2026-09-20）
+# The verifier's own layer: the three check functions had never been run by any test (2026-09-20)
 # ---------------------------------------------------------------------------
-# 覆蓋率量出來的：`verify_external_apis.py` 64%，而缺的 66 行不是散的——`_check_raw`、
-# `_check_post`、`_read_body_text`、`_error_body` **整段**，加上 `_run` 的列印與
-# `main()` 的兩個分支。也就是「驗證工具自己有沒有在說實話」這件事沒有任何守門。
+# Measured by coverage: `verify_external_apis.py` at 64%, and the missing 66 lines
+# are not scattered -- `_check_raw`, `_check_post`, `_read_body_text`,
+# `_error_body` **in full**, plus `_run`'s printing and `main()`'s two branches.
+# That is, "whether the verifier itself is telling the truth" had no guard at all.
 #
-# 下面的替身只長出這幾支真的會碰到的屬性。`aiohttp` 是在函式內 `import` 的，取得的
-# 是同一個模組物件，所以換掉 `ex.aiohttp.ClientSession` 對兩邊同時生效。
+# The stand-ins below only grow the attributes these functions actually touch.
+# `aiohttp` is `import`ed inside the functions, obtaining the same module object,
+# so replacing `ex.aiohttp.ClientSession` takes effect on both sides at once.
 
 
 class _BoomBody:
-    """`read()` 會炸的串流。診斷用的讀取不該把驗證本身帶下去。"""
+    """A stream whose `read()` throws. A diagnostic read should not take the verification down with it."""
 
     async def read(self, _n: int = -1) -> bytes:
         raise OSError("stream exploded")
 
 
 class _VerifierResponse:
-    """`aiohttp` 回應的替身。`content_type` 是 `_check_raw` 成功時會印的東西。"""
+    """A stand-in for an `aiohttp` response. `content_type` is what `_check_raw` prints on success."""
 
     def __init__(self, status, *, body=b"", content_type="application/json",
                  payload=None, boom_body=False):
@@ -1991,10 +2146,11 @@ class _VerifierResponse:
 
 
 class _Ctx:
-    """`session.get(...)` 回的那個非同步情境管理器。
+    """The async context manager returned by `session.get(...)`.
 
-    佇列裡放**例外實例**就是「這次請求炸掉」——真的 `aiohttp` 也是在 `__aenter__`
-    那一刻才拋，所以替身照著同一個契約，而不是照著呼叫端目前剛好怎麼寫。
+    Putting an **exception instance** in the queue means "this request blows up" --
+    real `aiohttp` also throws only at `__aenter__`, so the stand-in follows the
+    same contract, not how the caller happens to be written right now.
     """
 
     def __init__(self, result):
@@ -2010,7 +2166,7 @@ class _Ctx:
 
 
 class _VerifierSession:
-    """記錄用的 `ClientSession` 替身，回應一律從 `responses` 佇列取。"""
+    """A recording `ClientSession` stand-in; responses always come from the `responses` queue."""
 
     calls: list[dict] = []
     responses: list = []
@@ -2028,7 +2184,7 @@ class _VerifierSession:
         type(self).calls.append({
             "method": method, "url": url, "params": params,
             "headers": dict(headers or {}), "json": json_body})
-        assert type(self).responses, f"替身沒有準備給 {method} {url} 的回應"
+        assert type(self).responses, f"the stand-in has no prepared response for {method} {url}"
         return _Ctx(type(self).responses.pop(0))
 
     def get(self, url, *, params=None, headers=None, **kw):
@@ -2057,23 +2213,25 @@ _JSON_ENTRY = {"group": "g", "what": "w",
 
 
 def _json_answer(monkeypatch, status, data=None):
-    """把 `_check_json` 底下那條共用的 GET 換掉，回指定的 (status, data)。"""
+    """Replace the shared GET under `_check_json`, returning the given (status, data)."""
     async def fake_get(url, *, params=None, headers=None,
                        timeout=ex._HTTP_TIMEOUT_SEC, quiet_statuses=()):
         return status, data
     monkeypatch.setattr(ex, "_http_get_json", fake_get)
 
 
-# --- 一條規則、三個實作：宣告過的非 200 --------------------------------------
+# --- One rule, three implementations: a declared non-200 --------------------
 
 @pytest.mark.parametrize("kind", ["json", "raw", "post"])
 def test_every_checker_honours_an_expected_non_200(monkeypatch, verifier_http,
                                                    kind):
-    """`ok_statuses` 原本只有 `_check_json` 看得到。
+    """`ok_statuses` was originally only visible to `_check_json`.
 
-    一個**宣告了但沒有人讀**的鍵沒有任何症狀——跟 `_OWNER_ONLY_SLASH` 裡那個過期
-    字串同一個形狀，只是它失敗的方向是狼來了：那一筆會永遠報 FAIL，而報表上看起來
-    就像站方真的拒絕了我們。三支現在共用同一個說法，這支測試就是那個「比對」。
+    A key that is **declared but nobody reads** has no symptom -- the same shape as
+    that stale `_OWNER_ONLY_SLASH` string, only its failure direction is crying
+    wolf: that entry would forever report FAIL, and on the report it looks like the
+    site really refused us. All three now share the same wording, and this test is
+    that "comparison".
     """
     entry = {"json": _JSON_ENTRY, "raw": _RAW_ENTRY,
              "post": _POST_ENTRY}[kind] | {"ok_statuses": (404,)}
@@ -2084,22 +2242,24 @@ def test_every_checker_honours_an_expected_non_200(monkeypatch, verifier_http,
         verifier_http.responses.append(_VerifierResponse(404))
         checker = vx._check_raw if kind == "raw" else vx._check_post
         verdict, detail = _run(checker(entry))
-    assert verdict == "OK", f"{kind}: 宣告過的 404 被報成 {verdict}（{detail}）"
+    assert verdict == "OK", f"{kind}: a declared 404 was reported as {verdict} ({detail})"
     assert detail == vx._expected_status(404)[1], f"{kind}: {detail!r}"
 
 
-# --- 一條規則、三個實作：沒有回應時要講出逾時上限 -----------------------------
+# --- One rule, three implementations: name the timeout cap when nothing answers ---
 
 @pytest.mark.parametrize("kind, timeout", [
     ("json", 30.0), ("raw", 20.0), ("post", 15.0)])
 def test_every_checker_names_the_timeout_when_nothing_answers(
         monkeypatch, verifier_http, kind, timeout):
-    """「連不上」與「比我們的上限慢」是兩件事，而只有 `_check_json` 學會了。
+    """"Cannot connect" and "slower than our cap" are two things, and only `_check_json` had learned it.
 
-    2026-09-08 字典那一筆就是後者（端點回 200，只是要 20 秒，而上限 15 秒），當時
-    的訊息把人指向網路故障。`_check_raw`／`_check_post` 在 2026-09-20 以前回的是光禿
-    禿一個 `TimeoutError`——同一個誤導，而它們那兩筆的上限（20／30 秒）恰恰是最可能
-    「活著但比上限慢」的。
+    On 2026-09-08 the dictionary entry was the latter (the endpoint returns 200,
+    just takes 20s, while the cap was 15s), and the message at the time pointed
+    people at a network fault. Before 2026-09-20 `_check_raw` / `_check_post`
+    returned a bare `TimeoutError` -- the same misdirection, and their two entries'
+    caps (20 / 30s) are exactly the ones most likely to be "alive but slower than
+    the cap".
     """
     entry = {"json": _JSON_ENTRY, "raw": _RAW_ENTRY, "post": _POST_ENTRY}[kind]
     if kind == "json":
@@ -2110,33 +2270,36 @@ def test_every_checker_names_the_timeout_when_nothing_answers(
         checker = vx._check_raw if kind == "raw" else vx._check_post
         verdict, detail = _run(checker(entry))
     assert verdict == "UNREACHABLE"
-    assert f"{timeout:g}" in detail, f"{kind}: 沒有把逾時上限印出來：{detail!r}"
-    assert "比這個上限慢" in detail, f"{kind}: 只報了連不上：{detail!r}"
+    assert f"{timeout:g}" in detail, f"{kind}: did not print the timeout cap: {detail!r}"
+    assert "slower than this cap" in detail, f"{kind}: only reported unreachable: {detail!r}"
 
 
 @pytest.mark.parametrize("kind", ["raw", "post"])
 def test_a_connection_that_never_opened_is_not_blamed_on_slowness(
         verifier_http, kind):
-    """近似命中：DNS／被擋是**連線沒成立**，跟「回得慢」要分得開，否則兩種都會被
-    導去改逾時。例外的類別名要留著，那是唯一能分辨的線索。"""
+    """Near-miss: DNS / blocked is **the connection never opening**, which must be
+    told apart from "replies slowly", or both get sent to change the timeout. The
+    exception's class name must be kept, it is the only clue that distinguishes
+    them."""
     verifier_http.responses.append(OSError("no route to host"))
     entry = _RAW_ENTRY if kind == "raw" else _POST_ENTRY
     checker = vx._check_raw if kind == "raw" else vx._check_post
     verdict, detail = _run(checker(entry))
     assert verdict == "UNREACHABLE"
     assert "OSError" in detail, detail
-    assert "連線本身沒有成立" in detail, detail
-    assert "比這個上限慢" not in detail, f"把連不上說成回得慢：{detail!r}"
+    assert "the connection itself never opened" in detail, detail
+    assert "slower than this cap" not in detail, f"reported unreachable as slow: {detail!r}"
 
 
-# --- CDN 那一筆：拿不到樣本圖等於沒驗到 ---------------------------------------
+# --- The CDN entry: no sample image means unverified -------------------------
 
 @pytest.mark.parametrize("post", [None, {}, {"id": 1, "md5": "x"}])
 def test_the_cdn_check_skips_when_there_is_no_sample_image(monkeypatch, post):
-    """CDN 沒有固定網址，得先跟 API 要一張現有的圖。要不到就是**沒驗到**。
+    """The CDN has no fixed URL, it must first ask the API for an existing image. Failing to get one means **unverified**.
 
-    這兩個 `SKIP` 是整支腳本裡僅有的兩個，所以「刻意跳過」從來不存在——見
-    `test_the_verifier_exit_code_is_three_way` 那張表上換邊的那一格。
+    These two `SKIP`s are the only two in the whole script, so "deliberately
+    skipped" never exists -- see the cell that changed sides in
+    `test_the_verifier_exit_code_is_three_way`.
     """
     async def no_post(*_args, **_kwargs):
         return post
@@ -2155,9 +2318,10 @@ def test_the_cdn_check_skips_when_there_is_no_sample_image(monkeypatch, post):
 ])
 def test_the_cdn_check_downloads_the_sample_it_was_given(
         monkeypatch, verifier_http, post, expected):
-    """真的去抓那張圖，而且照 large → file → preview 的順序。
+    """Actually fetch that image, in the order large -> file -> preview.
 
-    順序不是隨便的：`--grid` 下載走的就是這條，驗證要打的是**同一個**網址。
+    The order is not arbitrary: `--grid` download goes through this, and the
+    verification must hit **the same** URL.
     """
     async def one_post(*_args, **_kwargs):
         return post
@@ -2171,18 +2335,19 @@ def test_the_cdn_check_downloads_the_sample_it_was_given(
     assert "image/png" in detail
 
 
-# --- raw 的標頭與失敗路徑 ------------------------------------------------
+# --- raw's headers and failure path -------------------------------------
 
 def test_a_raw_request_always_carries_a_user_agent(verifier_http):
-    """沒宣告 UA 的 raw 端點要補上共用的那個——這支腳本的全部價值就是「跟 bot 走
-    同一條路」，而 2026-08-30 兩個事故都出在標頭上。"""
+    """A raw endpoint with no declared UA must be given the shared one -- this
+    script's whole value is "walk the same path as the bot", and both 2026-08-30
+    incidents were in the headers."""
     verifier_http.responses.append(_VerifierResponse(200))
     _run(vx._check_raw(_RAW_ENTRY))
     assert verifier_http.calls[0]["headers"]["User-Agent"] == ex._user_agent()
 
 
 def test_a_raw_entry_keeps_the_user_agent_it_declared(verifier_http):
-    """近似命中：iqdb 那一筆要的是瀏覽器風格 UA，補預設值不可以把它蓋掉。"""
+    """Near-miss: the iqdb entry wants a browser-style UA, and filling the default must not override it."""
     verifier_http.responses.append(_VerifierResponse(200))
     entry = _RAW_ENTRY | {"headers": {"User-Agent": ex._BROWSER_UA}}
     _run(vx._check_raw(entry))
@@ -2190,7 +2355,7 @@ def test_a_raw_entry_keeps_the_user_agent_it_declared(verifier_http):
 
 
 def test_a_raw_failure_quotes_what_the_upstream_said(verifier_http):
-    """403 的原因十之八九寫在主體裡。這條同時走過 `_read_body_text`。"""
+    """Nine times out of ten a 403's reason is in the body. This path also goes through `_read_body_text`."""
     body = json.dumps({"message": "blocked: missing contact"}).encode("utf-8")
     verifier_http.responses.append(_VerifierResponse(403, body=body))
     verdict, detail = _run(vx._check_raw(_RAW_ENTRY))
@@ -2201,14 +2366,14 @@ def test_a_raw_failure_quotes_what_the_upstream_said(verifier_http):
 
 def test_reading_a_failure_body_never_takes_the_verification_down(
         verifier_http):
-    """主體讀不到就回空字串。診斷是附加價值，不能反過來害整支掃描炸掉。"""
+    """When the body cannot be read, return an empty string. A diagnostic is added value, it must not blow up the whole scan."""
     assert _run(vx._read_body_text(_VerifierResponse(500, boom_body=True))) == ""
-    resp = _VerifierResponse(500, body="上游說明".encode("utf-8"))
-    assert _run(vx._read_body_text(resp)) == "上游說明"
+    resp = _VerifierResponse(500, body="upstream detail".encode("utf-8"))
+    assert _run(vx._read_body_text(resp)) == "upstream detail"
 
 
 def test_the_second_request_for_a_reason_is_allowed_to_fail(verifier_http):
-    """`_error_body` 是「已經失敗之後再打一次」。它自己失敗時只是少一句原因。"""
+    """`_error_body` is "hit it once more after already failing". When it fails itself, it just misses one reason line."""
     verifier_http.responses.append(OSError("still down"))
     assert _run(vx._error_body("https://example.test/x")) == ""
     verifier_http.responses.append(
@@ -2216,7 +2381,7 @@ def test_the_second_request_for_a_reason_is_allowed_to_fail(verifier_http):
     assert "slow down" in _run(vx._error_body("https://example.test/x"))
 
 
-# --- POST 那一筆 ---------------------------------------------------------
+# --- The POST entry ------------------------------------------------------
 
 def test_the_post_check_sends_the_declared_query_with_a_user_agent(
         verifier_http):
@@ -2233,42 +2398,44 @@ def test_the_post_check_sends_the_declared_query_with_a_user_agent(
 @pytest.mark.parametrize("payload", [{"errors": [{}]}, [], None, "data"])
 def test_the_post_check_rejects_a_200_with_the_wrong_shape(verifier_http,
                                                            payload):
-    """GraphQL 端點回 200 不代表查得到——沒有 `data` 就是壞的。"""
+    """A 200 from the GraphQL endpoint does not mean it queried -- no `data` means broken."""
     verifier_http.responses.append(_VerifierResponse(200, payload=payload))
     verdict, _detail = _run(vx._check_post(_POST_ENTRY))
     assert verdict == "FAIL"
 
 
 def test_a_post_failure_does_not_blame_the_user_agent(verifier_http):
-    """走完整條路（不是只測 `_diagnose`）確認 `method="POST"` 真的傳下去了。"""
+    """Walk the whole path (not just test `_diagnose`) to confirm `method="POST"` is really passed down."""
     verifier_http.responses.append(_VerifierResponse(403, body=b"<html>x"))
     verdict, detail = _run(vx._check_post(_POST_ENTRY))
     assert verdict == "FAIL"
     assert ex._UA_CONTACT_KEY not in detail, detail
 
 
-# --- 診斷的順序：上游自己說的優先，5xx 也不例外 -------------------------------
+# --- Diagnosis order: what the upstream says wins, 5xx included --------------
 
 def test_the_diagnosis_prefers_the_upstream_even_for_a_5xx():
-    """2026-09-20 補的那一格。
+    """The cell added 2026-09-20.
 
-    原本 5xx 直接回「52x 通常是前面的 CDN 連不到原站」，於是一個帶著 JSON 說明的
-    503（「維護到某日」那種）會被這支工具改寫成一句猜測——正好違反本函式 docstring
-    立的規矩。同一個形狀在 403 上已經害過一次（2026-09-07 動畫資料庫）。
+    Originally 5xx returned "52x usually means the fronting CDN cannot reach the
+    origin" directly, so a 503 carrying a JSON explanation ("maintenance until X")
+    would be rewritten by this tool into a guess -- exactly violating the rule set
+    in this function's docstring. The same shape already hurt once on a 403
+    (2026-09-07 anime database).
     """
     body = json.dumps({"message": "scheduled maintenance until 2026-10-01"})
     out = vx._diagnose(503, body=body)
-    assert "scheduled maintenance" in out, f"猜測蓋掉了事實：{out!r}"
+    assert "scheduled maintenance" in out, f"the guess overwrote the fact: {out!r}"
     assert "CDN" not in out, out
 
 
 def test_a_5xx_without_a_readable_reason_still_gets_the_cdn_hint():
-    """反向守門：收斂猜測不可以做成「什麼都不說」。CDN 的挑戰頁撈不出 JSON。"""
+    """A reverse guard: narrowing the guess must not become "say nothing". A CDN challenge page yields no JSON."""
     out = vx._diagnose(522, body="<html>error code: 522</html>")
-    assert "CDN" in out and "上游" in out, out
+    assert "CDN" in out and "upstream" in out, out
 
 
-# --- `_run` 的挑選與列印 --------------------------------------------------
+# --- `_run`'s selection and printing -------------------------------------
 
 def _record_checks(monkeypatch, verdict="OK"):
     seen = []
@@ -2294,10 +2461,11 @@ def test_only_checks_the_groups_that_were_asked_for(monkeypatch):
 
 def test_every_endpoint_gets_a_line_and_every_bad_one_gets_a_reason(
         monkeypatch, capsys):
-    """`--json` 以外的那條路：一行一筆，非 OK 的多印一行原因。
+    """The non-`--json` path: one line per entry, plus one reason line for a non-OK.
 
-    `monkeypatch.setattr(vx, "_QUIET", False)` 不只是設值——`main()` 會用 `global`
-    把它寫成 True 並留在那裡，所以這裡同時是在把那個汙染關起來（teardown 會還原）。
+    `monkeypatch.setattr(vx, "_QUIET", False)` is not only setting a value --
+    `main()` writes it True with `global` and leaves it there, so this also fences
+    off that contamination (teardown restores it).
     """
     monkeypatch.setattr(vx, "_QUIET", False)
     _record_checks(monkeypatch, verdict="FAIL")
@@ -2308,11 +2476,12 @@ def test_every_endpoint_gets_a_line_and_every_bad_one_gets_a_reason(
 
 
 def test_every_verdict_the_checkers_can_return_is_registered():
-    """判定字串散在三支檢查函式的 `return` 裡，兩份登記都得對得上。
+    """The verdict strings are scattered across the three check functions' `return`s, and both registrations must match.
 
-    忘了登記的後果分兩半：`_run` 會在掃到一半時 `KeyError`（吵，但至少看得見），
-    而 `_exit_code` 那半是**安靜**的——沒被列進 `_UNVERIFIED_VERDICTS` 的新判定會
-    自動算成「驗過而且正常」，也就是這一整天在修的那個形狀。
+    Forgetting to register has two halves: `_run` KeyErrors mid-scan (noisy, but at
+    least visible), while the `_exit_code` half is **silent** -- a new verdict not
+    in `_UNVERIFIED_VERDICTS` is automatically counted as "verified and healthy",
+    which is the shape being fixed all this day.
     """
     tree = ast.parse(Path(vx.__file__).read_text(encoding="utf-8"))
     returned = set()
@@ -2325,21 +2494,22 @@ def test_every_verdict_the_checkers_can_return_is_registered():
         if isinstance(head, ast.Constant) and isinstance(head.value, str):
             tuples += 1
             returned.add(head.value)
-    assert tuples >= 8, f"判定掃描沒抓到東西（{tuples}）——空集合看起來跟乾淨一樣"
+    assert tuples >= 8, f"the verdict scan caught nothing ({tuples}) -- an empty set looks like clean"
     assert returned == set(vx._VERDICT_MARKS), (
-        f"判定與顯示登記對不上：{returned ^ set(vx._VERDICT_MARKS)}")
+        f"verdicts and display registration disagree: {returned ^ set(vx._VERDICT_MARKS)}")
     classified = vx._UNVERIFIED_VERDICTS | {"OK", "FAIL"}
     assert returned == classified, (
-        f"有判定沒有被結束碼分類：{returned ^ classified}")
+        f"a verdict is not classified by the exit code: {returned ^ classified}")
 
 
-# --- main() 的統計 -------------------------------------------------------
+# --- main()'s statistics -------------------------------------------------
 
 def test_main_counts_every_result_exactly_once(monkeypatch, capsys):
-    """四個數字要**加得起來**。
+    """The four numbers must **add up**.
 
-    原本「ok」是減出來的（總數 − failed − unreachable），所以 `SKIP` 被算進 ok，
-    而任何未來新增的判定也會自動被算成好的。減法把沒列到的東西默默歸成正常。
+    Originally "ok" was subtracted (total - failed - unreachable), so `SKIP` was
+    counted into ok, and any future new verdict is automatically counted as good.
+    Subtraction silently folds anything unlisted into the normal ones.
     """
     async def fake_run(_only):
         return [_r(v) for v in ("OK", "OK", "FAIL", "UNREACHABLE", "SKIP")]
@@ -2357,7 +2527,7 @@ def test_main_counts_every_result_exactly_once(monkeypatch, capsys):
 
 def test_main_says_which_config_key_to_set_when_there_is_no_contact(
         monkeypatch, capsys):
-    """沒設聯絡方式時，開頭那行要指名道姓——403 光看狀態碼查不出來。"""
+    """With no contact set, the opening line must name it -- a 403 is not diagnosable from the status code alone."""
     async def fake_run(_only):
         return [_r("OK")]
 
@@ -2371,22 +2541,24 @@ def test_main_says_which_config_key_to_set_when_there_is_no_contact(
 
 
 def test_a_200_that_is_not_json_is_a_failure(monkeypatch):
-    """HTTP 200 但內容解不開＝那個端點對我們而言是壞的，不是 OK。
+    """HTTP 200 but the content will not parse = that endpoint is broken for us, not OK.
 
-    這條的價值在 `_http_get_json` 的契約：它解析失敗時回的是 `(200, None)`，而
-    「狀態碼漂亮」正是最容易被當成健康的一種壞法。
+    The value of this is in `_http_get_json`'s contract: on a parse failure it
+    returns `(200, None)`, and "the status code is pretty" is exactly the kind of
+    breakage most easily mistaken for healthy.
     """
     _json_answer(monkeypatch, 200, None)
     verdict, detail = _run(vx._check_json(_JSON_ENTRY))
     assert verdict == "FAIL"
-    assert "不是 JSON" in detail
+    assert "not JSON" in detail
 
 
 def test_a_failure_page_bigger_than_the_cap_leaves_no_reason_but_no_crash():
-    """失敗頁也有上限——主體是第三方送來的，錯誤處理路徑上不能有無上限的讀取。
+    """The failure page has a cap too -- the body is third-party, and there must be no unbounded read on the error path.
 
-    超過上限時 `read_capped_body` 回 `None`，診斷就少一句原因；**不可以**變成
-    例外，也不可以把 `None` 當成字串往下丟。
+    Over the cap, `read_capped_body` returns `None`, and the diagnosis loses one
+    reason line; it **must not** become an exception, and `None` must not be passed
+    down as a string.
     """
     oversize = b"x" * (vx._DIAG_BODY_CAP + 1)
     resp = _VerifierResponse(503, body=oversize)
@@ -2395,7 +2567,7 @@ def test_a_failure_page_bigger_than_the_cap_leaves_no_reason_but_no_crash():
 
 def test_everything_unreachable_says_it_is_probably_the_network(monkeypatch,
                                                                 capsys):
-    """一整片連不上通常是這一端沒網路，別讓人去查站方是不是封鎖了我們。"""
+    """A whole sea of unreachable usually means this end has no network; do not send people to check whether the site blocked us."""
     async def fake_run(_only):
         return [_r("UNREACHABLE"), _r("UNREACHABLE")]
 
@@ -2404,19 +2576,20 @@ def test_everything_unreachable_says_it_is_probably_the_network(monkeypatch,
     monkeypatch.setattr(ex, "_configured_contact", lambda: "x")
     assert vx.main([]) == vx.EXIT_UNVERIFIED
     out = capsys.readouterr().out
-    assert "沒有網路" in out, out
+    assert "no network" in out, out
     assert "0 ok, 0 failed, 2 unreachable, 0 skipped" in out, out
 
 
 def test_the_summary_repeats_every_failure_at_the_bottom(monkeypatch,
                                                         capsys):
-    """掃描有 22 筆，逐筆那行會被捲走；結尾必須把 FAIL 連同原因再列一次。
+    """The scan has 22 entries and the per-entry lines scroll away; the end must list each FAIL with its reason again.
 
-    只有 `--json` 被測過的話，這段文字輸出永遠不會執行——而人讀的是這一段。
+    If only `--json` is tested, this text output never runs -- and this is what
+    people read.
     """
     async def fake_run(_only):
-        bad = _r("FAIL") | {"group": "wiki", "what": "百科摘要",
-                            "detail": "HTTP 403  ← 上游自己說：no contact"}
+        bad = _r("FAIL") | {"group": "wiki", "what": "encyclopedia summary",
+                            "detail": "HTTP 403  <- upstream said: no contact"}
         return [_r("OK"), bad]
 
     monkeypatch.setattr(vx, "_run", fake_run)
@@ -2425,12 +2598,12 @@ def test_the_summary_repeats_every_failure_at_the_bottom(monkeypatch,
     assert vx.main([]) == vx.EXIT_FAIL
     out = capsys.readouterr().out
     assert "FAIL  wiki" in out, out
-    assert "no contact" in out, f"結尾只報了標題、沒有原因：{out!r}"
+    assert "no contact" in out, f"the end reported only the title, no reason: {out!r}"
     assert "1 ok, 1 failed, 0 unreachable, 0 skipped" in out, out
 
 
 # ---------------------------------------------------------------------------
-# 兩個只抽一張的圖庫：隨機排序的 meta tag 與「從回應裡挑一張」
+# The two single-pick image boards: the random-order meta tag and "pick one from the response"
 # ---------------------------------------------------------------------------
 
 _POST_READERS = {
@@ -2447,11 +2620,13 @@ _POST_READERS = {
 
 @pytest.mark.parametrize("name", sorted(_POST_READERS))
 def test_every_post_reader_drops_entries_that_are_not_objects(name, fake_http, monkeypatch):
-    """站方出錯或改結構時會回夾著非物件的 list。呼叫端一律 `.get(...)`，所以讀進來的時候
-    就要濾掉——漏一個的話，那個指令只剩一句泛用的失敗。
+    """When the site errors or changes structure it returns a list with non-objects
+    inside. Callers always use `.get(...)`, so they must be filtered on the way in
+    -- miss one and that command is left with a single generic failure.
 
-    抽一張的那幾支用 `random.choice`：固定成「挑第一個」、並把垃圾排在前面，沒濾的版本就
-    **一定**挑到垃圾——不固定的話，它有五分之一的機會剛好挑到真的那筆而照樣通過。"""
+    The single-pick ones use `random.choice`: fix it to "pick the first" and put the
+    junk first, so an unfiltered version **always** picks junk -- unfixed, it has a
+    one-in-five chance of happening to pick the real one and passing anyway."""
     monkeypatch.setattr(ex.random, "choice", lambda seq: seq[0])
     fetch, wrapped, shape = _POST_READERS[name]
     real = {"id": 987_654_321, "tag_string_general": "a b"}
@@ -2462,8 +2637,9 @@ def test_every_post_reader_drops_entries_that_are_not_objects(name, fake_http, m
 
 
 def test_the_post_reader_table_covers_every_list_reading_fetcher():
-    """`_POST_READERS` 少列一個讀 list 的抓取函式，上一支就看不到它。對著 `_FETCHERS` 對帳：
-    只有 e621 的 tag 查詢不在這裡——它與 danbooru_tags 共用 `_query_tags_json`。"""
+    """If `_POST_READERS` omits a list-reading fetcher, the previous test cannot see
+    it. Reconcile against `_FETCHERS`: only e621's tag query is absent here -- it
+    shares `_query_tags_json` with danbooru_tags."""
     assert set(_FETCHERS) - set(_POST_READERS) == {"e621_tags"}
 
 
@@ -2473,8 +2649,9 @@ def test_the_post_reader_table_covers_every_list_reading_fetcher():
 ])
 def test_a_random_post_fetch_asks_for_random_order_and_returns_one_post(
         fetch, meta, wrap, fake_http):
-    """沒有這個 meta tag，兩個站都照「最新」排序，同一組標籤每次抽到的都是同一批。
-    使用者自己寫了排序就照他的，不再疊一個——兩個排序同時出現時站方只認其中一個。"""
+    """Without this meta tag, both sites sort by "newest", so the same tag set draws
+    the same batch every time. If the user wrote their own sort, honour it and do not
+    stack another -- with two sort orders present, the site only recognises one."""
     fake_http.replies = [(200, wrap([{"id": 7}]))]
     assert _run(fetch("cat_ears")) == {"id": 7}
     assert fake_http.calls[-1]["params"]["tags"] == f"cat_ears {meta}random"
