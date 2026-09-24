@@ -285,3 +285,18 @@ def test_local_midnight_since_shape():
     assert since.endswith(" 00:00:00")
     y, m, d = since.split(" ")[0].split("-")
     assert len(y) == 4 and len(m) == 2 and len(d) == 2
+
+
+def test_repo_row_skips_linked_worktrees(tmp_path):
+    # A linked git worktree's `.git` is a FILE pointing into another repo's
+    # /worktrees/; its commits belong to that repo, so churn must skip it to
+    # avoid double-counting. A normal repo (.git dir) is still scanned.
+    wt = tmp_path / "wt_sc"
+    wt.mkdir()
+    (wt / ".git").write_text(
+        "gitdir: D:/Codes/Imervue/.git/worktrees/wt_sc\n", encoding="utf-8")
+    assert b._churn_repo_row(wt, lambda d: "should-not-run") is None
+
+    normal = tmp_path / "normal"
+    (normal / ".git").mkdir(parents=True)
+    assert b._churn_repo_row(normal, lambda d: "OUT") == ("normal", "OUT")

@@ -22019,8 +22019,20 @@ def _churn_repo_row(d: Path, run) -> tuple | None:
     資料夾在列舉途中消失是常態，不算掃描失敗；是 repo 但 git 出錯才記成 `(名稱, None)`，
     由報告計入「讀不到」。"""
     try:
-        if not d.is_dir() or not (d / ".git").exists():
+        marker = d / ".git"
+        if not d.is_dir() or not marker.exists():
             return None
+        # Skip linked worktrees: their `.git` is a file pointing into another
+        # repo's `/worktrees/`, so their commits belong to that repo and
+        # counting them here would double-count it (e.g. an Imervue worktree
+        # checked out beside the projects).
+        if marker.is_file():
+            try:
+                if "worktrees/" in marker.read_text(
+                        encoding="utf-8", errors="replace").replace("\\", "/"):
+                    return None
+            except OSError:
+                return None
     except OSError:
         return None
     try:
