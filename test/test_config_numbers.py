@@ -911,7 +911,7 @@ def test_a_correct_config_says_nothing_about_unknown_keys(tmp_path, monkeypatch,
     _cfg_with(tmp_path, monkeypatch, {"images_per_character": 7})
     assert "不認得" not in capsys.readouterr().err
     _bot_cfg_with(tmp_path, monkeypatch, {"alert_user_id": 456})
-    assert "不認得" not in capsys.readouterr().err
+    assert "unrecognised config key" not in capsys.readouterr().err
 
 
 def test_json_comment_keys_are_not_treated_as_unknown(tmp_path, monkeypatch,
@@ -923,7 +923,7 @@ def test_json_comment_keys_are_not_treated_as_unknown(tmp_path, monkeypatch,
     """
     _bot_cfg_with(tmp_path, monkeypatch,
                   {"_alert_user_id_comment": "說明文字", "alert_user_id": 1})
-    assert "不認得" not in capsys.readouterr().err
+    assert "unrecognised config key" not in capsys.readouterr().err
 
 
 def test_the_unknown_key_warning_prints_names_but_never_values(
@@ -945,7 +945,7 @@ def test_the_unknown_key_warning_is_capped(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     listed = sum(1 for i in range(30) if f"bogus_key_{i}" in err)
     assert listed == 8, f"列了 {listed} 個，應該剛好 8 個：{err!r}"
-    assert "另有 22 個" in err, f"沒報剩下幾個：{err!r}"
+    assert "22 more" in err, f"沒報剩下幾個：{err!r}"
 
 
 def test_the_unknown_key_scan_returns_what_it_found():
@@ -1207,7 +1207,7 @@ def test_a_clamped_bot_value_says_so_in_words_of_its_own(
     assert cfg["dorossi_cc_hard_limit_off_sec"] == floor
     err = capsys.readouterr().err
     assert "dorossi_cc_hard_limit_off_sec" in err
-    assert "不合用" not in err, f"夾被講成了拒絕：{err!r}"
+    assert "unusable value" not in err, f"夾被講成了拒絕：{err!r}"
 
 
 def test_a_value_above_the_floor_is_not_reported_as_clamped(

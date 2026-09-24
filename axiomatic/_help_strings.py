@@ -1,25 +1,35 @@
-"""三語 help 字串（純資料）。
+"""Three-language help strings (pure data).
 
-**這個模組不得 import discord_bot**——那會造成循環相依。它只放資料：不要在這裡
-放 f-string、`.format()` 或任何會執行的東西。
+**This module must not import discord_bot** — that would be a circular
+dependency. It holds data only: do not put an f-string, `.format()`, or anything
+executable here.
 
-指令表面是**斜線指令**；`!` 與 `@bot` 只留作不宣傳的相容路徑，所以這裡不提。
-唯一的例外是 `@bot <文字>` 自由提問入口，那條刻意保留 mention 形式。
+The command surface is **slash commands**; `!` and `@bot` are kept only as
+unadvertised compat paths, so they are not mentioned here. The one exception is
+the `@bot <text>` free-question entry point, which deliberately keeps the
+mention form.
 
-**zh-CN 段落刻意使用簡體**（給中國大陸使用者），不要「修正」成繁體——
-CLAUDE.md 的語言硬規則對這一段有明文例外。
+**The zh-CN sections deliberately use Simplified** (for Mainland China users),
+and must not be "corrected" to Traditional — CLAUDE.md's Language hard rule has
+an explicit exception for these sections.
 
-**這個檔案是手寫維護的，沒有產生器。** 原本這裡寫著「清單由 `scratchpad/gen_help.py`
-從指令樹產生」——2026-09-09 查證：那支檔案不存在，連 `scratchpad/` 這個目錄都沒有。
-一句指向幽靈檔案的說明比沒有說明更糟：讀的人會以為手改會被下一次重新產生蓋掉
-（於是不敢改，或改了不當一回事），而隔壁的 `commands/*.md` **真的**是產生的
-（`gen_command_docs.py`，DoD #2 明文禁止手改），兩者很容易混為一談。
+**This file is maintained by hand; there is no generator.** It used to say "the
+list is generated from the command tree by `scratchpad/gen_help.py`" — verified
+2026-09-09: that file does not exist, nor even the `scratchpad/` directory. A
+note pointing at a phantom file is worse than no note: a reader assumes a hand
+edit will be overwritten by the next regeneration (so they dare not edit, or edit
+without care), and the neighbouring `commands/*.md` **really is** generated
+(`gen_command_docs.py`, hand edits explicitly forbidden by DoD #2), so the two
+are easily confused.
 
-真正在守這個檔案的是 `test_docs_sync.py`，它從指令樹用 AST 抽出每個指令、雙向比對
-（有指令沒寫到 → 紅；寫了樹上沒有的 → 也紅）；`a|b|c` 併寫在比對時會展開。
-群描述另有逐字回聲測試。所以**手改是正當做法**，改完跑 `test_docs_sync.py` 即可。
+What actually guards this file is `test_docs_sync.py`, which extracts every
+command from the command tree by AST and reconciles both ways (a command not
+written → red; written but not on the tree → also red); an `a|b|c` shorthand is
+expanded during comparison. Group descriptions have a separate verbatim-echo
+test. So **editing by hand is the right approach**, just run `test_docs_sync.py`
+afterwards.
 
-要不要補一支產生器是**已經評估過、刻意先不做**的。
+Whether to add a generator has been **evaluated and deliberately deferred**.
 """
 
 CHANNEL_HELP_SECTIONS: list[str] = [
@@ -31,12 +41,12 @@ CHANNEL_HELP_SECTIONS: list[str] = [
     ),
     (
         "## Direct commands\n"
-        "- `/eta` — 預估完成時間（有終止標記只算到標記為止）\n"
-        "- `/latest` — 上傳最近 N 張產出圖\n"
-        "- `/queue` — 各佇列剩餘筆數與實際會跑的配對數\n"
-        "- `/run` — 啟動背景產圖（可排程：in 90m / at 02:00 / cancel）\n"
-        "- `/status` — 背景產圖的執行狀態與變體\n"
-        "- `/stop` — 停止背景產圖\n"
+        "- `/eta` — Estimated completion time (counted only up to an end marker if one is set)\n"
+        "- `/latest` — Upload the most recent N output images\n"
+        "- `/queue` — Remaining count per queue and the pairs that will actually run\n"
+        "- `/run` — Start background generation (schedulable: in 90m / at 02:00 / cancel)\n"
+        "- `/status` — Background generation run state and variant\n"
+        "- `/stop` — Stop background generation\n"
     ),
     (
         "## `/todo` — Generation queues\n"
@@ -415,13 +425,13 @@ MENTION_HELP_SECTIONS: list[str] = [
     ),
     (
         "## Direct commands\n"
-        "- `/booru` — 圖庫搜圖：tag 隨機一張（可模糊；不帶 tag 用預設圖）\n"
-        "- `/e621` — furry 取向圖庫隨機一張（預設 NSFW；加 rating:safe 限 SFW）\n"
-        "- `/grid` — 圖庫最新 4 張拼 2x2 上傳（等同 /booru 同時開 latest 與 grid）\n"
-        "- `/help` — 指令說明（tw / cn / en）\n"
-        "- `/iqdb` — 跨圖庫反向圖搜（回前幾名來源＋相似度 %）\n"
-        "- `/nsfw` — 圖庫搜圖 NSFW 捷徑（自動補 rating:explicit）\n"
-        "- `/safebooru` — 全站 SFW 圖庫隨機一張\n"
+        "- `/booru` — Gallery image search: a random image by tag (fuzzy allowed; no tag uses the default image)\n"
+        "- `/e621` — A random image from a furry-oriented gallery (NSFW by default; add rating:safe for SFW only)\n"
+        "- `/grid` — Stitch the latest 4 gallery images into a 2x2 and upload (same as /booru with latest and grid on)\n"
+        "- `/help` — Command help (tw / cn / en)\n"
+        "- `/iqdb` — Cross-gallery reverse image search (top few sources + similarity %)\n"
+        "- `/nsfw` — NSFW shortcut for gallery image search (auto-adds rating:explicit)\n"
+        "- `/safebooru` — A random site-wide SFW image\n"
     ),
     (
         "## `/dorossi` — Assistant backend\n"

@@ -1,39 +1,50 @@
-"""對話平台介接層（adapter seam）：讓同一批 handler 在別的平台上也跑得起來。
+"""The chat-platform adapter seam: lets the same set of handlers run on other
+platforms too.
 
-bot 的 handler 從來沒有真的綁死在某一個函式庫的訊息型別上——它們吃的是**鴨子型別**，
-而且那個型別小到可以整個寫下來。`_InteractionMessageProxy` 的 docstring 量過：全模組
-只用到 `reply`、`author`、`channel`（`.send` / `.id` / `.typing()`）、`mentions`、
-`guild`、`content`、`id`、`attachments`，其餘一個都沒有。`_DorossiRestoredMessage` 是
-第二個代理，形狀一樣。**那個形狀就是這個模組要一般化的接縫。**
+The bot's handlers were never really tied to one library's message type — they
+consume a **duck type**, and that type is small enough to write down in full.
+`_InteractionMessageProxy`'s docstring measured it: the whole module uses only
+`reply`, `author`, `channel` (`.send` / `.id` / `.typing()`), `mentions`,
+`guild`, `content`, `id`, `attachments`, and nothing else.
+`_DorossiRestoredMessage` is a second proxy with the same shape. **That shape is
+the seam this module generalises.**
 
-本模組只有標準函式庫，而且**刻意不 import `discord`**（也不 import `discord_bot`——
-那會是循環）。對外送的附件與嵌入訊息一律用鴨子型別讀（`.fp` / `.filename` /
-`.title` / `.description` / `.fields`），所以既有 handler 交出來的
-`discord.File` / `discord.Embed` 不必改寫就餵得進來。
+This module is standard library only, and **deliberately does not import
+`discord`** (nor `discord_bot` — that would be circular). Outbound attachments
+and embeds are read by duck typing throughout (`.fp` / `.filename` / `.title` /
+`.description` / `.fields`), so the `discord.File` / `discord.Embed` an existing
+handler hands over feed in without any rewrite.
 
-## 介面的五件事
+## The five things in the interface
 
-1. **身分**（`ChatUser`）──`id` 是**bot 內部的整數身分**，不是平台上的那一個。
-   對照見 `resolve_identity()`：擁有者映成 `OWNER_USER_ID`，其他人一律映成一個
-   **負數**。整個 repo 的閘門都寫成 `author.id != OWNER_USER_ID`，所以把對照放在
-   這一個決策點，既有的每一道閘不改一個字就對每個平台成立；負數則保證撞不到任何
-   一個設定得出來的 Discord id（`_coerce_int_list` 只收 `>= 0`）。
-2. **對話**（`ChatConversation`）──`.id` / `.send()` / `.typing()`。允許清單裡的
-   對話拿的 `.id` 就是 `CHANNEL_ID`：那個對話**就是**這個平台的「設定頻道」，
-   `!` 的頻道閘與 help 的 `include_channel_only` 因此自動成立。
-3. **收到的訊息**（`ChatMessage`）──`content` / `attachments` / `reply()`。
-4. **送出去的訊息**（`SentChatMessage`）──`.edit()`。Dorossi 的即時預覽整回合都在
-   編輯同一則訊息，所以這一格是必要的，不是裝飾。
-5. **做不到的事**（`PlatformCapabilities` ＋ `UnsupportedOperation`）──能力用旗標
-   問得到，呼叫端**明確降級**；做不到的事丟 `UnsupportedOperation`，不是當掉，也
-   不是安靜地什麼都沒發生。`ReplaceOnEditMessage` 是「不能編輯」那一種平台
-   （例如只能推播的平台）的降級實作。
+1. **Identity** (`ChatUser`) — `id` is the **bot's internal integer identity**,
+   not the one on the platform. See `resolve_identity()` for the mapping: the
+   owner maps to `OWNER_USER_ID`, everyone else to a **negative** number. Every
+   gate in the repo is written `author.id != OWNER_USER_ID`, so putting the
+   mapping at this one decision point makes every existing gate hold on every
+   platform without a word changing; a negative number is guaranteed never to
+   collide with any Discord id that could be configured (`_coerce_int_list`
+   accepts only `>= 0`).
+2. **Conversation** (`ChatConversation`) — `.id` / `.send()` / `.typing()`. A
+   conversation in the allow list gets `.id` equal to `CHANNEL_ID`: that
+   conversation **is** this platform's "command channel", so `!`'s channel gate
+   and help's `include_channel_only` hold automatically.
+3. **Received message** (`ChatMessage`) — `content` / `attachments` / `reply()`.
+4. **Sent message** (`SentChatMessage`) — `.edit()`. Dorossi's live preview edits
+   the same message for the whole round, so this slot is necessary, not
+   decorative.
+5. **Things it cannot do** (`PlatformCapabilities` + `UnsupportedOperation`) —
+   capabilities can be queried by flag and the caller **degrades explicitly**;
+   something it cannot do raises `UnsupportedOperation`, not a crash and not a
+   silent nothing-happened. `ReplaceOnEditMessage` is the degraded
+   implementation for the "cannot edit" kind of platform (e.g. a push-only one).
 
-## 為什麼不是「再寫一套指令樹」
+## Why not "write another command tree"
 
-擁有者已裁定：其他平台重用既有的隱藏文字派發器（`!` 指令與 `@bot <文字>`），
-斜線那棵樹維持原樣。所以這個模組**不認識任何一個指令**——它只負責把一則平台訊息
-變成一個 handler 認得的物件，再交給 `discord_bot.dispatch_external_message`。
+The owner has ruled: other platforms reuse the existing hidden text dispatcher
+(`!` commands and `@bot <text>`), and the slash tree stays as-is. So this module
+**knows no commands at all** — it only turns a platform message into an object a
+handler recognises, then hands it to `discord_bot.dispatch_external_message`.
 """
 from __future__ import annotations
 
@@ -45,39 +56,47 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable
 
-# 每新增一個平台就多一列。**這份清單是註冊的唯一入口**：`build_transports()` 只
-# import 這裡列到的模組，沒列到的檔案放在套件裡也不會被載入。反過來也對帳——
-# `test_platform_transports` 會比對磁碟上的 `_*_transport.py` 與這份清單，兩個方
-# 向都釘：多一個檔案沒列進來會**安靜地整個平台不存在**，而那跟「沒設定所以不啟用」
-# 長得一模一樣。
+# One row per new platform. **This list is the sole entry point for
+# registration**: `build_transports()` only imports the modules listed here, and
+# a file not listed is never loaded even if it sits in the package. It is
+# reconciled the other way too — `test_platform_transports` compares the
+# `_*_transport.py` files on disk against this list in both directions: an extra
+# file not listed here means **that whole platform silently does not exist**,
+# which looks exactly like "not configured, so not enabled".
 TRANSPORT_MODULES: tuple[str, ...] = ("_telegram_transport",)
 
 
 class UnsupportedOperation(RuntimeError):
-    """這個平台做不到這件事。
+    """This platform cannot do this.
 
-    **這是介面的一部分，不是意外。** 平台之間的能力差很多（有的不能編輯已送出的
-    訊息、有的不能傳檔案），而「安靜地什麼都沒發生」是最貴的失敗形態：使用者以為
-    送出去了。所以做不到的事要嘛由呼叫端先問 `capabilities` 再決定怎麼做，要嘛
-    在這裡丟出來被看見。
+    **This is part of the interface, not an accident.** Platforms differ a lot in
+    capability (some cannot edit an already-sent message, some cannot send
+    files), and "silently nothing happened" is the most expensive failure mode:
+    the user thinks it was sent. So something that cannot be done either has the
+    caller query `capabilities` first and decide accordingly, or is raised here
+    to be seen.
     """
 
 
 class DeliveryFailed(ConnectionError):
-    """平台**連不上**（或一直限流），這一則沒送出去。跟「平台說了不」（4xx）分開：
-    前者等連線回來再送就會好，後者再送也一樣。
+    """The platform is **unreachable** (or keeps rate-limiting) and this message
+    did not go out. Kept separate from "the platform said no" (4xx): the former
+    succeeds once the connection returns, the latter fails again on resend.
 
-    是 `ConnectionError` 的子類別，所以呼叫端把它當「對話平台斷線」處理——Dorossi 的
-    答案會停進 outbox，等平台回來再送（2026-09-24）。在這之前 transport 把失敗吞成
-    `None`，答案安靜地消失。"""
+    A subclass of `ConnectionError`, so the caller treats it as "the chat
+    platform disconnected" — Dorossi's answer parks in the outbox and is resent
+    when the platform returns (2026-09-24). Before this the transport swallowed
+    the failure into `None` and the answer silently vanished."""
 
 
 @dataclass(frozen=True)
 class PlatformCapabilities:
-    """一個平台做得到什麼。呼叫端拿這個**明確降級**，不要靠 try/except 試出來。
+    """What a platform can do. The caller uses this to **degrade explicitly**,
+    rather than feeling it out with try/except.
 
-    `text_limit` 是單則訊息的字元上限（送出前由 `chunk_text()` 切好）；
-    `file_bytes_limit` 是單一附件的位元組上限，0 代表這個平台不收附件。
+    `text_limit` is the per-message character limit (chunked before sending by
+    `chunk_text()`); `file_bytes_limit` is the byte limit for a single
+    attachment, and 0 means this platform accepts no attachments.
     """
 
     edit_message: bool = False
@@ -91,30 +110,35 @@ class PlatformCapabilities:
 
 
 # ---------------------------------------------------------------------------
-# 身分對照（fail-closed）
+# Identity mapping (fail-closed)
 # ---------------------------------------------------------------------------
-# `OWNER_USER_ID` 是**某一個平台上的** id，而全 repo 的閘門都拿它直接比對
-# （`message.author.id != OWNER_USER_ID`，三個表面各一份，`test_bot_helpers` 兩個
-# 方向對帳）。所以其他平台的身分要嘛在每一道閘上多開一條分支，要嘛在**進來的那一
-# 刻**就映成同一個號碼系統。選後者：閘門一個字都不用改，而「誰是擁有者」只有這裡
-# 一個決策點——`CLAUDE.md` 對 `_owner_detail()` 寫的就是同一條理由。
+# `OWNER_USER_ID` is an id **on one particular platform**, and every gate in the
+# repo compares against it directly (`message.author.id != OWNER_USER_ID`, one
+# copy per surface, reconciled both ways by `test_bot_helpers`). So identity on
+# another platform must either open an extra branch on every gate, or be mapped
+# into the same number system **at the moment it arrives**. The latter is chosen:
+# no gate changes a word, and "who is the owner" has a single decision point here
+# — the same reasoning `CLAUDE.md` gives for `_owner_detail()`.
 #
-# 非擁有者映成**負數**，三個理由：
-#   * 永遠不等於 `OWNER_USER_ID`（那是正的），所以 fail-closed 是結構性的，不是
-#     靠記得寫對比較式；
-#   * `_coerce_int_list` 只收 `>= 0`，所以負數不可能出現在 `user_roles` 或
-#     `path_reveal_channel_ids` 裡——別的平台的使用者拿不到角色，也拿不到「可露
-#     路徑的表面」；
-#   * 同一個人每次進來拿到同一個號碼（雜湊自平台名＋平台 id），所以稽核記錄與
-#     指令計數仍然分得出人。
+# A non-owner maps to a **negative** number, for three reasons:
+#   * never equal to `OWNER_USER_ID` (which is positive), so fail-closed is
+#     structural, not a matter of remembering to write the comparison right;
+#   * `_coerce_int_list` accepts only `>= 0`, so a negative number can never
+#     appear in `user_roles` or `path_reveal_channel_ids` — a user on another
+#     platform gets no role and no "path-revealing surface";
+#   * the same person gets the same number every time (hashed from platform name
+#     + platform id), so audit records and command counts can still tell people
+#     apart.
 _UID_DIGEST_BYTES = 6
-# 取不到發話者身分時用這一個。**不是 0**：`alert_user_id` 的預設就是 0，讓兩件
-# 不同的事共用一個號碼遲早會有人把它們接在一起。
+# Used when the sender's identity cannot be read. **Not 0**: `alert_user_id`'s
+# default is 0, and letting two different things share one number means someone
+# will eventually wire them together.
 UNKNOWN_SENDER_UID = -1
 
 
 def external_uid(platform: str, platform_id: str) -> int:
-    """平台上的 id → 這個 bot 內部的負數身分。同樣的輸入永遠得到同樣的號碼。"""
+    """Platform id → this bot's internal negative identity. The same input always
+    gives the same number."""
     raw = f"{platform}:{platform_id}".encode("utf-8")
     digest = hashlib.blake2b(raw, digest_size=_UID_DIGEST_BYTES).digest()
     return -(2 + int.from_bytes(digest, "big"))
@@ -122,12 +146,14 @@ def external_uid(platform: str, platform_id: str) -> int:
 
 def resolve_identity(platform: str, platform_id: Any, owner_ids: Iterable[str],
                      owner_uid: int) -> tuple[int, bool]:
-    """回 `(內部 uid, 是不是擁有者)`。
+    """Return `(internal uid, is owner)`.
 
-    比對用**字串**：平台的使用者 id 不見得是整數（有的平台是英數字串），而把它
-    轉成 int 再比會讓一個合法的 id 在轉換失敗時安靜地變成「不是擁有者」——方向
-    雖然安全，但原因會消失。取不到 id、id 是空的、或不在設定的擁有者清單裡，
-    一律不是擁有者（fail-closed，與既有三道閘同一個立場）。
+    Compares as **strings**: a platform's user id is not necessarily an integer
+    (some platforms use alphanumeric strings), and converting to int before
+    comparing would make a valid id silently become "not the owner" on a
+    conversion failure — the direction is safe, but the reason vanishes. No id,
+    an empty id, or an id not in the configured owner list is always not the
+    owner (fail-closed, the same stance as the three existing gates).
     """
     if platform_id is None:
         return UNKNOWN_SENDER_UID, False
@@ -141,12 +167,15 @@ def resolve_identity(platform: str, platform_id: Any, owner_ids: Iterable[str],
 
 def conversation_uid(platform: str, chat_id: Any, *, command_channel_id: int,
                      allowed_chat_ids: Iterable[str]) -> tuple[int, bool]:
-    """回 `(內部頻道 id, 這個對話是不是「設定頻道」)`。
+    """Return `(internal channel id, whether this conversation is the "command
+    channel")`.
 
-    在允許清單裡的對話拿的就是 `CHANNEL_ID`——它**就是**這個平台的設定頻道，所以
-    `!` 的頻道閘、help 的 `include_channel_only` 全部自動成立，不必在每一處多寫
-    一條「或者這是 Telegram」。其餘對話拿一個負數（理由同 `external_uid`：撞不到
-    任何一個設定得出來的頻道 id，也永遠不會落進 `path_reveal_channel_ids`）。
+    A conversation in the allow list gets exactly `CHANNEL_ID` — it **is** this
+    platform's command channel, so `!`'s channel gate and help's
+    `include_channel_only` all hold automatically, without an extra "or is this
+    Telegram" written in every place. Every other conversation gets a negative
+    number (same reason as `external_uid`: it collides with no configurable
+    channel id, and can never land in `path_reveal_channel_ids`).
     """
     text = "" if chat_id is None else str(chat_id).strip()
     allowed = {str(one).strip() for one in allowed_chat_ids if str(one).strip()}
@@ -156,13 +185,14 @@ def conversation_uid(platform: str, chat_id: Any, *, command_channel_id: int,
 
 
 # ---------------------------------------------------------------------------
-# 送出去的東西：文字切塊、附件正規化、嵌入訊息攤平
+# Outbound: text chunking, attachment normalisation, embed flattening
 # ---------------------------------------------------------------------------
 _CODE_FENCE = "```"
 
 
 def _unclosed_fence(text: str) -> str:
-    """`text` 結尾停在程式碼區塊裡時，回一個可以重開同一個區塊的分隔符號。"""
+    """When `text` ends inside a code block, return a delimiter that can reopen
+    the same block."""
     if text.count(_CODE_FENCE) % 2 == 0:
         return ""
     tail = text[text.rfind(_CODE_FENCE) + len(_CODE_FENCE):]
@@ -172,13 +202,17 @@ def _unclosed_fence(text: str) -> str:
 
 
 def chunk_text(text: str, limit: int) -> list[str]:
-    """把一段長回覆切成平台吃得下的幾則，優先切在換行。
+    """Split a long reply into a few messages the platform can accept, preferring
+    to cut at a newline.
 
-    跨切點的程式碼區塊會在前一則收尾、下一則重開（語言標籤一起帶過去）：每一則
-    訊息各自算一次 markdown，不補的話下一則會把程式碼當散文顯示，而它的收尾分隔
-    符號又會開一個新的區塊，把後面整段吞進去。與 `discord_bot._chunk_for_discord`
-    同一條規則；**刻意各有一份**，因為上限與 markdown 方言是逐平台的，而共用一份
-    會讓其中一邊遷就另一邊。
+    A code block that spans a cut point is closed in the previous message and
+    reopened in the next (carrying the language tag along): each message is
+    rendered as markdown on its own, and without this the next message would show
+    the code as prose, while its closing delimiter would open a new block and
+    swallow everything after it. Same rule as
+    `discord_bot._chunk_for_discord`; **deliberately a separate copy**, because
+    the limit and the markdown dialect are per-platform, and sharing one copy
+    would make one side accommodate the other.
     """
     text = (text or "").strip()
     if not text:
@@ -192,11 +226,14 @@ def chunk_text(text: str, limit: int) -> list[str]:
             cut = limit
         head, rest = rest[:cut], rest[cut:].lstrip("\n")
         reopen = _unclosed_fence(head)
-        # **重開分隔符號會把字加回 `rest`，所以它必須比切掉的那一段短。** 上限大到
-        # 正常值（3900）時這永遠成立；但上限小到跟分隔符號差不多時，每一圈切掉四個
-        # 字元又加回四個，迴圈就**永遠不會結束**。這不是理論上的角落：切塊函式是純
-        # 字串函式，下一個平台把上限設多少由它自己決定。切不出進度就放棄排版——
-        # 訊息送得出去永遠比程式碼區塊完不完整重要。
+        # **A reopen delimiter adds characters back to `rest`, so it must be
+        # shorter than the piece just cut.** When the limit is at a normal value
+        # (3900) this always holds; but when the limit is about as small as the
+        # delimiter, each loop cuts four characters and adds four back, and the
+        # loop **never terminates**. This is not a theoretical corner: the
+        # chunker is a pure string function and the next platform decides its own
+        # limit. If it cannot make progress, give up the formatting — a message
+        # getting out is always more important than a code block staying intact.
         if reopen and len(reopen) + 1 < cut:
             head = f"{head}\n{_CODE_FENCE}"
             rest = f"{reopen}\n{rest}"
@@ -208,7 +245,8 @@ def chunk_text(text: str, limit: int) -> list[str]:
 
 @dataclass
 class OutboundFile:
-    """要送出去的一個附件。`data` 已經在記憶體裡，因為每個平台的上傳方式都不同。"""
+    """An attachment to send. `data` is already in memory, because every platform
+    uploads differently."""
 
     filename: str
     data: bytes
@@ -219,10 +257,12 @@ _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 
 def _read_outbound_file(obj: Any) -> OutboundFile | None:
-    """鴨子型別讀一個附件物件（handler 交出來的是函式庫的 `File`）。
+    """Duck-type read an attachment object (the handler hands over the library's
+    `File`).
 
-    讀不出來就回 `None`，讓呼叫端走「有文字沒附件」那條路——`safe_reply` 對同一
-    個情況早就是這個立場：「有文字沒附件」遠好過「什麼都沒有」。
+    If it cannot be read, return `None` and let the caller take the "text but no
+    attachment" path — `safe_reply` has long held this stance for the same case:
+    "text but no attachment" is far better than "nothing at all".
     """
     if obj is None:
         return None
@@ -247,11 +287,13 @@ def _read_outbound_file(obj: Any) -> OutboundFile | None:
 
 
 def flatten_embed(embed: Any) -> str:
-    """把一個嵌入訊息攤平成純文字。
+    """Flatten an embed into plain text.
 
-    只有這個平台**有**嵌入訊息的時候才輪得到原生的那一份；其餘平台看到的必須是
-    同樣的內容，不能因為沒有嵌入訊息就整塊消失——那正是「安靜地什麼都沒發生」。
-    一樣走鴨子型別（`.title` / `.description` / `.fields` / `.footer`）。
+    The native embed is only used on a platform that **has** embeds; every other
+    platform must see the same content, and it cannot vanish wholesale just
+    because there are no embeds — that would be exactly "silently nothing
+    happened". Duck-typed as usual (`.title` / `.description` / `.fields` /
+    `.footer`).
     """
     if embed is None:
         return ""
@@ -278,10 +320,11 @@ def flatten_embed(embed: Any) -> str:
 
 def outbound_parts(content: Any = None, *, embed: Any = None, file: Any = None,
                    files: Any = None) -> tuple[str, list[OutboundFile]]:
-    """把 handler 那一套送出引數正規化成 `(文字, 附件清單)`。
+    """Normalise the handler's send arguments into `(text, attachment list)`.
 
-    handler 呼叫 `reply(content, embed=..., file=..., files=...)` 的寫法散在全模組
-    兩百多處，逐一改成平台中立是不可能的；所以正規化放在這一個地方。
+    The handler's `reply(content, embed=..., file=..., files=...)` form is spread
+    across two hundred-plus places in the module, and rewriting each one to be
+    platform-neutral is impossible; so the normalisation lives in this one place.
     """
     text = "" if content is None else str(content)
     extra = flatten_embed(embed)
@@ -296,10 +339,11 @@ def outbound_parts(content: Any = None, *, embed: Any = None, file: Any = None,
 
 
 # ---------------------------------------------------------------------------
-# handler 看得到的四個物件
+# The four objects the handler sees
 # ---------------------------------------------------------------------------
 class ChatAttachment:
-    """收到的一個附件。handler 只用 `filename` 與 `await read()`（量過，就這兩個）。"""
+    """A received attachment. The handler uses only `filename` and `await read()`
+    (measured, just those two)."""
 
     __slots__ = ("filename", "size", "_fetch")
 
@@ -314,7 +358,8 @@ class ChatAttachment:
 
 
 class ChatUser:
-    """發話者。`id` 是**內部 uid**（見 `resolve_identity`），不是平台上的那一個。"""
+    """The sender. `id` is the **internal uid** (see `resolve_identity`), not the
+    one on the platform."""
 
     __slots__ = ("id", "platform_id", "name", "display_name", "mention",
                  "is_owner")
@@ -325,22 +370,27 @@ class ChatUser:
         self.platform_id = platform_id
         self.name = display_name or str(platform_id)
         self.display_name = self.name
-        # 別的平台沒有「@ 一個人」的通用寫法，所以這裡只給顯示名稱。唯一的呼叫端
-        # 是警示訊息的稱呼，拿不到真正的 mention 也不影響它能不能送出去。
+        # Other platforms have no universal way to "@ a person", so this gives
+        # only the display name. The one caller is the salutation in an alert
+        # message, and not having a real mention does not affect whether it can
+        # be sent.
         self.mention = self.name
         self.is_owner = is_owner
 
     def __str__(self) -> str:
-        # 稽核記錄寫的是 `str(message.author)`。沒有這一支的話那一欄會變成
-        # `<object at 0x…>`——記錄還在、看起來正常，只是再也認不出是誰。
+        # Audit records write `str(message.author)`. Without this method that
+        # column becomes `<object at 0x…>` — the record is still there and looks
+        # normal, only nobody can tell who it was any more.
         return f"{self.name}@{self.platform_id}"
 
 
 class _TypingScope:
-    """`async with channel.typing():`。平台不支援就是一個什麼都不做的殼。
+    """`async with channel.typing():`. On a platform that does not support it,
+    this is a do-nothing shell.
 
-    不支援時**不丟例外**：typing 是純粹的體感，為了它讓一個指令整個失敗是壞交易。
-    要知道支不支援的呼叫端問 `capabilities.typing_indicator`。
+    When unsupported it **does not raise**: typing is pure feel, and failing a
+    whole command for it is a bad trade. A caller that needs to know asks
+    `capabilities.typing_indicator`.
     """
 
     __slots__ = ("_channel", "_task")
@@ -367,7 +417,8 @@ class _TypingScope:
 
 
 class ChatConversation:
-    """一個對話（頻道／群組／私訊）。handler 用 `.id` / `.send()` / `.typing()`。"""
+    """A conversation (channel / group / DM). The handler uses `.id` / `.send()`
+    / `.typing()`."""
 
     __slots__ = ("id", "platform_chat_id", "is_direct", "is_command_chat",
                  "guild", "_transport")
@@ -379,8 +430,9 @@ class ChatConversation:
         self.id = uid
         self.is_direct = is_direct
         self.is_command_chat = is_command_chat
-        # 別的平台沒有「伺服器」這一層。`None` 正是既有兩個代理給的值，handler 早就
-        # 處理得了（私訊本來就沒有）。
+        # Other platforms have no "server" layer. `None` is exactly what the two
+        # existing proxies give, and the handler already copes with it (a DM has
+        # never had one).
         self.guild = None
 
     @property
@@ -402,11 +454,12 @@ class ChatConversation:
 
 
 class ChatMessage:
-    """收到的一則訊息——就是 handler 吃的那個鴨子型別。
+    """A received message — the very duck type the handler consumes.
 
-    屬性刻意只有 `_InteractionMessageProxy` 量到的那幾個。**不要加投機性的屬性**：
-    每多一個沒人用的欄位，就是各平台之間多一條沒有測試涵蓋的分歧，而那正是那個
-    代理的 docstring 從第一版就寫著的話。
+    The attributes are deliberately only those `_InteractionMessageProxy`
+    measured. **Do not add speculative attributes**: every extra field nobody
+    uses is one more untested divergence between platforms, which is exactly what
+    that proxy's docstring has said since its first version.
     """
 
     __slots__ = ("author", "channel", "guild", "mentions", "content", "id",
@@ -434,18 +487,23 @@ class ChatMessage:
 
 
 class SentChatMessage:
-    """已經送出去的一則訊息。兩個用途：Dorossi 的即時預覽要編輯它，以及事後的結果要
-    **回在它底下**（`/gen image` 的「產圖中…」佔位訊息就是這樣用的）。
+    """A message that has already been sent. Two uses: Dorossi's live preview
+    edits it, and a later result **replies underneath it** (the `/gen image`
+    "generating…" placeholder message is used exactly this way).
 
-    `reply()` 與 `ChatMessage.reply` 同一個形狀（2026-09-24 補）。少了它，呼叫端對一則
-    bot 自己送出的訊息 `safe_reply` 會丟 `AttributeError`，而那條路的外層把例外吞進
-    stderr——產好的圖整張消失、佔位訊息永遠停在「產圖中」，只有這個平台會這樣。
+    `reply()` has the same shape as `ChatMessage.reply` (added 2026-09-24).
+    Without it, `safe_reply` on a message the bot sent itself would raise
+    `AttributeError`, and the outer layer of that path swallows the exception into
+    stderr — the finished image vanishes entirely and the placeholder stays stuck
+    at "generating" forever, on this platform alone.
 
-    `edit()` 的行為由平台能力決定，而且**兩種都不是當掉**：
-      * 平台編輯得動 → 真的編輯；
-      * 編輯不動 → 丟 `UnsupportedOperation`，呼叫端要嘛事先問過
-        `capabilities.edit_message` 而根本不走即時預覽，要嘛改用
-        `ReplaceOnEditMessage`（下面那一個）把編輯降級成「偶爾補一則新訊息」。
+    `edit()`'s behaviour is decided by platform capability, and **neither is a
+    crash**:
+      * the platform can edit → it really edits;
+      * it cannot edit → raises `UnsupportedOperation`, and the caller either
+        queried `capabilities.edit_message` beforehand and never opens a live
+        preview at all, or uses `ReplaceOnEditMessage` (the one below) to degrade
+        editing into "occasionally post a new message".
     """
 
     __slots__ = ("id", "channel", "platform_message_id", "_content")
@@ -477,20 +535,25 @@ class SentChatMessage:
 
 
 class ReplaceOnEditMessage(SentChatMessage):
-    """「編輯不動」那一種平台的降級實作：把編輯變成節流過的新訊息。
+    """The degraded implementation for the "cannot edit" kind of platform: turn
+    an edit into a throttled new message.
 
-    **這是明說出來的取捨，不是修好了。** 即時預覽在這種平台上只剩下每隔
-    `min_interval_sec` 一則的進度訊息，而最後那一則答案是獨立的一則訊息；不想要這
-    種行為的呼叫端應該在**建立預覽之前**先問 `capabilities.edit_message`，直接不
-    開串流。把它放進介面裡，是為了讓下一個接平台的人有一個現成、而且行為寫得明白
-    的選擇，而不是自己在 transport 裡臨時湊一個。
+    **This is a stated trade-off, not a fix.** On such a platform the live
+    preview is only a progress message every `min_interval_sec`, and the final
+    answer is a separate message; a caller that does not want this behaviour
+    should query `capabilities.edit_message` **before creating the preview** and
+    simply not stream. It is placed in the interface so the next person wiring up
+    a platform has a ready-made choice with clearly-written behaviour, rather than
+    improvising one inside a transport.
 
-    ⚠️ **節流一定要配一次「補送」，否則最後一次編輯會被吃掉。** 呼叫端
-    （`discord_bot._DorossiLiveMessage.finalize`）送最終答案的方式就是再編輯一次，
-    而那一次若剛好落在節流窗裡，純節流的版本會**安靜地丟掉整個答案**——使用者看到
-    的是一則停在半路的進度訊息，而且沒有任何地方會講。所以被擋下來的內容會存著，
-    由一個背景任務在窗口結束時補送最新的那一份。代價只是最終答案最多晚
-    `min_interval_sec` 秒出現。
+    ⚠️ **Throttling must always come with a "flush", or the last edit gets
+    eaten.** The caller (`discord_bot._DorossiLiveMessage.finalize`) sends the
+    final answer by editing one more time, and if that lands inside the throttle
+    window, a pure-throttle version would **silently drop the whole answer** — the
+    user sees a progress message stopped halfway, with nothing anywhere saying so.
+    So the held-back content is stored and a background task flushes the latest
+    version when the window ends. The only cost is the final answer appearing up
+    to `min_interval_sec` seconds late.
     """
 
     __slots__ = ("_last_emitted", "_min_interval", "_pending", "_flush")
@@ -523,7 +586,8 @@ class ReplaceOnEditMessage(SentChatMessage):
         return sent or self
 
     async def _flush_later(self) -> None:
-        """窗口結束時補送最新的那一份。被取消是正常收場，永不往外拋。"""
+        """Flush the latest version when the window ends. Being cancelled is a
+        normal ending, and it never propagates outward."""
         try:
             while True:
                 wait = self._min_interval - (_monotonic() - self._last_emitted)
@@ -538,27 +602,29 @@ class ReplaceOnEditMessage(SentChatMessage):
         except asyncio.CancelledError:
             raise
         except Exception:  # pylint: disable=broad-except
-            # 補送失敗就算了：它是「盡力而為」的那一層，而這是背景任務，往外拋只會
-            # 變成一句沒有上下文的 'Task exception was never retrieved'。
+            # A failed flush is let go: it is the "best effort" layer, and this is
+            # a background task, so propagating would only become a context-less
+            # 'Task exception was never retrieved'.
             return
 
 
 def _monotonic() -> float:
-    # 抽成一支是為了讓測試換得掉；`time` 只在這裡用到。
+    # Extracted into a function so tests can swap it; `time` is used only here.
     import time
     return time.monotonic()
 
 
 # ---------------------------------------------------------------------------
-# Transport 與註冊表
+# Transport and registry
 # ---------------------------------------------------------------------------
 @dataclass
 class TransportContext:
-    """建立 transport 需要的一切。**由 `discord_bot` 注入，反過來就是循環相依。**
+    """Everything needed to build a transport. **Injected by `discord_bot`; the
+    reverse would be a circular dependency.**
 
-    `handle_message` 是「收到一則訊息要做什麼」——實際上就是
-    `discord_bot.dispatch_external_message`。transport 不 import bot，bot 也不必
-    知道任何一個平台的細節。
+    `handle_message` is "what to do with a received message" — in practice
+    `discord_bot.dispatch_external_message`. The transport does not import the
+    bot, and the bot does not need to know any platform's details.
     """
 
     config: dict = field(default_factory=dict)
@@ -566,17 +632,19 @@ class TransportContext:
     command_channel_id: int = 0
     handle_message: Callable[[ChatMessage], Awaitable[None]] | None = None
     project_root: Any = None
-    # 平台斷線之後又連得上時叫一次（送出停著的答案）。不得 raise、不得卡住收訊。
+    # Called once when the platform reconnects after a disconnect (to send parked
+    # answers). Must not raise, must not block receiving.
     on_recovered: Callable[[], Awaitable[None]] | None = None
 
 
 class ChatTransport(abc.ABC):
-    """一個平台的長命背景迴圈。
+    """A platform's long-lived background loop.
 
-    生命週期與既有的幾條背景迴圈完全一樣：啟動時建立、
-    `_ensure_background_tasks_alive` 每次重新連線時救活、死掉時留一行**帶名字**的
-    紀錄。所以 `run()` 必須是「會一直跑下去」的協程；它自己 return 就等於這個平台
-    停了。
+    Its lifecycle is exactly the same as the existing background loops: created
+    at startup, revived by `_ensure_background_tasks_alive` on every reconnect,
+    and leaving a **named** log line when it dies. So `run()` must be a coroutine
+    that "keeps running forever"; its returning on its own means this platform
+    stopped.
     """
 
     name: str = "chat"
@@ -584,45 +652,53 @@ class ChatTransport(abc.ABC):
     @property
     @abc.abstractmethod
     def capabilities(self) -> PlatformCapabilities:
-        """這個平台做得到什麼。"""
+        """What this platform can do."""
 
     @abc.abstractmethod
     async def run(self) -> None:
-        """長命迴圈。"""
+        """The long-lived loop."""
 
     @abc.abstractmethod
     async def deliver(self, channel: ChatConversation, content: Any,
                       **kwargs) -> SentChatMessage | None:
-        """把一則訊息送到 `channel`。"""
+        """Send a message to `channel`."""
 
     async def revise(self, sent: SentChatMessage, content: str, **kwargs) -> None:
-        """編輯一則已送出的訊息。編輯不動的平台不必實作（`SentChatMessage.edit`
-        在呼叫到這裡之前就會丟 `UnsupportedOperation`）。"""
+        """Edit an already-sent message. A platform that cannot edit need not
+        implement it (`SentChatMessage.edit` raises `UnsupportedOperation` before
+        it ever reaches here)."""
         raise UnsupportedOperation(f"{self.name} cannot edit a sent message")
 
     async def typing_loop(self, channel: ChatConversation) -> None:
-        """「正在輸入」的持續回報。被取消是正常收場，不要在這裡吞掉取消。"""
+        """The ongoing "is typing" signal. Being cancelled is a normal ending; do
+        not swallow the cancellation here."""
         await asyncio.sleep(0)
 
     def conversation_for(self, platform_chat_id: str) -> ChatConversation | None:
-        """從存下來的對話 id 重建一個對話，給「事後才送」的東西用（排程回報之類）。
+        """Rebuild a conversation from a stored conversation id, for things sent
+        after the fact (scheduled reports and the like).
 
-        回 None ＝這個平台不支援，或那個對話不是它肯回話的地方。**授權在這裡決定**：
-        那個 id 來自磁碟，而磁碟不能自己決定 bot 往哪裡說話——所以只放行這個平台本來
-        就會回話的對話（允許清單、擁有者的私訊）。預設不支援。"""
+        Returns None = this platform does not support it, or that conversation is
+        not somewhere it will reply. **Authorisation is decided here**: the id
+        came from disk, and disk cannot decide where the bot speaks — so only
+        conversations this platform would reply to anyway are allowed (the allow
+        list, the owner's DM). Unsupported by default."""
         del platform_chat_id
         return None
 
     async def close(self) -> None:
-        """關掉這個 transport 自己開的資源。永不 raise。"""
+        """Close the resources this transport opened itself. Never raises."""
 
 
 def origin_of(channel: Any) -> dict:
-    """事後要回到這個對話時該存的欄位：`{"platform", "platform_chat_id"}`。
+    """The fields to store for returning to this conversation later:
+    `{"platform", "platform_chat_id"}`.
 
-    既有平台的頻道回空 dict——那邊照舊只存整數頻道 id。別的平台不能只存整數：私訊
-    的 id 是負數（既有平台找不到），允許清單裡的對話等於 `CHANNEL_ID`（找到的是既有
-    平台的頻道）。"""
+    An existing-platform channel returns an empty dict — that side still stores
+    only the integer channel id. Another platform cannot store only an integer: a
+    DM id is negative (the existing platform cannot find it), and a conversation
+    in the allow list equals `CHANNEL_ID` (which would find the existing
+    platform's channel)."""
     if isinstance(channel, ChatConversation):
         return {"platform": channel.transport.name,
                 "platform_chat_id": str(channel.platform_chat_id)}
@@ -631,11 +707,14 @@ def origin_of(channel: Any) -> dict:
 
 def find_conversation(transports: Iterable[ChatTransport],
                       record: Any) -> tuple[bool, ChatConversation | None]:
-    """`origin_of` 存下來的紀錄 → `(這是不是別的平台的紀錄, 對話或 None)`。
+    """A record stored by `origin_of` → `(whether this is another platform's
+    record, the conversation or None)`.
 
-    第一個值讓呼叫端分得出兩件事：「不是別的平台的紀錄」要照舊走既有平台；「是、
-    但找不回來」（平台沒開、對話沒被授權）**不可以**退回既有平台的頻道——那正是
-    這一支要修的「送錯地方」。永不 raise。"""
+    The first value lets the caller tell two things apart: "not another
+    platform's record" takes the existing platform as before; "yes, but cannot be
+    recovered" (the platform is off, the conversation is not authorised) **must
+    not** fall back to the existing platform's channel — which is exactly the
+    "sent to the wrong place" this function fixes. Never raises."""
     if not isinstance(record, dict):
         return False, None
     platform = record.get("platform")
@@ -662,11 +741,14 @@ _FACTORIES: dict[str, Callable[[TransportContext], ChatTransport | None]] = {}
 def register_transport(
         name: str,
         factory: Callable[[TransportContext], ChatTransport | None]) -> None:
-    """註冊一個平台。`factory` 回 `None` 代表「沒設定」——**那必須是安靜的**。
+    """Register a platform. A `factory` returning `None` means "not configured" —
+    **and that must be silent**.
 
-    「沒設定」與「設定壞了」是兩件事：前者是絕大多數人的常態（一個 repo 不會同時
-    接四個平台），每次啟動都抱怨一次就是下一個洗掉記錄檔的雜訊源；後者才要出聲，
-    而且由 factory 自己在那一刻講清楚是哪一個鍵。
+    "Not configured" and "misconfigured" are two different things: the former is
+    the norm for almost everyone (one repo does not wire up four platforms at
+    once), and complaining once on every startup is the next source of log-washing
+    noise; the latter is what should make a sound, and the factory says clearly at
+    that moment which key it was.
     """
     _FACTORIES[name] = factory
 
@@ -676,12 +758,14 @@ def registered_transports() -> tuple[str, ...]:
 
 
 def import_transport_modules() -> None:
-    """把 `TRANSPORT_MODULES` 列到的模組載進來（註冊是 import 的副作用）。
+    """Import the modules listed in `TRANSPORT_MODULES` (registration is a side
+    effect of the import).
 
-    兩種 import 形狀都試，理由與 `_bot_config` 對 `_warn_dedup` 的那一段一模一樣：
-    直接跑 `discord_bot.py` 時 `axiomatic/` 自己在 `sys.path` 上（裸名成立），走
-    套件路徑時不在（只有 `axiomatic.x` 成立）。只寫一種的話，另一條路會在 import
-    期整支炸掉，而本機常走的那一側永遠是綠的。
+    Both import shapes are tried, for exactly the same reason as `_bot_config`'s
+    passage on `_warn_dedup`: running `discord_bot.py` directly puts `axiomatic/`
+    itself on `sys.path` (the bare name holds), while the package path does not
+    (only `axiomatic.x` holds). Writing only one would blow up the whole import on
+    the other path, while the side taken most often locally stays green.
     """
     for name in TRANSPORT_MODULES:
         try:
@@ -691,11 +775,13 @@ def import_transport_modules() -> None:
 
 
 def build_transports(context: TransportContext) -> list[ChatTransport]:
-    """建出所有「有設定而且開著」的 transport。沒設定的平台安靜缺席。
+    """Build every transport that "is configured and enabled". Unconfigured
+    platforms are silently absent.
 
-    一個 factory 自己爆掉不得拖垮其他平台，也不得拖垮 bot 的啟動——這是
-    `_ensure_background_tasks_alive` 對背景迴圈立的同一條規則（每一條各自 try，
-    失敗只留一行帶名字的紀錄，下一次重新連線還會再試）。
+    One factory blowing up must not drag down the other platforms, nor the bot's
+    startup — the same rule `_ensure_background_tasks_alive` sets for background
+    loops (each one tries on its own, a failure leaves one named log line, and the
+    next reconnect tries again).
     """
     import_transport_modules()
     built: list[ChatTransport] = []
