@@ -14995,6 +14995,41 @@ def test_a_generated_image_pings_the_at_bot_asker_and_slash_stays_on_the_placeho
     assert [c for c, _kw in sl_chan.sent] == [], sl_chan.sent
     assert (sl_chan.fetch_calls, sl_chan.history_calls) == (0, 0)
 
+    # ---- 別的平台：`ChatMessage` 也是真的收到的訊息，結果回在發問那一則底下 ----
+    # （2026-09-24 以前只收 `discord.Message`，於是別的平台一律回在佔位訊息底下——
+    # 而佔位訊息當時連 `reply` 都沒有，整張圖不見。）
+    import _chat_platform as cp
+    delivered: list = []
+
+    class _Platform(cp.ChatTransport):
+        name = "stubplat"
+
+        @property
+        def capabilities(self):
+            return cp.PlatformCapabilities(reply_reference=True)
+
+        async def run(self):
+            return None
+
+        async def deliver(self, channel, content=None, **kwargs):
+            delivered.append((content, kwargs.get("reply_to")))
+            return cp.SentChatMessage(channel, f"m{len(delivered)}", str(content))
+
+        async def revise(self, sent, content, **kwargs):
+            return None
+
+    conv = cp.ChatConversation(_Platform(), "c9", uid=-9, is_direct=True,
+                               is_command_chat=True)
+    far_asker = cp.ChatMessage(
+        author=cp.ChatUser(owner, "u1", "owner", is_owner=True), channel=conv,
+        content="a cat", message_id=-4242, platform="stubplat",
+        platform_message_id="p77")
+    primary = _Chan(4444)
+    ctx = submit_and_finish(far_asker, primary)
+    assert ctx.get("trigger_message") is far_asker, "別的平台的發問沒有被存成觸發訊息"
+    assert ("🖼️ 你要的圖來了。", "p77") in delivered, delivered
+    assert primary.sent == [], "結果跑到既有平台的頻道去了"
+
 
 # ---------------------------------------------------------------------------
 # `/dorossi` 整族的擁有者閘——fail-closed 版本
@@ -17229,9 +17264,9 @@ def test_restore_discards_a_malformed_file_without_crashing(_sr_env, monkeypatch
 def test_the_malformed_file_parser_accepts_a_well_formed_record():
     """正面對照：上面那支的「全部刪掉」要有意義，合法的紀錄必須解析得出來。"""
     now = 1_789_000_000.0
-    due, cid = b._parse_scheduled_run_record(
+    due, cid, origin = b._parse_scheduled_run_record(
         json.dumps({"due": now + 60, "channel_id": 4242}), now)
-    assert (due, cid) == (now + 60, 4242)
+    assert (due, cid, origin) == (now + 60, 4242, {})
     # 上限是含的，與解析器一致。
     assert b._parse_scheduled_run_record(json.dumps(
         {"due": now + b.SCHEDULE_HORIZON_SEC, "channel_id": 1}), now)[0] == (
@@ -17239,6 +17274,122 @@ def test_the_malformed_file_parser_accepts_a_well_formed_record():
     with pytest.raises(ValueError):
         b._parse_scheduled_run_record(json.dumps(
             {"due": now + b.SCHEDULE_HORIZON_SEC + 1, "channel_id": 1}), now)
+
+
+def test_a_negative_channel_id_is_valid_only_with_a_platform_origin():
+    """別的平台的私訊在這個 bot 裡是負數號碼。帶著來源的紀錄要收（找回對話靠來源），沒有
+    來源的負數照舊是壞資料——少了後半，這條放寬就變成「任何負數都收」。"""
+    now = 1_789_000_000.0
+    origin = {"platform": "stubplat", "platform_chat_id": "777"}
+    got = b._parse_scheduled_run_record(
+        json.dumps({"due": now + 60, "channel_id": -5, **origin}), now)
+    assert got == (now + 60, -5, origin)
+    for bad in ({}, {"platform": "", "platform_chat_id": "777"},
+                {"platform": "stubplat", "platform_chat_id": "  "},
+                {"platform": "stubplat", "platform_chat_id": 777}):
+        with pytest.raises(ValueError):
+            b._parse_scheduled_run_record(
+                json.dumps({"due": now + 60, "channel_id": -5, **bad}), now)
+    with pytest.raises(ValueError):
+        b._parse_scheduled_run_record(json.dumps(
+            {"due": now + 60, "channel_id": True, **origin}), now)
+
+
+def test_a_run_scheduled_on_another_platform_is_restored_there(_sr_env, monkeypatch):
+    """重啟後讀回：經那個平台找回對話，「仍然有效」講在那裡；既有平台一個字都沒收到。
+    找不回來（平台沒開）就保留落地檔、只寫 log，**不**退回既有平台的設定頻道。"""
+    import _chat_platform as cp
+    delivered: list = []
+
+    class _Platform(cp.ChatTransport):
+        name = "stubplat"
+
+        @property
+        def capabilities(self):
+            return cp.PlatformCapabilities()
+
+        async def run(self):
+            return None
+
+        async def deliver(self, channel, content=None, **kwargs):
+            delivered.append(content)
+
+        def conversation_for(self, platform_chat_id):
+            if platform_chat_id != "777":
+                return None
+            return cp.ChatConversation(self, "777", uid=-5, is_direct=True,
+                                       is_command_chat=False)
+
+    channels = _sr_client(monkeypatch, known=(4242, b.CHANNEL_ID))
+    due = time.time() + 3600
+    record = {"due": due, "channel_id": -5, "platform": "stubplat",
+              "platform_chat_id": "777"}
+
+    monkeypatch.setattr(b, "_chat_transports", [])
+    _sr_env.file.write_text(json.dumps(record), encoding="utf-8")
+    _sr_run(b._restore_scheduled_run_once())
+    assert b._scheduled_run_task is None and _sr_env.file.exists()
+    assert delivered == [] and all(not ch.sent for ch in channels.values())
+
+    monkeypatch.setattr(b, "_scheduled_run_restored", False)
+    monkeypatch.setattr(b, "_chat_transports", [_Platform()])
+
+    async def _body():
+        await b._restore_scheduled_run_once()
+        task = b._scheduled_run_task
+        assert task is not None, "沒有重新排上"
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    _sr_run(_body())
+    assert len(delivered) == 1 and "仍然有效" in delivered[0], delivered
+    assert all(not ch.sent for ch in channels.values()), channels
+
+
+def test_run_in_from_another_platform_records_its_conversation(_sr_env, monkeypatch):
+    """`/run in` 從別的平台下：落地檔要帶上那個對話的來源，重啟後才找得回去。"""
+    import _chat_platform as cp
+
+    class _Platform(cp.ChatTransport):
+        name = "stubplat"
+
+        @property
+        def capabilities(self):
+            return cp.PlatformCapabilities()
+
+        async def run(self):
+            return None
+
+        async def deliver(self, channel, content=None, **kwargs):
+            return None
+
+    conv = cp.ChatConversation(_Platform(), "777", uid=-5, is_direct=True,
+                               is_command_chat=False)
+    message = types.SimpleNamespace(channel=conv, author=types.SimpleNamespace(id=1))
+
+    async def _body():
+        await b.cmd_run(message, "in 90m")
+        task = b._scheduled_run_task
+        record = json.loads(_sr_env.file.read_text(encoding="utf-8"))
+        task.cancel()
+        await _sr_settle(task)
+        return record
+
+    record = _sr_run(_body())
+    assert (record["platform"], record["platform_chat_id"], record["channel_id"]) == (
+        "stubplat", "777", -5), record
+
+
+def test_scheduling_a_run_from_another_platform_stores_where_it_came_from(
+        monkeypatch, tmp_path):
+    target = tmp_path / "scheduled_run.json"
+    monkeypatch.setattr(b, "SCHEDULED_RUN_FILE", target)
+    origin = {"platform": "stubplat", "platform_chat_id": "777"}
+    assert b._save_scheduled_run(1_900_000_000.0, -5, origin) is True
+    stored = json.loads(target.read_text(encoding="utf-8"))
+    assert stored == {"due": 1_900_000_000.0, "channel_id": -5, **origin}
+    assert b._save_scheduled_run(1_900_000_000.0, 4242) is True
+    assert set(json.loads(target.read_text(encoding="utf-8"))) == {"due", "channel_id"}
 
 
 def test_restore_runs_only_once_per_process(_sr_env, monkeypatch):
@@ -18648,6 +18799,50 @@ def _record_watchdog_run(env, monkeypatch, events, *, known=(_RW_CHANNEL,),
     return channels
 
 
+def test_a_recording_started_on_another_platform_reports_back_there(
+        _record_env, monkeypatch):
+    """從別的平台開錄：自動結束的通知要回到那個對話。那邊的 id 在既有平台上找不到
+    （私訊是負數；允許清單裡的對話等於設定頻道），拿 id 去找只會落到既有平台的設定
+    頻道——這裡讓 id 故意撞上一個既有平台的頻道，那個頻道一個字都不能收到。"""
+    import _chat_platform as cp
+    delivered: list = []
+
+    class _Platform(cp.ChatTransport):
+        name = "stubplat"
+
+        @property
+        def capabilities(self):
+            return cp.PlatformCapabilities()
+
+        async def run(self):
+            return None
+
+        async def deliver(self, channel, content=None, **kwargs):
+            delivered.append(content)
+
+        async def revise(self, sent, content, **kwargs):
+            return None
+
+    conv = cp.ChatConversation(_Platform(), "c9", uid=_RW_CHANNEL, is_direct=False,
+                               is_command_chat=True)
+    scheduled: list = []
+    monkeypatch.setattr(b, "safe_reply", lambda *_a, **_k: asyncio.sleep(0))
+    monkeypatch.setattr(b, "_MACRO_RECORDING", None)
+    monkeypatch.setattr(b, "_MACRO_RUNNING", None)
+    monkeypatch.setattr(b._gui, "record_start", lambda: None)
+    monkeypatch.setattr(b, "_schedule_coro", lambda coro, **_kw: scheduled.append(coro))
+    message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.OWNER_USER_ID),
+                                    channel=conv)
+    _sr_run(b._macro_record(message, "rec1"))
+    (watchdog,) = scheduled
+    monkeypatch.setattr(b._gui, "RECORD_MAX_SEC", 0.01)
+    _record_env.events(_recorded_clicks(2))
+    channels = _sr_client(monkeypatch, known=(_RW_CHANNEL,))
+    _sr_run(watchdog)
+    assert channels[_RW_CHANNEL].sent == [], "通知落到既有平台的頻道了"
+    assert len(delivered) == 1 and "自動結束並存成巨集" in delivered[0], delivered
+
+
 def test_the_record_watchdog_tells_the_recording_channel_what_it_saved(
         _record_env, monkeypatch):
     """存了 3 步、上限截掉 3 個動作、1 步略過：三件事都要講，存檔要記在發起人名下
@@ -18845,7 +19040,8 @@ def test_starting_a_recording_hands_the_watchdog_its_channel_owner_and_sequence(
         channel=types.SimpleNamespace(id=_RW_CHANNEL))
     _sr_run(b._macro_record(message, "rec2"))
     assert scheduled == [("watchdog", "rec2", {
-        "seq": 42, "channel_id": _RW_CHANNEL, "user_id": b.OWNER_USER_ID})]
+        "seq": 42, "channel_id": _RW_CHANNEL, "user_id": b.OWNER_USER_ID,
+        "conversation": None})]
     assert b._MACRO_RECORDING == "rec2"
     assert b._MACRO_RECORDING_SEQ == 42
     assert replies and replies[0].startswith("⏺️ 開始錄製 `rec2`")

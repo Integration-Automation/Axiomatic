@@ -515,7 +515,113 @@ def test_a_marker_field_out_of_range_falls_back_to_now_and_the_configured_channe
     所以退回「現在＋設定的頻道」照樣接續，不是丟掉這一筆。時鐘誤差 60 秒以內照收。"""
     marker.write_text(body, encoding="utf-8")
     got = b._read_network_resume(_NOW)
-    assert got == (expected or (_NOW, b.CHANNEL_ID))
+    assert got == (*(expected or (_NOW, b.CHANNEL_ID)), {})
+
+
+@pytest.mark.parametrize("channel_id", [0, -5])
+def test_a_marker_with_an_origin_keeps_it_even_without_a_positive_channel(marker, channel_id):
+    """沒有設定頻道的部署（設定頻道是 0）寫下的落地檔頻道就是 0。帶著來源時那只是退路：
+    判成「格式壞了」會連來源一起丟掉，重啟後「網路已恢復」就沒有地方講。沒有來源的 0
+    照舊是壞的（上一支的 zero-channel）。"""
+    marker.write_text(
+        '{"since": %r, "channel_id": %d, "platform": "stubplat", "platform_chat_id": "777"}'
+        % (_NOW - 100, channel_id), encoding="utf-8")
+    assert b._read_network_resume(_NOW) == (
+        _NOW - 100, channel_id, {"platform": "stubplat", "platform_chat_id": "777"})
+
+
+def test_a_marker_that_is_not_an_object_falls_back_instead_of_raising(marker):
+    """`[1, 2]` 過得了 `json.loads`，但它不是物件——漏接的話這支丟例外，而不是照
+    「讀不懂就用預設接續」那條規則走。"""
+    marker.write_text("[1, 2]", encoding="utf-8")
+    assert b._read_network_resume(_NOW) == (_NOW, b.CHANNEL_ID, {})
+
+
+def test_a_batch_parked_from_another_platform_reports_back_there_after_a_restart(
+        monkeypatch, marker):
+    """斷網停下的批次是從別的平台下的：落地檔帶著來源，重啟後「網路已恢復」講在那個
+    對話；找不回來（平台沒開）才退回設定頻道——批次通知本來就以它為預設去處。"""
+    import _chat_platform as cp
+    delivered: list = []
+
+    class _Platform(cp.ChatTransport):
+        name = "stubplat"
+
+        @property
+        def capabilities(self):
+            return cp.PlatformCapabilities()
+
+        async def run(self):
+            return None
+
+        async def deliver(self, channel, content=None, **kwargs):
+            delivered.append(content)
+
+        def conversation_for(self, platform_chat_id):
+            return cp.ChatConversation(self, platform_chat_id, uid=-5, is_direct=True,
+                                       is_command_chat=False)
+
+    conv = _Platform().conversation_for("777")
+    assert b._save_network_resume(conv.id, time.time() - 3600, cp.origin_of(conv))
+    stored = json.loads(marker.read_text(encoding="utf-8"))
+    assert stored["channel_id"] == b.CHANNEL_ID and stored["platform_chat_id"] == "777"
+
+    primary = _Channel(b.CHANNEL_ID)
+    resolved = _restore_env(monkeypatch, primary)
+    monkeypatch.setattr(b, "_chat_transports", [_Platform()])
+    _probe_script(monkeypatch, [False])
+    runs = _fake_runs(monkeypatch)
+    _restore_and_settle()
+    assert resolved == [], "找得回對話卻還去找設定頻道"
+    assert len(runs) == 1 and isinstance(runs[0].channel, cp.ChatConversation)
+    assert any("網路已恢復" in text for text in delivered), delivered
+    assert primary.sent == []
+
+    # 平台沒開：退回設定頻道，批次照樣接續。
+    assert b._save_network_resume(conv.id, time.time() - 3600, cp.origin_of(conv))
+    resolved = _restore_env(monkeypatch, primary)
+    monkeypatch.setattr(b, "_chat_transports", [])
+    _probe_script(monkeypatch, [False])
+    runs = _fake_runs(monkeypatch)
+    _restore_and_settle()
+    assert resolved == [b.CHANNEL_ID] and len(runs) == 1 and runs[0].channel is primary
+
+
+def test_parking_a_batch_from_another_platform_records_its_conversation(monkeypatch, marker):
+    """停下來的那一刻就要把來源寫進落地檔。`_clear_pid` 換成記錄用的替身——真的那一支會
+    刪掉**正式批次**的存活訊號；停止旗標設起來，讓它在排定接續之前就返回。"""
+    import _chat_platform as cp
+
+    class _Platform(cp.ChatTransport):
+        name = "stubplat"
+
+        @property
+        def capabilities(self):
+            return cp.PlatformCapabilities()
+
+        async def run(self):
+            return None
+
+        async def deliver(self, channel, content=None, **kwargs):
+            return None
+
+    cleared: list = []
+
+    async def _notify(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(b, "_clear_pid", lambda: cleared.append(1))
+    monkeypatch.setattr(b, "_supervisor_notify", _notify)
+    monkeypatch.setattr(b, "_webrunner_stop_requested", True)
+    monkeypatch.setattr(b, "_webrunner_fallback_task", None)
+    for name in ("_webrunner_proc", "_webrunner_pid", "_webrunner_variant"):
+        monkeypatch.setattr(b, name, None)
+    conv = cp.ChatConversation(_Platform(), "777", uid=-5, is_direct=True,
+                               is_command_chat=False)
+    asyncio.run(b._park_batch_for_network(conv))
+    stored = json.loads(marker.read_text(encoding="utf-8"))
+    assert (stored["platform"], stored["platform_chat_id"]) == ("stubplat", "777"), stored
+    assert cleared == [1] and b._webrunner_fallback_task is None
 
 
 def test_a_marker_is_discarded_when_a_run_is_already_alive(monkeypatch, marker):

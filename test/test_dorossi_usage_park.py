@@ -283,6 +283,42 @@ def test_a_turn_with_no_usable_anchor_is_not_parked():
     assert run_at is None and row is None
 
 
+def test_a_turn_from_another_platform_is_not_parked():
+    """別的平台的訊息 id 也是整數，但還原時查回當初那一次請求只會問既有平台，必定失敗——
+    停下去等於在行程內就把它丟進失敗佇列，而使用者剛被告知「額度回來會自動重跑」。
+    所以跟沒有錨點一樣：不停，當場講一句撞到上限。對話物件是真的 `ChatConversation`，
+    id 刻意都是正整數，擋下它的只能是平台判斷。"""
+    import _chat_platform as cp
+
+    class _Platform(cp.ChatTransport):
+        name = "stubplat"
+
+        @property
+        def capabilities(self):
+            return cp.PlatformCapabilities()
+
+        async def run(self):
+            return None
+
+        async def deliver(self, channel, content=None, **kwargs):
+            return None
+
+        async def revise(self, sent, content, **kwargs):
+            return None
+
+    conv = cp.ChatConversation(_Platform(), "c9", uid=CHANNEL_ID, is_direct=False,
+                               is_command_chat=True)
+    msg = cp.ChatMessage(
+        author=cp.ChatUser(b.DOROSSI_USER_ID, "u1", "owner", is_owner=True),
+        channel=conv, content="停一下這題", message_id=MESSAGE_ID,
+        platform="stubplat", platform_message_id="p1")
+    run_at, row = _park(message=msg)
+    assert run_at is None and row is None
+    # 對照組：同樣的 id、既有平台的訊息照樣停得進去。
+    run_at, row = _park()
+    assert run_at is not None and row is not None
+
+
 def test_a_non_owner_turn_is_not_parked():
     """過不了 Dorossi 自己的閘就不要停（fail-closed）。
 

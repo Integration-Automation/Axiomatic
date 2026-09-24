@@ -6330,6 +6330,9 @@ def _dorossi_is_platform_offline(exc) -> bool:
     try:
         if isinstance(exc, aiohttp.ClientConnectionError):
             return True
+        # 別的平台的 transport 連不上時丟這個（2026-09-24；之前它把失敗吞成 None）。
+        if isinstance(exc, _chat_platform.DeliveryFailed):
+            return True
         if isinstance(exc, (discord.GatewayNotFound, discord.ConnectionClosed)):
             return True
         if isinstance(exc, discord.HTTPException):
@@ -6972,7 +6975,14 @@ def _dorossi_park_anchor(message) -> tuple[int, int] | None:
 
     兩個都必須是真的整數（`bool` 不算）——還原時要拿 `message_id` 向平台查回當初那一次
     請求，查不回來的列會被停進失敗佇列，所以錨點不成立時**不要停放**，直接回舊行為
-    （當場講一句「撞到上限」）比較誠實。"""
+    （當場講一句「撞到上限」）比較誠實。
+
+    **別的平台進來的訊息一律不成立**（2026-09-24）。它的 id 也是整數，但查回的那一步
+    （`_dorossi_restore_channel`、`_resolve_trigger_message`）只會問既有平台：私訊的負數
+    id 找不到頻道，允許清單裡的對話找到的是設定頻道、再拿負數訊息 id 去查必定失敗。
+    停下去的結果是行程內就掉進失敗佇列——而使用者剛剛被告知「額度回來會自動重跑」。"""
+    if isinstance(getattr(message, "channel", None), _chat_platform.ChatConversation):
+        return None
     cid = getattr(getattr(message, "channel", None), "id", None)
     mid = getattr(message, "id", None)
     if (isinstance(cid, int) and not isinstance(cid, bool)
@@ -8848,7 +8858,9 @@ async def _dorossi_outbox_park(message, uid: str, sid: str, chunks: list) -> Non
     """把一則送不出去的答案停進 slot 的 `outbox`。slot 不在就算了（fail-closed）。"""
     entry = {"ts": time.time(), "chunks": [str(c)[:1900] for c in chunks][:20],
              "channel_id": getattr(getattr(message, "channel", None), "id", None),
-             "message_id": getattr(message, "id", None)}
+             "message_id": getattr(message, "id", None),
+             # 別的平台才有：重送時經那個平台找回對話（`_dorossi_outbox_send_one`）。
+             **_chat_platform.origin_of(getattr(message, "channel", None))}
 
     def _mut(state: dict) -> bool:
         sess = (_dorossi_user_record(state, uid).get("sessions") or {}).get(sid)
@@ -8936,6 +8948,9 @@ async def _dorossi_outbox_send_one(uid: str, sid: str, entry: dict) -> str:
     chunks = [c for c in (entry.get("chunks") or []) if isinstance(c, str) and c]
     if not chunks:
         return "dropped"
+    is_platform, conversation = _chat_platform.find_conversation(_chat_transports, entry)
+    if is_platform:
+        return await _dorossi_outbox_send_platform(uid, sid, conversation, chunks)
     channel = await _dorossi_restore_channel(entry.get("channel_id"))
     if channel is None:
         return "dropped"
@@ -8957,6 +8972,28 @@ async def _dorossi_outbox_send_one(uid: str, sid: str, entry: dict) -> str:
                            allowed_mentions=discord.AllowedMentions.none())
         for chunk in chunks:
             await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as exc:  # pylint: disable=broad-except
+        if _dorossi_is_platform_offline(exc):
+            return "offline"
+        traceback.print_exc()
+        return "dropped"
+    _dorossi_event("outbox_sent", uid=uid, sid=sid, chunks=len(chunks))
+    return "sent"
+
+
+async def _dorossi_outbox_send_platform(uid: str, sid: str, conversation,
+                                        chunks: list) -> str:
+    """別的平台那一則的重送。這邊查不回「當初那一次請求」（那是既有平台才有的查法），
+    所以授權換成兩件事：那個對話是 transport 肯回話的地方（`conversation_for` 已經判過，
+    找不回來就是 None），以及那一格是擁有者的——不重送別人的答案。"""
+    if conversation is None or uid != str(DOROSSI_USER_ID):
+        print(f"[dorossi] outbox {sid}: its conversation is not reachable or not the "
+              "owner's; not re-sending", file=sys.stderr)
+        return "dropped"
+    try:
+        await conversation.send(f"📬〔{sid}〕斷線期間沒送出去的回覆：")
+        for chunk in chunks:
+            await conversation.send(chunk)
     except Exception as exc:  # pylint: disable=broad-except
         if _dorossi_is_platform_offline(exc):
             return "offline"
@@ -12320,11 +12357,13 @@ async def mcmd_generate(message: discord.Message, rest: str) -> None:
     # （`DEFAULT_MENTIONS.replied_user`），而產圖常常要排隊好幾分鐘——那個 ping 就是
     # 「圖好了」的通知。回在 bot 自己的佔位訊息底下的話，被回覆的是 bot，發問的人
     # 什麼通知都收不到（2026-09-20 修）。
-    # 只收**真的** `discord.Message`：斜線的 `message` 是 `_InteractionMessageProxy`，
-    # 它的 `.id` 是 interaction id、不是訊息，也沒有 `reply` 以外的訊息語意；斜線那條
-    # 照舊回在佔位訊息（就是 bot 回覆那一次互動的訊息）底下。ctx 只活在記憶體裡、
-    # 從不序列化（`_generate_append_history` 用具名鍵另建 dict），放一個 Message 安全。
-    if isinstance(message, discord.Message):
+    # 只收**真的**收到的訊息：`discord.Message`，或別的平台進來的 `ChatMessage`（它的
+    # `reply` 會掛在發問那一則底下，通知一樣會到發問的人）。斜線的 `message` 是
+    # `_InteractionMessageProxy`，它的 `.id` 是 interaction id、不是訊息，也沒有
+    # `reply` 以外的訊息語意；斜線那條照舊回在佔位訊息（就是 bot 回覆那一次互動的
+    # 訊息）底下。ctx 只活在記憶體裡、從不序列化（`_generate_append_history` 用具名鍵
+    # 另建 dict），放一個訊息物件安全。
+    if isinstance(message, (discord.Message, _chat_platform.ChatMessage)):
         ctx["trigger_message"] = message
 
     # 6. Send a placeholder reply showing the queue position (mirrors Dorossi).
@@ -14319,14 +14358,19 @@ async def _batch_network_is_down() -> bool:
         return False
 
 
-def _save_network_resume(channel_id, since: float) -> bool:
-    """寫「網路回來就接續」的落地檔（原子）。失敗只記 stderr、回 False。"""
+def _save_network_resume(channel_id, since: float, origin: dict | None = None) -> bool:
+    """寫「網路回來就接續」的落地檔（原子）。失敗只記 stderr、回 False。
+
+    `origin` 是 `_chat_platform.origin_of(channel)`：批次是從別的平台下的，重啟後的通知
+    要回到那個對話（2026-09-24）。頻道 id 照舊換成正的設定頻道——那是找不回對話時的
+    退路，批次的通知本來就以設定頻道為預設的去處。"""
     if (not isinstance(channel_id, int) or isinstance(channel_id, bool)
             or channel_id <= 0):
         channel_id = CHANNEL_ID
     try:
         _atomic_write_text(NETWORK_RESUME_FILE, _json.dumps(
-            {"since": since, "channel_id": channel_id}, allow_nan=False))
+            {"since": since, "channel_id": channel_id, **(origin or {})},
+            allow_nan=False))
         return True
     except (OSError, ValueError, TypeError) as error:
         print(f"network resume marker could not be saved "
@@ -14351,8 +14395,9 @@ def _clear_network_resume_file() -> bool:
         return False
 
 
-def _read_network_resume(now: float) -> tuple[float, int] | None:
-    """`(斷網起點, 頻道 id)`；沒有檔案回 None。
+def _read_network_resume(now: float) -> tuple[float, int, dict] | None:
+    """`(斷網起點, 頻道 id, 來源)`；沒有檔案回 None。來源是別的平台的
+    `{"platform", "platform_chat_id"}`，沒有（或讀不懂）就是空 dict。
 
     **檔案在但內容壞了，仍然回一筆**（起點＝現在、頻道＝設定的頻道）：檔案存在這件
     事本身就是「使用者沒有叫停、要接續」的意思，而擁有者的裁定是只有明確的停止
@@ -14365,21 +14410,27 @@ def _read_network_resume(now: float) -> tuple[float, int] | None:
     except (OSError, UnicodeDecodeError) as error:
         print(f"network resume marker unreadable ({type(error).__name__}); "
               "resuming with defaults", file=sys.stderr)
-        return now, CHANNEL_ID
+        return now, CHANNEL_ID, {}
     try:
         data = _json.loads(raw)
         since = float(data["since"])
         channel_id = data["channel_id"]
         if not (math.isfinite(since) and 0 < since <= now + 60):
             raise ValueError("since is out of range")
+        platform, chat_id = data.get("platform"), data.get("platform_chat_id")
+        origin = ({"platform": platform, "platform_chat_id": chat_id}
+                  if isinstance(platform, str) and platform
+                  and isinstance(chat_id, str) and chat_id.strip() else {})
+        # 帶著來源時頻道 id 只是退路，可以不是正數：沒有設定頻道的部署（設定頻道是 0）
+        # 寫下的就是 0，而找回對話靠的是來源。與 `_parse_scheduled_run_record` 同一條規則。
         if (isinstance(channel_id, bool) or not isinstance(channel_id, int)
-                or channel_id <= 0):
+                or (channel_id <= 0 and not origin)):
             raise ValueError("channel id is invalid")
     except (ValueError, TypeError, KeyError, OverflowError) as error:
         print(f"network resume marker malformed ({type(error).__name__}); "
               "resuming with defaults", file=sys.stderr)
-        return now, CHANNEL_ID
-    return since, channel_id
+        return now, CHANNEL_ID, {}
+    return since, channel_id, origin
 
 
 async def _wait_until_online() -> bool:
@@ -14478,7 +14529,8 @@ async def _park_batch_for_network(channel) -> None:
     _webrunner_variant = None
     _clear_pid()
     since = time.time()
-    saved = _save_network_resume(getattr(channel, "id", None), since)
+    saved = _save_network_resume(getattr(channel, "id", None), since,
+                                 _chat_platform.origin_of(channel))
     print("batch parked: the network is down; waiting for it to come back",
           file=sys.stderr)
     await _supervisor_notify(
@@ -14509,7 +14561,7 @@ async def _restore_network_resume_once() -> None:
         record = _read_network_resume(time.time())
         if record is None:
             return
-        since, channel_id = record
+        since, channel_id, origin = record
         if _webrunner_alive():
             _clear_network_resume_file()
             print("network resume: a run is already alive; marker discarded",
@@ -14518,8 +14570,12 @@ async def _restore_network_resume_once() -> None:
         if (_webrunner_fallback_task is not None
                 and not _webrunner_fallback_task.done()):
             return
-        channel = await _resolve_origin_channel(
-            channel_id, label="network resume")
+        # 別的平台下的批次：找得回那個對話就講在那裡；找不回來（平台沒開）退回設定頻道
+        # ——批次通知本來就以它為預設去處，這裡不像排程回報那樣寧可不講。
+        _is_platform, channel = _chat_platform.find_conversation(_chat_transports, origin)
+        if channel is None:
+            channel = await _resolve_origin_channel(
+                channel_id, label="network resume")
         if channel is None:
             channel = _NoChannel()
         _webrunner_fallback_task = asyncio.create_task(
@@ -15106,17 +15162,21 @@ def _extract_run_label(arg: str) -> tuple[str, str]:
     return _clean_batch_label(tail), ""
 
 
-def _save_scheduled_run(when_ts: float, channel_id) -> bool:
+def _save_scheduled_run(when_ts: float, channel_id, origin: dict | None = None) -> bool:
     """把延後啟動落地（原子寫入）。成功回 True；失敗只記 stderr、回 False——排程
     照樣在記憶體裡，只是撐不過重啟，呼叫端要讓使用者知道。
 
     `when_ts` 一律來自 `_parse_run_schedule`，那裡已經保證有限且在範圍內；
-    `allow_nan=False` 只是確保萬一有人繞過它，落地的也不會是非法 JSON。"""
+    `allow_nan=False` 只是確保萬一有人繞過它，落地的也不會是非法 JSON。
+
+    `origin` 是 `_chat_platform.origin_of(channel)`：別的平台的對話才有內容，重啟後
+    經那個平台找回（2026-09-24）；既有平台照舊只存頻道 id。"""
     if not isinstance(channel_id, int) or isinstance(channel_id, bool):
         channel_id = CHANNEL_ID
     try:
         _atomic_write_text(SCHEDULED_RUN_FILE, _json.dumps(
-            {"due": when_ts, "channel_id": channel_id}, allow_nan=False))
+            {"due": when_ts, "channel_id": channel_id, **(origin or {})},
+            allow_nan=False))
         return True
     except (OSError, ValueError, TypeError) as error:
         print(f"scheduled run could not be saved ({type(error).__name__})",
@@ -15134,9 +15194,13 @@ def _clear_scheduled_run_file() -> None:
               f"({type(error).__name__})", file=sys.stderr)
 
 
-def _parse_scheduled_run_record(raw: str, now: float) -> tuple[float, int]:
-    """落地檔內容 → `(到點時刻, 頻道 id)`。不合法一律丟 `ValueError`，訊息是固定的
+def _parse_scheduled_run_record(raw: str, now: float) -> tuple[float, int, dict]:
+    """落地檔內容 → `(到點時刻, 頻道 id, 來源)`。不合法一律丟 `ValueError`，訊息是固定的
     原因代號——**不含檔案內容**，因為這行會進 stderr，而 stderr 會進 `/log tail`。
+
+    來源是別的平台的 `{"platform", "platform_chat_id"}`（沒有就是空 dict）。帶著來源時
+    頻道 id 可以是負數——那是那個平台的私訊在這個 bot 裡的號碼，找回對話靠的是來源、
+    不是它；沒有來源時照舊只收正整數。
 
     時刻要守的和 `_parse_run_schedule` 一樣：有限、為正（Windows 的
     `time.localtime` 對負數丟例外），而且不超過現在起 `SCHEDULE_HORIZON_SEC`——正常
@@ -15160,10 +15224,15 @@ def _parse_scheduled_run_record(raw: str, now: float) -> tuple[float, int]:
     # 同 `_parse_run_schedule`：正向連鎖比較，nan 才會被擋下。
     if not 0 < due <= now + SCHEDULE_HORIZON_SEC:
         raise ValueError("due is out of range")
+    platform, chat_id = data.get("platform"), data.get("platform_chat_id")
+    origin = ({"platform": platform, "platform_chat_id": chat_id}
+              if isinstance(platform, str) and platform
+              and isinstance(chat_id, str) and chat_id.strip() else {})
     channel_id = data.get("channel_id")
-    if isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0:
+    if (isinstance(channel_id, bool) or not isinstance(channel_id, int)
+            or (channel_id <= 0 and not origin)):
         raise ValueError("channel id is invalid")
-    return due, channel_id
+    return due, channel_id, origin
 
 
 async def _resolve_origin_channel(channel_id, *, label: str):
@@ -15226,13 +15295,16 @@ async def _restore_scheduled_run_once() -> None:
             return
         now = time.time()
         try:
-            due, channel_id = _parse_scheduled_run_record(raw, now)
+            due, channel_id, origin = _parse_scheduled_run_record(raw, now)
         except ValueError as error:
             print(f"scheduled run file malformed ({error}); discarded",
                   file=sys.stderr)
             _clear_scheduled_run_file()
             return
-        channel = await _resolve_scheduled_run_channel(channel_id)
+        # 別的平台排的：經那個平台找回對話，找不回來**不**退回既有平台的頻道。
+        is_platform, channel = _chat_platform.find_conversation(_chat_transports, origin)
+        if not is_platform:
+            channel = await _resolve_scheduled_run_channel(channel_id)
         if channel is None:
             print("scheduled run not restored: no channel to report to; "
                   "the file is kept for the next start", file=sys.stderr)
@@ -15433,7 +15505,8 @@ async def cmd_run(message: discord.Message, payload: str = "") -> None:
         _scheduled_run_task = asyncio.create_task(
             _scheduled_run_loop(message.channel, when_ts))
         saved = _save_scheduled_run(
-            when_ts, getattr(getattr(message, "channel", None), "id", None))
+            when_ts, getattr(getattr(message, "channel", None), "id", None),
+            _chat_platform.origin_of(getattr(message, "channel", None)))
         await safe_reply(
             message,
             f"⏰ scheduled `/run` for **{when_str}** (in "
@@ -18917,11 +18990,18 @@ def _recording_notes(converted: "_gui.RecordedMacro") -> list[str]:
     return notes
 
 
-async def _macro_record_autostop_report(channel_id, text: str) -> None:
+async def _macro_record_autostop_report(channel_id, text: str, *,
+                                        conversation=None) -> None:
     """自動停止沒有觸發訊息可回：講在開始錄製的那個頻道，找不到就退回設定的頻道；
-    都找不到、或送不出去，只寫 stderr。永不 raise（它在計時器的收尾路徑上）。"""
+    都找不到、或送不出去，只寫 stderr。永不 raise（它在計時器的收尾路徑上）。
+
+    `conversation` 是別的平台的對話物件（2026-09-24）。那邊的 id 不是既有平台的頻道
+    id——私訊是負數、允許清單裡的對話等於 `CHANNEL_ID`——拿 id 去找只會落到既有平台的
+    設定頻道。計時器活在同一個行程裡，所以直接拿著物件就好，不必跨重啟。"""
     try:
-        channel = await _resolve_origin_channel(channel_id, label="macro record")
+        channel = conversation
+        if channel is None:
+            channel = await _resolve_origin_channel(channel_id, label="macro record")
         if channel is None:
             print("macro record auto-stop: no channel to report to",
                   file=sys.stderr)
@@ -18932,7 +19012,7 @@ async def _macro_record_autostop_report(channel_id, text: str) -> None:
 
 
 async def _macro_record_watchdog(name: str, *, seq: int, channel_id=None,
-                                 user_id: int = 0) -> None:
+                                 user_id: int = 0, conversation=None) -> None:
     """錄太久就自己停下來，並在開始錄製的頻道講一聲。
 
     忘記按停是常態（下指令的人不在電腦前面），而一個一直掛著的鍵鼠監聽會持續
@@ -18983,14 +19063,16 @@ async def _macro_record_watchdog(name: str, *, seq: int, channel_id=None,
               f"{_gui.MACRO_MAX_STEPS}-step cap, "
               f"{converted.unrecordable} unrecordable step(s) skipped",
               file=sys.stderr)
-        await _macro_record_autostop_report(channel_id, text)
+        await _macro_record_autostop_report(channel_id, text,
+                                            conversation=conversation)
     except asyncio.CancelledError:
         raise
     except Exception as error:  # pylint: disable=broad-except
         print(f"_macro_record_watchdog failed: {error!r}", file=sys.stderr)
         await _macro_record_autostop_report(
             channel_id,
-            f"⚠️ 巨集錄製 `{(name or '').strip()}` 自動結束時出了問題，請查看 log。")
+            f"⚠️ 巨集錄製 `{(name or '').strip()}` 自動結束時出了問題，請查看 log。",
+            conversation=conversation)
 
 
 async def _macro_record(message: discord.Message, name: str) -> None:
@@ -19064,10 +19146,15 @@ async def _macro_record(message: discord.Message, name: str) -> None:
         _MACRO_RECORDING = None
         await safe_reply(message, f"❌ {error}")
         return
-    # 自動停止時沒有訊息可回，所以開始的這一刻就把「講給誰聽」記下來。
+    # 自動停止時沒有訊息可回，所以開始的這一刻就把「講給誰聽」記下來。別的平台的對話
+    # 連物件一起交過去（id 在既有平台上找不到它，見 `_macro_record_autostop_report`）。
+    conversation = (message.channel
+                    if isinstance(message.channel, _chat_platform.ChatConversation)
+                    else None)
     _schedule_coro(_macro_record_watchdog(
         name, seq=seq, channel_id=getattr(message.channel, "id", None),
-        user_id=message.author.id if message.author else 0),
+        user_id=message.author.id if message.author else 0,
+        conversation=conversation),
         label="macro-watchdog")
     await safe_reply(
         message,
@@ -19970,8 +20057,17 @@ def _schedule_expired(entry: dict, now: float) -> bool:
 
 
 async def _schedule_report(entry: dict, text: str) -> None:
-    """把一句話送回當初建立這筆排程的頻道。送不出去只寫 log。"""
-    channel = client.get_channel(int(entry.get("channel_id") or 0))
+    """把一句話送回當初建立這筆排程的頻道。送不出去只寫 log。
+
+    別的平台建立的排程存著 `platform`／`platform_chat_id`（`_chat_platform.origin_of`），
+    經那個平台找回對話；找不回來就只寫 log，**不**退回既有平台的頻道（2026-09-24）。"""
+    is_platform, channel = _chat_platform.find_conversation(_chat_transports, entry)
+    if is_platform and channel is None:
+        print(f"schedule #{entry.get('id')} report: its conversation is not reachable",
+              file=sys.stderr)
+        return
+    if not is_platform:
+        channel = client.get_channel(int(entry.get("channel_id") or 0))
     if channel is None:
         return
     try:
@@ -20302,6 +20398,8 @@ async def cmd_schedule(message: discord.Message, payload: str) -> None:
                     "user_id": message.author.id if message.author else 0,
                     "last_run": 0.0,
                     "last_date": "",
+                    # 別的平台才有這兩個欄位（見 `_schedule_report`）。
+                    **_chat_platform.origin_of(message.channel),
                 }
                 data["next_id"] = int(entry["id"]) + 1
                 # 固定時刻的補跑判定是「今天還沒跑過且已過設定時刻」。剛建立的
@@ -24436,6 +24534,7 @@ def _build_chat_transports() -> None:
             command_channel_id=CHANNEL_ID,
             handle_message=dispatch_external_message,
             project_root=PROJECT_ROOT,
+            on_recovered=_dorossi_outbox_flush,
         )
         _chat_transports = _chat_platform.build_transports(context)
     except Exception as error:  # pylint: disable=broad-except

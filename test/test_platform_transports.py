@@ -278,6 +278,192 @@ def _stub(**caps):
     return transport, channel
 
 
+@pytest.mark.parametrize("reply_reference", [True, False])
+def test_a_sent_message_can_be_replied_to(reply_reference):
+    """事後的結果回在 bot 自己送出的那一則底下（`/gen image` 的佔位訊息）。平台支援
+    引用就帶上那一則的 id，不支援就單純送進同一個對話——兩種都送得出去。"""
+    seen: list = []
+
+    class _Recording(_StubTransport):
+        async def deliver(self, channel, content=None, **kwargs):
+            seen.append((content, kwargs.get("reply_to")))
+            return await super().deliver(channel, content, **kwargs)
+
+    transport = _Recording(cp.PlatformCapabilities(reply_reference=reply_reference))
+    channel = cp.ChatConversation(transport, "c1", uid=-5, is_direct=True,
+                                  is_command_chat=True)
+    placeholder = cp.SentChatMessage(channel, "41", "產圖中…")
+    sent = asyncio.run(placeholder.reply("好了", mention_author=True))
+    assert sent is not None
+    assert seen == [("好了", "41" if reply_reference else None)]
+
+
+def test_a_generated_image_reaches_the_platform_it_was_asked_on(monkeypatch, tmp_path):
+    """`/gen image` 從別的平台下的：結果要回到那個對話，不是既有平台的設定頻道，也不是
+    消失。
+
+    修之前的實況：ctx 的 `channel_id` 是負數、`client.get_channel` 找不到，於是退回
+    事件監看的頻道；回覆目標是「產圖中…」那一則（`SentChatMessage`），而它沒有
+    `reply`——`safe_reply` 丟 `AttributeError`，外層吞進 stderr，整張圖不見、佔位訊息
+    永遠停在「產圖中」。這支走真的 `_handle_single_image_done`。"""
+    import discord_bot as b
+
+    delivered: list = []
+
+    class _Recording(_StubTransport):
+        async def deliver(self, channel, content=None, **kwargs):
+            delivered.append((content, sorted(kwargs)))
+            return await super().deliver(channel, content, **kwargs)
+
+    transport = _Recording(cp.PlatformCapabilities(reply_reference=True))
+    channel = cp.ChatConversation(transport, "c1", uid=-5, is_direct=True,
+                                  is_command_chat=True)
+    placeholder = cp.SentChatMessage(channel, "41", "產圖中…")
+    image = tmp_path / "output" / "_oneshot" / "rid" / "one.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 64)
+
+    primary: list = []
+
+    class _Primary:
+        async def send(self, content=None, **_kwargs):
+            primary.append(content)
+
+    monkeypatch.setattr(b, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(b, "OUTPUT_ROOT", tmp_path / "output")
+    monkeypatch.setattr(b, "_generate_append_history", lambda *_a, **_k: None)
+    monkeypatch.setattr(b, "_schedule_coro",
+                        lambda coro=None, *_a, **_k: coro.close() if coro else None)
+    monkeypatch.setattr(b.client, "get_channel", lambda *_a, **_k: None)
+    monkeypatch.setattr(b, "_single_image_pending", {"rid": {
+        "channel_id": channel.id, "message_id": -77, "placeholder": placeholder}})
+    asyncio.run(b._handle_single_image_done(
+        _Primary(), {"request_id": "rid", "ok": True,
+                     "path": "output/_oneshot/rid/one.png"}))
+    assert primary == [], "結果跑到既有平台的頻道去了"
+    assert len(delivered) == 1 and delivered[0][0] == "🖼️ 你要的圖來了。", delivered
+    assert "reply_to" in delivered[0][1], delivered
+
+
+class _Rebuilding(_StubTransport):
+    """`conversation_for` 認得一個對話 id；其他一律找不回來。"""
+
+    def __init__(self, known: str = "c1"):
+        super().__init__(cp.PlatformCapabilities())
+        self.known = known
+
+    def conversation_for(self, platform_chat_id):
+        if platform_chat_id != self.known:
+            return None
+        return cp.ChatConversation(self, platform_chat_id, uid=-5, is_direct=True,
+                                   is_command_chat=False)
+
+
+def test_the_origin_of_a_conversation_names_its_platform_and_chat():
+    transport = _Rebuilding()
+    conv = cp.ChatConversation(transport, "c1", uid=-5, is_direct=True,
+                               is_command_chat=False)
+    assert cp.origin_of(conv) == {"platform": "stub", "platform_chat_id": "c1"}
+    assert cp.origin_of(object()) == {}, "既有平台的頻道不帶這兩個欄位"
+    assert cp.origin_of(None) == {}
+
+
+@pytest.mark.parametrize("record, expected", [
+    ({"channel_id": 55}, (False, "none")),                       # 既有平台的紀錄
+    ({"platform": "", "platform_chat_id": "c1"}, (False, "none")),
+    (None, (False, "none")),
+    ({"platform": "stub", "platform_chat_id": "c1"}, (True, "conv")),
+    ({"platform": "stub", "platform_chat_id": " c1 "}, (True, "conv")),
+    ({"platform": "stub", "platform_chat_id": "c2"}, (True, "none")),   # 沒被授權
+    ({"platform": "stub", "platform_chat_id": 7}, (True, "none")),      # 壞資料
+    ({"platform": "stub"}, (True, "none")),
+    ({"platform": "gone", "platform_chat_id": "c1"}, (True, "none")),   # 平台沒開
+])
+def test_a_stored_origin_is_resolved_only_through_its_own_platform(record, expected):
+    """第一個值分得出「不是別的平台的紀錄」（照舊走既有平台）與「是、但找不回來」（**不**
+    退回既有平台——那就是送錯地方）。"""
+    is_platform, conv = cp.find_conversation([_Rebuilding()], record)
+    assert (is_platform, "conv" if conv is not None else "none") == expected
+
+
+def test_a_transport_that_explodes_while_rebuilding_is_contained(capsys):
+    class _Broken(_Rebuilding):
+        def conversation_for(self, platform_chat_id):
+            raise RuntimeError("secret detail")
+
+    got = cp.find_conversation([_Broken()], {"platform": "stub", "platform_chat_id": "c1"})
+    assert got == (True, None)
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err and "secret detail" not in err
+
+
+@pytest.mark.parametrize("chat_id, expected", [
+    ("-100", ("group", 4242, True)),        # 允許清單 → 就是這個平台的設定頻道
+    ("777", ("private", None, False)),      # 擁有者的私訊
+    ("888", None),                          # 陌生人的私訊：磁碟不能決定 bot 跟誰說話
+    ("", None),
+    ("  ", None),
+])
+def test_the_platform_only_rebuilds_conversations_it_would_answer_in(
+        monkeypatch, tmp_path, chat_id, expected):
+    transport = _built(monkeypatch, tmp_path)
+    conv = transport.conversation_for(chat_id)
+    if expected is None:
+        assert conv is None
+        return
+    kind, uid, is_command_chat = expected
+    assert conv is not None and conv.platform_chat_id == chat_id
+    assert conv.is_direct is (kind == "private")
+    assert conv.is_command_chat is is_command_chat
+    if uid is not None:
+        assert conv.id == uid
+    else:
+        assert conv.id < 0
+    assert transport.conversation_for(chat_id) is conv, "同一個對話要是同一個物件"
+
+
+def test_a_schedule_made_on_another_platform_reports_back_there(monkeypatch, tmp_path,
+                                                                  capsys):
+    """排程是事後才回報的東西，跨重啟也要回得去：`cmd_schedule` 存 `platform`／
+    `platform_chat_id`，`_schedule_report` 經那個平台找回對話。找不回來就只寫 log，
+    **不**落到既有平台的頻道。對話的整數 id 刻意撞上一個既有平台找得到的頻道。"""
+    import discord_bot as b
+    import types
+
+    transport = _Rebuilding()
+    conv = transport.conversation_for("c1")
+    primary: list = []
+
+    class _Primary:
+        async def send(self, content=None, **_kw):
+            primary.append(content)
+
+    monkeypatch.setattr(b, "SCHEDULE_FILE", tmp_path / "sched.json")
+    monkeypatch.setattr(b, "_is_owner", lambda _m: True)
+    monkeypatch.setattr(b, "safe_reply", lambda *_a, **_k: asyncio.sleep(0))
+    monkeypatch.setattr(b, "_chat_transports", [transport])
+    monkeypatch.setattr(b.client, "get_channel", lambda *_a, **_k: _Primary())
+    message = types.SimpleNamespace(channel=conv,
+                                    author=types.SimpleNamespace(id=7))
+    asyncio.run(b.cmd_schedule(message, "add 09:30 sh echo hi"))
+    (entry,) = b._load_schedules()["entries"]
+    assert (entry["platform"], entry["platform_chat_id"]) == ("stub", "c1"), entry
+
+    asyncio.run(b._schedule_report(entry, "排程跑完了"))
+    assert transport.sent == ["排程跑完了"] and primary == []
+
+    # 找不回來（平台沒開）：什麼都不送，尤其不送到既有平台。
+    monkeypatch.setattr(b, "_chat_transports", [])
+    capsys.readouterr()
+    asyncio.run(b._schedule_report(entry, "第二次"))
+    assert transport.sent == ["排程跑完了"] and primary == []
+    assert "not reachable" in capsys.readouterr().err, "什麼都沒送卻沒留下原因"
+
+    # 對照組：既有平台建立的排程照舊用頻道 id。
+    asyncio.run(b._schedule_report({"id": 2, "channel_id": 55}, "既有平台"))
+    assert primary == ["既有平台"]
+
+
 def test_editing_on_a_platform_that_cannot_edit_is_refused_out_loud():
     """安靜地什麼都沒發生是最貴的失敗形態：呼叫端以為那則訊息更新了。"""
     _transport, channel = _stub(edit_message=False)
@@ -1005,13 +1191,99 @@ def test_a_nan_rate_limit_wait_does_not_crash_the_transport(monkeypatch, tmp_pat
 
 
 def test_two_rate_limits_in_a_row_give_up(monkeypatch, tmp_path):
-    """再重試只是把限流拉長。放棄，並留一行 stderr。"""
+    """再重試只是把限流拉長。放棄，並留一行 stderr。
+
+    放棄回的是 `UNREACHABLE`（「現在送不了」），不是 `None`（「平台說不」）：送出那一側
+    靠這個區別決定要不要把答案停起來等之後重送（2026-09-24）。它仍是假值，只問「有沒有
+    結果」的呼叫端照舊當成失敗。"""
     transport = _built(monkeypatch, tmp_path)
     limited = _RateLimited(times=5)
     transport._request = limited
     _no_sleep(monkeypatch)
-    assert asyncio.run(transport._api("sendMessage", {})) is None
+    result = asyncio.run(transport._api("sendMessage", {}))
+    assert result is tg.UNREACHABLE and not result
     assert limited.calls == 2
+
+
+def test_an_unreachable_platform_is_not_reported_as_a_rejection(monkeypatch, tmp_path):
+    """連不上（`_request` 回 None）回 `UNREACHABLE`；平台說不（400）回 `None`。送出那一側
+    只在前者丟 `DeliveryFailed`——後者等多久再送都一樣是 400。"""
+    transport = _built(monkeypatch, tmp_path)
+
+    async def _down(method, payload, data):
+        return None
+
+    transport._request = _down
+    _no_sleep(monkeypatch)
+    assert asyncio.run(transport._api("sendMessage", {})) is tg.UNREACHABLE
+
+
+@pytest.mark.parametrize("answer, raises", [
+    (tg.UNREACHABLE, True), (None, False), ({"message_id": 9}, False)],
+    ids=["unreachable", "rejected", "sent"])
+def test_sending_raises_only_when_the_platform_cannot_be_reached(
+        monkeypatch, tmp_path, answer, raises):
+    """文字、附件、編輯三條路一樣：連不上就丟 `DeliveryFailed`（呼叫端把答案停起來等重送），
+    被拒絕就照舊回 None／略過。在這之前三條都把連不上吞成 None，答案安靜地消失。"""
+    transport, api, channel = _wired(monkeypatch, tmp_path)
+
+    async def _answer(method, payload=None, *, data=None):
+        api.calls.append((method, payload, data))
+        return answer
+
+    transport._api = _answer
+    sent = cp.SentChatMessage(channel, "5", "舊的")
+    actions = [
+        lambda: transport.deliver(channel, "答案"),
+        lambda: transport.deliver(channel, None, file=_FakeFile("a.txt", b"1")),
+        lambda: sent.edit("新的"),
+    ]
+    for action in actions:
+        if raises:
+            with pytest.raises(cp.DeliveryFailed):
+                asyncio.run(action())
+        else:
+            asyncio.run(action())
+    assert isinstance(cp.DeliveryFailed("x"), ConnectionError)
+    assert (sent._content == "舊的") is raises, "沒送到的編輯被記成已顯示"
+
+
+@pytest.mark.parametrize("polls, recovered", [
+    ([tg.UNREACHABLE, [], []], 1),
+    ([tg.UNREACHABLE, tg.UNREACHABLE, [], tg.UNREACHABLE, []], 2),
+    ([[], [], []], 0),
+    ([tg.UNREACHABLE, tg.UNREACHABLE], 0),
+], ids=["one-outage", "two-outages", "never-down", "still-down"])
+def test_the_recovery_hook_fires_once_per_outage(monkeypatch, tmp_path, polls, recovered):
+    """收訊從連不上變回連得上時叫一次 `on_recovered`（送出停著的答案）。一直連得上時不叫
+    ——每一輪都叫的話，停著的答案清單每幾十秒就被整份讀一次。"""
+    transport = _built(monkeypatch, tmp_path)
+    fired: list = []
+
+    async def _recovered():
+        fired.append(1)
+
+    script = list(polls)
+
+    async def _api(method, payload=None, *, data=None):
+        if not script:
+            raise asyncio.CancelledError
+        return script.pop(0)
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    transport._context.on_recovered = _recovered
+    transport._api = _api
+    monkeypatch.setattr(tg.asyncio, "sleep", _fake_sleep)
+
+    async def _go():
+        with pytest.raises(asyncio.CancelledError):
+            await transport.run()
+        await asyncio.gather(*transport._inflight, return_exceptions=True)
+
+    asyncio.run(_go())
+    assert len(fired) == recovered
 
 
 def test_an_ordinary_rejection_is_not_retried(monkeypatch, tmp_path, capsys):

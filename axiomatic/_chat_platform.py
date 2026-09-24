@@ -63,6 +63,15 @@ class UnsupportedOperation(RuntimeError):
     """
 
 
+class DeliveryFailed(ConnectionError):
+    """平台**連不上**（或一直限流），這一則沒送出去。跟「平台說了不」（4xx）分開：
+    前者等連線回來再送就會好，後者再送也一樣。
+
+    是 `ConnectionError` 的子類別，所以呼叫端把它當「對話平台斷線」處理——Dorossi 的
+    答案會停進 outbox，等平台回來再送（2026-09-24）。在這之前 transport 把失敗吞成
+    `None`，答案安靜地消失。"""
+
+
 @dataclass(frozen=True)
 class PlatformCapabilities:
     """一個平台做得到什麼。呼叫端拿這個**明確降級**，不要靠 try/except 試出來。
@@ -425,7 +434,12 @@ class ChatMessage:
 
 
 class SentChatMessage:
-    """已經送出去的一則訊息。存在的理由只有一個：Dorossi 的即時預覽要編輯它。
+    """已經送出去的一則訊息。兩個用途：Dorossi 的即時預覽要編輯它，以及事後的結果要
+    **回在它底下**（`/gen image` 的「產圖中…」佔位訊息就是這樣用的）。
+
+    `reply()` 與 `ChatMessage.reply` 同一個形狀（2026-09-24 補）。少了它，呼叫端對一則
+    bot 自己送出的訊息 `safe_reply` 會丟 `AttributeError`，而那條路的外層把例外吞進
+    stderr——產好的圖整張消失、佔位訊息永遠停在「產圖中」，只有這個平台會這樣。
 
     `edit()` 的行為由平台能力決定，而且**兩種都不是當掉**：
       * 平台編輯得動 → 真的編輯；
@@ -443,6 +457,12 @@ class SentChatMessage:
         self.id = external_uid(f"{channel.transport.name}#msg",
                                str(platform_message_id))
         self._content = content
+
+    async def reply(self, content: Any = None, **kwargs) -> "SentChatMessage | None":
+        kwargs.pop("mention_author", None)
+        if self.channel.capabilities.reply_reference:
+            kwargs.setdefault("reply_to", self.platform_message_id)
+        return await self.channel.send(content, **kwargs)
 
     async def edit(self, content: Any = None, **kwargs) -> "SentChatMessage":
         if not self.channel.capabilities.edit_message:
@@ -546,6 +566,8 @@ class TransportContext:
     command_channel_id: int = 0
     handle_message: Callable[[ChatMessage], Awaitable[None]] | None = None
     project_root: Any = None
+    # 平台斷線之後又連得上時叫一次（送出停著的答案）。不得 raise、不得卡住收訊。
+    on_recovered: Callable[[], Awaitable[None]] | None = None
 
 
 class ChatTransport(abc.ABC):
@@ -582,8 +604,56 @@ class ChatTransport(abc.ABC):
         """「正在輸入」的持續回報。被取消是正常收場，不要在這裡吞掉取消。"""
         await asyncio.sleep(0)
 
+    def conversation_for(self, platform_chat_id: str) -> ChatConversation | None:
+        """從存下來的對話 id 重建一個對話，給「事後才送」的東西用（排程回報之類）。
+
+        回 None ＝這個平台不支援，或那個對話不是它肯回話的地方。**授權在這裡決定**：
+        那個 id 來自磁碟，而磁碟不能自己決定 bot 往哪裡說話——所以只放行這個平台本來
+        就會回話的對話（允許清單、擁有者的私訊）。預設不支援。"""
+        del platform_chat_id
+        return None
+
     async def close(self) -> None:
         """關掉這個 transport 自己開的資源。永不 raise。"""
+
+
+def origin_of(channel: Any) -> dict:
+    """事後要回到這個對話時該存的欄位：`{"platform", "platform_chat_id"}`。
+
+    既有平台的頻道回空 dict——那邊照舊只存整數頻道 id。別的平台不能只存整數：私訊
+    的 id 是負數（既有平台找不到），允許清單裡的對話等於 `CHANNEL_ID`（找到的是既有
+    平台的頻道）。"""
+    if isinstance(channel, ChatConversation):
+        return {"platform": channel.transport.name,
+                "platform_chat_id": str(channel.platform_chat_id)}
+    return {}
+
+
+def find_conversation(transports: Iterable[ChatTransport],
+                      record: Any) -> tuple[bool, ChatConversation | None]:
+    """`origin_of` 存下來的紀錄 → `(這是不是別的平台的紀錄, 對話或 None)`。
+
+    第一個值讓呼叫端分得出兩件事：「不是別的平台的紀錄」要照舊走既有平台；「是、
+    但找不回來」（平台沒開、對話沒被授權）**不可以**退回既有平台的頻道——那正是
+    這一支要修的「送錯地方」。永不 raise。"""
+    if not isinstance(record, dict):
+        return False, None
+    platform = record.get("platform")
+    if not isinstance(platform, str) or not platform:
+        return False, None
+    chat_id = record.get("platform_chat_id")
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        return True, None
+    for transport in transports:
+        if getattr(transport, "name", None) != platform:
+            continue
+        try:
+            return True, transport.conversation_for(chat_id.strip())
+        except Exception as error:  # pylint: disable=broad-except
+            print(f"chat transport {platform!r} could not rebuild a conversation: "
+                  f"{type(error).__name__}", file=sys.stderr)
+            return True, None
+    return True, None
 
 
 _FACTORIES: dict[str, Callable[[TransportContext], ChatTransport | None]] = {}

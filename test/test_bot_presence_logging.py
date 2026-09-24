@@ -533,7 +533,7 @@ def test_probe_status_shows_the_window_title_only_to_the_owner(probe_status, mon
                                                               asker, shows_title):
     """前景視窗的標題常帶主機路徑與程式名，而這個指令在誰都叫得到的檢視那一級。原文只給
     擁有者（`_owner_detail`，身分閘）；取不到提問者一律當成不是擁有者。"""
-    title = r"D:\Codes\secret\notes.txt - Notepad"
+    title = r"C:\work\secret\notes.txt - Notepad"
     monkeypatch.setattr(b.presence_probe, "probe_foreground_window_raw", lambda: title)
     if asker is not None:
         uid = b.OWNER_USER_ID if asker == "owner" else b.OWNER_USER_ID + 1

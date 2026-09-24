@@ -120,7 +120,7 @@
 | DOM／產圖行為 | 共用的放 `axiomatic/_webrunner_shared.py`；driver 專屬的兩個變體都要改 |
 | 跨行程檔案 | 原子寫入，並同時加進 `CLAUDE.md` 原子寫入清單與 `test/test_atomic_writes.py` 的 `_CROSS_PROCESS_CONSTANTS`；新的根目錄檔案要分類為追蹤的專案資產或 gitignored 的執行期產物（`test/test_gitignore_coverage.py`） |
 | 外部 API | `axiomatic/_external_apis.py`（唯一外送出口 `_http_get_json`）＋ `axiomatic/verify_external_apis.py` |
-| 對話平台 | 新增 `axiomatic/_<平台>_transport.py`，列進 `_chat_platform.TRANSPORT_MODULES`，在 `_bot_config` 的 `_DEFAULT_PLATFORMS` / `_PLATFORM_COERCERS` 各加一列，憑證檔照 `<平台>_bot_token.md` 的約定命名（連同範本與 `.gitignore`、`test_gitignore_coverage._IGNORED_RUNTIME`），並在 `docs/platforms.md` 寫使用說明 |
+| 對話平台 | 新增 `axiomatic/_<平台>_transport.py`，列進 `_chat_platform.TRANSPORT_MODULES`，在 `_bot_config` 的 `_DEFAULT_PLATFORMS` / `_PLATFORM_COERCERS` 各加一列，憑證檔照 `<平台>_bot_token.md` 的約定命名（連同範本與 `.gitignore`、`test_gitignore_coverage._IGNORED_RUNTIME`），並在 `docs/platforms.md` 寫使用說明。要讓延後的回報（`/run in`、斷網接續、排程回報）回到原對話，transport 要實作 `conversation_for(platform_chat_id)`；送不出去時丟 `_chat_platform.DeliveryFailed`，連線恢復時呼叫 `TransportContext.on_recovered`，擁有者的回覆才會先留著、之後補送 |
 | 使用者說明（README） | 四份 README 一起改：章節用 `<!-- section: <key> -->` 標記對齊，指令表四份逐字相同，切換器四份互連；數字引用在 `test_docs_sync._README_NUMBER_PATTERNS` 每種語言各一組。簡體與日文那兩份整份豁免語言守門，名單同時列在 `test_language._NON_TRADITIONAL_MARKDOWN` 與 `audit_simplified_chars.DELIBERATE_FILES`（兩向對帳） |
 | 桌面控制功能 | `axiomatic/_gui_control.py`，錯誤以泛用訊息的 `GuiError` 拋出 |
 | prompt 文字／presence 規則 | `bot_prompts/`（由 `_bot_prompts.py` 載入）；`presence_games.json`、`presence_music.json`、`presence_rpc.json`（各自的 `.example.json` 是範本） |

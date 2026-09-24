@@ -1071,6 +1071,87 @@ def test_an_undeliverable_answer_is_parked_not_lost(outbox, monkeypatch):
     assert (box[0]["channel_id"], box[0]["message_id"]) == (55, 77)
 
 
+def _far_platform(*, up: bool, authorized: bool = True):
+    """別的平台的替身：`up` 決定送得出去還是連不上；`authorized` 決定 `conversation_for`
+    肯不肯把那個對話找回來。"""
+    import _chat_platform as cp
+    sent: list = []
+
+    class _Platform(cp.ChatTransport):
+        name = "stubplat"
+
+        @property
+        def capabilities(self):
+            return cp.PlatformCapabilities(reply_reference=True)
+
+        async def run(self):
+            return None
+
+        async def deliver(self, channel, content=None, **kwargs):
+            if not up:
+                raise cp.DeliveryFailed("stubplat is unreachable")
+            sent.append(content)
+            return cp.SentChatMessage(channel, str(len(sent)), str(content))
+
+        def conversation_for(self, platform_chat_id):
+            if not authorized or platform_chat_id != "777":
+                return None
+            return cp.ChatConversation(self, "777", uid=-5, is_direct=True,
+                                       is_command_chat=False)
+
+    transport = _Platform()
+    conv = cp.ChatConversation(transport, "777", uid=-5, is_direct=True,
+                               is_command_chat=False)
+    message = cp.ChatMessage(
+        author=cp.ChatUser(b.DOROSSI_USER_ID, "u1", "owner", is_owner=True),
+        channel=conv, content="問題", message_id=-9, platform="stubplat",
+        platform_message_id="p1")
+    return transport, message, sent
+
+
+def test_an_answer_the_other_platform_could_not_take_is_parked_and_resent_there(
+        outbox, monkeypatch):
+    """走真的 `_dorossi_reply_final`：平台連不上時 transport 丟 `DeliveryFailed`，答案停進
+    outbox 並記下來源；平台回來後清送經那個平台找回對話、送到那裡。修之前 transport 把
+    失敗吞成 None，這一則答案安靜地不見了。"""
+    down, message, _ = _far_platform(up=False)
+    asyncio.run(b._dorossi_deliver_answer(message, None, UID, "s1", ["第一段", "第二段"]))
+    (entry,) = _box(outbox)
+    assert (entry["platform"], entry["platform_chat_id"]) == ("stubplat", "777"), entry
+
+    up, _msg, sent = _far_platform(up=True)
+    primary = _SendChannel()
+    monkeypatch.setattr(b, "_chat_transports", [up])
+    monkeypatch.setattr(b, "client", types.SimpleNamespace(get_channel=lambda _cid: primary))
+    asyncio.run(b._dorossi_outbox_flush())
+    assert sent[0].startswith("📬〔s1〕") and sent[1:] == ["第一段", "第二段"], sent
+    assert _box(outbox) is None and primary.sent == []
+
+
+@pytest.mark.parametrize("case", ["still-down", "not-authorized", "not-the-owner"])
+def test_a_parked_answer_for_the_other_platform_is_kept_or_dropped_correctly(
+        outbox, monkeypatch, case):
+    """平台還是連不上 → 留著等下次；找不回對話（沒被授權）或那一格不是擁有者的 → 丟掉，
+    在設定頻道講一聲（不含內容），**不**改送到既有平台。"""
+    down, message, _ = _far_platform(up=False)
+    asyncio.run(b._dorossi_deliver_answer(message, None, UID, "s1", ["答案"]))
+    transport, _msg, sent = _far_platform(up=(case != "still-down"),
+                                          authorized=(case != "not-authorized"))
+    if case == "not-the-owner":
+        outbox.state[str(STRANGER)] = outbox.state.pop(UID)
+    notice = _SendChannel()
+    monkeypatch.setattr(b, "_chat_transports", [transport])
+    monkeypatch.setattr(b, "client", types.SimpleNamespace(get_channel=lambda _cid: notice))
+    asyncio.run(b._dorossi_outbox_flush())
+    assert sent == []
+    owner_box = (outbox.state.get(UID) or outbox.state.get(str(STRANGER)))["sessions"]["s1"]
+    if case == "still-down":
+        assert len(owner_box.get("outbox") or []) == 1 and notice.sent == []
+    else:
+        assert not owner_box.get("outbox")
+        assert len(notice.sent) == 1 and "答案" not in notice.sent[0]
+
+
 def test_a_delivery_failure_that_is_not_the_network_still_raises(outbox, monkeypatch):
     async def boom(*_a, **_k):
         raise ValueError("x")

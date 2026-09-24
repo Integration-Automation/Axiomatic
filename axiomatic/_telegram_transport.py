@@ -34,14 +34,14 @@ try:
     from _chat_platform import (  # noqa: E402
         ChatAttachment, ChatConversation, ChatMessage, ChatTransport, ChatUser,
         PlatformCapabilities, SentChatMessage, TransportContext,
-        chunk_text, conversation_uid, external_uid, outbound_parts,
+        DeliveryFailed, chunk_text, conversation_uid, external_uid, outbound_parts,
         register_transport, resolve_identity,
     )
 except ImportError:  # 套件路徑（`from axiomatic import _telegram_transport`）
     from axiomatic._chat_platform import (  # type: ignore  # noqa: E402
         ChatAttachment, ChatConversation, ChatMessage, ChatTransport, ChatUser,
         PlatformCapabilities, SentChatMessage, TransportContext,
-        chunk_text, conversation_uid, external_uid, outbound_parts,
+        DeliveryFailed, chunk_text, conversation_uid, external_uid, outbound_parts,
         register_transport, resolve_identity,
     )
 
@@ -123,6 +123,26 @@ def read_platform_token(path: Path) -> str:
     return raw
 
 
+class _Unreachable:
+    """`_api` 連不上平台（或連兩次被限流）時回的標記，不是 `None`。
+
+    假值、不是 dict 也不是 list，所以只問「有沒有結果」的呼叫端（收訊、下載、打字中）
+    照舊把它當成失敗；要分辨「平台不在」與「平台說了不」的（送出、編輯）才認它，並丟
+    `DeliveryFailed`。不用一個共用的旗標記錄上一次的原因：收訊與送出是同時進行的，
+    旗標會被另一條路蓋掉。"""
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "UNREACHABLE"
+
+
+UNREACHABLE = _Unreachable()
+
+
 class TelegramTransport(ChatTransport):
     """一個平台的長輪詢迴圈。長命、受監督、死掉時留一行帶名字的紀錄。"""
 
@@ -140,6 +160,7 @@ class TelegramTransport(ChatTransport):
         self._offset: int | None = None
         self._started_at = 0.0
         self._chats: dict[str, ChatConversation] = {}
+        self._unreachable_since_recovery = False
         # 處理中的更新。參照留在這裡，工作才不會在跑到一半時被回收。
         self._inflight: set[asyncio.Task] = set()
 
@@ -188,7 +209,7 @@ class TelegramTransport(ChatTransport):
         for attempt in (0, 1):
             body = await self._request(method, payload, data)
             if body is None:
-                return None
+                return UNREACHABLE
             if body.get("ok"):
                 return body.get("result")
             code = body.get("error_code")
@@ -209,7 +230,8 @@ class TelegramTransport(ChatTransport):
             if retry_after <= 0:
                 print(f"telegram: {method} rejected (error_code={code})",
                       file=sys.stderr)
-                return None
+                # 第二次還是被限流：那不是「平台說不」，是「現在送不了」。
+                return UNREACHABLE if code == 429 else None
             await asyncio.sleep(retry_after)
         return None
 
@@ -250,6 +272,7 @@ class TelegramTransport(ChatTransport):
                     "allowed_updates": ["message"],
                 })
                 offset_before = self._offset
+                self._note_reachability(updates is not UNREACHABLE)
                 if updates is not None and not isinstance(updates, list):
                     updates = None
                 if updates is not None:
@@ -380,6 +403,39 @@ class TelegramTransport(ChatTransport):
         self._chats[key] = conversation
         return conversation
 
+    def _note_reachability(self, reachable: bool) -> None:
+        """收訊那一次連不連得上。從連不上變回連得上時，叫一次 `on_recovered`（送出停著的
+        答案）；交給一個獨立的 task，收訊不等它。"""
+        if not reachable:
+            self._unreachable_since_recovery = True
+            return
+        if not self._unreachable_since_recovery:
+            return
+        self._unreachable_since_recovery = False
+        callback = self._context.on_recovered
+        if callback is None:
+            return
+        task = asyncio.ensure_future(callback())
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+
+    def conversation_for(self, platform_chat_id: str) -> ChatConversation | None:
+        """見 `ChatTransport.conversation_for`。放行的只有兩種：允許清單裡的對話，以及
+        擁有者的私訊——這個平台上私訊的對話 id 就是對方的使用者 id，所以「擁有者清單
+        裡的 id」就是擁有者的私訊。其他一律 None。"""
+        key = str(platform_chat_id or "").strip()
+        if not key:
+            return None
+        allowed = {str(one).strip() for one in self._allowed_chat_ids}
+        owners = {str(one).strip() for one in self._owner_ids}
+        if key not in allowed and key not in owners:
+            return None
+        channel_id, is_command_chat = conversation_uid(
+            PLATFORM_NAME, key, command_channel_id=self._context.command_channel_id,
+            allowed_chat_ids=self._allowed_chat_ids)
+        chat_type = "private" if key in owners and key not in allowed else "group"
+        return self._conversation(key, chat_type, channel_id, is_command_chat)
+
     def _attachments(self, raw: dict) -> list[ChatAttachment]:
         """訊息附帶的檔案／圖片。取最大的那一張（平台把同一張圖給好幾個尺寸）。"""
         found: list[ChatAttachment] = []
@@ -467,6 +523,10 @@ class TelegramTransport(ChatTransport):
                 payload["allow_sending_without_reply"] = True
                 reply_to = None
             result = await self._api("sendMessage", payload)
+            if result is UNREACHABLE:
+                # 整則當成沒送出去（前面幾塊可能已經送了——重送時會重複，但重複好過
+                # 答案少一截而且沒有人知道）。
+                raise DeliveryFailed(f"{PLATFORM_NAME} is unreachable")
             if isinstance(result, dict) and result.get("message_id") is not None:
                 sent = SentChatMessage(channel, str(result["message_id"]), chunk)
         for one in files:
@@ -488,6 +548,8 @@ class TelegramTransport(ChatTransport):
         field = "photo" if one.is_image else "document"
         form.add_field(field, one.data, filename=one.filename)
         result = await self._api(method, data=form)
+        if result is UNREACHABLE:
+            raise DeliveryFailed(f"{PLATFORM_NAME} is unreachable")
         if isinstance(result, dict) and result.get("message_id") is not None:
             return SentChatMessage(channel, str(result["message_id"]), "")
         return None
@@ -495,12 +557,15 @@ class TelegramTransport(ChatTransport):
     async def revise(self, sent: SentChatMessage, content: str, **kwargs) -> None:
         text = content if len(content) <= TEXT_HARD_LIMIT \
             else content[:TEXT_HARD_LIMIT]
-        await self._api("editMessageText", {
+        result = await self._api("editMessageText", {
             "chat_id": sent.channel.platform_chat_id,
             "message_id": _as_int(sent.platform_message_id),
             "text": text,
             "disable_web_page_preview": True,
         })
+        if result is UNREACHABLE:
+            # 丟出去，`SentChatMessage.edit` 才不會把沒送到的內容記成「已顯示」。
+            raise DeliveryFailed(f"{PLATFORM_NAME} is unreachable")
 
     async def typing_loop(self, channel: ChatConversation) -> None:
         while True:
