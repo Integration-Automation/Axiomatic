@@ -19,6 +19,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import tempfile
 import time
@@ -19255,6 +19256,113 @@ def test_the_dorossi_log_views_survive_junk_lines(monkeypatch, tmp_path):
     assert "last 2" in sent[-1] and "`?` `error`" in sent[-1], sent[-1]
     _sr_run(b.mcmd_dorossi_errors(message, ""))
     assert "queue_full" in sent[-1] and "error" in sent[-1], sent[-1]
+
+
+@pytest.mark.parametrize("status, payload, expect", [
+    (-1, None, "查詢失敗"),
+    (503, None, "查詢失敗"),
+    (200, ["not", "an", "object"], "查詢失敗"),
+    (200, {"data": None, "errors": [{"message": "x"}]}, "no anime matching"),
+    (200, {"data": {"Media": None}}, "no anime matching"),
+    (200, {"data": ["unexpected"]}, "no anime matching"),
+    (200, {"data": {"Media": {"title": None, "description": 5, "siteUrl": 3,
+                              "episodes": 12}}}, "embed"),
+    (200, {"data": {"Media": {"title": "Frieren", "description": None}}}, "embed"),
+], ids=["unreachable", "http-error", "list-body", "graphql-error", "no-media", "list-data",
+        "odd-fields", "string-title"])
+def test_anime_lookup_survives_every_payload_shape(monkeypatch, status, payload, expect):
+    """回應是外部資料：錯誤時 `data` 是 null、欄位可能是 null 或別的型別。舊版對每一層都直接
+    `.get(...)`，讀到不是物件的那一刻整個指令只剩一句泛用錯誤。"""
+    sent: list = []
+
+    async def _post(url, body, *, headers=None, timeout=None):
+        assert body["variables"] == {"search": "frieren"}
+        return status, payload
+
+    async def _reply(_message, content=None, **kw):
+        sent.append(("embed", kw["embed"]) if "embed" in kw else (content, None))
+
+    monkeypatch.setattr(b, "_http_post_json", _post)
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    _sr_run(b.mcmd_anime(types.SimpleNamespace(), "frieren"))
+    assert len(sent) == 1 and expect in sent[0][0], sent
+    if expect == "embed":
+        embed = sent[0][1]
+        assert embed.title == "frieren" and embed.url is None and embed.description == ""
+
+
+_OLD_IQDB_ROW = re.compile(
+    r'<a href="(//[^"]+)"[^>]*><img[^>]*></a>.*?(\d+)%\s*similarity', re.DOTALL)
+
+
+def test_iqdb_rows_match_the_old_pattern():
+    """換掉的那條單一樣式在小輸入上是對的，只是慢——拿它當對照組，隨機拼出的頁面兩邊
+    必須逐字相同（連「落在一格中間的連結被跳過」都一樣）。"""
+    import random as _random
+    rng = _random.Random(20260924)
+    pieces = ['<a href="//a.x/1"><img src=t></a>', '<a href="//b.y/2" c><img></a>',
+              "12% similarity", "7%  similarity", " text ", "99%", "similarity",
+              '<a href="//c.z/3">no img</a>', "\n", "3%\nsimilarity"]
+    for _ in range(3000):
+        html = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 12)))
+        assert b._iqdb_rows(html) == _OLD_IQDB_ROW.findall(html), html
+
+
+def test_iqdb_rows_stay_linear_on_hostile_input():
+    """舊樣式對 580 KB 的這種頁面要 112 秒（本機實測），而它跑在事件迴圈上。這裡用 6000 格
+    （約 10 秒）：夠讓平方時間的寫法越過 2 秒上限，又不會長到把測試行程拖到逾時。"""
+    import time as _time
+    html = '<a href="//x/y"><img></a> 5% ' * 6000
+    started = _time.perf_counter()
+    assert b._iqdb_rows(html) == []
+    assert _time.perf_counter() - started < 2.0
+
+
+def test_iqdb_search_drops_an_oversized_page(monkeypatch):
+    """結果頁超過上限就不讀、回失敗，不把整頁吃進記憶體再解析。"""
+    class _Content:
+        def __init__(self, data):
+            self._data = data
+
+        async def read(self, n=-1):
+            chunk, self._data = self._data[:n], self._data[n:]
+            return chunk
+
+    class _Resp:
+        status = 200
+
+        def __init__(self, data):
+            self.content = _Content(data)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    pages: list = []
+
+    class _Session:
+        def __init__(self, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def get(self, *_a, **_kw):
+            return _Resp(pages.pop(0))
+
+    monkeypatch.setattr(b.aiohttp, "ClientSession", _Session)
+    monkeypatch.setattr(b, "IQDB_MAX_RESPONSE_BYTES", 64)
+    pages.append(b"x" * 65)
+    assert _sr_run(b._iqdb_search("https://img.example/a.png")) == (-1, [])
+    pages.append(b'<a href="//s.example/p/1"><img></a> 88% similarity')
+    status, rows = _sr_run(b._iqdb_search("https://img.example/a.png"))
+    assert status == 200 and rows == [
+        {"site": "s.example", "url": "https://s.example/p/1", "similarity": 88}], rows
 
 
 def test_tag_suggest_skips_posts_whose_general_tags_are_not_text(monkeypatch):

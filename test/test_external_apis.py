@@ -202,6 +202,30 @@ def sized_http(monkeypatch):
     return _SizedSession
 
 
+def test_a_post_goes_through_the_same_exit_as_a_get(sized_http, monkeypatch):
+    """POST 與 GET 共用出口：同樣帶預設 User-Agent、同樣算一次呼叫、同樣有大小上限。
+    本體要真的以 JSON 送出去——只看回傳值的話，一個把本體丟掉的版本也會通過。"""
+    bodies: list = []
+
+    class _Recording(sized_http):
+        def post(self, url, *, params=None, headers=None, **kw):
+            bodies.append(kw.get("json"))
+            return super().post(url, params=params, headers=headers, **kw)
+
+    monkeypatch.setattr(ex.aiohttp, "ClientSession", _Recording)
+    before = ex._METRICS_API_CALLS
+    sized_http.raw = json.dumps({"data": {"ok": True}}).encode("utf-8")
+    status, data = _run(ex._http_post_json("https://example.invalid/gql", {"query": "q"}))
+    assert (status, data) == (200, {"data": {"ok": True}})
+    call = sized_http.calls[-1]
+    assert call["method"] == "POST" and bodies == [{"query": "q"}]
+    assert call["headers"].get("User-Agent"), call
+    assert ex._METRICS_API_CALLS == before + 1
+
+    sized_http.declared = ex._MAX_RESPONSE_BYTES + 1
+    assert _run(ex._http_post_json("https://example.invalid/gql", {})) == (200, None)
+
+
 def test_a_normal_response_still_parses(sized_http):
     sized_http.raw = json.dumps([{"id": 1}]).encode("utf-8")
     status, data = _run(ex._http_get_json("https://example.invalid/x"))
@@ -481,7 +505,7 @@ def test_both_response_readers_go_through_the_shared_helper():
     件事，否則它會活得比它的理由久。
     """
     wanted = {
-        "_external_apis.py": "_http_get_json",
+        "_external_apis.py": "_http_json",
         "discord_bot.py": "_send_danbooru_grid",
     }
     for path in (_MODULE, _BOT_SOURCE):
@@ -500,7 +524,8 @@ def test_both_response_readers_go_through_the_shared_helper():
 
 
 def test_only_http_get_json_opens_a_session():
-    """本模組裡**只有** `_http_get_json` 可以開 `aiohttp.ClientSession`。
+    """本模組裡**只有** `_http_json`（`_http_get_json`／`_http_post_json` 底下那一支）
+    可以開 `aiohttp.ClientSession`。
 
     這是這次事故的結構性成因，不是風格問題。原本三個 Danbooru fetcher 各自
     inline 一份 `async with aiohttp.ClientSession(...)`，於是三份**都**繞過了
@@ -519,11 +544,11 @@ def test_only_http_get_json_opens_a_session():
             func = inner.func
             name = (func.attr if isinstance(func, ast.Attribute)
                     else getattr(func, "id", ""))
-            if name == "ClientSession" and node.name != "_http_get_json":
+            if name == "ClientSession" and node.name != "_http_json":
                 offenders.append(f"{node.name}:{inner.lineno}")
     assert not offenders, (
         f"這些函式自己開了 ClientSession：{offenders}。本模組的外送出口只能是 "
-        "`_http_get_json`——繞過去就等於繞過 User-Agent 與 API 計數，而那正是 "
+        "`_http_json`——繞過去就等於繞過 User-Agent 與 API 計數，而那正是 "
         "2026-08-30 那次 Danbooru 全站 403 沒被任何人發現的原因。")
 
 
@@ -847,7 +872,8 @@ def _request_url(node):
     func = node.func
     name = (func.attr if isinstance(func, ast.Attribute)
             else getattr(func, "id", ""))
-    return node.args[0] if name in ("_http_get_json", "get", "post") else None
+    return (node.args[0] if name in ("_http_get_json", "_http_post_json", "get", "post")
+            else None)
 
 
 def _host_of(url_node, bindings):
@@ -1046,10 +1072,10 @@ def _per_call_timeout_sites(path):
             def bindings():
                 return (_function_bindings(func, module_bindings)
                         if func is not None else module_bindings)
-            if name == "_http_get_json":
+            if name in ("_http_get_json", "_http_post_json"):
                 for kw in node.keywords:
                     if kw.arg == "timeout":
-                        ident = named(kw.value, node.lineno, "`_http_get_json`")
+                        ident = named(kw.value, node.lineno, f"`{name}`")
                         host = (_host_of(node.args[0], bindings()) if node.args
                                 else None)
                         sites.append((ident, consts.get(ident),
@@ -1461,9 +1487,13 @@ def test_the_default_user_agent_is_applied_in_the_one_place_it_can_be():
     禁用詞清單本來就容易誤傷；`test_language.py` 早就記過同一個教訓：會亂叫的
     守門，最後會被人關掉。真正要釘住的是下面這條不變式。）
     """
-    default_ua = inspect.getsource(ex._http_get_json)
-    assert "_BOT_UA" in default_ua, (
-        "`_http_get_json` 不再補預設 UA 了——那是所有站台的唯一保障。")
+    # 看**呼叫**，不看字串：這裡原本問的是 `"_BOT_UA" in 原始碼`，而命中的是 docstring 裡
+    # 那句「見 `_BOT_UA`」——程式真正呼叫的是 `_user_agent()`，把那一行刪掉照樣是綠的。
+    exit_tree = ast.parse(inspect.getsource(ex._http_json))
+    called = {c.func.id for c in ast.walk(exit_tree)
+              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+    assert "_user_agent" in called, (
+        "`_http_json` 不再補預設 UA 了——那是所有站台的唯一保障。")
     for name in ("_danbooru_posts", "_fetch_danbooru_posts_latest",
                  "_query_tags_json"):
         body = inspect.getsource(getattr(ex, name))

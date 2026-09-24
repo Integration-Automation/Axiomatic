@@ -102,6 +102,7 @@ from _external_apis import (
     _BROWSER_UA,
     _BOT_UA,
     read_capped_body,
+    _http_post_json,
 )
 # 跨行程「單一 Chrome 槽」諮詢鎖。被動共用模組（與 _batch_config / _bot_config /
 # _run_progress 同屬允許的第三方通道，不是 bot↔webrunner 直接 import）。bot 在任何
@@ -4020,37 +4021,31 @@ async def mcmd_anime(message: discord.Message, rest: str) -> None:
       }
     }
     """
-    try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=ANIME_TIMEOUT_SEC)
-        ) as s:
-            async with s.post(
-                "https://graphql.anilist.co",
-                json={"query": query, "variables": {"search": title}},
-                headers={"User-Agent": _BOT_UA},
-            ) as r:
-                if r.status != 200:
-                    await safe_reply(message, f"anime 查詢失敗 (HTTP {r.status})")
-                    return
-                payload = await r.json()
-    except Exception as error:  # pylint: disable=broad-except
-        print(f"anime lookup failed: {error!r}", file=sys.stderr)
-        await safe_reply(message, _owner_error(
-            message, error, "anime 查詢失敗，請稍後再試。"))
+    status, payload = await _http_post_json(
+        "https://graphql.anilist.co",
+        {"query": query, "variables": {"search": title}},
+        timeout=ANIME_TIMEOUT_SEC)
+    if status != 200 or not isinstance(payload, dict):
+        # 細節（狀態碼、例外）已由 `_http_post_json` 寫進 stderr。
+        await safe_reply(message, "anime 查詢失敗，請稍後再試。")
         return
-    media = (payload.get("data") or {}).get("Media")
-    if not media:
+    # 回應是外部資料：每一層都可能不是物件（錯誤時 `data` 是 null、欄位可能是 null）。
+    data = payload.get("data")
+    media = data.get("Media") if isinstance(data, dict) else None
+    if not isinstance(media, dict):
         await safe_reply(message, f"no anime matching `{title}`")
         return
-    t = media.get("title", {})
+    t = media.get("title")
+    t = t if isinstance(t, dict) else {}
     name = t.get("english") or t.get("romaji") or title
-    desc = (media.get("description") or "").replace("<br>", "").strip()
+    desc = media.get("description")
+    desc = desc.replace("<br>", "").strip() if isinstance(desc, str) else ""
     if len(desc) > 600:
         desc = desc[:600] + "…"
     embed = discord.Embed(
         title=name,
         description=desc,
-        url=media.get("siteUrl", ""),
+        url=media.get("siteUrl") if isinstance(media.get("siteUrl"), str) else None,
         color=0x02A9FF,
     )
     embed.add_field(name="year", value=str(media.get("seasonYear", "?")), inline=True)
@@ -4589,10 +4584,33 @@ async def mcmd_e621(message: discord.Message, rest: str) -> None:
 # IQDB 每筆 row 大概長：
 #   <a href="//<site>/..."><img src="..." ...></a> ... <X>% similarity
 # 之間可能換行，所以用 DOTALL 跨行抓。
-_IQDB_ROW = re.compile(
-    r'<a href="(//[^"]+)"[^>]*><img[^>]*></a>.*?(\d+)%\s*similarity',
-    re.DOTALL,
-)
+# 搜圖結果頁：每一格是「縮圖連結」後面跟著「NN% similarity」。**不要**把兩段合成一條
+# `<a…></a>.*?(\d+)%\s*similarity`（2026-09-24 換掉的就是那條）：懶惰的 `.*?` 對每一個
+# 後面再也沒有 similarity 的連結都會一路掃到結尾，於是成本是「連結數 × 頁長」。本機實測
+# 580 KB 的惡意頁要 112 秒，而它跑在事件迴圈上——心跳會斷。拆成兩條各自線性的樣式、
+# 從上一格的結尾接著找，配對結果與舊寫法逐字相同（`test_iqdb_rows_match_the_old_pattern`）。
+_IQDB_ANCHOR = re.compile(r'<a href="(//[^"]+)"[^>]*><img[^>]*></a>')
+_IQDB_SIMILARITY = re.compile(r'(\d+)%\s*similarity')
+# 結果頁的上限。正常一頁幾十 KB；超過就不讀——這些位元組不是我們控制的。
+IQDB_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
+def _iqdb_rows(html: str) -> list[tuple[str, str]]:
+    """結果頁 → `[(連結, 相似度百分比字串), …]`，照頁面順序。線性時間。
+
+    配對規則：每個連結配上它**之後**第一個相似度；下一個連結從那個相似度的結尾往後找
+    （落在中間的連結被跳過）。找不到下一個相似度就結束——後面的連結也不可能配得到。"""
+    rows: list[tuple[str, str]] = []
+    pos = 0
+    while True:
+        anchor = _IQDB_ANCHOR.search(html, pos)
+        if anchor is None:
+            return rows
+        similarity = _IQDB_SIMILARITY.search(html, anchor.end())
+        if similarity is None:
+            return rows
+        rows.append((anchor.group(1), similarity.group(1)))
+        pos = similarity.end()
 
 
 async def _iqdb_search(image_url: str) -> tuple[int, list[dict]]:
@@ -4610,13 +4628,18 @@ async def _iqdb_search(image_url: str) -> tuple[int, list[dict]]:
             ) as resp:
                 if resp.status != 200:
                     return resp.status, []
-                html = await resp.text()
+                body = await read_capped_body(resp.content, IQDB_MAX_RESPONSE_BYTES)
     except Exception as error:  # pylint: disable=broad-except
         print(f"iqdb fetch failed: {error!r}", file=sys.stderr)
         return -1, []
+    if body is None:
+        print(f"iqdb response over {IQDB_MAX_RESPONSE_BYTES} bytes; dropped",
+              file=sys.stderr)
+        return -1, []
+    html = body.decode("utf-8", errors="replace")
     seen: set[str] = set()
     out: list[dict] = []
-    for url, sim_pct in _IQDB_ROW.findall(html):
+    for url, sim_pct in _iqdb_rows(html):
         full = "https:" + url if url.startswith("//") else url
         if full in seen:
             continue

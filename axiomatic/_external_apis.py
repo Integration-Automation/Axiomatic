@@ -190,8 +190,26 @@ async def read_capped_body(content, cap: int) -> bytes | None:
 async def _http_get_json(url: str, *, params=None, headers=None,
                         timeout: float = _HTTP_TIMEOUT_SEC,
                         quiet_statuses: tuple[int, ...] = ()):
-    """Small wrapper around aiohttp GET → JSON. Returns (status, data) or
-    (status_or_-1, None) on failure.
+    """GET → JSON。回 `(status, data)`；失敗回 `(status 或 -1, None)`。實作在 `_http_json`。"""
+    return await _http_json("GET", url, params=params, headers=headers,
+                            timeout=timeout, quiet_statuses=quiet_statuses)
+
+
+async def _http_post_json(url: str, payload, *, headers=None,
+                         timeout: float = _HTTP_TIMEOUT_SEC):
+    """POST 一個 JSON 本體 → JSON。回傳形狀與 `_http_get_json` 相同。
+
+    與 GET 共用同一個出口，所以 User-Agent、呼叫計數、回應大小上限與「非 200 留一行
+    stderr」都一樣。2026-09-24 之前唯一的 POST 呼叫端（動畫查詢）自己開連線、用
+    `r.json()` 把整個回應吃進來，是這道大小上限之外的另一個出口。"""
+    return await _http_json("POST", url, json_body=payload, headers=headers,
+                            timeout=timeout)
+
+
+async def _http_json(method: str, url: str, *, params=None, json_body=None,
+                     headers=None, timeout: float = _HTTP_TIMEOUT_SEC,
+                     quiet_statuses: tuple[int, ...] = ()):
+    """一次請求 → JSON。回 `(status, data)`；失敗回 `(status 或 -1, None)`。
 
     **本模組唯一的外送出口。** 三個理由，缺一不可：
 
@@ -213,6 +231,7 @@ async def _http_get_json(url: str, *, params=None, headers=None,
     """
     global _METRICS_API_CALLS
     _METRICS_API_CALLS += 1
+    label = f"http_{method.lower()}_json"
     # 呼叫端的標頭覆寫預設值，而不是反過來——這樣 e621／Safebooru 那種有自己
     # UA 規範的站台仍然可以指定，但「什麼都沒給」不會再變成「沒有 UA」。
     merged = {"User-Agent": _user_agent()}
@@ -222,18 +241,20 @@ async def _http_get_json(url: str, *, params=None, headers=None,
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=timeout)
         ) as s:
-            async with s.get(url, params=params, headers=merged) as r:
+            request = s.get if method == "GET" else s.post
+            extra = {} if json_body is None else {"json": json_body}
+            async with request(url, params=params, headers=merged, **extra) as r:
                 if r.status != 200:
                     if r.status not in quiet_statuses:
                         # 帶上 params：查這種故障時「是哪個 tag 壞的」幾乎一定是
                         # 下一個問題。只進 stderr／log，不會到對話平台。
                         detail = repr(params)[:200] if params else ""
-                        print(f"http_get_json {url} {detail}: HTTP {r.status}",
+                        print(f"{label} {url} {detail}: HTTP {r.status}",
                               file=sys.stderr)
                         if r.status in (403, 429) and not _configured_contact():
                             # 講清楚要動哪個鍵。這種 403 光看狀態碼查不出來——
                             # 我們**有**帶 UA，站方要的是裡面有聯絡方式。
-                            print(f"http_get_json: HTTP {r.status} 且 "
+                            print(f"{label}: HTTP {r.status} 且 "
                                   f"`{_UA_CONTACT_KEY}` 未設定。有些站台"
                                   "（例如維基媒體）要求 User-Agent 裡帶得到人的"
                                   "聯絡方式（URL 或 email），只自報名稱不夠。"
@@ -243,7 +264,7 @@ async def _http_get_json(url: str, *, params=None, headers=None,
                     return r.status, None
                 declared = r.content_length
                 if declared is not None and declared > _MAX_RESPONSE_BYTES:
-                    print(f"http_get_json {url}: 回應宣稱 {declared} 位元組，"
+                    print(f"{label} {url}: 回應宣稱 {declared} 位元組，"
                           f"超過 {_MAX_RESPONSE_BYTES} 上限，不讀",
                           file=sys.stderr)
                     return r.status, None
@@ -251,7 +272,7 @@ async def _http_get_json(url: str, *, params=None, headers=None,
                 # 回應截斷成合法但不完整的位元組——見 `read_capped_body`。
                 raw = await read_capped_body(r.content, _MAX_RESPONSE_BYTES)
                 if raw is None:
-                    print(f"http_get_json {url}: 回應超過 "
+                    print(f"{label} {url}: 回應超過 "
                           f"{_MAX_RESPONSE_BYTES} 位元組上限，丟棄",
                           file=sys.stderr)
                     return r.status, None
@@ -262,7 +283,7 @@ async def _http_get_json(url: str, *, params=None, headers=None,
                 return r.status, _json.loads(
                     raw.decode("utf-8", errors="replace"))
     except Exception as error:  # pylint: disable=broad-except
-        print(f"http_get_json {url}: {error!r}", file=sys.stderr)
+        print(f"{label} {url}: {error!r}", file=sys.stderr)
         return -1, None
 
 def _dict_entries(data) -> list[dict]:
