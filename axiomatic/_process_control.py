@@ -429,6 +429,7 @@ STALE_COMPONENTS = {
         "axiomatic/_gui_control.py",
         "axiomatic/_bot_prompts.py",
         "axiomatic/_process_control.py",
+        "axiomatic/_resource_report.py",
         "axiomatic/_queue_consume.py",
         "axiomatic/presence_probe.py",
         "axiomatic/_batch_config.py",
