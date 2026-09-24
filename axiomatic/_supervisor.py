@@ -5,72 +5,93 @@
 lock is the only staleness-free way to answer "is another instance already
 running?").
 
-子行程輸出的落地（`stream_child` / `trim_log` / `say` 一組）也收在這裡：兩支
-啟動器都要把子行程的 stdout+stderr 同時送到主控台與記錄檔，實作只該有一份。
+The landing of child-process output (`stream_child` / `trim_log` / `say` as a
+set) lives here too: both launchers must tee the child's stdout+stderr to the
+console and the log file at once, and there should be only one implementation.
 """
 from __future__ import annotations
 
 import errno
 import os
-import subprocess  # nosec B404 — 監督者就是在起子行程
+import subprocess  # nosec B404 — the supervisor's whole job is to spawn children
 import sys
 import threading
 import time
 
 
-# 子行程用這個 rc 說「不是我壞了，是**已經有另一個實例在跑**」。
+# The child uses this rc to say "I didn't break — **another instance is already
+# running**".
 #
-# 為什麼需要一個專用 rc：supervisor 的重啟迴圈原本只有兩種放棄條件，兩種都擋不到
-# 這一類失敗。退避只是把重試拉慢，rapid-fail giveup 看的是「跑多久」——而被鎖擋掉
-# 的子行程每次都在一秒內**乾淨地**結束，重試一百次也不會變成功，中間每一輪還照印
-# 一行「restarting in Ns」。所以要一個 rc 讓 supervisor 直接分辨「重試沒有意義」。
+# Why a dedicated rc is needed: the supervisor's restart loop originally had only
+# two give-up conditions, and neither catches this class of failure. Backoff only
+# slows retries down, and rapid-fail giveup looks at "how long it ran" — but a
+# child blocked by the lock exits **cleanly** within a second every time, so
+# retrying a hundred times will never succeed, and every round still prints a
+# "restarting in Ns" line. So we need an rc that lets the supervisor tell
+# outright that "retrying is pointless".
 #
-# 為什麼是 3：0 是正常結束、1 是未捕捉例外與一般失敗、2 是 CPython 自己的命令列
-# 錯誤（`python 不存在的檔案.py`）。3 是第一個沒有被佔用的值。**不要改成 1**：
-# 那會跟真的崩潰混在一起，supervisor 就分不出來了。
+# Why 3: 0 is a normal exit, 1 is an uncaught exception and general failure, 2 is
+# CPython's own command-line error (`python nonexistent_file.py`). 3 is the first
+# value not already taken. **Do not change it to 1**: that would blur it with a
+# real crash and the supervisor could no longer tell them apart.
 RC_ALREADY_RUNNING = 3
 
-# 子行程用這個 rc 說「**設定還沒填**」——憑證檔或 `bot_config.json` 不存在／還是
-# 範本的原樣。與 `RC_ALREADY_RUNNING` 同一類：重試一百次也不會變成功，而且每一輪
-# 都會再印一次同樣的抱怨。全新 clone 第一次啟動一定會走到這條路，所以它必須是一
-# 句看得懂的話加上一個乾淨的結束，不是 traceback 加上無限重生。
+# The child uses this rc to say "**configuration is not filled in yet**" — the
+# credentials file or `bot_config.json` is missing / still the template as
+# shipped. Same class as `RC_ALREADY_RUNNING`: retrying a hundred times will
+# never succeed, and every round reprints the same complaint. A brand-new clone
+# always takes this path on its first launch, so it must be a legible sentence
+# plus a clean exit, not a traceback plus endless respawning.
 #
-# **這一個刻意跨兩套 rc 契約**（bot 的與 webrunner 的），所以取的是兩邊都還沒用到
-# 的 5：bot 用掉 0–3，webrunner 用掉 0–4。兩邊問的是同一個問題（「這台機器上還沒
-# 有可用的設定」），答案也一樣（停下來等人），沒有理由給它兩個不同的數字。
+# **This one deliberately spans two rc contracts** (the bot's and the
+# webrunner's), so it takes 5, which neither side has used yet: the bot uses
+# 0–3, the webrunner uses 0–4. Both sides ask the same question ("this machine
+# has no usable configuration yet") and have the same answer (stop and wait for a
+# human), so there is no reason to give it two different numbers.
 RC_SETUP_INCOMPLETE = 5
 
-# ---- webrunner 專用的 rc 契約（與上面那個 bot 用的 rc 互不相干）------------
-# 兩支監督者（`start_webrunner.py` 與 bot 的 `_watch_for_fallback`）都用這裡的
-# 值判斷「要不要重生」，收在同一處避免兩邊漂移。
+# ---- webrunner-specific rc contract (unrelated to the bot's rc above) --------
+# Both supervisors (`start_webrunner.py` and the bot's `_watch_for_fallback`) use
+# the values here to decide "should we respawn", kept in one place to stop the
+# two from drifting.
 #
-# 3 = **零產出**：這一輪嘗試過生成、卻一張都沒存（走完整輪的 zero-save backstop，
-#     以及「連續失敗到 abort 門檻」的中途放棄，都回這個值）。重生**一次**是對的
-#     ——壞掉的是這個 session。但連續好幾輪都零產出，就代表重生解決不了，該停。
-#     注意這個值與 `RC_ALREADY_RUNNING` 同為 3 是巧合、互不影響：那個是 bot 本體
-#     對 bot 啟動器說的話，這個是 webrunner 對 webrunner 監督者說的話，兩條線
-#     沒有交集。**不要**把 `child_exit_is_fatal` 拿來判 webrunner 的 rc。
-# 4 = **被擋住**：站方跳出購買／方案資訊，重試不會有結果。重生一次都嫌多。
+# 3 = **zero output**: this round attempted generation but saved not a single
+#     image (both the full-round zero-save backstop and the mid-round give-up
+#     from "consecutive failures reaching the abort threshold" return this).
+#     Respawning **once** is right — what broke is this session. But several
+#     rounds in a row with zero output means respawning cannot fix it; stop.
+#     Note that this value being 3 like `RC_ALREADY_RUNNING` is a coincidence and
+#     they do not affect each other: that one is what the bot body says to the
+#     bot launcher, this one is what the webrunner says to the webrunner
+#     supervisor, and the two lines never cross. **Do not** use
+#     `child_exit_is_fatal` to judge the webrunner's rc.
+# 4 = **blocked**: the site pops up purchase / plan information, and retrying
+#     will get nowhere. Respawning even once is too much.
 RC_ZERO_PROGRESS = 3
 RC_GENERATION_BLOCKED = 4
 
 
 def webrunner_exit_needs_human(rc: int) -> bool:
-    """webrunner 結束後：True = 不要重生，直接停下來等人處理。
+    """After the webrunner exits: True = do not respawn, just stop and wait for
+    a human.
 
-    判準與 `child_exit_is_fatal` 一樣是「重試會不會有機會成功」，但對象不同
-    （webrunner 子行程 vs bot 子行程），所以刻意是兩個函式。
+    The criterion is the same as `child_exit_is_fatal` — "does retrying have any
+    chance of succeeding" — but the subject differs (webrunner child vs bot
+    child), so these are deliberately two functions.
     """
     return rc in (RC_GENERATION_BLOCKED, RC_SETUP_INCOMPLETE)
 
 
 def child_exit_is_fatal(rc: int) -> bool:
-    """子行程結束後：True = supervisor 不要重試，直接收工。
+    """After the child exits: True = the supervisor should not retry, just wrap
+    up.
 
-    兩種：「已經有另一個實例在跑」與「設定還沒填」。判準是**重試會不會有機會
-    成功**，不是「錯誤嚴不嚴重」：憑證過期、設定值寫錯這些重試也不會成功，但它們
-    的 rc 跟真正的崩潰無法區分，只能靠 rapid-fail giveup 兜著。缺檔案這一種分得
-    出來，所以它有自己的 rc。
+    Two cases: "another instance is already running" and "configuration is not
+    filled in yet". The criterion is **whether retrying has any chance of
+    succeeding**, not "how severe the error is": expired credentials or a wrong
+    config value also will not succeed on retry, but their rc is indistinguishable
+    from a real crash and can only be caught by rapid-fail giveup. The
+    missing-file case is distinguishable, so it has its own rc.
     """
     return rc in (RC_ALREADY_RUNNING, RC_SETUP_INCOMPLETE)
 
@@ -95,27 +116,35 @@ def restart_backoff(
 
 
 class InstanceLock:
-    """持有中的單一實例鎖。呼叫端**應該**把它保留到行程結束。
+    """A held single-instance lock. The caller **should** keep it alive until
+    the process ends.
 
-    **這個類別刻意沒有 `__del__`，也不得有。** 實測（Windows 11 / CPython）：
-    `hasattr(InstanceLock, "__del__")` 是 False，而丟掉最後一個參照再 `gc.collect()`
-    之後，第二次 `acquire_single_instance_lock` 仍然回 `None`——**鎖還在**。因為
-    鎖掛在 open file description 上，沒有人關 fd 就沒有人放鎖：物件被回收時 fd
-    洩漏，鎖一路被持有到行程結束，互斥仍然成立。
+    **This class deliberately has no `__del__`, and must not have one.** Measured
+    (Windows 11 / CPython): `hasattr(InstanceLock, "__del__")` is False, and after
+    dropping the last reference and calling `gc.collect()`, a second
+    `acquire_single_instance_lock` still returns `None` — **the lock is still
+    held**. Because the lock hangs off the open file description, nobody closes
+    the fd so nobody releases the lock: when the object is collected the fd leaks,
+    the lock stays held until the process ends, and mutual exclusion still holds.
 
-    這是刻意選的安全方向，**不要「把 `__del__` 補完」**：多洩漏一個 fd 沒有人會
-    受傷（一個行程一把，行程結束時 OS 全收），靜默放掉鎖則會讓第二個實例起得
-    來——兩個批次監督者搶同一份 `.chrome_profile/`、各自 nuclear sweep 把對方的
-    Chrome 殺掉，而兩邊的記錄看起來都正常。`test_supervisor` 有兩支在守這條
-    （`test_instance_lock_must_not_grow_a_del_method` 釘屬性、
-    `test_dropping_the_reference_does_not_release_the_lock` 釘行為）。
+    This is a deliberately chosen safe direction; **do not "finish off" the
+    `__del__`**: leaking one extra fd hurts nobody (one per process, all reclaimed
+    by the OS when the process ends), whereas silently releasing the lock lets a
+    second instance start — two batch supervisors fighting over the same
+    `.chrome_profile/`, each nuclear-sweeping the other's Chrome, while both logs
+    look normal. `test_supervisor` guards this with two tests
+    (`test_instance_lock_must_not_grow_a_del_method` pins the attribute,
+    `test_dropping_the_reference_does_not_release_the_lock` pins the behaviour).
 
-    這跟 `acquire_single_instance_lock` 那條「判斷不出來就往照常啟動倒」是**兩件
-    不同的事**，別混在一起講：那條講的是**取不到鎖時**往哪邊倒（往放行），這條
-    講的是**已經拿到鎖之後**參照消失怎麼辦（維持持有）。
+    This is **a different thing** from `acquire_single_instance_lock`'s "when it
+    cannot decide, fall toward starting anyway"; do not conflate them: that one is
+    about which way to fall **when the lock cannot be obtained** (toward allowing),
+    this one is about what to do **after the lock has been obtained** when the
+    reference disappears (keep holding it).
 
-    `degraded=True` 代表「鎖機制本身不可用」（見
-    `acquire_single_instance_lock` 的說明），此時它只是個空殼，不保證互斥。
+    `degraded=True` means "the locking mechanism itself is unavailable" (see the
+    notes on `acquire_single_instance_lock`); in that case it is just an empty
+    shell and guarantees no mutual exclusion.
     """
 
     __slots__ = ("_fd", "path", "degraded")
@@ -126,12 +155,15 @@ class InstanceLock:
         self.degraded = degraded
 
     def release(self) -> None:
-        """放掉鎖——**只是禮貌性收尾**，不是正確性的一部分。
+        """Release the lock — **just a courtesy wrap-up**, not part of
+        correctness.
 
-        行程無論正常結束、未捕捉例外還是被 `taskkill /F` 砍掉，OS 都會關掉 fd
-        並連帶放掉鎖，所以漏呼叫它不會留下一把誰也解不開的殘留鎖。刻意做成呼叫
-        幾次都不炸：`finally` 裡的那次可能已經釋放過，而 `degraded` 的空殼
-        （`fd is None`）根本沒有 fd 可關。
+        Whether the process exits normally, on an uncaught exception, or is cut
+        down by `taskkill /F`, the OS closes the fd and releases the lock along
+        with it, so failing to call this leaves no unbreakable stale lock behind.
+        Deliberately made safe to call several times: the one in `finally` may
+        have released already, and a `degraded` empty shell (`fd is None`) has no
+        fd to close at all.
         """
         if self._fd is None:
             return
@@ -142,21 +174,28 @@ class InstanceLock:
             pass
 
 
-# 「這個檔案已經被別人鎖住了」專用的 errno。**只有這幾個**代表「另一個實例正在
-# 跑」；其他任何 errno 代表的是「這台機器上的鎖機制有問題」，那是完全不同的一件事
-# ——把兩者混成同一個答案，會讓一個與併發無關的問題長得跟「已經有實例在跑」一模一
-# 樣，然後啟動器永遠拒絕啟動（見 `acquire_single_instance_lock` 的說明）。
+# The errno set for "this file is already locked by someone else". **Only these**
+# mean "another instance is running"; any other errno means "the locking
+# mechanism on this machine has a problem", which is an entirely different thing —
+# blurring the two into one answer makes a concurrency-unrelated problem look
+# exactly like "an instance is already running", and then the launcher refuses to
+# start forever (see the notes on `acquire_single_instance_lock`).
 #
-# 兩個平台給的答案不一樣，所以**兩邊都要收**（本機實測，2026-09-08）：
-#   * Windows `msvcrt.locking(fd, LK_NBLCK, 1)` 對已鎖住的區段給 **EACCES(13)**。
-#     阻塞版 `LK_LOCK` 重試失敗給 **EDEADLOCK(36)**——我們用的是非阻塞版，收著純粹
-#     是保險（哪天有人改成阻塞版，至少不會被誤判成「鎖壞了」）。
-#   * POSIX `flock(fd, LOCK_EX | LOCK_NB)` 對已持有的檔案給 **EWOULDBLOCK/EAGAIN**。
+# The two platforms give different answers, so **catch both** (measured locally,
+# 2026-09-08):
+#   * Windows `msvcrt.locking(fd, LK_NBLCK, 1)` gives **EACCES(13)** for an
+#     already-locked region. The blocking `LK_LOCK` gives **EDEADLOCK(36)** when
+#     its retries fail — we use the non-blocking version, so catching it is purely
+#     insurance (if someone switches to the blocking version one day, at least it
+#     will not be misread as "the lock broke").
+#   * POSIX `flock(fd, LOCK_EX | LOCK_NB)` gives **EWOULDBLOCK/EAGAIN** for an
+#     already-held file.
 #
-# `EWOULDBLOCK` 在 Linux 上就是 `EAGAIN`（都是 11），**但在 Windows 的 CPython 上
-# 不是**：實測 `errno.EAGAIN == 11` 而 `errno.EWOULDBLOCK == 10035`（Winsock 的
-# WSAEWOULDBLOCK）。所以不能只寫其中一個，也不能假設兩者相等。
-# 用 `getattr` 取值是因為這幾個名字不保證每個平台都有；取不到就當它不存在。
+# `EWOULDBLOCK` on Linux is just `EAGAIN` (both 11), **but on Windows CPython it
+# is not**: measured `errno.EAGAIN == 11` while `errno.EWOULDBLOCK == 10035`
+# (Winsock's WSAEWOULDBLOCK). So you cannot write only one of them, nor assume
+# the two are equal. `getattr` is used because these names are not guaranteed to
+# exist on every platform; if one is missing, treat it as absent.
 _LOCK_HELD_ERRNOS = frozenset(
     value for value in (
         getattr(errno, _name, None)
@@ -166,39 +205,50 @@ _LOCK_HELD_ERRNOS = frozenset(
 
 
 def acquire_single_instance_lock(path) -> InstanceLock | None:
-    """對 `path` 取得行程生命週期內的獨佔鎖，用來擋掉「同一支程式被啟動兩次」。
-    取得 → 回 `InstanceLock`；**已有其他實例持有 → 回 None**。
+    """Acquire an exclusive, process-lifetime lock on `path`, used to block "the
+    same program being started twice". Acquired → return `InstanceLock`;
+    **already held by another instance → return None**.
 
-    **一支程式一個鎖檔**：啟動器鎖 `.discord_bot_supervisor.lock`、bot 本體鎖
-    `.discord_bot.lock`，刻意分開。共用同一個檔案的話，啟動器會把自己 spawn 出來
-    的 bot 擋掉——那是啟動器唯一該放行的子行程。
+    **One lock file per program**: the launcher locks
+    `.discord_bot_supervisor.lock`, the bot body locks `.discord_bot.lock`,
+    deliberately kept separate. If they shared one file, the launcher would block
+    the very bot it spawned — the one child the launcher must let through.
 
-    用 OS 層的檔案鎖而不是 pid 檔，是因為 pid 檔有兩個治不好的毛病：行程被硬砍
-    時檔案會殘留（下次永遠拒絕啟動），而 PID 又會被系統回收再指派（殘留的 pid
-    剛好對上不相干的行程，一樣永遠拒絕啟動）。OS 鎖在行程消失的當下就自動釋放，
-    連 `taskkill /F` 也一樣，沒有殘留這回事。
+    An OS-level file lock is used rather than a pid file because a pid file has
+    two incurable flaws: when the process is hard-killed the file lingers (every
+    subsequent start refused forever), and the PID gets reclaimed and reassigned
+    by the system (a lingering pid happens to match an unrelated process, again
+    refusing every start forever). An OS lock releases automatically the instant
+    the process disappears, even under `taskkill /F`, so there is no such thing as
+    a leftover.
 
-    **「判斷不出來」時往哪邊倒**：倒向「照常啟動」（回一個 `degraded` 的殼），
-    不是倒向「拒絕啟動」。這跟 CLAUDE.md 那條 PID 存活探測的保守方向相反，是
-    刻意的——那條規則守的是「別開出第二套 Chrome」，代價對稱；這裡兩種錯誤的
-    代價不對稱：判錯成「拒絕」會讓 bot 因為一個無關的檔案系統問題**完全不啟動**
-    且沒人會發現，判錯成「放行」最多退回加這道鎖之前的狀態（重複實例）。
+    **Which way to fall when it "cannot decide"**: fall toward "start anyway"
+    (return a `degraded` shell), not toward "refuse to start". This is the
+    opposite of CLAUDE.md's conservative direction for PID liveness probing, and
+    it is deliberate — that rule guards "do not open a second Chrome stack", where
+    the costs are symmetric; here the two mistakes have asymmetric costs: getting
+    it wrong as "refuse" makes the bot **fail to start at all** over an unrelated
+    filesystem problem with nobody noticing, while getting it wrong as "allow" at
+    worst reverts to the state before this lock existed (duplicate instances).
 
-    **三種結果，靠 errno 分**（2026-09-08 修；在那之前只有兩種，任何 `OSError`
-    都算「已有實例」，等於把上面那條政策寫反了）：
+    **Three outcomes, told apart by errno** (fixed 2026-09-08; before that there
+    were only two, and any `OSError` counted as "already an instance", i.e. the
+    policy above written backwards):
 
-    | 結果 | 意思 | 回傳 |
+    | Outcome | Meaning | Return |
     |---|---|---|
-    | 鎖到了 | 只有我在跑 | `InstanceLock`（`degraded=False`）|
-    | `_LOCK_HELD_ERRNOS` | 另一個實例正在跑 | `None` |
-    | 其他 errno／沒有 `msvcrt`&`fcntl`／開不了檔 | **判斷不出來** | `InstanceLock(degraded=True)` |
+    | Got the lock | Only I am running | `InstanceLock` (`degraded=False`) |
+    | `_LOCK_HELD_ERRNOS` | Another instance is running | `None` |
+    | Other errno / no `msvcrt`&`fcntl` / cannot open the file | **Cannot decide** | `InstanceLock(degraded=True)` |
 
-    `degraded=True` 是「我沒有提供互斥保護」的誠實回報，**呼叫端有責任講出來**：
-    兩支啟動器都會 `say()` 一行。不然放行就是無聲的，而無聲的降級跟沒有這把鎖
-    是同一件事。
+    `degraded=True` is an honest report of "I provided no mutual-exclusion
+    protection", and **the caller is responsible for saying so**: both launchers
+    `say()` a line. Otherwise the allow is silent, and a silent degradation is the
+    same thing as not having this lock at all.
 
-    子行程不會繼承這把鎖：Python 3.4+ 起 fd 預設 non-inheritable（PEP 446），
-    所以 launcher 底下 spawn 出來的 bot 不會把鎖一起帶走。
+    The child does not inherit this lock: since Python 3.4+ fds are
+    non-inheritable by default (PEP 446), so the bot spawned under the launcher
+    does not carry the lock away with it.
     """
     path = str(path)
     try:
@@ -211,37 +261,43 @@ def acquire_single_instance_lock(path) -> InstanceLock | None:
     try:
         if os.name == "nt":
             import msvcrt
-            # LK_NBLCK：非阻塞，鎖目前位置起算 1 byte。已被別人鎖住就丟
-            # OSError，不會卡住。
+            # LK_NBLCK: non-blocking, locks 1 byte from the current position. If
+            # already locked by someone else it raises OSError and does not hang.
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as error:
         if error.errno in _LOCK_HELD_ERRNOS:
-            # 被別的實例鎖住了——這是本函式唯一會回 None 的路徑。
+            # Locked by another instance — this is the only path that returns None.
             try:
                 os.close(fd)
             except OSError:
                 pass
             return None
-        # 「鎖不動」不等於「有人持有」。走到這裡代表鎖呼叫本身壞了（EBADF、
-        # EINVAL、不支援檔案鎖的網路磁碟給的 ENOLCK……），也就是**判斷不出來**，
-        # 依本函式上面寫明的政策倒向「照常啟動」。
+        # "cannot lock" is not the same as "someone holds it". Reaching here means
+        # the lock call itself broke (EBADF, EINVAL, the ENOLCK a network drive
+        # that does not support file locks gives, …), i.e. **cannot decide**, so
+        # fall toward "start anyway" per the policy spelled out above.
         #
-        # **這一行改掉了一個安全機制的失效方向，是刻意的**（2026-09-08）：改之前
-        # 任何 `OSError` 都回 `None`，於是一個與併發完全無關的檔案系統問題會被講成
-        # 「已經有另一個實例在執行」，啟動器從此**永遠拒絕啟動**，而訊息還指著一個
-        # 不存在的實例——沒有人查得出來。改之後未知 errno 會放行，代價是可能出現
-        # 重複實例。選後者是因為這個函式的政策本來就寫著往「照常啟動」倒，現在只是
-        # 讓程式碼跟它一致；而且放行**不再是無聲的**：`degraded` 會被兩支啟動器印
-        # 出來，stderr 也會留下 errno。
+        # **This line deliberately changed a safety mechanism's failure
+        # direction** (2026-09-08): before the change any `OSError` returned
+        # `None`, so a filesystem problem with nothing to do with concurrency got
+        # reported as "another instance is already running", the launcher then
+        # **refused to start forever**, and the message even pointed at an instance
+        # that did not exist — nobody could trace it. After the change an unknown
+        # errno lets it through, at the cost of possible duplicate instances. The
+        # latter is chosen because this function's policy already says to fall
+        # toward "start anyway"; this just makes the code match it. And the allow
+        # is **no longer silent**: `degraded` is printed by both launchers, and the
+        # errno is left on stderr too.
         print(f"single-instance lock check failed (errno={error.errno}): "
-              f"{error!r}; 照常啟動，但這次沒有互斥保護",
+              f"{error!r}; starting anyway, but without mutual exclusion this time",
               file=sys.stderr)
         return InstanceLock(fd, path, degraded=True)
     except ImportError as error:
-        # 平台沒有 msvcrt/fcntl（極罕見）。同樣往「照常啟動」倒。
+        # The platform has no msvcrt/fcntl (extremely rare). Fall toward "start
+        # anyway" as well.
         print(f"single-instance lock unsupported: {error!r}", file=sys.stderr)
         return InstanceLock(fd, path, degraded=True)
 
@@ -251,25 +307,31 @@ def acquire_single_instance_lock(path) -> InstanceLock | None:
 def other_launcher_pids(script_name: str, *, self_pid: int | None = None,
                         procs=None, also_contains: str | None = None
                         ) -> list[int]:
-    """還活著、正在跑 `script_name` 這支啟動器的**其他**行程 pid。
+    """The pids of **other** live processes running the `script_name` launcher.
 
-    只給「已經有另一個實例在執行」那句訊息當診斷用——**永遠不參與決策**（決策是
-    單一實例鎖的事），所以 psutil 缺席或不高興時回空 list 就好，不該擋住啟動。
+    Used only as diagnostics for the "another instance is already running"
+    message — **never part of a decision** (deciding is the single-instance lock's
+    job), so when psutil is absent or unhappy, returning an empty list is fine and
+    must not block startup.
 
-    2026-09-03 從 `start_discord_bot.py` 搬上來給兩支啟動器共用。搬的時候把原本
-    寫死的 `Path(__file__).name` 變成參數——放在這裡的話 `__file__` 會解析成
-    `_supervisor.py`，永遠掃不到任何啟動器。
+    Lifted up from `start_discord_bot.py` on 2026-09-03 to be shared by both
+    launchers. When lifted, the hardcoded `Path(__file__).name` became a
+    parameter — placed here, `__file__` would resolve to `_supervisor.py` and
+    never find any launcher.
 
-    `procs` 可注入（`(pid, name, cmdline, ppid)` 的可迭代物），所以這段判定測得
-    起來而不必真的去開兩個啟動器。
+    `procs` is injectable (an iterable of `(pid, name, cmdline, ppid)`), so this
+    logic is testable without actually opening two launchers.
 
-    `also_contains` 再多要求命令列裡有這個參數。bot 的啟動器現在是**一個平台一個
-    行程**、共用同一個腳本檔名，所以只比對檔名的話「telegram 那一支在跑嗎」會被
-    discord 那一支答成「在」。傳 `also_contains="telegram"` 就只算那個平台的。
-    **這仍然只是診斷**：手動 `py -3 start_discord_bot.py` 起的預設平台不帶
-    `--platform`，所以這裡看不到它——真正的互斥永遠是單一實例鎖的事。
+    `also_contains` additionally requires this argument to be on the command line.
+    The bot's launcher is now **one process per platform** and shares one script
+    filename, so matching on filename alone would let the discord one answer "yes"
+    to "is the telegram one running". Passing `also_contains="telegram"` counts
+    only that platform. **This is still only diagnostics**: a default platform
+    started manually with `py -3 start_discord_bot.py` carries no `--platform`, so
+    it is invisible here — real mutual exclusion is always the single-instance
+    lock's job.
     """
-    from axiomatic._process_control import (  # 延後匯入：避免啟動期的相依環
+    from axiomatic._process_control import (  # deferred import: avoids a startup dependency cycle
         cmdline_runs_script,
         collapse_interpreter_stub_pairs,
         looks_like_python_process,
@@ -284,10 +346,11 @@ def other_launcher_pids(script_name: str, *, self_pid: int | None = None,
             return []
 
         def _iter():
-            # 先用便宜的 `name` 過濾，再只對 Python 行程讀 `cmdline()`／`ppid()`。
-            # psutil 在 Windows 上每取一次 ppid 就重建整台機器的對照表，寫成
-            # `attrs=[..., "ppid"]` 是 O(N²)（實測 3.7 秒，而這是每次啟動都要跑
-            # 的路徑）。
+            # Filter first with the cheap `name`, then read `cmdline()` / `ppid()`
+            # only for Python processes. On Windows psutil rebuilds the whole
+            # machine's mapping table every time you fetch ppid, so writing
+            # `attrs=[..., "ppid"]` is O(N²) (measured 3.7 seconds, and this is a
+            # path that runs on every startup).
             for proc in psutil.process_iter(attrs=["pid", "name"]):
                 try:
                     yield (proc.info.get("pid"), proc.info.get("name"),
@@ -300,53 +363,61 @@ def other_launcher_pids(script_name: str, *, self_pid: int | None = None,
         for pid, name, cmdline, ppid in procs:
             if not looks_like_python_process(name):
                 continue
-            # 判定條件收緊成「參數就是這支腳本的路徑」：子字串比對會把任何
-            # **提到**檔名的命令列（shell、`python -c`）算成「另一個實例」。
+            # The condition is tightened to "the argument is this script's path":
+            # substring matching would count any command line that **mentions**
+            # the filename (a shell, `python -c`) as "another instance".
             try:
                 hit = cmdline_runs_script(cmdline, (script_name,))
             except Exception:  # pylint: disable=broad-except
                 continue
             if hit and also_contains is not None:
-                # 逐字比對一整個參數，不是子字串：`--platform telegram` 會被拆成
-                # 兩個 argv 元素，而子字串比對會讓 `telegram2` 這種名字誤中。
+                # Match a whole argument verbatim, not a substring: `--platform
+                # telegram` is split into two argv elements, whereas a substring
+                # match would let a name like `telegram2` match by mistake.
                 hit = any(str(arg) == also_contains for arg in (cmdline or ()))
             if hit:
-                # 自己這一筆**要留下**，交給 collapse 排除——它得看得到自己的
-                # ppid，才排得掉「自己的轉接殼」那一半。
+                # **Keep** our own entry and let collapse exclude it — it needs to
+                # see our own ppid to drop the "our own interpreter stub" half.
                 raw.append((pid, ppid, "launcher"))
     except Exception:  # pylint: disable=broad-except
         pass
-    # 啟動器經由 `.venv\Scripts\python.exe` 執行時，掃描會撞到「轉接殼 ＋ 本尊」
-    # 兩筆（cmdline 一模一樣、父子關係）。不併的話，一個既有實例會被報成兩個
-    # pid，讀的人以為自己真的開了兩份。
+    # When the launcher runs via `.venv\Scripts\python.exe`, the scan hits two
+    # entries, "stub + real" (identical cmdline, parent/child relationship). If
+    # not collapsed, one existing instance gets reported as two pids and the
+    # reader thinks they really opened two copies.
     return [pid for pid, _script in
             collapse_interpreter_stub_pairs(raw, exclude_pid=me)]
 
 
-# ---- 子行程輸出的落地（兩支啟動器共用）------------------------------------
+# ---- Landing child-process output (shared by both launchers) ----------------
 #
-# 2026-08-23 這件事已經在 webrunner 那一側踩過一次並修好：啟動器原本是
-# `subprocess.run(cmd)`，子行程直接繼承主控台，**關掉視窗那行就永遠找不回來**。
-# 當時的修法只套用在 `start_webrunner.py`，`start_discord_bot.py` 原封不動地留著
-# 同一個寫法到 2026-08-30。
+# On 2026-08-23 this was already hit and fixed on the webrunner side: the
+# launcher was `subprocess.run(cmd)`, the child inherited the console directly,
+# and **once the window was closed that line was gone forever**. That fix was
+# applied only to `start_webrunner.py`; `start_discord_bot.py` kept the same
+# pattern untouched until 2026-08-30.
 #
-# bot 那一側其實更嚴重，因為整條 Secrecy Layer 1 的設計就建立在「泛用訊息送
-# Discord、完整細節寫 log」上——bot 甚至會回「請查看 log」。沒有落地的檔案時，
-# 那句話指向的是一個不存在的東西，而所有 `print(..., file=sys.stderr)` 的診斷
-# （包含背景 task 崩潰、原始例外文字、supervisor 放棄原因）都只活在某個沒人看的
-# 主控台裡。
+# The bot side is actually worse, because the whole design of Secrecy Layer 1
+# rests on "send a generic message to Discord, write full detail to the log" —
+# the bot even replies "please check the log". With no landed file, that sentence
+# points at something that does not exist, and every `print(..., file=sys.stderr)`
+# diagnostic (including background-task crashes, raw exception text, and the
+# supervisor's give-up reason) lives only in some console nobody is watching.
 #
-# 所以實作收在這裡一份，兩支啟動器都用它。**不要**再在啟動器裡各寫一次。
+# So the implementation lives here in one copy, used by both launchers. **Do
+# not** write it again separately in each launcher.
 
 _LOG_PUMP_JOIN_SEC = 5.0
 
 
 def trim_log(path, *, max_bytes: int, keep_bytes: int) -> None:
-    """`path` 超過 `max_bytes` 時只保留最後 `keep_bytes`（切在整行邊界）。
+    """When `path` exceeds `max_bytes`, keep only the last `keep_bytes` (cut on a
+    whole-line boundary).
 
-    Best-effort：任何 I/O 失敗都只是不修剪，絕不讓監督者因為記錄檔而死。
-    尾段保留而不是整個清空——會炸掉的正是「崩潰 → 重生」那條接縫，清掉就等於把
-    要查的東西丟了。
+    Best-effort: any I/O failure just means no trim; never let the supervisor die
+    over a log file. The tail is kept rather than the whole thing cleared — the
+    seam that blows up is exactly "crash → respawn", and clearing it throws away
+    the very thing you need to investigate.
     """
     try:
         size = path.stat().st_size
@@ -357,7 +428,7 @@ def trim_log(path, *, max_bytes: int, keep_bytes: int) -> None:
     try:
         with path.open("rb") as handle:
             handle.seek(size - keep_bytes)
-            handle.readline()          # 丟掉 seek 落點那半行
+            handle.readline()          # drop the half-line where the seek landed
             tail = handle.read()
         path.write_bytes(tail)
     except OSError as error:
@@ -365,37 +436,44 @@ def trim_log(path, *, max_bytes: int, keep_bytes: int) -> None:
 
 
 def echo_line(line: str) -> None:
-    """把子行程的一行寫回啟動器自己的主控台。**任何情況下都不得往外丟例外。**
+    """Write one line from the child back to the launcher's own console. **Under
+    no circumstances may it throw an exception outward.**
 
-    子行程的輸出被強制成 UTF-8（見 `stream_child`），但**啟動器**的 stdout 不一定
-    是主控台——被重導向到檔案時它會用系統地區編碼，遇到編不出來的字就
-    `UnicodeEncodeError`。監督者不能因為一行日誌就掛掉，所以退成可替換寫法。
+    The child's output is forced to UTF-8 (see `stream_child`), but the
+    **launcher**'s stdout is not necessarily a console — when redirected to a file
+    it uses the system locale encoding, and hits `UnicodeEncodeError` on a
+    character it cannot encode. The supervisor must not die over one log line, so
+    it falls back to a replace-on-error write.
 
-    這裡的兩層 `try` 是**分開的**，不是同一個 `try` 的兩個 `except`（2026-09-07
-    修）。兩件事各自出過問題：
+    The two `try` blocks here are **separate**, not two `except` clauses of one
+    `try` (fixed 2026-09-07). Both things went wrong on their own:
 
-    1. 從 `except` 區塊裡丟出來的例外**不會**被同一個 `try` 的其他 `except`
-       接住。退版寫法原本是 `except UnicodeEncodeError:` 裡直接寫 stdout、下面
-       再掛一個 `except OSError: pass`——後者完全蓋不到前者。實測：第一次寫丟
-       `UnicodeEncodeError`、退版那次丟 `OSError(28)`，那個 `OSError` 直接穿出
-       本函式。
-    2. **寫進已關閉的串流丟的是 `ValueError` 不是 `OSError`。** 本函式跑在抽水
-       執行緒上，而 `pump_stream` 的 `except (OSError, ValueError)` 包的是整個
-       迴圈——所以主控台壞掉一次就等於**整條抽水停掉**，子行程接著把管線塞滿
-       然後永遠卡住。實測 3 行只抽到 1 行。那比沒有記錄檔更糟：監督者還活著、
-       批次卻不動了，而且什麼都不會說。
+    1. An exception thrown from inside an `except` block is **not** caught by
+       another `except` of the same `try`. The fallback used to be a direct
+       stdout write inside `except UnicodeEncodeError:` with an
+       `except OSError: pass` hung below it — the latter covers the former not at
+       all. Measured: the first write threw `UnicodeEncodeError`, the fallback
+       threw `OSError(28)`, and that `OSError` shot straight out of this function.
+    2. **Writing to a closed stream throws `ValueError`, not `OSError`.** This
+       function runs on the pump thread, and `pump_stream`'s
+       `except (OSError, ValueError)` wraps the whole loop — so one broken console
+       equals **the entire pump stopping**, and the child then fills the pipe and
+       hangs forever. Measured: 3 lines, only 1 pumped. That is worse than having
+       no log at all: the supervisor is still alive, the batch is stuck, and it
+       says nothing.
     """
     try:
         sys.stdout.write(line)
         sys.stdout.flush()
         return
     except UnicodeEncodeError:
-        pass                    # 往下走可替換寫法
+        pass                    # fall through to the replace-on-error write
     except (OSError, ValueError):
         return
-    # 退版路徑自己再包一層。`getattr` 取 `encoding`：這個物件不是我們控制的
-    # （可能是任何重導向包裝），少一個屬性也不該讓監督者死在一行日誌上。
-    # `LookupError`／`UnicodeError` 蓋的是「串流謊報自己的編碼」。
+    # The fallback path wraps itself again. `getattr` for `encoding`: this object
+    # is not one we control (it could be any redirection wrapper), and a missing
+    # attribute must not let the supervisor die over one log line either.
+    # `LookupError` / `UnicodeError` cover "the stream lies about its encoding".
     try:
         enc = getattr(sys.stdout, "encoding", None) or "ascii"
         sys.stdout.write(line.encode(enc, "replace").decode(enc, "replace"))
@@ -405,9 +483,11 @@ def echo_line(line: str) -> None:
 
 
 def log_write(log, line: str) -> None:
-    """把一行寫進記錄檔，前面加時間戳（主控台那份維持原樣，不加前綴）。
+    """Write one line to the log file, prefixed with a timestamp (the console
+    copy stays as-is, no prefix).
 
-    時間戳是事後對帳用的——`events.ndjson` 的 `ts` 要能跟這裡的行對得起來。
+    The timestamp is for reconciliation after the fact — `events.ndjson`'s `ts`
+    must line up with the lines here.
     """
     if log is None:
         return
@@ -418,21 +498,25 @@ def log_write(log, line: str) -> None:
 
 
 def say(log, message: str, *, err: bool = False) -> None:
-    """監督者自己的訊息：主控台 ＋ 記錄檔各一份。
+    """The supervisor's own messages: one copy to the console, one to the log
+    file.
 
-    放棄原因、rc、退避秒數這些正是事後診斷要看的東西，只印在主控台等於沒留。
+    Give-up reasons, rcs, and backoff seconds are exactly what after-the-fact
+    diagnosis needs to see, and printing only to the console keeps nothing.
     """
     print(message, file=sys.stderr if err else sys.stdout)
     log_write(log, message.strip() + "\n")
 
 
 def pump_stream(stream, log) -> None:
-    """把子行程的輸出一行一行送到主控台 ＋ 記錄檔，讀到 EOF 為止。
+    """Send the child's output line by line to the console + log file, until EOF.
 
-    **這條抽水迴圈跑在自己的執行緒上，而且絕不能停**：只要給了 `stdout=PIPE`
-    卻沒人讀，作業系統的管線緩衝區（Windows 上約 64 KB）一滿，子行程的下一個
-    print 就永遠卡住——比原本沒有記錄檔更糟。獨立執行緒的用意是連 Ctrl+C 之後
-    的收尾輸出也照抽，不會在等子行程收工時反而把它卡死。永不 raise。
+    **This pump loop runs on its own thread and must never stop**: as soon as
+    `stdout=PIPE` is given but nobody reads, once the OS pipe buffer (about 64 KB
+    on Windows) fills, the child's next print hangs forever — worse than having no
+    log at all. The point of a separate thread is to keep pumping even the wrap-up
+    output after Ctrl+C, so that waiting for the child to finish does not instead
+    wedge it. Never raises.
     """
     if stream is None:
         return
@@ -445,12 +529,14 @@ def pump_stream(stream, log) -> None:
 
 
 def reap_child(proc, log, *, grace_sec: float, kill_sec: float) -> int:
-    """Ctrl+C 之後把子行程收乾淨：先等它自己收工，逾時 terminate、再逾時 kill。
+    """Reap the child cleanly after Ctrl+C: first wait for it to finish on its
+    own, terminate on timeout, then kill on a further timeout.
 
-    為什麼不能直接把 KeyboardInterrupt 往上拋就走人：那會留下孤兒子行程（以及
-    webrunner 那一側的整棵 Chrome）。`subprocess.run` 在 KeyboardInterrupt 時是
-    `process.kill()`，Windows 上等於 TerminateProcess，子行程的 `finally` 完全
-    不會跑。這裡先禮後兵。
+    Why you cannot just re-raise KeyboardInterrupt and walk away: that would leave
+    an orphan child (and, on the webrunner side, a whole Chrome tree).
+    `subprocess.run` on KeyboardInterrupt does `process.kill()`, which on Windows
+    is TerminateProcess, so the child's `finally` does not run at all. Here it is
+    courtesy first, force after.
     """
     try:
         return proc.wait(timeout=grace_sec)
@@ -467,40 +553,51 @@ def reap_child(proc, log, *, grace_sec: float, kill_sec: float) -> int:
 def stream_child(cmd: list[str], log, *, cwd: str, on_spawn=None,
                  pump_name: str = "log-pump",
                  grace_sec: float = 30.0, kill_sec: float = 10.0) -> int:
-    """跑一次子行程，把它的 stdout＋stderr 同時寫到主控台與記錄檔，回 rc。
+    """Run the child once, tee its stdout+stderr to the console and the log file
+    at once, and return the rc.
 
-    子行程強制 `PYTHONIOENCODING=utf-8`：管線不是主控台，CPython 會退回系統地區
-    編碼（本機是 cp950），中文輸出就可能讓**子行程**自己炸掉。解碼端一併用
-    `errors="replace"`，任何怪位元組都不會中斷監督。呼叫端給的 `-u` 也還是要留，
-    否則子行程的輸出會在它自己的緩衝區裡積著、記錄檔變成一陣一陣的。
+    The child is forced to `PYTHONIOENCODING=utf-8`: a pipe is not a console, so
+    CPython falls back to the system locale encoding (cp950 here), and Chinese
+    output can then blow up the **child** itself. The decode end also uses
+    `errors="replace"`, so no odd byte interrupts supervision. The caller's `-u`
+    still has to stay, or the child's output would pile up in its own buffer and
+    the log would come out in bursts.
 
-    **「強制」＝覆寫，不是 `setdefault`**（2026-09-12 修）。這一行原本是
-    `env.setdefault(...)`，而上面這段說明從第一天就寫著「強制」——兩者差在呼叫端
-    環境**已經帶著一個值**的時候誰贏。選覆寫的理由是下面 `Popen` 的解碼端是
-    **寫死的** `encoding="utf-8"`：兩端只要不一致就是安靜的資料損壞，
-    `errors="replace"` 保證不會有例外，於是 rc 正常、沒有紅字，只有記錄檔裡的繁中
-    進度行、resume 不符的原因、放棄理由整段變成 U+FFFD。而啟動器最常見的起法
-    （桌面捷徑、開機自動啟動、排程工作、別人的殼）正是「環境裡有一個我們沒設過的
-    值」。本專案其餘 16 個交代子行程編碼的地方全部是覆寫
-    （`{**os.environ, "PYTHONIOENCODING": "utf-8"}`），這裡曾是唯一的例外，方向還
-    剛好是安靜壞掉的那一邊。
+    **"Forced" = overwrite, not `setdefault`** (fixed 2026-09-12). This line used
+    to be `env.setdefault(...)`, while the note above has said "forced" from day
+    one — the difference is who wins when the caller's environment **already
+    carries a value**. Overwrite is chosen because the decode end of the `Popen`
+    below is a **hardcoded** `encoding="utf-8"`: any mismatch between the two ends
+    is silent data corruption, `errors="replace"` guarantees no exception, and so
+    the rc is normal, there is no red text, and only the Traditional-Chinese
+    progress lines, resume-mismatch reasons, and give-up reasons in the log turn
+    into whole runs of U+FFFD. And the launcher's most common start paths (desktop
+    shortcut, autostart, scheduled task, someone else's shell) are exactly the
+    ones that carry "a value in the environment we never set". The other 16 places
+    in this project that specify a child's encoding all overwrite
+    (`{**os.environ, "PYTHONIOENCODING": "utf-8"}`); this was the one exception,
+    and its direction happened to be the silently-broken side.
 
-    也刻意**不**走「只有不是 UTF-8 變體才覆寫」的中間路線（放行
-    `utf-8:surrogateescape` 之類）：那要多一段 codec 正規化（而 `codecs.lookup`
-    自己會丟 `LookupError`），換來的只是保留呼叫端的錯誤處理器——那個處理器對我們
-    這一端毫無作用，因為我們本來就 `errors="replace"`。監督者的記錄檔長什麼樣，
-    不該取決於誰、從哪個殼把它點起來。
+    It also deliberately does **not** take the middle path of "only overwrite when
+    it is not a UTF-8 variant" (letting through `utf-8:surrogateescape` and the
+    like): that would need a stretch of codec normalisation (and `codecs.lookup`
+    itself throws `LookupError`), buying only the preservation of the caller's
+    error handler — which has no effect on our end, because we are already
+    `errors="replace"`. What the supervisor's log looks like should not depend on
+    who lit it up, or from which shell.
 
-    行為測試兩半都有（`test_supervisor.py`）：環境裡沒有那個變數
-    （`test_the_child_gets_utf8_io_encoding`），以及環境裡帶著一個錯的值
-    （`test_a_wrong_pythonioencoding_in_the_parent_is_overridden`）。**只有後者
-    分得出覆寫與 `setdefault`。** 這一站 `test_text_encoding` 的靜態掃描結構上
-    看不到——`cmd` 是呼叫端給的變數，掃描器認不出這是 Python 子行程——所以這兩支
-    具名測試就是它的全部覆蓋。
+    Behavioural tests cover both halves (`test_supervisor.py`): the variable
+    absent from the environment (`test_the_child_gets_utf8_io_encoding`), and a
+    wrong value present in the environment
+    (`test_a_wrong_pythonioencoding_in_the_parent_is_overridden`). **Only the
+    latter tells overwrite apart from `setdefault`.** `test_text_encoding`'s
+    static scan structurally cannot see this site — `cmd` is a variable the caller
+    supplies, and the scanner cannot recognise this as a Python child — so these
+    two named tests are its entire coverage.
     """
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
-    proc = subprocess.Popen(  # nosec B603 — cmd 由呼叫端組出來，不經 shell
+    proc = subprocess.Popen(  # nosec B603 — cmd is assembled by the caller, no shell
         cmd,
         cwd=cwd,
         stdout=subprocess.PIPE,
@@ -518,49 +615,59 @@ def stream_child(cmd: list[str], log, *, cwd: str, on_spawn=None,
                                 name=pump_name, daemon=True)
         pump.start()
     except Exception:  # pylint: disable=broad-except
-        # 子行程**已經起來了**，所以這條路不能只是往上拋（2026-09-07 修）。
-        # `on_spawn` 會做真的 I/O——`start_webrunner._on_spawn` 寫 `webrunner.pid`
-        # ——磁碟滿了或權限不對就丟 OSError。拋掉的話會留下一個 stdout 是 PIPE、
-        # 沒有人抽、也沒有人 wait 的孤兒：它下一次 print 就卡死在滿掉的管線裡，
-        # 而它手上握著整棵 Chrome。監督者自己死掉、批次還在那裡卡著不動，正是
-        # 最難查的那種收場。先收屍再把例外往上送。
+        # The child **is already up**, so this path cannot just re-raise (fixed
+        # 2026-09-07). `on_spawn` does real I/O — `start_webrunner._on_spawn`
+        # writes `webrunner.pid` — and a full disk or wrong permissions throw
+        # OSError. Re-raising would leave an orphan whose stdout is a PIPE nobody
+        # pumps and nobody waits on: its next print wedges in the filled pipe, and
+        # it is holding a whole Chrome tree. The supervisor itself dying while the
+        # batch sits there stuck is exactly the hardest kind of ending to
+        # diagnose. Reap first, then re-raise the exception.
         #
-        # `grace_sec=0`：這裡的子行程**沒有**收到 Ctrl+C，沒有理由自己收工，等
-        # 寬限期只是白等——直接 terminate，剩下的 Chrome 由 webrunner 下次啟動
-        # 的 `_kill_orphan_chrome()` 掃掉。
+        # `grace_sec=0`: the child here did **not** receive Ctrl+C and has no
+        # reason to finish on its own, so waiting out a grace period is wasted
+        # time — terminate straight away, and any leftover Chrome gets swept by
+        # `_kill_orphan_chrome()` on the webrunner's next start.
         #
-        # **不要**把這兩個 handler 改成 `except BaseException`：專案規則禁止
-        # （`test_exception_handlers.test_nothing_swallows_cancellation`，理由是
-        # 那會連 `CancelledError`／`KeyboardInterrupt` 一起吞掉），而這裡也不需要
-        # ——真正會留下孤兒的是 `on_spawn` 丟 `OSError`（pid 檔寫不進去），那是
-        # `Exception`。Ctrl+C 落在這個微小視窗裡的情況本來就由**主控台群組**兜著：
-        # 子行程跟啟動器在同一個群組，同一個 Ctrl+C 它自己也收到了。
+        # **Do not** change these two handlers to `except BaseException`: project
+        # rules forbid it (`test_exception_handlers.test_nothing_swallows_cancellation`,
+        # because that would swallow `CancelledError` / `KeyboardInterrupt` too),
+        # and it is not needed here either — what actually leaves an orphan is
+        # `on_spawn` throwing `OSError` (the pid file cannot be written), which is
+        # an `Exception`. A Ctrl+C landing in this tiny window is already covered
+        # by the **console group**: the child and the launcher are in the same
+        # group, so the child received the same Ctrl+C itself.
         try:
             say(log, "supervisor: spawn hook failed; terminating the child "
                      "that was already started", err=True)
             reap_child(proc, log, grace_sec=0, kill_sec=kill_sec)
         except Exception:  # pylint: disable=broad-except  # nosec B110
-            pass               # 收屍失敗也不能蓋掉原本那個例外
+            pass               # a failed reap must not mask the original exception
         raise
     try:
         return proc.wait()
     except KeyboardInterrupt:
-        # 同一個主控台群組，子行程也收到了 Ctrl+C。抽水執行緒還活著，所以它在
-        # 收尾時大量輸出也不會把自己卡在滿掉的管線裡。
+        # Same console group, so the child received Ctrl+C too. The pump thread is
+        # still alive, so even a burst of wrap-up output will not wedge it in a
+        # filled pipe.
         reap_child(proc, log, grace_sec=grace_sec, kill_sec=kill_sec)
         raise
     finally:
         pump.join(timeout=_LOG_PUMP_JOIN_SEC)
-        # 抽水還卡在 read 就**不要**關（2026-09-07 加的條件）。實測：
-        # `BufferedReader.close()` 不會丟例外，也不會把串流從抽水手上抽走——它去
-        # 搶同一把鎖，於是**一路擋到那次 read 回來為止**（量到 19.05 秒，正好是
-        # 子行程還活著的時間）。
+        # If the pump is still stuck in read, **do not** close (condition added
+        # 2026-09-07). Measured: `BufferedReader.close()` throws no exception and
+        # does not wrest the stream away from the pump — it contends for the same
+        # lock, and so **blocks until that read returns** (measured 19.05 seconds,
+        # exactly how long the child stayed alive).
         #
-        # 正常路徑走不到：`proc.wait()` 回來＝子行程已死＝管線 EOF＝抽水立刻結束。
-        # 走得到的是「收屍失敗、子行程還活著」那條（`reap_child` 裡的
-        # `terminate()`／`kill()` 自己丟例外）——那時候這一行會把監督者**永久**卡在
-        # 收工的最後一步，而它手上還握著單一實例鎖，於是誰也重啟不了，畫面上什麼
-        # 都沒有。抽水是 daemon 執行緒，行程結束時 OS 會把 fd 收掉。
+        # The normal path never reaches this: `proc.wait()` returning = the child
+        # is dead = pipe EOF = the pump ends immediately. What does reach it is the
+        # "reap failed, child still alive" path (`reap_child`'s `terminate()` /
+        # `kill()` throwing their own exception) — then this line would wedge the
+        # supervisor **permanently** at the last step of wrapping up, while it
+        # still holds the single-instance lock, so nobody can restart and nothing
+        # shows on screen. The pump is a daemon thread, so the OS reclaims the fd
+        # when the process ends.
         if proc.stdout is not None and not pump.is_alive():
             try:
                 proc.stdout.close()

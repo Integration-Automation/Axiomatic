@@ -1,12 +1,14 @@
 """Tests for process supervisor backoff policy.
 
-可直接 `py -3 test/test_supervisor.py`（自帶 runner），也可 pytest。
+Can be run directly with `py -3 test/test_supervisor.py` (self-contained runner)
+or via pytest.
 
-注意：匯入走「把套件目錄（`axiomatic/`）放進 sys.path，再直接 import `_supervisor`」
-這條路（與其餘 test_*.py 一致），而**不是** `from axiomatic._supervisor import ...`。
-後者只有在 repo root 也在 sys.path 上時才成立（pytest 回合由 `pytest.ini` 的
-`pythonpath` 與 conftest 補上），單獨執行本檔會
-`ModuleNotFoundError: No module named 'axiomatic'`。
+Note: imports take the "put the package directory (`axiomatic/`) on sys.path,
+then import `_supervisor` directly" path (consistent with the other test_*.py),
+and **not** `from axiomatic._supervisor import ...`. The latter only works when
+the repo root is on sys.path too (which the pytest run gets from `pytest.ini`'s
+`pythonpath` and conftest); running this file on its own gives
+`ModuleNotFoundError: No module named 'axiomatic'`.
 """
 import ast
 import contextlib
@@ -25,10 +27,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "axiomatic"))
-# repo root 也要在路徑上：`other_launcher_pids` 內部走
-# `from axiomatic._process_control import ...`，pytest 回合由 `pytest.ini` 的
-# `pythonpath` 與 conftest 補上 repo root，但 `py -3 test/test_supervisor.py` 不會——
-# 少了這一行，standalone 模式下那幾支會是 `ModuleNotFoundError: No module named 'axiomatic'`。
+# The repo root must be on the path too: `other_launcher_pids` internally does
+# `from axiomatic._process_control import ...`; the pytest run gets the repo root
+# from `pytest.ini`'s `pythonpath` and conftest, but `py -3 test/test_supervisor.py`
+# does not — without this line, those tests would be
+# `ModuleNotFoundError: No module named 'axiomatic'` in standalone mode.
 sys.path.insert(1, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from _supervisor import (  # noqa: E402
@@ -43,9 +46,11 @@ PKG_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "axiomatic")
 REPO_ROOT = os.path.dirname(PKG_ROOT)
 BOT_SCRIPT = os.path.join(PKG_ROOT, "discord_bot.py")
-# bot 本體的實例鎖是**逐平台**的，住在 `state/<平台>/`。這裡照 `_platform_runtime`
-# 算，而不是自己再拼一次路徑：拼錯的話下面那支端對端測試會握到一把沒有人爭的鎖，
-# 於是 bot 正常往下跑、回一個不是 rc=3 的碼，而紅字看起來像「閘門壞了」。
+# The bot body's instance lock is **per-platform** and lives in `state/<platform>/`.
+# Compute it via `_platform_runtime` rather than re-assembling the path here: get
+# it wrong and the end-to-end test below would hold a lock nobody contends for,
+# so the bot runs on normally and returns a code that is not rc=3, and the red
+# looks like "the gate broke".
 sys.path.insert(0, PKG_ROOT)
 import _platform_runtime as _pr  # noqa: E402
 
@@ -89,7 +94,7 @@ def _lock_path(tmpdir) -> str:
 
 
 def test_second_acquire_is_refused_while_the_first_still_holds(tmp_path):
-    """這就是那次「兩套 bot 同時在跑」要擋掉的情境。"""
+    """This is exactly the "two bots running at once" situation to block."""
     path = _lock_path(tmp_path)
     first = acquire_single_instance_lock(path)
     assert first is not None and not first.degraded
@@ -100,7 +105,8 @@ def test_second_acquire_is_refused_while_the_first_still_holds(tmp_path):
 
 
 def test_lock_is_reusable_once_the_holder_releases(tmp_path):
-    """釋放後必須能重新取得——否則 supervisor 重啟一次就再也起不來。"""
+    """Must be reacquirable after release — otherwise the supervisor can never
+    start again after one restart."""
     path = _lock_path(tmp_path)
     first = acquire_single_instance_lock(path)
     assert first is not None
@@ -111,7 +117,8 @@ def test_lock_is_reusable_once_the_holder_releases(tmp_path):
 
 
 def test_release_is_idempotent(tmp_path):
-    """`finally: lock.release()` 可能在已釋放後再跑一次，不可以炸掉。"""
+    """`finally: lock.release()` may run again after already releasing; it must
+    not blow up."""
     path = _lock_path(tmp_path)
     lock = acquire_single_instance_lock(path)
     assert lock is not None
@@ -120,92 +127,109 @@ def test_release_is_idempotent(tmp_path):
 
 
 def test_an_unusable_lock_file_lets_the_launcher_start_anyway(tmp_path):
-    """判斷不出來時往「照常啟動」倒，不是往「拒絕啟動」倒。
+    """When it cannot decide, fall toward "start anyway", not toward "refuse to
+    start".
 
-    這條方向是刻意的，跟 CLAUDE.md 那條 PID 存活探測的保守方向相反：判錯成
-    「拒絕」會讓 bot 因為一個無關的檔案系統問題完全不啟動、而且沒有人會發現；
-    判錯成「放行」最多退回加這道鎖之前的狀態。回傳值必須是 degraded 的殼而
-    **不是** None——None 是「已有實例」專用的答案。
+    This direction is deliberate and the opposite of CLAUDE.md's conservative
+    direction for PID liveness probing: getting it wrong as "refuse" makes the bot
+    fail to start at all over an unrelated filesystem problem, with nobody
+    noticing; getting it wrong as "allow" at worst reverts to the state before
+    this lock existed. The return value must be a degraded shell and **not**
+    None — None is the answer reserved for "already an instance".
     """
     path = os.path.join(str(tmp_path), "no_such_dir", "nested", "instance.lock")
     lock = acquire_single_instance_lock(path)
-    assert lock is not None, "不可回 None——那會被 launcher 解讀成『已有實例』"
+    assert lock is not None, "must not return None — the launcher reads that as 'already an instance'"
     assert lock.degraded is True
     lock.release()
 
 
 def test_a_degraded_shell_can_still_be_released(tmp_path):
-    """`degraded` 的空殼（`fd is None`）呼叫 `release()` 不得炸。
+    """A `degraded` empty shell (`fd is None`) must not blow up on `release()`.
 
-    啟動器的收尾路徑是無條件 `finally: lock.release()`，它分不出手上這個是真的鎖
-    還是降級的殼。這一行炸掉的話，使用者看到的是收工時一整段 traceback，真正的
-    結束原因被蓋在下面。
+    The launcher's wrap-up path is an unconditional `finally: lock.release()`, and
+    it cannot tell whether it holds a real lock or a degraded shell. If this line
+    blows up, the user sees a whole traceback on wrap-up, with the real exit
+    reason buried underneath.
     """
     from _supervisor import InstanceLock
     shell = InstanceLock(None, _lock_path(tmp_path), degraded=True)
     shell.release()
-    shell.release()             # 兩次也不炸
+    shell.release()             # twice does not blow up either
 
 
 def test_instance_lock_must_not_grow_a_del_method():
-    """`InstanceLock` **不可以**有 `__del__`。加上去會靜默放行第二個實例。
+    """`InstanceLock` **must not** have a `__del__`. Adding one silently lets a
+    second instance through.
 
-    鎖掛在 open file description 上，所以「關掉 fd」就等於「放掉鎖」。目前沒有
-    `__del__`，因此丟掉參照只是洩漏一個 fd，鎖繼續持有到行程結束——互斥仍然成立
-    （行為由 `test_dropping_the_reference_does_not_release_the_lock` 釘住）。
+    The lock hangs off the open file description, so "closing the fd" equals
+    "releasing the lock". There is currently no `__del__`, so dropping a reference
+    only leaks one fd while the lock stays held until the process ends — mutual
+    exclusion still holds (behaviour pinned by
+    `test_dropping_the_reference_does_not_release_the_lock`).
 
-    這支存在的理由是那段 docstring 曾經反過來寫，說「一旦被回收，`__del__` 關掉
-    fd 就等於放掉鎖」。一個維護者讀到它、發現類別上根本沒有 `__del__`，非常可能
-    會「把它補完」——而補完之後就會**真的**產生那段話警告的缺陷：呼叫端只要沒把
-    lock 存進變數（或那個變數在某次重構中不再被參照到），鎖就在無人察覺的情況下
-    被放掉，第二個監督者起得來，兩個 webrunner 搶同一份 `.chrome_profile/`。
+    This test exists because that docstring once said the opposite — "once
+    collected, `__del__` closing the fd equals releasing the lock". A maintainer
+    reading it, finding no `__del__` on the class, is very likely to "finish it
+    off" — and finishing it off would **actually** create the defect that passage
+    warns about: as soon as a caller does not store the lock in a variable (or that
+    variable stops being referenced in some refactor), the lock is released
+    unnoticed, a second supervisor starts, and two webrunners fight over the same
+    `.chrome_profile/`.
 
-    要收 fd 的話請呼叫 `release()`，不要掛在物件生命週期上。
+    To reclaim the fd, call `release()`; do not hang it on the object's lifetime.
     """
     from _supervisor import InstanceLock
     assert "__del__" not in InstanceLock.__dict__, (
-        "InstanceLock 長出了 __del__。物件被回收＝鎖被放掉＝第二個實例靜默起來，"
-        "而且完全沒有訊息。收 fd 請用 release()，不要掛在物件生命週期上。")
+        "InstanceLock grew a __del__. Object collected = lock released = a second "
+        "instance starts silently, with no message at all. Reclaim the fd with "
+        "release(), do not hang it on the object's lifetime.")
     assert not hasattr(InstanceLock, "__del__"), (
-        "InstanceLock 從某個基底類別繼承到了 __del__，後果同上。")
+        "InstanceLock inherited a __del__ from some base class; same consequence.")
 
 
 def test_dropping_the_reference_does_not_release_the_lock(tmp_path):
-    """丟掉最後一個參照之後，鎖必須**還在**。
+    """After dropping the last reference, the lock must **still be held**.
 
-    這是上一支的行為面，兩支互補：屬性那支說得出原因（不要加 `__del__`），這支
-    問的是**結果**而不是拼法，所以換一種寫法照樣抓得到。
+    This is the behavioural side of the previous test, and the two complement
+    each other: the attribute test states the reason (do not add `__del__`), while
+    this one asks about the **result** rather than the spelling, so it catches
+    another way of writing it just the same.
 
-    （順帶實測：`weakref.finalize(lock, ...)` 目前根本寫不出來——`__slots__` 裡沒有
-    `__weakref__`，會丟 `TypeError: cannot create weak reference`。那是額外一層意外
-    的保護，但**不要靠它**：有人往 `__slots__` 加一個 `__weakref__` 就沒了，而那看
-    起來完全無害。這支測的是最終結果，加了也擋得住。）
+    (Measured, incidentally: `weakref.finalize(lock, ...)` cannot even be written
+    right now — `__slots__` has no `__weakref__`, so it throws
+    `TypeError: cannot create weak reference`. That is an extra accidental layer
+    of protection, but **do not rely on it**: someone adding a `__weakref__` to
+    `__slots__` removes it, and that looks entirely harmless. This test checks the
+    final result, so it still holds even after that.)
     """
     path = _lock_path(tmp_path)
     lock = acquire_single_instance_lock(path)
     assert lock is not None
     if lock.degraded:
         lock.release()
-        pytest.skip("這台機器拿不到檔案鎖，測不出互斥")
+        pytest.skip("this machine cannot get a file lock; mutual exclusion untestable")
 
     del lock
     gc.collect()
-    gc.collect()                # 有參照循環時第二次才收得掉
+    gc.collect()                # a reference cycle needs a second pass to reclaim
 
     intruder = acquire_single_instance_lock(path)
     if intruder is not None:
         intruder.release()
     assert intruder is None, (
-        "參照被回收之後鎖就放掉了——第二個實例現在起得來。八成是有人幫 "
-        "InstanceLock 加了 __del__（或等價的 finalizer）。")
+        "the lock was released once the reference was collected — a second "
+        "instance can start now. Most likely someone gave InstanceLock a "
+        "__del__ (or an equivalent finalizer).")
 
 
 def test_the_already_running_rc_stays_distinguishable_from_a_crash():
-    """這個 rc 唯一的用途就是「跟其他退出方式分得出來」。
+    """This rc's only use is "being distinguishable from other exit paths".
 
-    0 是正常結束、1 是未捕捉例外與一般失敗、2 是 CPython 自己的命令列錯誤——
-    改成其中任何一個，supervisor 就會把「已有實例」誤判成一次普通崩潰然後照常
-    重試，也就是這條規則要擋的那個空轉迴圈。
+    0 is a normal exit, 1 is an uncaught exception and general failure, 2 is
+    CPython's own command-line error — change it to any of these and the
+    supervisor misreads "already an instance" as an ordinary crash and retries as
+    usual, i.e. the spinning loop this rule exists to block.
     """
     assert RC_ALREADY_RUNNING not in (0, 1, 2)
     assert child_exit_is_fatal(RC_ALREADY_RUNNING) is True
@@ -214,11 +238,14 @@ def test_the_already_running_rc_stays_distinguishable_from_a_crash():
 
 
 def test_the_launcher_actually_consumes_the_fatal_rc():
-    """光是「bot 回 rc=3」沒有用——真正的失效模式是 supervisor 照樣重試。
+    """"the bot returns rc=3" alone is useless — the real failure mode is the
+    supervisor retrying regardless.
 
-    靜態檢查啟動器的 `main()` 裡真的有呼叫 `child_exit_is_fatal`。刪掉那段處理
-    不會讓任何既有測試變紅（bot 照樣乾淨退出、退避數學照樣正確），但會讓啟動器
-    每 5～300 秒重生一次註定被同一把鎖擋掉的子行程。
+    Statically check that the launcher's `main()` actually calls
+    `child_exit_is_fatal`. Deleting that handling makes no existing test go red
+    (the bot still exits cleanly, the backoff maths is still correct), but it would
+    make the launcher respawn, every 5–300 seconds, a child doomed to be blocked
+    by the same lock.
     """
     with open(BOT_LAUNCHER, encoding="utf-8") as handle:
         tree = ast.parse(handle.read(), BOT_LAUNCHER)
@@ -227,47 +254,58 @@ def test_the_launcher_actually_consumes_the_fatal_rc():
          if isinstance(node, ast.FunctionDef) and node.name == "main"),
         None,
     )
-    assert main_fn is not None, "start_discord_bot.py 沒有 main()"
+    assert main_fn is not None, "start_discord_bot.py has no main()"
     called = {
         node.func.id
         for node in ast.walk(main_fn)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "child_exit_is_fatal" in called, (
-        "start_discord_bot.main() 沒有檢查子行程的致命 rc；被鎖擋掉的 bot 會被"
-        "當成普通崩潰無限重試。")
+        "start_discord_bot.main() does not check the child's fatal rc; a bot "
+        "blocked by the lock would be treated as an ordinary crash and retried "
+        "forever.")
 
 
 @pytest.mark.repo_write_ok(
     "state", "state/discord", "state/discord/.discord.discord_bot.lock",
-    reason="端對端契約本身就是『正式的實例鎖被握著時，直接執行 bot 會以 rc=3 被擋』；"
-           "子行程的 bot 讀的是寫死在它自己模組裡的正式鎖路徑，導到暫存區就量不到。"
-           "開這個檔只是嘗試上鎖，內容無關緊要，而且它本來就被 git 忽略。")
+    reason="the end-to-end contract itself is 'while the production instance lock "
+           "is held, running the bot directly is blocked with rc=3'; the child "
+           "bot reads the production lock path hardcoded in its own module, so "
+           "redirecting to a temp area cannot measure it. Opening this file is "
+           "only an attempt to lock, its content is irrelevant, and it is already "
+           "git-ignored.")
 def test_running_the_bot_directly_is_refused_with_the_fatal_rc():
-    """繞過啟動器直接執行 `discord_bot.py` 也要被擋掉，並用那個 rc 退出。
+    """Running `discord_bot.py` directly, bypassing the launcher, must be blocked
+    too, and exit with that rc.
 
-    這是整條契約唯一的端對端驗證：常數對不上、bot 沒接上鎖、或閘門被擺在會先
-    失敗的東西後面，這裡都會紅。**驗證過會紅**：把 `main()` 的鎖檢查拿掉，這條
-    會拿到 bot 正常啟動（或 token 錯誤）的 rc 而不是 3。
+    This is the only end-to-end check of the whole contract: a mismatched
+    constant, a bot not wired to the lock, or the gate placed after something that
+    fails first — any of them goes red here. **Verified it goes red**: remove
+    `main()`'s lock check and this test gets the rc of a normally-starting bot (or
+    a token error) instead of 3.
     """
     if importlib.util.find_spec("discord") is None:
-        pytest.skip("這個直譯器沒有裝對話平台函式庫，跑不起 bot 本體")
-    # 自己拿鎖來造出「已有實例」的情境。拿不到（`None` 專指已被別人持有，多半是
-    # bot 正在跑）也一樣有效——那本來就是同一個情境，期望值不變，所以照跑不 skip。
+        pytest.skip("this interpreter has no chat-platform library; cannot run the bot body")
+    # Take the lock ourselves to create the "already an instance" situation.
+    # Failing to take it (`None` specifically means already held by someone else,
+    # usually a running bot) is equally valid — it is the same situation, the
+    # expectation is unchanged, so run on rather than skip.
     held = acquire_single_instance_lock(BOT_LOCK_FILE)
     if held is not None and held.degraded:
         held.release()
-        pytest.skip("這台機器拿不到檔案鎖，測不出互斥")
+        pytest.skip("this machine cannot get a file lock; mutual exclusion untestable")
     try:
         proc = subprocess.run(
             [sys.executable, BOT_SCRIPT],
             capture_output=True, text=True, timeout=180, cwd=REPO_ROOT,
             check=False,
-            # bot 的訊息是 UTF-8 中文，而 Windows 上管線**兩端**都預設走本機
-            # code page（cp950）。`encoding="utf-8"` 只管**解碼端**；子行程的
-            # **編碼端**要靠 `PYTHONIOENCODING`，否則收到的是 cp950 位元組被
-            # 當成 UTF-8 解，`errors="replace"` 再把它靜靜換成一串 U+FFFD。
-            # （這段註解原本只講對了一半，2026-09-12 補上編碼端。）
+            # The bot's messages are UTF-8 Chinese, and on Windows **both ends**
+            # of the pipe default to the local code page (cp950). `encoding="utf-8"`
+            # covers only the **decode end**; the child's **encode end** needs
+            # `PYTHONIOENCODING`, or the cp950 bytes received get decoded as UTF-8
+            # and `errors="replace"` quietly turns them into a run of U+FFFD.
+            # (This comment used to be only half right; the encode end was added
+            # 2026-09-12.)
             encoding="utf-8", errors="replace",
             env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
@@ -275,24 +313,26 @@ def test_running_the_bot_directly_is_refused_with_the_fatal_rc():
         if held is not None:
             held.release()
     assert proc.returncode == RC_ALREADY_RUNNING, (
-        f"直接執行 bot 本體時應該以 rc={RC_ALREADY_RUNNING} 被擋掉，實際 "
-        f"rc={proc.returncode}。stderr 尾段：{(proc.stderr or '')[-800:]}")
+        f"running the bot body directly should be blocked with rc={RC_ALREADY_RUNNING}, "
+        f"got rc={proc.returncode}. stderr tail: {(proc.stderr or '')[-800:]}")
 
 
 # --------------------------------------------------------------------------
-# DoD #5：直譯器探索順序（本地 `.venv` → `py -3` → `sys.executable`）
+# DoD #5: interpreter discovery order (local `.venv` → `py -3` → `sys.executable`)
 # --------------------------------------------------------------------------
-# `CLAUDE.md` 說這個順序「必須完整保留——fresh clone 靠它」，但在這幾條之前**沒
-# 有任何東西在檢查**，而它被寫了**兩份**（兩支啟動器各一），是典型會各自漂移的
-# 配對。失敗形態一樣安靜：把 `.venv` 那一步拿掉，開發機照跑（系統直譯器剛好也
-# 裝了東西），fresh clone 則會用一個沒有相依的直譯器去啟動，然後在 import 期死掉；
-# 反過來把順序倒過來，正式行程會悄悄換成系統直譯器——那正是「三份相依版本」那個
-# 陷阱的來源。
+# `CLAUDE.md` says this order "MUST remain intact — fresh clones depend on it",
+# but before these tests **nothing was checking it**, and it is written in **two
+# copies** (one per launcher), a classic pair that drifts apart. The failure mode
+# is just as silent: remove the `.venv` step and the dev machine still runs (the
+# system interpreter happens to have things installed too), while a fresh clone
+# starts on a dependency-less interpreter and then dies during import; reverse the
+# order instead and the production process quietly switches to the system
+# interpreter — exactly the source of the "three dependency versions" trap.
 _LAUNCHERS = ("start_discord_bot.py", "start_webrunner.py")
 
 
 def _python_command_node(launcher: str) -> ast.FunctionDef:
-    """啟動器裡 `python_command()` 的 AST 節點（不靠文字切割）。"""
+    """The AST node of `python_command()` in the launcher (no text splitting)."""
     path = os.path.join(REPO_ROOT, launcher)
     with open(path, encoding="utf-8") as handle:
         tree = ast.parse(handle.read(), path)
@@ -300,23 +340,26 @@ def _python_command_node(launcher: str) -> ast.FunctionDef:
         if isinstance(node, ast.FunctionDef) and node.name == "python_command":
             return node
     raise AssertionError(
-        f"{launcher} 找不到 `python_command()`——DoD #5 的探索順序住在那裡，"
-        "改名了就把這支測試一起更新，不要讓它靜默失效。")
+        f"{launcher} has no `python_command()` — DoD #5's discovery order lives "
+        "there; if it is renamed, update this test along with it, do not let it "
+        "silently fail.")
 
 
 def _discovery_order(launcher: str) -> list[str]:
-    """`python_command()` 依**執行順序**回傳的候選。
+    """The candidates `python_command()` returns, in **execution order**.
 
-    刻意看 `return` 的先後而不是字串在原始碼裡出現的位置：`venv_py = REPO_ROOT /
-    '.venv' / …` 那一行永遠在最前面，所以照文字位置判斷的話，把 `.venv` 那個
-    `if` 整段搬到 `py -3` 後面也照樣會過——順序被換掉卻沒人發現。
+    Deliberately looks at the order of `return`s rather than where a string
+    appears in the source: the line `venv_py = REPO_ROOT / '.venv' / …` is always
+    first, so judging by text position would let you move the whole `.venv` `if`
+    block after `py -3` and still pass — the order swapped with nobody noticing.
     """
     returns = [node for node in ast.walk(_python_command_node(launcher))
                if isinstance(node, ast.Return) and node.value is not None]
     order: list[str] = []
-    # 依行號排序＝依原始碼順序。`ast.walk` 是廣度優先，巢狀在 `if` 裡的 return 會
-    # 排在最外層那個 `return [sys.executable]` 後面，順序整個是錯的。這個函式是
-    # 一串 guard clause，所以原始碼順序就是執行順序。
+    # Sorting by line number = source order. `ast.walk` is breadth-first, so a
+    # return nested in an `if` would sort after the outermost
+    # `return [sys.executable]`, and the order would be entirely wrong. This
+    # function is a chain of guard clauses, so source order is execution order.
     for node in sorted(returns, key=lambda n: n.lineno):
         returned = ast.unparse(node.value)
         if "venv_py" in returned:
@@ -330,38 +373,44 @@ def _discovery_order(launcher: str) -> list[str]:
 
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 def test_the_interpreter_discovery_order_is_intact(launcher):
-    """三個候選都要在，而且**執行順序**不能換。"""
+    """All three candidates must be present, and the **execution order** must not
+    change."""
     expected = [".venv", "py -3", "sys.executable"]
     actual = _discovery_order(launcher)
     assert actual == expected, (
-        f"{launcher} 的 `python_command()` 探索順序是 {actual}，"
-        f"DoD #5 要求 {expected}。順序就是規則本身：`.venv` 必須排第一，否則"
-        "正式行程會悄悄換到系統直譯器上跑（相依版本當場分岔）；而沒有 `.venv` 的"
-        "fresh clone 就靠後兩步才啟動得起來。")
+        f"{launcher}'s `python_command()` discovery order is {actual}, "
+        f"DoD #5 requires {expected}. The order is the rule itself: `.venv` must be "
+        "first, or the production process quietly switches to the system "
+        "interpreter (dependency versions fork on the spot); and a fresh clone "
+        "without `.venv` only starts thanks to the last two steps.")
 
 
 def test_both_launchers_discover_the_interpreter_the_same_way():
-    """兩份 `python_command()` 必須逐字相同——這是會各自漂移的配對。"""
+    """The two copies of `python_command()` must be identical verbatim — this is
+    the pair that drifts apart."""
     sources = {name: ast.unparse(_python_command_node(name))
                for name in _LAUNCHERS}
     first, second = _LAUNCHERS
     assert sources[first] == sources[second], (
-        f"`{first}` 與 `{second}` 的 `python_command()` 不一樣了。兩支啟動器要用"
-        "同一套探索順序，否則 bot 與 webrunner 會跑在不同的直譯器上——相依版本"
-        "當場分岔，而且要到其中一邊 import 失敗才看得出來。"
+        f"`{first}` and `{second}`'s `python_command()` differ now. Both launchers "
+        "must use the same discovery order, or the bot and webrunner run on "
+        "different interpreters — dependency versions fork on the spot, and it only "
+        "shows once one side's import fails."
         f"\n--- {first} ---\n{sources[first]}\n--- {second} ---\n{sources[second]}")
 
 
 
 
 # ---------------------------------------------------------------------------
-# 子行程輸出的落地：兩支啟動器都要有，實作只有一份
+# Landing child-process output: both launchers must have it, one implementation
 #
-# 2026-08-23 webrunner 那一側踩過並修好：啟動器原本 `subprocess.run(cmd)`，子行程
-# 直接繼承主控台，關掉視窗那行就永遠找不回來。當時只改了那一支，
-# `start_discord_bot.py` 原封不動留到 2026-08-30——而 bot 那一側其實更嚴重，整條
-# Secrecy Layer 1 就建立在「泛用訊息送 Discord、完整細節寫 log」上，bot 甚至會回
-# 「請查看 log」，指向一個不存在的檔案。
+# Hit and fixed on the webrunner side 2026-08-23: the launcher was
+# `subprocess.run(cmd)`, the child inherited the console directly, and once the
+# window was closed that line was gone forever. Only that one was changed;
+# `start_discord_bot.py` stayed untouched until 2026-08-30 — and the bot side is
+# actually worse, since the whole of Secrecy Layer 1 rests on "send a generic
+# message to Discord, write full detail to the log", and the bot even replies
+# "please check the log", pointing at a file that does not exist.
 # ---------------------------------------------------------------------------
 
 _LAUNCHER_PATHS = {
@@ -371,7 +420,7 @@ _LAUNCHER_PATHS = {
 
 
 def _called_names(path):
-    """這支啟動器呼叫過的函式名（`f(...)` 與 `x.f(...)` 都算）。"""
+    """The names of functions this launcher calls (`f(...)` and `x.f(...)` both count)."""
     with open(path, "r", encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
     names = set()
@@ -387,25 +436,30 @@ def _called_names(path):
 
 @pytest.mark.parametrize("launcher", sorted(_LAUNCHER_PATHS))
 def test_both_launchers_tee_the_child_into_a_log_file(launcher):
-    """兩支啟動器都必須走 `stream_child`，而且都要修剪自己的 log。
+    """Both launchers must go through `stream_child`, and both must trim their
+    own log.
 
-    `subprocess.run(cmd)` 讓子行程直接繼承主控台——視窗一關就什麼都不剩，而這兩支
-    印出來的東西（接續判定的 diverging fields、原始例外、supervisor 放棄原因）正是
-    事後唯一能查的線索。
+    `subprocess.run(cmd)` makes the child inherit the console directly — once the
+    window is closed nothing is left, and what these two print (the diverging
+    fields of resume decisions, raw exceptions, the supervisor's give-up reason)
+    is the only clue available afterward.
     """
     names = _called_names(_LAUNCHER_PATHS[launcher])
     assert "stream_child" in names, (
-        f"{launcher} 沒有用 `stream_child` 起子行程。直接 `subprocess.run` 的話"
-        "子行程繼承主控台，關掉視窗就什麼都不剩。")
+        f"{launcher} does not start the child with `stream_child`. With a bare "
+        "`subprocess.run` the child inherits the console, and closing the window "
+        "leaves nothing.")
     assert "trim_log" in names, (
-        f"{launcher} 沒有呼叫 `trim_log`——附加式的 log 會無限長大。")
+        f"{launcher} does not call `trim_log` — an append-mode log grows without bound.")
 
 
 @pytest.mark.parametrize("launcher", sorted(_LAUNCHER_PATHS))
 def test_no_launcher_runs_the_child_through_subprocess_run(launcher):
-    """反面：`subprocess.run` 不得再用來跑被監督的子行程。
+    """The reverse: `subprocess.run` must no longer be used to run the supervised
+    child.
 
-    這是原本的寫法，看起來完全正常，所以只有守門擋得住它回來。
+    This is the original pattern, and it looks entirely normal, so only a guard
+    can keep it from coming back.
     """
     with open(_LAUNCHER_PATHS[launcher], "r", encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
@@ -416,11 +470,13 @@ def test_no_launcher_runs_the_child_through_subprocess_run(launcher):
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "subprocess"]
     assert not hits, (
-        f"{launcher}:{hits} 又用 `subprocess.run` 跑子行程了——那條路沒有記錄檔。")
+        f"{launcher}:{hits} runs the child through `subprocess.run` again — that "
+        "path has no log file.")
 
 
 def _run_child(tmp_path, body, **kwargs):
-    """把 `body` 寫成腳本、用 `stream_child` 跑它，回 `(rc, log 內容, 主控台)`。"""
+    """Write `body` as a script, run it with `stream_child`, return `(rc, log
+    content, console)`."""
     import contextlib
     import io
     import _supervisor as sup
@@ -437,27 +493,30 @@ def _run_child(tmp_path, body, **kwargs):
 
 
 def test_stream_child_lands_stdout_stderr_and_rc(tmp_path):
-    """stdout、stderr、rc 三者都要到位，而且主控台那一份也還在。
+    """stdout, stderr, and rc must all land, and the console copy must remain too.
 
-    合併 stderr 是刻意的：診斷訊息大半走 stderr，分兩個管線就要兩條抽水迴圈，而
-    交錯的順序才是看得懂事情經過的關鍵。
+    Merging stderr is deliberate: most diagnostics go to stderr, splitting into
+    two pipes would need two pump loops, and the interleaved order is the key to
+    understanding what happened.
     """
     rc, log, console = _run_child(tmp_path, (
         "import sys\n"
         "print('到 stdout 的中文')\n"
         "print('to stderr', file=sys.stderr)\n"
         "sys.exit(7)\n"))
-    assert rc == 7, f"rc 沒傳回來：{rc}"
+    assert rc == 7, f"rc was not passed back: {rc}"
     assert "到 stdout 的中文" in log, log[:300]
-    assert "to stderr" in log, "stderr 沒有被合併進來——診斷訊息大半走 stderr"
-    assert "到 stdout 的中文" in console, "主控台那一份不見了；落地不該取代即時輸出"
+    assert "to stderr" in log, "stderr was not merged in — most diagnostics go to stderr"
+    assert "到 stdout 的中文" in console, "the console copy is gone; landing must not replace live output"
 
 
 def test_the_pump_does_not_deadlock_on_a_chatty_child(tmp_path):
-    """輸出超過管線緩衝區（Windows 上約 64 KB）時不得卡死。
+    """Output exceeding the pipe buffer (about 64 KB on Windows) must not
+    deadlock.
 
-    給了 `stdout=PIPE` 卻沒人讀，子行程的下一個 print 就永遠卡住——那比原本沒有
-    記錄檔更糟（批次會整個停住而不是掉一份 log）。抽水必須在自己的執行緒上。
+    With `stdout=PIPE` given but nobody reading, the child's next print hangs
+    forever — worse than having no log at all (the batch stalls entirely rather
+    than dropping a log). The pump must be on its own thread.
     """
     rc, log, _console = _run_child(tmp_path, (
         "import sys\n"
@@ -467,15 +526,17 @@ def test_the_pump_does_not_deadlock_on_a_chatty_child(tmp_path):
         "sys.exit(0)\n"))
     assert rc == 0
     assert log.count("x" * 40) == 4000, (
-        f"只收到 {log.count('x' * 40)} / 4000 行——管線滿了之後卡住了。")
-    assert "TAIL-MARKER" in log, "最後一行沒收到"
+        f"only received {log.count('x' * 40)} / 4000 lines — it wedged once the pipe filled.")
+    assert "TAIL-MARKER" in log, "the last line did not arrive"
 
 
 def test_a_bad_byte_from_the_child_does_not_stop_the_pump(tmp_path):
-    """子行程吐出不合法的位元組時，後面的輸出還要繼續收。
+    """When the child emits illegal bytes, the output after them must keep being
+    collected.
 
-    來源是外部（子行程可能印出任何東西），所以解碼端用 `errors="replace"`；一個
-    怪位元組就讓抽水中斷的話，剩下的整段診斷都會不見。
+    The source is external (the child could print anything), so the decode end
+    uses `errors="replace"`; if one odd byte broke the pump, the whole rest of the
+    diagnostics would vanish.
     """
     _rc, log, _console = _run_child(tmp_path, (
         "import sys\n"
@@ -487,13 +548,16 @@ def test_a_bad_byte_from_the_child_does_not_stop_the_pump(tmp_path):
 
 
 def test_the_child_gets_utf8_io_encoding(tmp_path):
-    """子行程強制 UTF-8 文字 I/O。
+    """The child is forced to UTF-8 text I/O.
 
-    管線不是主控台，CPython 會退回系統地區編碼（本機是 cp950），中文輸出就可能讓
-    **子行程自己**炸掉——那是加了記錄檔反而把事情弄壞。
+    A pipe is not a console, so CPython falls back to the system locale encoding
+    (cp950 here), and Chinese output can blow up **the child itself** — the case
+    where adding a log file breaks things instead.
 
-    先把父行程自己的 `PYTHONIOENCODING` 拿掉再量：不然這支在「開發者的殼剛好已經
-    設了」的機器上會永遠綠，量到的是環境而不是程式碼（本機的殼就是 `UTF-8`）。
+    Pop the parent's own `PYTHONIOENCODING` before measuring: otherwise this test
+    is always green on a machine where "the developer's shell happens to have set
+    it", measuring the environment rather than the code (this machine's shell is
+    `UTF-8`).
     """
     saved = os.environ.pop("PYTHONIOENCODING", None)
     try:
@@ -504,27 +568,34 @@ def test_the_child_gets_utf8_io_encoding(tmp_path):
         if saved is not None:
             os.environ["PYTHONIOENCODING"] = saved
     assert "enc=utf-8" in log.lower(), (
-        f"子行程的 stdout 編碼不是 utf-8：{log[:200]!r}")
+        f"the child's stdout encoding is not utf-8: {log[:200]!r}")
 
 
 def test_a_wrong_pythonioencoding_in_the_parent_is_overridden(tmp_path):
-    """呼叫端環境帶著一個**錯的** `PYTHONIOENCODING` 時，子行程仍然要吐 UTF-8。
+    """When the caller's environment carries a **wrong** `PYTHONIOENCODING`, the
+    child must still emit UTF-8.
 
-    這是上一支的另一半，而且是唯一分得出「強制」與「讓步」的那一半。上一支先
-    `os.environ.pop(...)` 再量（那是對的，理由白紙黑字寫在它的 docstring），但也
-    因此只涵蓋「環境裡沒有這個變數」的情境——而在那個情境下
-    `env.setdefault(...)`（讓步）與 `env[...] = ...`（覆寫）行為**一模一樣**，
-    所以「把強制改成讓步」這個變異在 2026-09-12 之前活得下來。
+    This is the other half of the previous test, and the only half that tells
+    "force" apart from "yield". The previous test does `os.environ.pop(...)` before
+    measuring (which is right, and its reasoning is spelled out in its docstring),
+    but for that reason only covers the "variable absent from the environment"
+    case — and in that case `env.setdefault(...)` (yield) and `env[...] = ...`
+    (overwrite) behave **identically**, so the "turn force into yield" mutation
+    survived until 2026-09-12.
 
-    讓步的方向剛好是安靜壞掉的那一邊：`stream_child` 的解碼端是**寫死的**
-    `encoding="utf-8", errors="replace"`，所以子行程若照 cp950／big5 編，回來的是
-    一串 U+FFFD——沒有例外、沒有紅字、rc 也正常，只有 `webrunner.log` 裡的繁中
-    進度行、resume 不符的原因、放棄理由整段變成問號。而啟動器最常見的起法（桌面
-    捷徑、開機自動啟動、排程工作、別人的殼）正是「環境裡有一個我們沒設過的值」。
+    Yield's direction happens to be the silently-broken side: `stream_child`'s
+    decode end is a **hardcoded** `encoding="utf-8", errors="replace"`, so if the
+    child encodes as cp950/big5, what comes back is a run of U+FFFD — no exception,
+    no red text, a normal rc, and only the Traditional-Chinese progress lines,
+    resume-mismatch reasons, and give-up reasons in `webrunner.log` turned into
+    question marks. And the launcher's most common start paths (desktop shortcut,
+    autostart, scheduled task, someone else's shell) are exactly the ones that
+    carry "a value in the environment we never set".
 
-    量的是**子行程真的怎麼編碼**而不是傳下去的 env 字典：這支的覆蓋對象是
-    `stream_child` 這個具名守門，而它存在的理由就是靜態掃描器看不出它開的是
-    Python（命令列是呼叫端給的變數）。端到端量一次才算數。
+    It measures **how the child actually encodes** rather than the env dict passed
+    down: this test's target is the named guard `stream_child`, which exists
+    precisely because a static scanner cannot tell it opens Python (the command
+    line is a variable the caller supplies). Only an end-to-end measurement counts.
     """
     saved = os.environ.get("PYTHONIOENCODING")
     os.environ["PYTHONIOENCODING"] = "cp950"
@@ -539,32 +610,36 @@ def test_a_wrong_pythonioencoding_in_the_parent_is_overridden(tmp_path):
         else:
             os.environ["PYTHONIOENCODING"] = saved
     assert "enc=utf-8" in log.lower(), (
-        "呼叫端環境帶著 `PYTHONIOENCODING=cp950`，子行程就跟著用了它——這是"
-        "讓步（`setdefault`）而不是覆寫，而解碼端是寫死的 utf-8。"
-        f"子行程回報的編碼：{log[:200]!r}")
+        "the caller's environment carried `PYTHONIOENCODING=cp950` and the child "
+        "followed it — this is a yield (`setdefault`) rather than an overwrite, "
+        "while the decode end is hardcoded utf-8. "
+        f"The encoding the child reported: {log[:200]!r}")
     assert "繁中這一行要原樣回來" in log, (
-        f"兩端編碼不一致，繁中那一行沒有原樣回來：{log[:200]!r}")
-    # 用 `chr(0xFFFD)` 而不是直接貼一個替代字元：原始碼裡擺一個真的 U+FFFD，讀起來會
-    # 像這個檔案自己壞掉了，而且下一個編輯器可能順手把它「修正」掉。
+        f"the two ends' encodings disagreed and the Chinese line did not come back verbatim: {log[:200]!r}")
+    # Use `chr(0xFFFD)` rather than pasting a replacement character directly: a
+    # real U+FFFD in the source reads as if this file itself broke, and the next
+    # editor might "correct" it out of hand.
     assert chr(0xFFFD) not in log, (
-        f"記錄檔裡有 {log.count(chr(0xFFFD))} 個替代字元（U+FFFD），代表子行程"
-        "照另一種編碼寫、我們照 utf-8 解。")
+        f"the log has {log.count(chr(0xFFFD))} replacement characters (U+FFFD), "
+        "meaning the child wrote in another encoding and we decoded as utf-8.")
 
 
 def test_log_lines_carry_a_timestamp_but_the_console_does_not(tmp_path):
-    """記錄檔那份加時間戳（事後要跟 `events.ndjson` 的 ts 對得起來），主控台不加。"""
+    """The log copy carries a timestamp (must line up with `events.ndjson`'s ts
+    afterward); the console copy does not."""
     import re
     _rc, log, console = _run_child(tmp_path, "print('MARK')\n")
     line = next(l for l in log.splitlines() if "MARK" in l)
     assert re.match(r"^\[\d\d-\d\d \d\d:\d\d:\d\d\] MARK", line), line
     assert console.splitlines()[0] == "MARK", (
-        f"主控台那份被加了前綴：{console.splitlines()[0]!r}")
+        f"the console copy got a prefix: {console.splitlines()[0]!r}")
 
 
 def test_say_goes_to_both_the_console_and_the_log(tmp_path):
-    """監督者自己的訊息也要落地。
+    """The supervisor's own messages must land too.
 
-    放棄原因、rc、退避秒數正是事後診斷要看的東西，只印主控台等於沒留。
+    Give-up reasons, rcs, and backoff seconds are exactly what after-the-fact
+    diagnosis needs to see, and printing only to the console keeps nothing.
     """
     import contextlib
     import io
@@ -581,9 +656,11 @@ def test_say_goes_to_both_the_console_and_the_log(tmp_path):
 
 
 def test_say_and_log_write_tolerate_no_log_at_all():
-    """記錄檔開不起來時（唯讀磁碟、權限）啟動器照樣要能跑。
+    """When the log file cannot be opened (read-only disk, permissions), the
+    launcher must still run.
 
-    `log=None` 是明確支援的狀態：落不了地就退回只印主控台，不能因此拒絕啟動。
+    `log=None` is an explicitly supported state: if it cannot land, fall back to
+    console-only, and do not refuse to start over it.
     """
     import contextlib
     import io
@@ -597,10 +674,11 @@ def test_say_and_log_write_tolerate_no_log_at_all():
 
 
 def test_trim_log_keeps_the_tail_and_cuts_on_a_line_boundary(tmp_path):
-    """修剪保留**尾段**、而且切在整行邊界。
+    """Trimming keeps the **tail** and cuts on a whole-line boundary.
 
-    會炸掉的正是「崩潰 → 重生」那條接縫，所以要留最後那一段而不是最前面；切在
-    半行上則會讓第一行變成無法解讀的碎片。
+    The seam that blows up is exactly "crash → respawn", so keep the last stretch
+    rather than the first; cutting on a half-line makes the first line an
+    unreadable fragment.
     """
     import _supervisor as sup
 
@@ -609,63 +687,70 @@ def test_trim_log_keeps_the_tail_and_cuts_on_a_line_boundary(tmp_path):
     sup.trim_log(path, max_bytes=50_000, keep_bytes=20_000)
     text = path.read_text(encoding="utf-8")
     assert path.stat().st_size <= 20_000, path.stat().st_size
-    assert text.splitlines()[-1] == "line 19999", "尾段沒留住"
+    assert text.splitlines()[-1] == "line 19999", "the tail was not kept"
     assert text.splitlines()[0].startswith("line "), (
-        f"第一行是半行碎片：{text.splitlines()[0]!r}")
+        f"the first line is a half-line fragment: {text.splitlines()[0]!r}")
 
-    # 沒超過上限就一個位元組都不該動。
+    # Below the limit, not a single byte should be touched.
     before = path.read_bytes()
     sup.trim_log(path, max_bytes=10_000_000, keep_bytes=1000)
-    assert path.read_bytes() == before, "沒超過上限卻被修剪了"
+    assert path.read_bytes() == before, "trimmed even though it was below the limit"
 
 
 def test_trim_log_must_not_become_an_atomic_write(tmp_path):
-    """`trim_log` **刻意**就地覆寫，不得改成「同目錄 temp → os.replace」。
+    """`trim_log` **deliberately** overwrites in place; it must not become
+    "same-directory temp → os.replace".
 
-    這條看起來跟 `CLAUDE.md` 的跨行程原子寫入硬規則衝突，所以要把理由寫死在這裡，
-    否則遲早有人「順手修正」它——而 `webrunner.log` 確實是跨行程檔案（啟動器寫、
-    bot 的 `/log tail` 讀）。
+    This looks like it conflicts with `CLAUDE.md`'s cross-process atomic-write
+    hard rule, so the reason is pinned here, or sooner or later someone "tidily
+    fixes" it — and `webrunner.log` really is a cross-process file (the launcher
+    writes, the bot's `/log tail` reads).
 
-    差別在於**這個檔案同時有兩個活著的 append 控制代碼**：啟動器的 tee，以及
-    第三方函式庫自己的 logger（它的檔名在 Windows 上與我們的只差大小寫，也就是
-    **同一個檔案**——`Path("webrunner.log").resolve()` 指向磁碟上的 `WEBRunner.log`。
-    實測那個檔案裡就同時有兩種格式的行）。
+    The difference is that **this file has two live append handles at once**: the
+    launcher's tee, and the third-party library's own logger (whose filename on
+    Windows differs from ours only in case, i.e. **the same file** —
+    `Path("webrunner.log").resolve()` points at `WEBRunner.log` on disk. Measured:
+    that file really does contain lines in both formats).
 
-    2026-08-30 在這台機器上實測兩種寫法（結果就是下面這段在驗的）：
-      * 就地覆寫：成功，而且另一個控制代碼**之後的 append 照樣落在可見的檔案裡**。
-      * `os.replace`：直接 `PermissionError [WinError 5] 存取被拒`——Windows 不讓你
-        取代一個別人開著的檔案。
+    On 2026-08-30 both approaches were measured on this machine (the result is
+    exactly what the block below verifies):
+      * In-place overwrite: succeeds, and the other handle's **subsequent appends
+        still land in the visible file**.
+      * `os.replace`: straight to `PermissionError [WinError 5] access denied` —
+        Windows will not let you replace a file someone else has open.
 
-    後者的下場不是「少了一次修剪」而是**永遠不再修剪**：`trim_log` 把 `OSError`
-    吞掉只回傳，所以記錄檔會一路長下去，而且一個字都不會說。原子寫入在這裡不是
-    更安全，是靜默失效。
+    The latter's outcome is not "one missed trim" but **never trimming again**:
+    `trim_log` swallows `OSError` and just returns, so the log grows without bound
+    and says nothing. An atomic write here is not safer, it is a silent failure.
     """
     import _supervisor as sup
 
     log = tmp_path / "app.log"
     log.write_text("old-line\n" * 400, encoding="utf-8")
 
-    # 模擬第三方函式庫：以 append 模式握著同一個檔案不放。
+    # Simulate the third-party library: hold the same file open in append mode.
     holder = open(log, "a", encoding="utf-8")
     try:
         holder.write("from-the-other-handle-1\n")
         holder.flush()
 
         sup.trim_log(log, max_bytes=200, keep_bytes=100)
-        assert log.stat().st_size <= 200, "沒有修剪"
+        assert log.stat().st_size <= 200, "did not trim"
 
-        # 修剪之後，另一個控制代碼仍然寫得進**可見的**檔案。
+        # After trimming, the other handle still writes into the **visible** file.
         holder.write("from-the-other-handle-2\n")
         holder.flush()
         text = log.read_text(encoding="utf-8")
         assert "from-the-other-handle-2" in text, (
-            "修剪換掉了 inode，另一個行程的 append 掉進看不見的舊檔案了。"
-            "trim_log 必須就地覆寫。")
+            "trimming swapped the inode, and the other process's append fell into "
+            "the now-invisible old file. trim_log must overwrite in place.")
     finally:
         holder.close()
 
-    # 反面：確認 os.replace 在這個情境下真的會失敗——這支測試的理由建立在這件事上，
-    # 哪天平台行為變了，這裡會紅，那就該重新評估整條規則而不是默默留著。
+    # The reverse: confirm os.replace really does fail in this situation — this
+    # test's rationale rests on that, so if platform behaviour ever changes this
+    # goes red, and then the whole rule should be re-evaluated rather than quietly
+    # left in place.
     if os.name == "nt":
         log2 = tmp_path / "app2.log"
         log2.write_text("x\n", encoding="utf-8")
@@ -676,8 +761,9 @@ def test_trim_log_must_not_become_an_atomic_write(tmp_path):
             try:
                 os.replace(tmp, log2)
                 raise AssertionError(
-                    "Windows 現在允許取代開著的檔案了——本測試的前提變了，"
-                    "重新評估 trim_log 該不該改成原子寫入，不要直接刪掉這一段。")
+                    "Windows now allows replacing an open file — this test's "
+                    "premise has changed; re-evaluate whether trim_log should "
+                    "become an atomic write, do not just delete this block.")
             except PermissionError:
                 pass
         finally:
@@ -685,28 +771,31 @@ def test_trim_log_must_not_become_an_atomic_write(tmp_path):
 
 
 def test_trim_log_does_not_use_an_atomic_writer():
-    """靜態面：`trim_log` 的原始碼裡不得出現 `os.replace`。
+    """The static side: `os.replace` must not appear in `trim_log`'s source.
 
-    上面那支驗的是行為，這支擋的是「看起來很對」的一行修改。兩支都要——行為那支
-    需要平台配合，靜態這支在任何平台都會擋。
+    The test above verifies behaviour; this one blocks a "looks right" one-line
+    change. Both are needed — the behavioural one needs platform cooperation, the
+    static one blocks on any platform.
     """
     import _supervisor as sup
 
     source = inspect.getsource(sup.trim_log)
     assert "os.replace" not in source and "replace(" not in source, (
-        "trim_log 用了 os.replace。這個檔案同時有兩個活著的 append 控制代碼，"
-        "Windows 上 os.replace 會直接 PermissionError，而 trim_log 把 OSError "
-        "吞掉——結果是記錄檔再也不會被修剪，且完全無聲。")
+        "trim_log uses os.replace. This file has two live append handles at once, "
+        "on Windows os.replace goes straight to PermissionError, and trim_log "
+        "swallows OSError — the result is the log never being trimmed again, and "
+        "entirely silently.")
 
 
 def test_trim_log_never_raises_on_a_missing_file(tmp_path):
-    """記錄檔不存在／讀不到時只是不修剪——監督者不得因為記錄檔而死。"""
+    """When the log file is missing / unreadable, just do not trim — the
+    supervisor must not die over a log file."""
     import _supervisor as sup
     sup.trim_log(tmp_path / "nope.log", max_bytes=1, keep_bytes=1)
 
 
 def main():
-    # parametrize 過的案例在 standalone 時要自己展開，否則會少跑。
+    # Parametrized cases must be expanded by hand in standalone, or some are missed.
     import tempfile
 
     groups = [
@@ -737,7 +826,8 @@ def main():
          test_a_degraded_shell_can_still_be_released),
         ("test_dropping_the_reference_does_not_release_the_lock",
          test_dropping_the_reference_does_not_release_the_lock),
-        # POSIX 分支那三支刻意不用 monkeypatch fixture，所以 standalone 也跑得到。
+        # The three POSIX-branch tests deliberately avoid the monkeypatch fixture,
+        # so standalone reaches them too.
         ("test_the_posix_branch_takes_a_non_blocking_exclusive_flock",
          test_the_posix_branch_takes_a_non_blocking_exclusive_flock),
         ("test_the_posix_branch_maps_a_locked_file_to_none_and_closes_the_fd",
@@ -753,7 +843,8 @@ def main():
                 f(d) for d in [tempfile.mkdtemp(prefix="supervisor_test_")]
             ][0],
         ))
-    # errno 白名單那兩組——這次改動的核心，standalone 也要跑得到。
+    # The two errno-whitelist groups — the core of this change, standalone must
+    # reach them too.
     for errno_name, expected in _CONTENDED_ERRNOS:
         groups.append((
             "test_a_contended_lock_errno_still_means_another_instance"
@@ -789,8 +880,9 @@ def main():
     groups.append((
         "test_both_launchers_discover_the_interpreter_the_same_way",
         test_both_launchers_discover_the_interpreter_the_same_way))
-    # DoD #5 的行為面：這幾支刻意用 `_Swapped` 而不是 monkeypatch fixture，
-    # 就是為了 standalone runner 也跑得到（AST 守門看不到接線對不對）。
+    # DoD #5's behavioural side: these deliberately use `_Swapped` rather than the
+    # monkeypatch fixture, precisely so the standalone runner reaches them too (the
+    # AST guard cannot see whether the wiring is right).
     for launcher in _LAUNCHERS:
         for os_name in sorted(_VENV_LAYOUT):
             groups.append((
@@ -850,7 +942,7 @@ def main():
          test_a_bad_byte_from_the_child_does_not_stop_the_pump),
         ("test_the_child_gets_utf8_io_encoding",
          test_the_child_gets_utf8_io_encoding),
-        # 同一條規則的另一半——只有它分得出覆寫與 `setdefault`。
+        # The other half of the same rule — only it tells overwrite apart from `setdefault`.
         ("test_a_wrong_pythonioencoding_in_the_parent_is_overridden",
          test_a_wrong_pythonioencoding_in_the_parent_is_overridden),
         ("test_log_lines_carry_a_timestamp_but_the_console_does_not",
@@ -888,7 +980,7 @@ def main():
          test_a_stuck_child_is_killed_last),
         ("test_the_two_timeouts_are_not_swapped",
          test_the_two_timeouts_are_not_swapped),
-        # 失敗路徑裡不吃 fixture 的那幾支。
+        # The failure-path tests that take no fixture.
         ("test_other_launcher_pids_without_psutil_returns_empty",
          test_other_launcher_pids_without_psutil_returns_empty),
         ("test_other_launcher_pids_skips_a_process_it_cannot_parse",
@@ -910,16 +1002,18 @@ def main():
         print(name)
         try:
             fn()
-        except pytest.skip.Exception as reason:  # 環境限制，不是失敗
+        except pytest.skip.Exception as reason:  # environment limit, not a failure
             skipped += 1
-            print(f"  SKIP（{reason}）\n")
+            print(f"  SKIP ({reason})\n")
             continue
         print("  PASS\n")
-    suffix = f"（{skipped} 筆因環境略過）" if skipped else ""
-    # 這個 runner 是**逐支具名註冊**的，所以它一定會落後於檔案裡實際定義的測試——
-    # 2026-09-03 實測 30/34，少的四支是吃 pytest fixture／parametrize 的那幾支，
-    # 叫不動是應該的。問題不在少跑，而在**沒有講**：一句不帶條件的「ALL N PASSED」
-    # 會被讀成「全部都過了」。所以這裡照 `test_bot_helpers` 的做法把差額印出來。
+    suffix = f" ({skipped} skipped due to environment)" if skipped else ""
+    # This runner registers each test **by name individually**, so it will always
+    # lag behind the tests actually defined in the file — measured 30/34 on
+    # 2026-09-03, the missing four being the ones that take a pytest fixture /
+    # parametrize, which it rightly cannot invoke. The problem is not running
+    # fewer, but **not saying so**: an unconditional "ALL N PASSED" reads as
+    # "everything passed". So print the shortfall, following `test_bot_helpers`.
     try:
         declared = sum(
             1 for node in ast.parse(
@@ -928,8 +1022,8 @@ def main():
             and node.name.startswith("test_"))
         missing = declared - len(groups)
         if missing > 0:
-            suffix += (f"（另有 {missing} 支需要 pytest fixture／parametrize，"
-                       "standalone 跑不到；完整結果請跑 pytest）")
+            suffix += (f" ({missing} more need a pytest fixture / parametrize and "
+                       "standalone cannot reach them; for the full result run pytest)")
     except Exception:  # pylint: disable=broad-except  # nosec B110
         pass
     print(f"ALL {len(groups) - skipped} TEST GROUPS PASSED{suffix}")
@@ -938,23 +1032,27 @@ def main():
 
 
 # ---------------------------------------------------------------------------
-# 兩支啟動器都要有單一實例鎖
+# Both launchers must have a single-instance lock
 #
-# 2026-09-03 補。`start_discord_bot.py` 從 2026-08-30 就有一把，`start_webrunner.py`
-# 一直沒有——純屬遺漏，而**沒鎖的那一側後果更重**：bot 本體自己還有第二把鎖兜著，
-# webrunner 一層都沒有。兩個批次監督者同時跑 ⇒ 兩個 webrunner 搶同一份
-# `.chrome_profile/`、互相 nuclear sweep、從同一組 `todo_*.md` 重複取件，兩邊看起來
-# 都正常。這在接上「開機自動啟動」之後會從偶發變成常態（使用者手動開著、開機任務
-# 又開一個），所以鎖是那條路的前置條件。
+# Added 2026-09-03. `start_discord_bot.py` has had one since 2026-08-30;
+# `start_webrunner.py` never did — purely an omission, and **the unlocked side
+# has the heavier consequences**: the bot body has a second lock backing it up,
+# the webrunner has not one layer. Two batch supervisors running at once ⇒ two
+# webrunners fighting over the same `.chrome_profile/`, nuclear-sweeping each
+# other, picking the same `todo_*.md` items twice, both looking normal. Once
+# "autostart" is wired up this goes from occasional to routine (the user has one
+# open manually, the startup task opens another), so the lock is a prerequisite
+# for that path.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 def test_every_launcher_takes_a_single_instance_lock(launcher):
-    """用 AST 檢查真的有呼叫，不是只 import 進來擺著。
+    """Use AST to check it is actually called, not just imported and left sitting.
 
-    這支測試存在的理由就是它抓到的那個不對稱：兩支啟動器長得幾乎一樣，少一把鎖
-    從外面完全看不出來，而症狀（重複實例）看起來像是別的東西壞了。
+    This test exists because of the asymmetry it caught: the two launchers look
+    almost identical, a missing lock is invisible from the outside, and the
+    symptom (duplicate instances) looks like something else broke.
     """
     path = os.path.join(REPO_ROOT, launcher)
     with open(path, encoding="utf-8") as handle:
@@ -962,13 +1060,15 @@ def test_every_launcher_takes_a_single_instance_lock(launcher):
     called = {node.func.id for node in ast.walk(tree)
               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
     assert "acquire_single_instance_lock" in called, (
-        f"{launcher} 沒有取得單一實例鎖。兩支啟動器都必須擋掉「被啟動兩次」——"
-        "webrunner 那一側尤其重要，它底下沒有第二層保護。")
+        f"{launcher} does not acquire a single-instance lock. Both launchers must "
+        "block 'being started twice' — the webrunner side especially, since it has "
+        "no second layer of protection underneath.")
 
 
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 def test_every_launcher_locks_its_own_file(launcher):
-    """一支程式一個鎖檔。共用的話啟動器會把自己 spawn 的子行程擋掉。"""
+    """One lock file per program. Sharing one means the launcher blocks the very
+    child it spawned."""
     path = os.path.join(REPO_ROOT, launcher)
     with open(path, encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
@@ -976,11 +1076,12 @@ def test_every_launcher_locks_its_own_file(launcher):
              for node in ast.walk(tree)
              if isinstance(node, ast.Assign) and len(node.targets) == 1
              and isinstance(node.targets[0], ast.Name)}
-    assert "LOCK_FILE" in names, f"{launcher} 沒有定義 LOCK_FILE"
+    assert "LOCK_FILE" in names, f"{launcher} does not define LOCK_FILE"
 
 
 def test_the_two_launchers_do_not_share_a_lock_file():
-    """共用一個鎖檔 ＝ 先起來的那一支把另一支永久擋掉。"""
+    """Sharing one lock file = whichever starts first blocks the other
+    permanently."""
     seen = {}
     for launcher in _LAUNCHERS:
         path = os.path.join(REPO_ROOT, launcher)
@@ -991,19 +1092,22 @@ def test_the_two_launchers_do_not_share_a_lock_file():
                     and isinstance(node.targets[0], ast.Name)
                     and node.targets[0].id == "LOCK_FILE"):
                 seen[launcher] = ast.unparse(node.value)
-    assert len(seen) == len(_LAUNCHERS), f"有啟動器沒有 LOCK_FILE：{seen}"
+    assert len(seen) == len(_LAUNCHERS), f"a launcher has no LOCK_FILE: {seen}"
     assert len(set(seen.values())) == len(seen), (
-        f"兩支啟動器共用同一個鎖檔：{seen}。這會讓其中一支永遠啟動不了。")
-    # bot 本體自己那一把也不得與啟動器共用（見 acquire_single_instance_lock）。
+        f"the two launchers share the same lock file: {seen}. That makes one of "
+        "them unable to start forever.")
+    # The bot body's own lock must not be shared with the launcher either (see
+    # acquire_single_instance_lock).
     assert ".discord_bot.lock" not in {v.split('/')[-1].strip('\'"')
                                        for v in seen.values()}
 
 
 def test_other_launcher_pids_ignores_a_process_that_merely_mentions_the_name():
-    """子字串比對會把「命令列裡剛好提到檔名」的 shell 與 `python -c` 算成實例。
+    """A substring match would count a shell or `python -c` that "just mentions
+    the filename on the command line" as an instance.
 
-    這條規則在 `_process_control` 那邊實測過 7 筆裡有 5 筆是這種；搬上來共用之後
-    要確定沒有在搬家途中掉了。
+    Measured on the `_process_control` side, 5 of 7 entries were this kind; after
+    lifting it up to be shared, make sure it was not lost in the move.
     """
     from _supervisor import other_launcher_pids
     procs = [(11, "python.exe", ["python.exe", "-c", "print('start_webrunner.py')"], 1)]
@@ -1018,7 +1122,7 @@ def test_other_launcher_pids_finds_a_real_second_instance():
 
 
 def test_other_launcher_pids_excludes_itself():
-    """自己不是「另一個實例」。"""
+    """We are not "another instance"."""
     from _supervisor import other_launcher_pids
     procs = [(99, "python.exe",
               ["C:/py/python.exe", "D:/Work/Example/start_webrunner.py"], 1)]
@@ -1026,22 +1130,25 @@ def test_other_launcher_pids_excludes_itself():
 
 
 def test_other_launcher_pids_collapses_the_shim_and_the_real_interpreter():
-    r"""`.venv\Scripts\python.exe` 是轉接殼，會 spawn 真的直譯器：cmdline 一模一樣、
-    父子關係。不併的話一個既有實例會被報成兩個 pid，讀的人以為自己開了兩份。"""
+    r"""`.venv\Scripts\python.exe` is a stub that spawns the real interpreter:
+    identical cmdline, parent/child relationship. If not collapsed, one existing
+    instance gets reported as two pids and the reader thinks they opened two."""
     from _supervisor import other_launcher_pids
     cmd = ["D:/Work/Example/.venv/Scripts/python.exe",
            "D:/Work/Example/start_webrunner.py"]
-    procs = [(11, "python.exe", cmd, 1),      # 轉接殼
-             (12, "python.exe", cmd, 11)]     # 本尊（parent = 11）
+    procs = [(11, "python.exe", cmd, 1),      # the stub
+             (12, "python.exe", cmd, 11)]     # the real one (parent = 11)
     assert other_launcher_pids("start_webrunner.py", self_pid=99,
                                procs=procs) == [11]
 
 
 def test_other_launcher_pids_can_be_narrowed_to_one_platform():
-    """bot 的啟動器是**一個平台一個行程**，而它們共用同一個腳本檔名。
+    """The bot's launcher is **one process per platform**, and they share one
+    script filename.
 
-    不收窄的話「telegram 那一支在跑嗎」會被另一個平台的那一支答成「在」，於是
-    `wake_autostart` 永遠叫不醒它——而那個症狀是「叫醒完成」，看起來完全正常。
+    Without narrowing, "is the telegram one running" gets answered "yes" by
+    another platform's process, so `wake_autostart` can never wake it — and the
+    symptom is "wake complete", which looks entirely normal.
     """
     from _supervisor import other_launcher_pids
     script = "start_discord_bot.py"
@@ -1057,7 +1164,8 @@ def test_other_launcher_pids_can_be_narrowed_to_one_platform():
 
 
 def test_the_platform_filter_matches_a_whole_argument_not_a_substring():
-    """`telegram2` 不是 `telegram`。逐字比對一整個 argv 元素，不是子字串。"""
+    """`telegram2` is not `telegram`. Match a whole argv element verbatim, not a
+    substring."""
     from _supervisor import other_launcher_pids
     script = "start_discord_bot.py"
     procs = [(11, "python.exe",
@@ -1067,7 +1175,7 @@ def test_the_platform_filter_matches_a_whole_argument_not_a_substring():
 
 
 def test_other_launcher_pids_never_raises_on_junk():
-    """診斷用的東西不該把啟動器弄掛。"""
+    """A diagnostic must not crash the launcher."""
     from _supervisor import other_launcher_pids
     for junk in ([(None, None, None, None)], [(1, "python.exe", None, 0)], []):
         assert other_launcher_pids("start_webrunner.py", self_pid=9,
@@ -1075,7 +1183,7 @@ def test_other_launcher_pids_never_raises_on_junk():
 
 
 def _load_launcher(name):
-    """把啟動器當模組載進來（不執行 `main()`）。"""
+    """Load the launcher as a module (without running `main()`)."""
     path = os.path.join(REPO_ROOT, name)
     spec = importlib.util.spec_from_file_location(name[:-3], path)
     module = importlib.util.module_from_spec(spec)
@@ -1086,15 +1194,20 @@ def _load_launcher(name):
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 def test_a_held_lock_stops_the_launcher_before_it_spawns_anything(
         launcher, tmp_path, monkeypatch):
-    """鎖被別人持有時，啟動器必須在 spawn **之前**就退出。
+    """When the lock is held by someone else, the launcher must exit **before**
+    spawning anything.
 
-    AST 那兩支只證明「有呼叫、鎖檔不同」，證明不了接線對不對——`if lock is None`
-    寫反了照樣通過。這支從 `main()` 進去實跑一遍，斷言的是「監督迴圈根本沒被
-    呼叫」，也就是「沒有第二個瀏覽器堆疊被開出來」這件事本身。
+    The two AST tests only prove "it is called, the lock files differ", not
+    whether the wiring is right — `if lock is None` written backwards passes just
+    the same. This one enters through `main()` and actually runs, asserting "the
+    supervise loop was never called at all", i.e. the very fact that "no second
+    browser stack was opened".
 
-    刻意**不**用子行程跑真的啟動器：萬一鎖沒擋住，真的會 spawn 出一個 webrunner，
-    而 webrunner 一啟動就無條件 nuclear sweep 掉所有 chrome——正式批次的瀏覽器會
-    當場被殺。測一個安全機制不該冒它要防的那個險。
+    It deliberately does **not** run the real launcher in a subprocess: if the
+    lock failed to block, a webrunner really would be spawned, and a webrunner on
+    startup unconditionally nuclear-sweeps all chrome — the production batch's
+    browsers would be killed on the spot. Testing a safety mechanism should not
+    risk the very thing it guards against.
     """
     module = _load_launcher(launcher)
     monkeypatch.setattr(module, "LOCK_FILE", tmp_path / "test.lock")
@@ -1102,10 +1215,12 @@ def test_a_held_lock_stops_the_launcher_before_it_spawns_anything(
                         else "BOT_LOG", tmp_path / "test.log")
     monkeypatch.setattr(sys, "argv", [launcher])
 
-    # 攔截器**丟例外**而不是回一個 rc。回 rc 的話，bot 那一支的 `while True:`
-    # 監督迴圈會把「子行程乾淨結束」當成要重生，於是每 5 秒轉一圈永遠不停——
-    # 這支測試在變異測試裡就是這樣掛住的（實際踩到）。掛住的測試比紅掉的測試更
-    # 糟：紅的會指出問題，掛住的只是讓整輪停在那裡。
+    # The interceptor **raises** rather than returning an rc. If it returned an rc,
+    # the bot's `while True:` supervise loop would treat "the child exited cleanly"
+    # as a cue to respawn, spinning once every 5 seconds forever — which is exactly
+    # how this test hung under mutation testing (hit for real). A hung test is
+    # worse than a red one: red points at the problem, hung just leaves the whole
+    # run stuck there.
     class _Spawned(Exception):
         pass
 
@@ -1119,26 +1234,29 @@ def test_a_held_lock_stops_the_launcher_before_it_spawns_anything(
     if held is None or held.degraded:
         if held is not None:
             held.release()
-        pytest.skip("這台機器拿不到檔案鎖，測不出互斥")
+        pytest.skip("this machine cannot get a file lock; mutual exclusion untestable")
     try:
         try:
             rc = module.main()
         except _Spawned:
             pytest.fail(
-                f"{launcher} 在鎖已被持有的情況下**還是 spawn 了**。這正是這把鎖"
-                "要擋的：兩套堆疊同時跑，兩邊看起來都正常。")
+                f"{launcher} **still spawned** while the lock was held. This is "
+                "exactly what this lock blocks: two stacks running at once, both "
+                "looking normal.")
     finally:
         held.release()
 
-    assert rc != 0, f"{launcher} 被鎖擋下卻回報成功（rc={rc}）"
+    assert rc != 0, f"{launcher} was blocked by the lock but reported success (rc={rc})"
 
 
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 def test_a_missing_target_script_stops_the_launcher_before_anything_else(
         launcher, tmp_path, monkeypatch, capsys):
-    """要監督的那支程式不在（搬走、改名、clone 不完整）：回非 0、講一聲，**在拿鎖、
-    修剪記錄檔、spawn 之前**就停。拿了鎖才發現，會讓另一個正常的啟動器以為已經有人在跑。
-    每一個後續步驟都換成會丟例外的絆線。"""
+    """When the program to supervise is missing (moved, renamed, incomplete
+    clone): return non-zero, say a word, and stop **before taking the lock,
+    trimming the log, or spawning**. Finding out only after taking the lock would
+    make another healthy launcher think someone is already running. Every
+    subsequent step is replaced with a trip-wire that raises."""
     module = _load_launcher(launcher)
     missing = tmp_path / "gone.py"
     if "webrunner" in launcher:
@@ -1162,27 +1280,31 @@ def test_a_missing_target_script_stops_the_launcher_before_anything_else(
     try:
         rc = module.main()
     except _Reached:
-        pytest.fail(f"{launcher} 目標程式不在卻繼續往下走了")
+        pytest.fail(f"{launcher} kept going even though the target program is missing")
     assert rc == 1
     assert "gone.py" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
-# Ctrl+C 之後的收屍（`reap_child`）
+# Reaping after Ctrl+C (`reap_child`)
 #
-# 2026-09-05 量覆蓋率時發現這一支**一行都沒被跑過**。它是「先禮後兵」那條路：
-# 等 → terminate → kill。寫錯的後果不會當場報錯，而是留下孤兒子行程——webrunner
-# 那一側連帶留下整棵 Chrome，下一次啟動就變成兩套堆疊搶同一份 `.chrome_profile/`。
-# 用假的 proc 驗，不開真的行程：這裡要釘的是**順序與逾時值**，不是作業系統行為。
+# Measuring coverage on 2026-09-05 found that **not one line of this had ever
+# run**. It is the "courtesy first, force after" path: wait → terminate → kill.
+# Getting it wrong reports no error on the spot but leaves an orphan child — on
+# the webrunner side a whole Chrome tree along with it, and the next start becomes
+# two stacks fighting over the same `.chrome_profile/`. Verify with a fake proc,
+# not a real process: what to pin here is the **order and timeout values**, not
+# the OS's behaviour.
 # ---------------------------------------------------------------------------
 
 class _FakeProc:
-    """`wait()` 依腳本逐次回應：`"timeout"` 丟 TimeoutExpired，數字就當 rc 回傳。"""
+    """`wait()` responds by script, one call at a time: `"timeout"` throws
+    TimeoutExpired, a number is returned as the rc."""
 
     def __init__(self, script):
         self._script = list(script)
-        self.waits = []          # 每次 wait 收到的 timeout（None ＝沒給）
-        self.calls = []          # terminate / kill / wait 的先後順序
+        self.waits = []          # the timeout each wait received (None = not given)
+        self.calls = []          # the order of terminate / kill / wait
 
     def wait(self, timeout=None):
         self.waits.append(timeout)
@@ -1206,11 +1328,12 @@ def test_a_child_that_exits_in_time_is_not_terminated():
     rc = sup.reap_child(proc, None, grace_sec=30.0, kill_sec=10.0)
     assert rc == 0
     assert proc.calls == ["wait"], (
-        "子行程自己收工了卻還是被 terminate／kill：" + repr(proc.calls))
+        "the child finished on its own but was still terminated/killed: " + repr(proc.calls))
 
 
 def test_a_childs_own_exit_code_is_passed_through():
-    """收屍不能把 rc 吃掉——監督者要靠它分辨「自己停的」與「掛了」。"""
+    """Reaping must not swallow the rc — the supervisor needs it to tell "stopped
+    itself" from "crashed"."""
     import _supervisor as sup
 
     proc = _FakeProc([3])
@@ -1225,8 +1348,8 @@ def test_a_slow_child_gets_terminated_but_not_killed():
     assert rc == 0
     assert proc.calls == ["wait", "terminate", "wait"], repr(proc.calls)
     assert "kill" not in proc.calls, (
-        "terminate 之後就收工了，不該再 kill——kill 等於 TerminateProcess，"
-        "子行程的 finally 完全不會跑")
+        "it finished after terminate, so there should be no kill — kill equals "
+        "TerminateProcess, and the child's finally does not run at all")
 
 
 def test_a_stuck_child_is_killed_last():
@@ -1240,11 +1363,13 @@ def test_a_stuck_child_is_killed_last():
 
 
 def test_the_two_timeouts_are_not_swapped():
-    """寬限期給第一次等待、kill 逾時給第二次，最後那一次**不設逾時**。
+    """The grace period goes to the first wait, the kill timeout to the second,
+    and the last one has **no timeout**.
 
-    對調不會有任何症狀——兩個都是正數，流程照跑——但意思整個相反：本來要給子行程
-    30 秒收尾的，變成只給 10 秒。最後一次若也帶逾時則更糟：kill 之後還可能丟
-    TimeoutExpired 出去，收屍反而變成拋例外。
+    Swapping them has no symptom — both are positive, the flow runs the same — but
+    the meaning inverts entirely: the 30 seconds meant to let the child wrap up
+    becomes only 10. If the last one also carried a timeout it would be worse:
+    after kill it could throw TimeoutExpired outward, turning reaping into raising.
     """
     import _supervisor as sup
 
@@ -1254,31 +1379,36 @@ def test_the_two_timeouts_are_not_swapped():
 
 
 # ===========================================================================
-# 失敗路徑（2026-09-07 補齊）
+# Failure paths (filled in 2026-09-07)
 #
-# 量覆蓋率時（全套 2742 passed）不看百分比、只問「哪些 `except` 分支一行都沒被
-# 執行過」，答案是：**這個模組的每一個錯誤處理器都沒有**。監督者存在的唯一理由
-# 就是「別的東西壞掉的時候撐住」，所以這等於它最核心的職責從來沒被驗證過。而它
-# 是整條復原鏈的根——它自己在處理錯誤的路上掛掉，上面所有東西一起停，**而且不會
-# 有任何錯誤訊息**，因為會印訊息的那個東西就是掛掉的那個。
+# Measuring coverage (whole suite 2742 passed) without looking at percentages,
+# only asking "which `except` branches never ran a single line", the answer was:
+# **not one error handler in this module had**. The supervisor's only reason to
+# exist is to "hold up when other things break", so this means its most central
+# responsibility had never been verified. And it is the root of the whole
+# recovery chain — if it dies on its own error-handling path, everything above it
+# stops together, **and with no error message at all**, because the thing that
+# would print the message is the thing that died.
 #
-# 補的過程中抓到兩個真缺陷，各自有對應的行為測試（不是靜態掃描）：
-#   * `echo_line` 的退版寫入不在任何保護之下（見
-#     `test_a_console_that_breaks_during_the_fallback_never_escapes`）。
-#   * `stream_child` 的 spawn hook 失敗會留下孤兒子行程（見
-#     `test_a_failing_spawn_hook_does_not_leave_an_orphan`）。
+# Filling it in caught two real defects, each with a matching behavioural test
+# (not a static scan):
+#   * `echo_line`'s fallback write was under no protection at all (see
+#     `test_a_console_that_breaks_during_the_fallback_never_escapes`).
+#   * `stream_child`'s spawn-hook failure left an orphan child (see
+#     `test_a_failing_spawn_hook_does_not_leave_an_orphan`).
 # ===========================================================================
 
 
 class _NoModule:
-    """讓 `import <name>` 真的丟 `ImportError` 的 context manager。
+    """A context manager that makes `import <name>` really throw `ImportError`.
 
-    **一定要寫 `sys.modules[name] = None`，不可以 `pop`／`del`。** `pop` 只是清掉
-    快取，接下來的 `import` 會從磁碟重新載入**真的那一個**——2026-09-07 就是這樣
-    讓一支「模擬 psutil 不存在」的測試拿到真的 psutil，然後 `proc.kill()` 殺掉了
-    這台機器上一個跑了 78.7 小時的正式批次的 Chrome，而測試表面上只是斷言失敗。
-    CPython 看到 `sys.modules[name] is None` 會直接丟 `ImportError`、不會去找
-    檔案，那才是「不存在」。
+    **You must write `sys.modules[name] = None`, never `pop` / `del`.** `pop` only
+    clears the cache, and the next `import` reloads **the real one** from disk —
+    that is how, on 2026-09-07, a test "simulating psutil being absent" got the
+    real psutil and then `proc.kill()` killed the Chrome of a 78.7-hour production
+    batch on this machine, while the test on the surface only failed an assertion.
+    When CPython sees `sys.modules[name] is None` it throws `ImportError` outright,
+    without looking for the file — that is what "absent" means.
     """
 
     _ABSENT = object()
@@ -1296,27 +1426,29 @@ class _NoModule:
     def __exit__(self, *_exc):
         for name, saved in self._saved.items():
             if saved is self._ABSENT:
-                sys.modules.pop(name, None)   # 本來就不在，還原＝拿掉
+                sys.modules.pop(name, None)   # was absent to begin with; restore = remove
             else:
                 sys.modules[name] = saved
         return False
 
 
 # ---------------------------------------------------------------------------
-# 單一實例鎖：用**兩個真的行程**驗互斥
+# Single-instance lock: verify mutual exclusion with **two real processes**
 # ---------------------------------------------------------------------------
 #
-# 既有的那支（`test_second_acquire_is_refused_while_the_first_still_holds`）是同一
-# 個行程開兩個 fd。那證明得了「同一支程式不能自己鎖兩次」，證明不了這把鎖真正要
-# 擋的情境——**開機自動啟動的那一份，與使用者自己開的那一份，是兩個行程**。
-# Windows 的 `msvcrt.locking` 與 POSIX 的 `flock` 都是掛在 open file description
-# 上，同行程／跨行程的語意本來就可能不同，所以要跨行程才算驗過。
+# The existing test (`test_second_acquire_is_refused_while_the_first_still_holds`)
+# opens two fds in the same process. That proves "one program cannot lock itself
+# twice", not the situation this lock really guards — **the autostart copy and
+# the user's own copy are two processes**. Windows' `msvcrt.locking` and POSIX's
+# `flock` both hang off the open file description, and same-process / cross-process
+# semantics can differ, so it only counts as verified once it is cross-process.
 #
-# 鎖檔一律開在 `tmp_path`：正式的 `.webrunner_supervisor.lock` /
-# `.discord_bot_supervisor.lock` 摸都不要摸，這台機器上有長跑中的正式批次。
+# Lock files are always opened in `tmp_path`: do not so much as touch the
+# production `.webrunner_supervisor.lock` / `.discord_bot_supervisor.lock`, since
+# this machine has a long-running production batch.
 
 _LOCK_PROBE_SOURCE = '''
-"""一次性探針：試著取得單一實例鎖，把結果寫進 verdict 檔。"""
+"""One-shot probe: try to acquire the single-instance lock, write the result to a verdict file."""
 import os
 import pathlib
 import sys
@@ -1338,7 +1470,8 @@ pathlib.Path(tmp).write_text(verdict, encoding="utf-8")
 os.replace(tmp, verdict_path)
 
 if mode == "hold" and verdict == "ACQUIRED":
-    # 等父行程放行。60 秒是**自保上限**：測試中途被砍也不會留下一個握著鎖的孤兒。
+    # Wait for the parent to release. 60 seconds is a **self-protection cap**: if
+    # the test is cut down midway, no orphan is left holding the lock.
     deadline = time.time() + 60.0
     while time.time() < deadline and not pathlib.Path(go_path).exists():
         time.sleep(0.02)
@@ -1349,22 +1482,25 @@ if lock is not None:
 
 
 def _spawn_lock_probe(script, tmp_path, lock_file, tag, *, mode="try"):
-    """起一個真的行程去搶 `lock_file`，回 `(proc, verdict 檔)`。"""
+    """Start a real process to contend for `lock_file`, return `(proc, verdict
+    file)`."""
     verdict = tmp_path / (tag + ".verdict")
     proc = subprocess.Popen(
         [sys.executable, str(script), PKG_ROOT, str(lock_file), str(verdict),
          str(tmp_path / "go"), mode],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        # 子行程的診斷是 UTF-8，但管線**兩端**在 Windows 上都預設走 cp950。
-        # `encoding="utf-8"` 只管解碼端，子行程的編碼端要靠 `PYTHONIOENCODING`
-        # ——`_supervisor.stream_child` 從一開始就是這樣做的，這裡補齊。
+        # The child's diagnostics are UTF-8, but **both ends** of the pipe default
+        # to cp950 on Windows. `encoding="utf-8"` covers only the decode end; the
+        # child's encode end needs `PYTHONIOENCODING` — `_supervisor.stream_child`
+        # has done this from the start, and this matches it.
         text=True, encoding="utf-8", errors="replace",
         env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     return proc, verdict
 
 
 def _read_verdict(path, *, seconds=60.0):
-    """等 verdict 檔出現並回內容；逾時回 None（**有界**，不會把整輪卡住）。"""
+    """Wait for the verdict file to appear and return its content; on timeout
+    return None (**bounded**, never wedges the whole run)."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if path.exists():
@@ -1376,15 +1512,19 @@ def _read_verdict(path, *, seconds=60.0):
 
 
 def test_a_second_process_really_cannot_take_the_lock(tmp_path):
-    """兩個**真的行程**同時要這把鎖，只有一個拿得到；持有者退出後才輪得到別人。
+    """Two **real processes** want this lock at once, only one gets it; another
+    only gets a turn after the holder exits.
 
-    這正是 2026-09-03 補 `.webrunner_supervisor.lock` 的理由：兩個批次監督者同時
-    跑 ⇒ 兩個 webrunner 搶同一份 `.chrome_profile/`、各自 nuclear sweep 把對方的
-    Chrome 殺掉、從同一組 `todo_*.md` 重複取件，而**兩邊的 log 看起來都正常**。
+    This is exactly why `.webrunner_supervisor.lock` was added on 2026-09-03: two
+    batch supervisors running at once ⇒ two webrunners fighting over the same
+    `.chrome_profile/`, each nuclear-sweeping the other's Chrome, picking the same
+    `todo_*.md` items twice, while **both logs look normal**.
 
-    設計成「持有者先就位，挑戰者才起跑」而不是「三個一起搶」，是為了不引入時序
-    競賽：真的同時起跑的話，贏家可能在輸家還沒開始前就釋放了，於是偶爾兩個都
-    ACQUIRED——一支會隨機紅的守門，最後一定會被當成雜訊關掉。
+    Designing it as "the holder gets into place first, then the challenger starts"
+    rather than "three grabbing at once" avoids a timing race: with a true
+    simultaneous start, the winner might release before the loser even begins, so
+    occasionally both are ACQUIRED — a guard that goes red at random, which
+    eventually gets switched off as noise.
     """
     script = tmp_path / "lock_probe.py"
     script.write_text(_LOCK_PROBE_SOURCE, encoding="utf-8")
@@ -1396,18 +1536,19 @@ def test_a_second_process_really_cannot_take_the_lock(tmp_path):
     try:
         first = _read_verdict(holder_verdict)
         if first == "DEGRADED":
-            pytest.skip("這台機器拿不到檔案鎖，測不出互斥")
+            pytest.skip("this machine cannot get a file lock; mutual exclusion untestable")
         assert first == "ACQUIRED", (
-            f"持有者行程沒有拿到鎖（verdict={first!r}）")
+            f"the holder process did not get the lock (verdict={first!r})")
 
         for tag in ("other1", "other2"):
             proc, verdict_path = _spawn_lock_probe(
                 script, tmp_path, lock_file, tag)
             output = proc.communicate(timeout=120)[0]
-            assert proc.returncode == 0, f"探針自己壞了：{output}"
+            assert proc.returncode == 0, f"the probe itself broke: {output}"
             assert _read_verdict(verdict_path, seconds=10) == "REFUSED", (
-                f"{tag}：鎖已被另一個行程持有，第二個實例卻拿到了。這把鎖擋的就是"
-                "「開機自動啟動的那份 ＋ 使用者自己開的那份」同時在跑。")
+                f"{tag}: the lock is already held by another process but a second "
+                "instance got it. This lock blocks exactly 'the autostart copy + "
+                "the user's own copy' running at once.")
     finally:
         go.write_text("go", encoding="utf-8")
         try:
@@ -1416,29 +1557,35 @@ def test_a_second_process_really_cannot_take_the_lock(tmp_path):
             holder.kill()
             holder.communicate()
 
-    # 持有者結束 ⇒ OS 立刻放掉鎖，下一個行程必須拿得到。拿不到就代表殘留了一把
-    # 誰也解不開的鎖，開機自動啟動會從此永遠起不來。
+    # Holder exits ⇒ the OS releases the lock immediately, and the next process
+    # must be able to get it. If it cannot, a lock nobody can break was left
+    # behind, and autostart can never start again.
     proc, verdict_path = _spawn_lock_probe(script, tmp_path, lock_file, "after")
     output = proc.communicate(timeout=120)[0]
-    assert proc.returncode == 0, f"探針自己壞了：{output}"
+    assert proc.returncode == 0, f"the probe itself broke: {output}"
     assert _read_verdict(verdict_path, seconds=10) == "ACQUIRED", (
-        "持有者已經結束，鎖卻還是拿不到——殘留鎖會讓啟動器再也起不來。")
+        "the holder has already exited but the lock still cannot be obtained — a "
+        "stale lock would leave the launcher unable to start again.")
 
 
 def test_a_platform_without_file_locking_still_starts(tmp_path):
-    """沒有 `msvcrt`／`fcntl` 時往「照常啟動」倒，而且**不可以**回 None。
+    """With no `msvcrt` / `fcntl`, fall toward "start anyway", and **must not**
+    return None.
 
-    判錯成「拒絕」會讓啟動器因為一個與它無關的平台問題完全不啟動、而且沒有人會
-    發現；判錯成「放行」最多退回加這把鎖之前的狀態。`None` 是「已有實例」專用的
-    答案，這條路回它就等於謊報。
+    Getting it wrong as "refuse" makes the launcher fail to start at all over a
+    platform problem unrelated to it, with nobody noticing; getting it wrong as
+    "allow" at worst reverts to the state before this lock existed. `None` is the
+    answer reserved for "already an instance", so returning it on this path is a
+    lie.
     """
     path = _lock_path(tmp_path)
     with _NoModule("msvcrt", "fcntl"):
         lock = acquire_single_instance_lock(path)
-        assert lock is not None, "不可回 None——那會被啟動器解讀成『已有實例』"
-        assert lock.degraded is True, "鎖機制不可用時必須誠實標記成 degraded"
-        # degraded 是「沒有互斥保證」的殼，所以第二個也會拿到。這是刻意的取捨，
-        # 寫在這裡是為了讓下一個讀的人知道它不是漏掉。
+        assert lock is not None, "must not return None — the launcher reads that as 'already an instance'"
+        assert lock.degraded is True, "when the locking mechanism is unavailable it must honestly mark itself degraded"
+        # degraded is a shell with "no mutual-exclusion guarantee", so a second
+        # one gets it too. This is a deliberate trade-off, written here so the
+        # next reader knows it is not an oversight.
         second = acquire_single_instance_lock(path)
         assert second is not None and second.degraded is True
         second.release()
@@ -1446,19 +1593,22 @@ def test_a_platform_without_file_locking_still_starts(tmp_path):
 
 
 def test_refusing_a_second_instance_survives_a_failing_close(tmp_path):
-    """讓位那條路上連 `os.close` 都失敗，仍然要乾淨地回 `None`。
+    """Even when `os.close` fails on the stand-aside path, it must still return
+    `None` cleanly.
 
-    這是「已經有另一個實例」唯一的出口。它在收尾時 `os.close(fd)`，而 close 是
-    會失敗的（fd 早被別的東西回收、網路磁碟丟 EIO）。沒接住的話，第二個實例不是
-    印出「已經有另一個實例在執行」而是吐一整段 traceback ——使用者看到的是
-    「啟動器壞了」，不是「本來就不該開第二個」。
+    This is the only exit for "another instance already exists". It does
+    `os.close(fd)` on wrap-up, and close can fail (the fd was reclaimed by
+    something else, a network drive throws EIO). Uncaught, the second instance
+    does not print "another instance is already running" but spits a whole
+    traceback — the user sees "the launcher broke", not "a second one should never
+    have been opened".
     """
     path = _lock_path(tmp_path)
     first = acquire_single_instance_lock(path)
     assert first is not None
     if first.degraded:
         first.release()
-        pytest.skip("這台機器拿不到檔案鎖，測不出互斥")
+        pytest.skip("this machine cannot get a file lock; mutual exclusion untestable")
 
     real_open, real_close = os.open, os.close
     ours: set[int] = set()
@@ -1472,7 +1622,7 @@ def test_refusing_a_second_instance_survives_a_failing_close(tmp_path):
     def _fake_close(fd):
         if fd in ours:
             ours.discard(fd)
-            real_close(fd)      # 真的關掉，不然這支測試自己會漏 fd
+            real_close(fd)      # really close it, or this test itself leaks the fd
             raise OSError(9, "Bad file descriptor")
         return real_close(fd)
 
@@ -1483,60 +1633,70 @@ def test_refusing_a_second_instance_survives_a_failing_close(tmp_path):
         os.open, os.close = real_open, real_close
         first.release()
     assert second is None, (
-        "第二個實例應該安靜地拿到 None；收尾時的 close 失敗不該讓它爆出例外。")
+        "the second instance should quietly get None; a close failure on wrap-up "
+        "must not make it blow up with an exception.")
 
 
 def test_release_survives_a_close_that_fails(tmp_path):
-    """`finally: lock.release()` 在 fd 已經不見時也不得丟例外。
+    """`finally: lock.release()` must not throw even when the fd is already gone.
 
-    `release` 的註解說它只是禮貌性收尾（OS 在行程結束時本來就會放），所以它**更
-    不該**是啟動器收工路上唯一會炸的一行——那會把真正的結束原因蓋掉。
+    `release`'s note says it is just a courtesy wrap-up (the OS releases on
+    process exit anyway), so it must **all the more** not be the one line that
+    blows up on the launcher's wrap-up path — that would mask the real exit reason.
     """
     path = _lock_path(tmp_path)
     lock = acquire_single_instance_lock(path)
     assert lock is not None
-    # 從背後把 fd 關掉，`release` 之後那次 close 就會拿到 EBADF。
+    # Close the fd behind its back, so the close inside `release` then gets EBADF.
     os.close(lock._fd)          # noqa: SLF001  # pylint: disable=protected-access
-    lock.release()              # 不得丟例外
+    lock.release()              # must not throw
     again = acquire_single_instance_lock(path)
-    assert again is not None, "fd 都關了，鎖必須真的放掉"
+    assert again is not None, "the fd is closed, so the lock must really be released"
     again.release()
 
 
 # ---------------------------------------------------------------------------
-# POSIX 的 `fcntl.flock` 分支——在 Windows 上照樣測得到（2026-09-08）
+# The POSIX `fcntl.flock` branch — testable on Windows all the same (2026-09-08)
 # ---------------------------------------------------------------------------
 #
-# 曾有一筆待辦寫著這條分支「在一般的機器上永遠到不了，判定完成需要一台
-# Linux」。**前提是錯的。** kernel 真正的 flock 語意本來就不是我們該測的東西；我們
-# 自己寫的那一段全是純 Python，換掉 `os.name` 與 `fcntl` 兩個相依就跑得完：
+# A todo once said this branch "can never be reached on an ordinary machine, and
+# marking it done needs a Linux box". **The premise was wrong.** The kernel's real
+# flock semantics are not ours to test anyway; the stretch we wrote ourselves is
+# all pure Python, and swapping the two dependencies `os.name` and `fcntl` runs it
+# to completion:
 #
-#   * 有沒有走對分支（`os.name` 判斷）；
-#   * 旗標是不是 `LOCK_EX | LOCK_NB`——漏掉 `LOCK_NB` 會變成**阻塞版**，第二個實例
-#     不是印一行「已經有另一個實例在執行」然後退出，而是安靜地卡在那裡等到天荒地老，
-#     而開機自動啟動那份就這樣掛著；
-#   * 交給 flock 的是不是 `os.open` 拿到的那個 fd；
-#   * `OSError` 有沒有映射成 `None` 並把 fd 關掉；
-#   * `ImportError` 有沒有降級成殼而**不是** `None`。
+#   * whether the right branch is taken (the `os.name` check);
+#   * whether the flag is `LOCK_EX | LOCK_NB` — missing `LOCK_NB` turns it into
+#     the **blocking** version, and the second instance, instead of printing
+#     "another instance is already running" and exiting, quietly waits there
+#     forever, with the autostart copy hung like that;
+#   * whether the fd handed to flock is the one from `os.open`;
+#   * whether `OSError` maps to `None` and closes the fd;
+#   * whether `ImportError` degrades to a shell and **not** `None`.
 #
-# 教訓比這幾支測試本身值錢：「這個分支只有在別的作業系統上才跑得到」聽起來像事實，
-# 其實只是還沒想到怎麼把那個作業系統條件替換掉——跟 CLAUDE.md 那條「不要拿不存在
-# 的限制當理由推掉改動」是同一個形狀。
+# The lesson is worth more than the tests themselves: "this branch is only
+# reachable on another OS" sounds like a fact, but is really just not yet having
+# thought of how to substitute that OS condition away — the same shape as
+# CLAUDE.md's "do not use a non-existent limitation as a reason to push back a
+# change".
 
 try:
     import msvcrt as _REAL_MSVCRT
-except ImportError:             # 非 Windows
+except ImportError:             # non-Windows
     _REAL_MSVCRT = None
 
 _MISSING = object()
 
 
 class _PosixOs:
-    """讓 `_supervisor` 眼中的 `os.name` 變成 `"posix"`，其餘一律轉給真的 `os`。
+    """Make the `os.name` seen by `_supervisor` become `"posix"`, delegating
+    everything else to the real `os`.
 
-    刻意**不**寫 `setattr(os, "name", "posix")`：那會改到整個行程看到的 `os.name`，
-    本檔還有 daemon 抽水執行緒在跑，不該連它們一起騙。換掉的是
-    `_supervisor` 模組自己那個 `os` 名字，範圍剛好是被測的那一段。
+    Deliberately does **not** write `setattr(os, "name", "posix")`: that would
+    change the `os.name` the whole process sees, and this file still has daemon
+    pump threads running that should not be fooled along with it. What is swapped
+    is `_supervisor`'s own `os` name binding, scoped exactly to the code under
+    test.
     """
 
     name = "posix"
@@ -1546,10 +1706,11 @@ class _PosixOs:
 
 
 class _RecordingPosixOs(_PosixOs):
-    """再加上記帳：哪些 fd 被開、哪些被關。
+    """Plus bookkeeping: which fds are opened, which are closed.
 
-    測「fd 有沒有被關掉」不去翻 `lock._fd` 這種私有欄位——那會讓測試綁死在實作的
-    欄位名上；記 `os.close` 的呼叫問的才是行為本身。
+    Testing "was the fd closed" without reaching into a private field like
+    `lock._fd` — that would tie the test to the implementation's field name;
+    recording `os.close` calls asks about the behaviour itself.
     """
 
     def __init__(self):
@@ -1567,10 +1728,11 @@ class _RecordingPosixOs(_PosixOs):
 
 
 class _FakeFcntl:
-    """假的 `fcntl`：記下 `flock` 的呼叫，其餘什麼都不做。
+    """A fake `fcntl`: record the `flock` call, do nothing else.
 
-    常數用 POSIX 的真值（`LOCK_EX=2` / `LOCK_NB=4`），所以「只傳 `LOCK_EX`」的
-    阻塞版退化會得到 2 而不是 6——分得出來。
+    The constants use POSIX's real values (`LOCK_EX=2` / `LOCK_NB=4`), so a
+    "pass only `LOCK_EX`" blocking-version regression gets 2 rather than 6 —
+    distinguishable.
     """
 
     LOCK_SH = 1
@@ -1590,13 +1752,15 @@ class _FakeFcntl:
 
 def _msvcrt_must_not_be_used(*_args, **_kwargs):
     raise AssertionError(
-        "走到 Windows 分支了——`os.name` 的判斷壞了，POSIX 那一半根本沒被測到。")
+        "the Windows branch was taken — the `os.name` check broke, and the POSIX "
+        "half was never tested at all.")
 
 
 class _Swapped:
-    """`setattr` 版的 try/finally。**刻意不用 `monkeypatch` fixture**：本檔的
-    standalone runner（`py -3 test/test_supervisor.py`）沒有 pytest fixture，
-    用 fixture 的話這幾支在那條路上會整組消失。
+    """A `setattr`-based try/finally. **Deliberately not the `monkeypatch`
+    fixture**: this file's standalone runner (`py -3 test/test_supervisor.py`) has
+    no pytest fixtures, and with a fixture these tests would vanish entirely on
+    that path.
     """
 
     def __init__(self, obj, attr, value):
@@ -1617,10 +1781,12 @@ class _Swapped:
 
 
 class _FakeModule:
-    """把 `sys.modules[name]` 暫時換成一個假模組（還原時本來沒有就拿掉）。
+    """Temporarily replace `sys.modules[name]` with a fake module (removed on
+    restore if it was absent to begin with).
 
-    「模組**不存在**」不走這條，走 `_NoModule`——`sys.modules[name] = None` 才是
-    真的 ImportError，`pop`／`del` 只會讓下一次 import 載入**真的那一個**。
+    "The module is **absent**" does not take this path but `_NoModule` —
+    `sys.modules[name] = None` is the real ImportError, whereas `pop` / `del` only
+    makes the next import load **the real one**.
     """
 
     def __init__(self, name, module):
@@ -1642,11 +1808,13 @@ class _FakeModule:
 
 @contextlib.contextmanager
 def _posix_branch(fake_fcntl):
-    """把 `_supervisor` 暫時拉進 POSIX 分支，yield 出記帳用的假 `os`。
+    """Pull `_supervisor` temporarily into the POSIX branch, yielding the
+    bookkeeping fake `os`.
 
-    `fake_fcntl=None` ＝ 讓 `import fcntl` 丟 `ImportError`（走降級那條）。順手把
-    `msvcrt.locking` 換成「一被呼叫就爆」，這樣萬一分支判斷壞掉、走回 Windows 那
-    一半，是**當場失敗**而不是靠「flock 沒被呼叫」間接推論。
+    `fake_fcntl=None` = make `import fcntl` throw `ImportError` (the degrade path).
+    Also swap `msvcrt.locking` for "blow up the moment it is called", so that if
+    the branch check breaks and falls back to the Windows half, it **fails on the
+    spot** rather than being inferred indirectly from "flock was not called".
     """
     import _supervisor as sup
 
@@ -1664,118 +1832,132 @@ def _posix_branch(fake_fcntl):
 
 
 def test_the_posix_branch_takes_a_non_blocking_exclusive_flock(tmp_path):
-    """POSIX 那條路：`flock(fd, LOCK_EX | LOCK_NB)`，fd 就是剛 `os.open` 的那個。
+    """The POSIX path: `flock(fd, LOCK_EX | LOCK_NB)`, and the fd is the one just
+    `os.open`ed.
 
-    `LOCK_NB` 是這裡唯一真正致命的旗標。拿掉它 `flock` 會**阻塞**，於是第二個實例
-    既不會回 `None` 也不會印任何東西——它就掛在那裡等第一個結束。開機自動啟動的
-    那一份卡成這樣，使用者只會看到「bot 沒起來」，沒有任何線索。
+    `LOCK_NB` is the only truly fatal flag here. Remove it and `flock` **blocks**,
+    so the second instance neither returns `None` nor prints anything — it just
+    hangs there waiting for the first to finish. With the autostart copy stuck
+    like that, the user only sees "the bot did not come up", with no clue.
     """
     fake_fcntl = _FakeFcntl()
     with _posix_branch(fake_fcntl) as fake_os:
         lock = acquire_single_instance_lock(_lock_path(tmp_path))
         try:
             assert lock is not None and not lock.degraded, (
-                "POSIX 分支順利拿到鎖時要回一個正常的 InstanceLock")
-            assert len(fake_os.opened) == 1, "應該只開一個 fd"
+                "when the POSIX branch acquires the lock it must return a normal InstanceLock")
+            assert len(fake_os.opened) == 1, "should open only one fd"
             assert fake_fcntl.calls == [
                 (fake_os.opened[0],
                  _FakeFcntl.LOCK_EX | _FakeFcntl.LOCK_NB)
             ], (
-                "flock 必須拿 os.open 回來的那個 fd，旗標必須是 "
-                "LOCK_EX|LOCK_NB。少了 LOCK_NB 就是阻塞版：第二個實例不會被拒絕，"
-                "會安靜地卡住。")
+                "flock must take the fd os.open returned, and the flag must be "
+                "LOCK_EX|LOCK_NB. Missing LOCK_NB is the blocking version: the "
+                "second instance is not refused, it hangs quietly.")
         finally:
             lock.release()
 
 
 def test_the_posix_branch_maps_a_locked_file_to_none_and_closes_the_fd(tmp_path):
-    """已被別的行程鎖住 ⇒ 回 `None`，而且**要把 fd 關掉**。
+    """Already locked by another process ⇒ return `None`, and **close the fd**.
 
-    `None` 是「已有實例」專用的答案，回 degraded 的殼就等於讓第二個實例照常啟動。
-    fd 沒關掉的話，一支長命的啟動器每次退讓都漏一個 fd。
+    `None` is the answer reserved for "already an instance"; returning a degraded
+    shell lets the second instance start as usual. If the fd is not closed, a
+    long-lived launcher leaks one fd on every stand-aside.
     """
     fake_fcntl = _FakeFcntl(error=OSError(11, "Resource temporarily unavailable"))
     with _posix_branch(fake_fcntl) as fake_os:
         lock = acquire_single_instance_lock(_lock_path(tmp_path))
         assert lock is None, (
-            "flock 丟 OSError ＝ 已有另一個實例，必須回 None。回 InstanceLock "
-            "（含 degraded 的殼）就是放第二個監督者進來。")
+            "flock throwing OSError = another instance exists, must return None. "
+            "Returning an InstanceLock (including a degraded shell) lets a second "
+            "supervisor in.")
         assert len(fake_os.opened) == 1
         fd = fake_os.opened[0]
-        assert fake_os.closed == [fd], "讓位那條路要把剛開的 fd 關掉"
+        assert fake_os.closed == [fd], "the stand-aside path must close the fd just opened"
         with pytest.raises(OSError):
-            os.fstat(fd)        # 真的關了，不只是記了一筆
+            os.fstat(fd)        # really closed, not just recorded
 
 
 def test_the_posix_branch_without_fcntl_degrades_instead_of_refusing(tmp_path):
-    """POSIX 上沒有 `fcntl`（極罕見）時往「照常啟動」倒，**不可以**回 `None`。
+    """When there is no `fcntl` on POSIX (extremely rare), fall toward "start
+    anyway", and **must not** return `None`.
 
-    與 `test_a_platform_without_file_locking_still_starts` 同一條規則，但走的是
-    **另一行程式碼**：那支在這台機器上撞的是 `import msvcrt`，這支撞的是
-    `import fcntl`。
+    The same rule as `test_a_platform_without_file_locking_still_starts`, but via
+    **a different line of code**: that one hits `import msvcrt` on this machine,
+    this one hits `import fcntl`.
     """
     with _posix_branch(None) as fake_os:
         lock = acquire_single_instance_lock(_lock_path(tmp_path))
-        assert lock is not None, "不可回 None——那會被啟動器解讀成『已有實例』"
-        assert lock.degraded is True, "鎖機制不可用時必須誠實標記成 degraded"
-        # 這條路刻意**保留** fd（`InstanceLock(fd, ...)`），不像讓位那條當場關掉。
+        assert lock is not None, "must not return None — the launcher reads that as 'already an instance'"
+        assert lock.degraded is True, "when the locking mechanism is unavailable it must honestly mark itself degraded"
+        # This path deliberately **keeps** the fd (`InstanceLock(fd, ...)`), unlike
+        # the stand-aside path which closes it on the spot.
         assert len(fake_os.opened) == 1 and fake_os.closed == []
         lock.release()
         assert fake_os.closed == [fake_os.opened[0]]
 
 
 # ---------------------------------------------------------------------------
-# 「有人持有」與「這裡鎖不動」是兩件事，靠 errno 分（2026-09-08）
+# "someone holds it" and "cannot lock here" are two different things, told apart
+# by errno (2026-09-08)
 # ---------------------------------------------------------------------------
 #
-# 改之前 `acquire_single_instance_lock` 的 `except OSError` 一律 `return None`，
-# 也就是把**所有**鎖失敗都講成「已經有另一個實例在執行」。那跟這個函式自己
-# docstring 寫明的政策（判斷不出來就往「照常啟動」倒）**正好相反**，而且失敗形態
-# 極難追：一個與併發完全無關的檔案系統問題（EBADF／EINVAL／不支援檔案鎖的網路
-# 磁碟給的 ENOLCK）會讓啟動器**永遠拒絕啟動**，訊息還指著一個不存在的實例，甚至
-# 附上「既有 pid」——而那份 pid 清單是另一支診斷函式掃出來的，跟鎖沒有關係。
+# Before the change, `acquire_single_instance_lock`'s `except OSError` always
+# `return None`, i.e. reported **every** lock failure as "another instance is
+# already running". That is **exactly the opposite** of the policy this function's
+# own docstring spells out (when it cannot decide, fall toward "start anyway"),
+# and the failure mode is very hard to trace: a filesystem problem entirely
+# unrelated to concurrency (EBADF / EINVAL / the ENOLCK a network drive that does
+# not support file locks gives) makes the launcher **refuse to start forever**,
+# with the message pointing at an instance that does not exist and even attaching
+# "existing pids" — and that pid list is scanned by a different diagnostic
+# function, unrelated to the lock.
 #
-# 本機實測（Windows 11 / CPython，2026-09-08）：
+# Measured locally (Windows 11 / CPython, 2026-09-08):
 #
-#   msvcrt.locking(fd, LK_NBLCK, 1) 對已鎖住的區段   → errno=13  EACCES
-#   msvcrt.locking(fd, LK_LOCK,  1) 重試失敗          → errno=36  EDEADLOCK
-#   msvcrt.locking(壞掉的 fd)                          → errno=9   EBADF
-#   msvcrt.locking(fd, LK_NBLCK, -1)                   → errno=22  EINVAL
+#   msvcrt.locking(fd, LK_NBLCK, 1) on an already-locked region → errno=13  EACCES
+#   msvcrt.locking(fd, LK_LOCK,  1) retry failure                → errno=36  EDEADLOCK
+#   msvcrt.locking(a broken fd)                                   → errno=9   EBADF
+#   msvcrt.locking(fd, LK_NBLCK, -1)                              → errno=22  EINVAL
 #
-# 前兩個是「有人持有」，後兩個是「鎖不動」——**分得出來**，所以沒有理由混為一談。
+# The first two are "someone holds it", the last two are "cannot lock" —
+# **distinguishable**, so there is no reason to conflate them.
 
 _CONTENDED_ERRNOS = [
-    ("EACCES", 13),        # Windows msvcrt：實測值
+    ("EACCES", 13),        # Windows msvcrt: measured value
     ("EAGAIN", None),      # POSIX flock
-    ("EWOULDBLOCK", None),  # POSIX flock（Windows 上跟 EAGAIN 不同值，見下）
-    ("EDEADLK", None),     # ＝ EDEADLOCK(36)，阻塞版 msvcrt 的答案
+    ("EWOULDBLOCK", None),  # POSIX flock (a different value from EAGAIN on Windows, see below)
+    ("EDEADLK", None),     # = EDEADLOCK(36), the blocking msvcrt's answer
 ]
 
 
 @pytest.mark.parametrize(("name", "expected_value"), _CONTENDED_ERRNOS)
 def test_a_contended_lock_errno_still_means_another_instance(
         name, expected_value, tmp_path):
-    """代表「被別人持有」的那幾個 errno 必須照舊回 `None` 並關掉 fd。
+    """The errnos that mean "held by someone else" must still return `None` and
+    close the fd.
 
-    這是白名單**收得太緊**的方向：漏掉任何一個，真的有第二個實例時就會被放行，
-    而那正是這把鎖存在的唯一理由。
+    This is the direction where the whitelist is **too tight**: miss any one of
+    them and a real second instance gets let through, which is the only reason
+    this lock exists.
     """
     import errno as errno_mod
     number = getattr(errno_mod, name, None)
     if number is None:
-        pytest.skip(f"這個平台沒有 errno.{name}")
+        pytest.skip(f"this platform has no errno.{name}")
     if expected_value is not None:
         assert number == expected_value, (
-            f"errno.{name} 在這台機器上是 {number}，不是實測記錄的 "
-            f"{expected_value}——白名單的註解要跟著更新")
+            f"errno.{name} is {number} on this machine, not the measured-recorded "
+            f"{expected_value} — the whitelist's comment needs updating")
 
     fake_fcntl = _FakeFcntl(error=OSError(number, os.strerror(number)))
     with _posix_branch(fake_fcntl) as fake_os:
         lock = acquire_single_instance_lock(_lock_path(tmp_path))
         assert lock is None, (
-            f"errno={number}（{name}）代表另一個實例正在跑，必須回 None。回 "
-            "degraded 的殼就是放第二個監督者進來。")
-        assert fake_os.closed == fake_os.opened, "讓位那條路要把 fd 關掉"
+            f"errno={number} ({name}) means another instance is running, must "
+            "return None. Returning a degraded shell lets a second supervisor in.")
+        assert fake_os.closed == fake_os.opened, "the stand-aside path must close the fd"
 
 
 _UNDECIDABLE_ERRNOS = ["EBADF", "EINVAL", "ENOLCK", "ENOSYS", "EPERM", "EIO"]
@@ -1784,36 +1966,43 @@ _UNDECIDABLE_ERRNOS = ["EBADF", "EINVAL", "ENOLCK", "ENOSYS", "EPERM", "EIO"]
 @pytest.mark.parametrize("name", _UNDECIDABLE_ERRNOS)
 def test_an_unknown_lock_errno_degrades_instead_of_claiming_another_instance(
         name, tmp_path):
-    """不在白名單的 errno ＝「判斷不出來」⇒ degraded 的殼，**不是** `None`。
+    """An errno not on the whitelist = "cannot decide" ⇒ a degraded shell, **not**
+    `None`.
 
-    **這條就是這次改動買到的全部價值。** 回 `None` 的話，一個與併發無關的檔案
-    系統問題會被講成「已經有另一個實例在執行」，啟動器從此永遠拒絕啟動——而使用者
-    看到的訊息指著一個不存在的實例，沒有任何線索指向真正的原因。
+    **This is the entire value this change bought.** Returning `None` reports a
+    concurrency-unrelated filesystem problem as "another instance is already
+    running", the launcher refuses to start forever, and the message the user sees
+    points at an instance that does not exist, with no clue toward the real cause.
     """
     import errno as errno_mod
     number = getattr(errno_mod, name, None)
     if number is None:
-        pytest.skip(f"這個平台沒有 errno.{name}")
+        pytest.skip(f"this platform has no errno.{name}")
 
     fake_fcntl = _FakeFcntl(error=OSError(number, os.strerror(number)))
     with _posix_branch(fake_fcntl) as fake_os:
         lock = acquire_single_instance_lock(_lock_path(tmp_path))
         assert lock is not None, (
-            f"errno={number}（{name}）代表鎖機制本身有問題，不代表有別的實例。"
-            "回 None 會讓啟動器永遠拒絕啟動，而且錯誤訊息指向不存在的實例。")
-        assert lock.degraded is True, "放行時必須誠實標記成 degraded"
-        # 這條路刻意保留 fd（跟 `ImportError` 那條一致），`release()` 才關。
+            f"errno={number} ({name}) means the locking mechanism itself has a "
+            "problem, not that another instance exists. Returning None makes the "
+            "launcher refuse to start forever, with the error pointing at a "
+            "nonexistent instance.")
+        assert lock.degraded is True, "when allowing, it must honestly mark itself degraded"
+        # This path deliberately keeps the fd (consistent with the `ImportError`
+        # path); `release()` closes it.
         assert fake_os.closed == []
         lock.release()
 
 
 def test_an_oserror_without_an_errno_is_also_undecidable(tmp_path):
-    """`OSError` 的 `errno` 可能是 `None`。那更是「判斷不出來」，不是「有人持有」。
+    """An `OSError`'s `errno` can be `None`. That is all the more "cannot decide",
+    not "someone holds it".
 
-    `None in frozenset_of_ints` 是 False，所以這條**自然**落在降級那邊；寫一支釘住
-    是因為「順手把預設值改成回 None」看起來很無害。
+    `None in frozenset_of_ints` is False, so this **naturally** lands on the
+    degrade side; a test pins it because "casually change the default to return
+    None" looks harmless.
     """
-    fake_fcntl = _FakeFcntl(error=OSError("鎖呼叫壞了，沒有 errno"))
+    fake_fcntl = _FakeFcntl(error=OSError("the lock call broke, no errno"))
     with _posix_branch(fake_fcntl):
         lock = acquire_single_instance_lock(_lock_path(tmp_path))
         assert lock is not None and lock.degraded is True
@@ -1821,11 +2010,13 @@ def test_an_oserror_without_an_errno_is_also_undecidable(tmp_path):
 
 
 def test_the_contended_errno_list_covers_both_platforms():
-    """白名單必須同時涵蓋 Windows 與 POSIX 的答案，而且不能假設兩者相等。
+    """The whitelist must cover both the Windows and POSIX answers, and must not
+    assume the two are equal.
 
-    `EWOULDBLOCK` 在 Linux 上就是 `EAGAIN`（都是 11），**但在 Windows 的 CPython
-    上不是**：實測 `EAGAIN == 11`、`EWOULDBLOCK == 10035`（Winsock 的
-    WSAEWOULDBLOCK）。只寫其中一個，就會在某一個平台上漏掉「已被持有」的答案。
+    `EWOULDBLOCK` on Linux is just `EAGAIN` (both 11), **but on Windows CPython it
+    is not**: measured `EAGAIN == 11`, `EWOULDBLOCK == 10035` (Winsock's
+    WSAEWOULDBLOCK). Writing only one of them misses the "already held" answer on
+    one platform.
     """
     import errno as errno_mod
     from _supervisor import _LOCK_HELD_ERRNOS  # noqa: SLF001
@@ -1834,36 +2025,45 @@ def test_the_contended_errno_list_covers_both_platforms():
         number = getattr(errno_mod, name, None)
         if number is not None:
             assert number in _LOCK_HELD_ERRNOS, (
-                f"errno.{name}（{number}）不在白名單裡——那個平台的「已被持有」"
-                "會被誤判成「鎖壞了」，於是重複實例被放行。")
+                f"errno.{name} ({number}) is not in the whitelist — that platform's "
+                "'already held' would be misread as 'the lock broke', and duplicate "
+                "instances get let through.")
     for name in ("EBADF", "EINVAL", "ENOLCK"):
         number = getattr(errno_mod, name, None)
         if number is not None:
             assert number not in _LOCK_HELD_ERRNOS, (
-                f"errno.{name}（{number}）不該在白名單裡——那是「鎖不動」，"
-                "把它當成「有人持有」就會讓啟動器永遠拒絕啟動。")
+                f"errno.{name} ({number}) should not be in the whitelist — that is "
+                "'cannot lock', and treating it as 'someone holds it' makes the "
+                "launcher refuse to start forever.")
 
 
 # ---------------------------------------------------------------------------
-# `degraded` 必須被講出來（2026-09-08）
+# `degraded` must be announced (2026-09-08)
 # ---------------------------------------------------------------------------
 #
-# 在這之前，`degraded` 在正式程式碼裡**一處都沒有被讀過**——只有 `_supervisor.py`
-# 的三個地方設定它，其餘全是測試在讀。也就是說「這台機器上的互斥保護沒有生效」
-# 這件事，使用者永遠不會知道：啟動器照常啟動、log 一切正常，而重複實例會在幾天後
-# 以完全不同的症狀出現（webrunner 那一側是兩個批次互相 nuclear sweep）。
+# Before this, `degraded` was **read nowhere** in production code — only the three
+# places in `_supervisor.py` set it, and everything else reading it was tests.
+# That means "mutual-exclusion protection is not in effect on this machine" is
+# something the user would never know: the launcher starts as usual, the log looks
+# entirely normal, and duplicate instances surface days later with an entirely
+# different symptom (on the webrunner side, two batches nuclear-sweeping each
+# other).
 #
-# 無聲的降級跟沒有這把鎖是同一件事。上面那個 errno 白名單把「判斷不出來」從
-# 「拒絕啟動」改成「照常啟動」，**這一節是那個改動的另一半**：放行可以，但不准
-# 安靜地放行。
+# A silent degradation is the same thing as not having this lock. The errno
+# whitelist above changed "cannot decide" from "refuse to start" to "start
+# anyway"; **this section is the other half of that change**: allowing is fine,
+# but silently allowing is not.
 
 
 def _launcher_says_with_a_degraded_lock(launcher, tmp_path, monkeypatch):
-    """讓啟動器拿到一個 degraded 的鎖，回收它 `say()` 出來的 `(訊息, err)`。
+    """Give the launcher a degraded lock and collect the `(message, err)` it
+    `say()`s.
 
-    `acquire_single_instance_lock` 直接換成回殼的替身——**不去真的製造一個鎖不動的
-    檔案系統**。spawn 的入口一律換成會丟例外的攔截器（不可以回 rc：bot 那支的
-    `while True:` 會把乾淨結束當成要重生，測試會掛住而不是紅掉）。
+    `acquire_single_instance_lock` is swapped directly for a stub that returns a
+    shell — **without actually manufacturing a filesystem where locking fails**.
+    The spawn entry points are all swapped for an interceptor that raises (it must
+    not return an rc: the bot's `while True:` treats a clean exit as a cue to
+    respawn, and the test would hang rather than go red).
     """
     module = _load_launcher(launcher)
     work = tmp_path / launcher
@@ -1896,11 +2096,14 @@ def _launcher_says_with_a_degraded_lock(launcher, tmp_path, monkeypatch):
     try:
         module.main()
     except _Spawned:
-        pass                    # 走到 spawn 就夠了，這支不關心之後的事
+        pass                    # reaching spawn is enough; this does not care about what follows
     return said
 
 
 def _degraded_lines(said):
+    # The substring below matches the launchers' Chinese degraded-lock line, which
+    # lives in start_discord_bot.py / start_webrunner.py (out of scope here), so it
+    # is intentionally left untranslated.
     return [(message, err) for message, err in said
             if "單一實例保護" in message]
 
@@ -1908,54 +2111,63 @@ def _degraded_lines(said):
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 def test_every_launcher_announces_a_degraded_lock(launcher, tmp_path,
                                                   monkeypatch):
-    """互斥保護沒生效時，兩支啟動器都要出聲。
+    """When mutual-exclusion protection is not in effect, both launchers must
+    speak up.
 
-    這是 errno 白名單那個改動的配套：放行未知的鎖錯誤是刻意的取捨，但**放行不得
-    是無聲的**。少了這一行，「這台機器上的鎖沒用」就變成只有讀原始碼才知道的事。
+    This is the companion to the errno-whitelist change: allowing an unknown lock
+    error is a deliberate trade-off, but **allowing must not be silent**. Without
+    this line, "the lock on this machine does nothing" becomes something you learn
+    only by reading the source.
     """
     said = _launcher_says_with_a_degraded_lock(launcher, tmp_path, monkeypatch)
     lines = _degraded_lines(said)
     assert lines, (
-        f"{launcher} 拿到 degraded 的鎖卻什麼都沒說。使用者會以為重複啟動被擋著，"
-        "而實際上沒有。")
+        f"{launcher} got a degraded lock but said nothing. The user thinks "
+        "duplicate startup is blocked when it is not.")
 
     for message, err in lines:
-        # 降級**不是**錯誤，不要送到 stderr 讓它看起來像一次失敗。
+        # A degradation is **not** an error; do not send it to stderr where it
+        # looks like a failure.
         assert err is False, (
-            f"{launcher} 把降級訊息當成錯誤送出（err=True）。它是降級不是失敗，"
-            "混在錯誤裡會被當成雜訊略過。")
-        # 訊息不得帶主機絕對路徑（鎖檔路徑正是最順手會被塞進去的東西）。
+            f"{launcher} sent the degradation message as an error (err=True). It "
+            "is a degradation, not a failure; mixed in with errors it gets skipped "
+            "as noise.")
+        # The message must not carry a host absolute path (the lock file path is
+        # the most tempting thing to stuff in).
         assert ":\\" not in message and ":/" not in message, (
-            f"{launcher} 的降級訊息帶了主機絕對路徑：{message!r}")
+            f"{launcher}'s degradation message carries a host absolute path: {message!r}")
         assert str(tmp_path) not in message
 
 
 def test_both_launchers_use_the_same_degraded_wording(tmp_path, monkeypatch):
-    """兩支的措辭要一模一樣——這是「兩份實作」典型會各自漂移的地方。"""
+    """The two must be worded identically — this is a classic spot where "two
+    implementations" drift apart."""
     wordings = {}
     for launcher in _LAUNCHERS:
         said = _launcher_says_with_a_degraded_lock(launcher, tmp_path,
                                                    monkeypatch)
         lines = _degraded_lines(said)
-        assert lines, f"{launcher} 沒有講出降級"
+        assert lines, f"{launcher} did not announce the degradation"
         wordings[launcher] = [message for message, _err in lines]
 
     first, second = (wordings[name] for name in _LAUNCHERS)
     assert first == second, (
-        "兩支啟動器的降級訊息不一致。同一件事在兩個地方用兩種說法，讀 log 的人"
-        f"會以為是兩種不同的狀況：\n  {first}\n  {second}")
+        "the two launchers' degradation messages disagree. The same thing said "
+        "two ways in two places makes a log reader think they are two different "
+        f"situations:\n  {first}\n  {second}")
 
 
 # ---------------------------------------------------------------------------
-# `other_launcher_pids`：診斷用的東西**永遠不該**把啟動器弄掛
+# `other_launcher_pids`: a diagnostic **must never** crash the launcher
 # ---------------------------------------------------------------------------
 
 
 def test_other_launcher_pids_without_psutil_returns_empty():
-    """沒有 psutil 就回空 list——這只是給訊息用的診斷，決策是鎖的事。
+    """With no psutil, return an empty list — this is a diagnostic for the
+    message; deciding is the lock's job.
 
-    讓它往上丟 `ImportError` 的話，一個「順便講一下既有 pid」的功能會變成啟動器
-    起不來的原因。
+    Letting it re-raise `ImportError` would turn a "mention the existing pids in
+    passing" feature into the reason the launcher cannot start.
     """
     from _supervisor import other_launcher_pids
     with _NoModule("psutil"):
@@ -1963,14 +2175,16 @@ def test_other_launcher_pids_without_psutil_returns_empty():
 
 
 def test_other_launcher_pids_skips_a_process_it_cannot_parse():
-    """單一筆行程資料壞掉時跳過它，**不要**把整份掃描結果丟掉。
+    """When one process record is broken, skip it, **do not** throw away the whole
+    scan result.
 
-    psutil 回來的東西不是我們控制的（`cmdline()` 在權限不足或行程剛死時可能回
-    奇怪的值）。少認一筆只是訊息少一個 pid；整份掉光的話，使用者會看到「沒有其他
-    實例」——而事實正好相反。
+    What psutil returns is not ours to control (`cmdline()` can return odd values
+    when permissions are insufficient or a process just died). Missing one entry
+    only drops one pid from the message; losing the whole thing shows the user "no
+    other instances" — the exact opposite of the truth.
     """
     from _supervisor import other_launcher_pids
-    procs = [(11, "python.exe", 12345, 1),          # cmdline 不是序列
+    procs = [(11, "python.exe", 12345, 1),          # cmdline is not a sequence
              (12, "python.exe",
               ["py.exe", "D:/Work/Example/start_webrunner.py"], 1)]
     assert other_launcher_pids("start_webrunner.py", self_pid=99,
@@ -1978,82 +2192,92 @@ def test_other_launcher_pids_skips_a_process_it_cannot_parse():
 
 
 def test_other_launcher_pids_keeps_what_it_found_when_the_scan_blows_up():
-    """掃描器本身掃到一半炸掉時，已經找到的照樣回報。
+    """When the scanner itself blows up midway, still report what it already
+    found.
 
-    這條與上一條刻意用**不同**的輸入：上一條的例外發生在單筆解析（內層），這一條
-    發生在迭代器本身（外層）。用同一個輸入的話，兩層保護會互相遮蔽——刪掉任何一層
-    測試都還是綠的。
+    This deliberately uses **different** input from the previous test: there the
+    exception happens in per-entry parsing (inner), here in the iterator itself
+    (outer). Using the same input would let the two protection layers mask each
+    other — deleting either layer stays green.
     """
     from _supervisor import other_launcher_pids
 
     def _procs():
         yield (11, "python.exe",
                ["py.exe", "D:/Work/Example/start_webrunner.py"], 1)
-        raise RuntimeError("psutil 掃到一半炸了")
+        raise RuntimeError("psutil blew up midway through the scan")
 
     assert other_launcher_pids("start_webrunner.py", self_pid=99,
                                procs=_procs()) == [11]
 
 
 # ---------------------------------------------------------------------------
-# `trim_log` / `log_write` / `echo_line` / `pump_stream`：記錄檔壞掉不得傳染
+# `trim_log` / `log_write` / `echo_line` / `pump_stream`: a broken log must not
+# spread
 # ---------------------------------------------------------------------------
 
 
 def test_trim_log_stays_quiet_when_the_file_cannot_be_rewritten(tmp_path,
                                                                 capsys):
-    """修剪失敗只能是「這次不修剪」，不能是「監督者死掉」。
+    """A failed trim can only be "no trim this time", not "the supervisor dies".
 
-    `trim_log` 是本專案文件裡記載的原子寫入**例外**（它就地覆寫，因為這個檔案同時
-    有兩個活著的 append 控制代碼），所以它沒有 `os.replace` 兜底——寫到一半失敗的
-    可能性比別處高，這條路更該被驗過。
+    `trim_log` is the documented atomic-write **exception** in this project (it
+    overwrites in place, because this file has two live append handles at once), so
+    it has no `os.replace` fallback — a mid-write failure is more likely than
+    elsewhere, so this path all the more needs verifying.
 
-    順帶釘住「失敗要留下訊息」：整個吞掉的話，記錄檔會一路長下去而且一個字都不會
-    說（那正是改成原子寫入之後會發生的事）。
+    Also pins "a failure must leave a message": swallowing it entirely lets the
+    log grow without bound while saying not a word (which is exactly what would
+    happen after switching to an atomic write).
     """
     import _supervisor as sup
 
     path = tmp_path / "readonly.log"
     path.write_text("keep-me\n" * 200, encoding="utf-8")
     before = path.read_bytes()
-    os.chmod(path, 0o444)               # Windows 上＝設定唯讀屬性
+    os.chmod(path, 0o444)               # on Windows = set the read-only attribute
     try:
         sup.trim_log(path, max_bytes=100, keep_bytes=50)
     finally:
         os.chmod(path, 0o644)
-    assert path.read_bytes() == before, "寫不進去卻把檔案動了"
+    assert path.read_bytes() == before, "could not write but the file was changed"
     assert "trim_log" in capsys.readouterr().err, (
-        "修剪失敗必須留下一行診斷；靜默失效的話記錄檔會無限長大而沒有人知道。")
+        "a failed trim must leave a line of diagnostics; failing silently lets the "
+        "log grow without bound with nobody knowing.")
 
 
 def test_log_write_survives_a_dead_log_handle(tmp_path):
-    """記錄檔控制代碼壞掉時只是少一行，不能把抽水執行緒帶走。
+    """A broken log handle only drops one line; it must not take the pump thread
+    away.
 
-    **關掉的串流丟的是 `ValueError` 不是 `OSError`**，兩個都要接——這也是
-    `log_write` 的 `except` 寫成 `(OSError, ValueError)` 的原因。
+    **A closed stream throws `ValueError`, not `OSError`**, and both must be
+    caught — which is also why `log_write`'s `except` is `(OSError, ValueError)`.
     """
     import _supervisor as sup
 
     handle = (tmp_path / "closed.log").open("a", encoding="utf-8")
     handle.close()
-    sup.log_write(handle, "掉進關掉的檔案\n")     # ValueError 不得外流
+    sup.log_write(handle, "falls into a closed file\n")     # ValueError must not escape
 
     class _FullDisk:
         def write(self, _text):
             raise OSError(28, "No space left on device")
 
-    sup.log_write(_FullDisk(), "磁碟滿了\n")      # OSError 不得外流
+    sup.log_write(_FullDisk(), "disk is full\n")      # OSError must not escape
 
 
 def test_echo_line_falls_back_when_the_console_cannot_encode():
-    """啟動器的 stdout 被重導向到 cp950 檔案時，編不出來的字要退成替換字元。
+    """When the launcher's stdout is redirected to a cp950 file, an unencodable
+    character must fall back to a replacement character.
 
-    **不要拿日文假名當測資**：實測 cp950（Big5）**編得出**假名
-    （`"かな".encode("cp950")` ＝ `b"cf af cf ce"`），所以用假名的測試根本沒有走到
-    退版路徑，卻看起來是綠的。這裡用 emoji——那是 Big5 真的沒有的。
+    **Do not use Japanese kana as test data**: measured, cp950 (Big5) **can
+    encode** kana (`"かな".encode("cp950")` = `b"cf af cf ce"`), so a kana test
+    never takes the fallback path yet still looks green. Use an emoji here — that
+    is something Big5 really lacks.
 
-    這條在這台機器上是真實情境而不是理論：`locale.getpreferredencoding(False)`
-    是 cp950，而佇列內容裡有非中文字元。
+    This is a real situation on this machine, not a theoretical one:
+    `locale.getpreferredencoding(False)` is cp950, and the queue content contains
+    non-Chinese characters.
     """
     import _supervisor as sup
 
@@ -2069,13 +2293,13 @@ def test_echo_line_falls_back_when_the_console_cannot_encode():
     stream.flush()
     text = raw.getvalue().decode("cp950")
     assert "進度" in text and "33/75" in text, (
-        f"退版寫法把整行弄丟了：{text!r}。編不出來的**只有那一個字元**，"
-        f"其餘內容還是要看得到。")
-    assert "?" in text, f"編不出來的字元沒有被替換掉：{text!r}"
+        f"the fallback write lost the whole line: {text!r}. **Only that one "
+        f"character** is unencodable; the rest must still be visible.")
+    assert "?" in text, f"the unencodable character was not replaced: {text!r}"
 
 
 class _EncodeThenFail:
-    """第一次寫丟 `UnicodeEncodeError`，退版那次丟 `exc`。"""
+    """First write throws `UnicodeEncodeError`, the fallback write throws `exc`."""
 
     encoding = "cp950"
 
@@ -2095,21 +2319,24 @@ class _EncodeThenFail:
 
 
 @pytest.mark.parametrize("exc", [
-    OSError(28, "No space left on device"),      # 重導向的檔案所在磁碟滿了
-    ValueError("I/O operation on closed file."),  # 管線讀端已經關掉
-    LookupError("unknown encoding: bogus"),      # 串流謊報自己的編碼
+    OSError(28, "No space left on device"),      # the disk of the redirected file is full
+    ValueError("I/O operation on closed file."),  # the pipe's read end is already closed
+    LookupError("unknown encoding: bogus"),      # the stream lies about its encoding
 ])
 def test_a_console_that_breaks_during_the_fallback_never_escapes(exc):
-    """**真缺陷（2026-09-07 修）**：退版寫入原本完全沒有被保護。
+    """**Real defect (fixed 2026-09-07)**: the fallback write was under no
+    protection at all.
 
-    退版寫法原本住在 `except UnicodeEncodeError:` 區塊裡，而下面掛著
-    `except OSError: pass`——但**從 `except` 區塊裡丟出來的例外不會被同一個 `try`
-    的其他 `except` 接住**。實測：第一次寫丟 `UnicodeEncodeError`、退版那次丟
-    `OSError(28)`，那個 `OSError` 直接穿出 `echo_line`。
+    The fallback write used to live inside the `except UnicodeEncodeError:` block,
+    with `except OSError: pass` hung below — but **an exception thrown from inside
+    an `except` block is not caught by another `except` of the same `try`**.
+    Measured: the first write threw `UnicodeEncodeError`, the fallback threw
+    `OSError(28)`, and that `OSError` shot straight out of `echo_line`.
 
-    後果不是掉一行日誌：`echo_line` 跑在抽水執行緒上，例外會終止整條抽水迴圈，
-    子行程接著被自己塞滿的管線卡死——監督者還活著、批次卻不動了，而且什麼都不會
-    說。這支測試就是釘住「一行日誌絕對不能弄死監督者」。
+    The consequence is not one dropped log line: `echo_line` runs on the pump
+    thread, the exception terminates the whole pump loop, and the child then wedges
+    in its own filled pipe — the supervisor is still alive, the batch is stuck, and
+    it says nothing. This test pins "one log line must never kill the supervisor".
     """
     import _supervisor as sup
 
@@ -2117,20 +2344,23 @@ def test_a_console_that_breaks_during_the_fallback_never_escapes(exc):
     saved = sys.stdout
     sys.stdout = stream
     try:
-        sup.echo_line("進度 \U0001F600\n")   # 不得丟例外
+        sup.echo_line("進度 \U0001F600\n")   # must not throw
     finally:
         sys.stdout = saved
     assert stream.writes == 2, (
-        f"退版寫入根本沒有被嘗試（writes={stream.writes}）")
+        f"the fallback write was never even attempted (writes={stream.writes})")
 
 
 def test_a_broken_console_does_not_stop_the_pump():
-    """主控台寫壞掉時，抽水**必須繼續**——這是那個死結的迴歸測試。
+    """When the console write breaks, the pump **must keep going** — this is the
+    regression test for that deadlock.
 
-    `pump_stream` 的 `except (OSError, ValueError)` 包的是整個迴圈，所以只要
-    `echo_line` 丟得出例外，主控台壞一次就等於整條抽水停掉。實測（修之前）：3 行
-    只抽到 1 行。子行程接下來會把 ~64 KB 的管線緩衝區塞滿，然後**永遠卡在下一個
-    print**——比「沒有記錄檔」糟得多，因為批次會整個停住而不是掉一份 log。
+    `pump_stream`'s `except (OSError, ValueError)` wraps the whole loop, so as long
+    as `echo_line` can throw an exception, one broken console equals the entire
+    pump stopping. Measured (before the fix): 3 lines, only 1 pumped. The child
+    then fills the ~64 KB pipe buffer and **hangs forever on the next print** —
+    much worse than "no log", because the batch stalls entirely rather than
+    dropping a log.
     """
     import _supervisor as sup
 
@@ -2152,22 +2382,23 @@ def test_a_broken_console_does_not_stop_the_pump():
     finally:
         sys.stdout = saved
     assert log.getvalue().count("行") == 3, (
-        f"主控台壞掉把抽水一起帶走了，只抽到 {log.getvalue()!r}。"
-        "子行程接下來會被自己塞滿的管線卡死。")
+        f"the broken console took the pump down with it; only pumped {log.getvalue()!r}. "
+        "The child would then wedge in its own filled pipe.")
 
 
 def test_pump_stream_tolerates_no_stream_at_all():
-    """`proc.stdout` 是 `None`（呼叫端沒給 PIPE）時安靜收工。"""
+    """When `proc.stdout` is `None` (the caller gave no PIPE), finish quietly."""
     import _supervisor as sup
     sup.pump_stream(None, None)
 
 
 def test_pump_stream_stops_quietly_when_the_pipe_dies():
-    """管線中途壞掉：已經讀到的要留住，而且不得往上丟。
+    """When the pipe breaks midway: keep what was already read, and do not
+    re-raise.
 
-    抽水跑在 daemon 執行緒上，它丟出來的例外只會印一段沒有上下文的
-    `Exception in thread`，然後 `stream_child` 在 `proc.wait()` 那裡繼續等——
-    看起來像當掉，實際上是抽水已經死了。
+    The pump runs on a daemon thread, and an exception it throws only prints a
+    context-less `Exception in thread`, after which `stream_child` keeps waiting at
+    `proc.wait()` — it looks like a hang, but really the pump has died.
     """
     import _supervisor as sup
 
@@ -2178,37 +2409,39 @@ def test_pump_stream_stops_quietly_when_the_pipe_dies():
         def __next__(self):
             if not hasattr(self, "_done"):
                 self._done = True
-                return "壞掉之前這行要留住\n"
+                return "keep this line from before it broke\n"
             raise OSError(22, "The handle is invalid")
 
     log = io.StringIO()
-    sup.pump_stream(_DyingPipe(), log)          # 不得丟例外
-    assert "壞掉之前這行要留住" in log.getvalue()
+    sup.pump_stream(_DyingPipe(), log)          # must not throw
+    assert "keep this line from before it broke" in log.getvalue()
 
 
 # ---------------------------------------------------------------------------
-# `stream_child`：子行程已經起來之後的每一條錯誤路徑
+# `stream_child`: every error path after the child is already up
 # ---------------------------------------------------------------------------
 
 
 class _ProcWrapper:
-    """包住真的 `Popen`，只換掉要驗的那一個行為，其餘照實委派。"""
+    """Wrap a real `Popen`, swapping only the one behaviour under test and
+    delegating the rest verbatim."""
 
     def __init__(self, proc):
         self._proc = proc
 
     def __getattr__(self, name):
-        if name == "_proc":                     # 防止 `_proc` 還沒設好時無限遞迴
+        if name == "_proc":                     # avoid infinite recursion before `_proc` is set
             raise AttributeError(name)
         return getattr(self._proc, name)
 
 
 def _popen_shim(monkeypatch, wrap):
-    """把 `_supervisor` 命名空間裡的 `subprocess` 換成薄殼：照樣起真的子行程，
-    只是回傳前先讓 `wrap` 動手腳。
+    """Swap the `subprocess` in the `_supervisor` namespace for a thin shell: still
+    start the real child, just let `wrap` tamper before returning.
 
-    只換 `_supervisor.subprocess` 這個**名字**，不動 stdlib 模組本身——後者是全
-    行程生效的，剛好有別的執行緒在 spawn 就會一起中招。
+    Swap only the `_supervisor.subprocess` **name**, not the stdlib module itself —
+    the latter is process-wide, so another thread spawning at that moment would be
+    caught along with it.
     """
     import _supervisor as sup
 
@@ -2220,7 +2453,7 @@ def _popen_shim(monkeypatch, wrap):
         TimeoutExpired = real.TimeoutExpired
 
         @staticmethod
-        def Popen(*args, **kwargs):             # noqa: N802  # 對齊 stdlib 命名
+        def Popen(*args, **kwargs):             # noqa: N802  # match stdlib naming
             return wrap(real.Popen(*args, **kwargs))
 
     monkeypatch.setattr(sup, "subprocess", _Shim)
@@ -2235,12 +2468,15 @@ _SLEEPY_CHILD = (
 
 
 def test_ctrl_c_reaps_the_child_instead_of_orphaning_it(tmp_path, monkeypatch):
-    """Ctrl+C：例外要往上送（啟動器靠它收工），但子行程必須先被收乾淨。
+    """Ctrl+C: the exception must be re-raised (the launcher uses it to wrap up),
+    but the child must be reaped clean first.
 
-    直接把 `KeyboardInterrupt` 往上拋就走人的話會留下孤兒——webrunner 那一側連帶
-    留下整棵 Chrome，下一次啟動就變成兩套堆疊搶同一份 `.chrome_profile/`。
-    這裡用真的子行程 ＋ 真的管線，只把 `proc.wait()` 換成丟 `KeyboardInterrupt`
-    （測試裡沒有辦法對自己的主控台群組送真的 Ctrl+C 而不把 pytest 一起帶走）。
+    Just re-raising `KeyboardInterrupt` and walking away leaves an orphan — on the
+    webrunner side a whole Chrome tree along with it, and the next start becomes
+    two stacks fighting over the same `.chrome_profile/`. Here we use a real child
+    + a real pipe, only swapping `proc.wait()` for one that throws
+    `KeyboardInterrupt` (a test cannot send a real Ctrl+C to its own console group
+    without taking pytest down with it).
     """
     import _supervisor as sup
 
@@ -2252,15 +2488,19 @@ def test_ctrl_c_reaps_the_child_instead_of_orphaning_it(tmp_path, monkeypatch):
             self.interrupted = False
 
         def wait(self, timeout=None):
-            # 只攔 `stream_child` 那一次（沒有 timeout）；`reap_child` 帶著
-            # timeout 的那幾次要照實跑，否則驗到的就不是收屍流程本身。
+            # Intercept only the `stream_child` call (no timeout); the `reap_child`
+            # calls that carry a timeout must run for real, or what gets verified is
+            # not the reaping flow itself.
             if timeout is None and not self.interrupted:
-                # 先等子行程真的開口，再送 Ctrl+C。原本是一開始就送，於是這支
-                # 默默假設「子行程在 0.5 秒寬限期內就印得出第一行」——2026-09-22
-                # 從 IDE 啟動的環境帶著一個 `sitecustomize`，每個 Python 子行程
-                # 要 1.2 秒才起得來，這支就在兩個直譯器上一起紅了，而程式碼一個字
-                # 都沒動。要驗的是「Ctrl+C 之前說過的話不會不見」，前提是它真的
-                # 說過；等待有上限，逾時就照原樣送出，讓下面的斷言講出原因。
+                # Wait for the child to actually speak, then send Ctrl+C. It used to
+                # send immediately, silently assuming "the child prints its first
+                # line within the 0.5s grace period" — on 2026-09-22 an IDE-launched
+                # environment carried a `sitecustomize` that made every Python child
+                # take 1.2s to start, and this test went red on both interpreters at
+                # once, with the code untouched. What to verify is "what was said
+                # before Ctrl+C is not lost", which presupposes it was said; the wait
+                # is bounded, and on timeout it sends anyway so the assertion below
+                # states the reason.
                 deadline = time.monotonic() + 30.0
                 while time.monotonic() < deadline:
                     try:
@@ -2292,29 +2532,34 @@ def test_ctrl_c_reaps_the_child_instead_of_orphaning_it(tmp_path, monkeypatch):
                                  grace_sec=0.5, kill_sec=10.0)
     finally:
         proc = holder.get("proc")
-        if proc is not None and proc.poll() is None:   # 保險：絕不留孤兒
+        if proc is not None and proc.poll() is None:   # safety net: never leave an orphan
             proc.kill()
             proc.wait(timeout=30)
 
     proc = holder["proc"]
     assert proc.poll() is not None, (
-        "Ctrl+C 之後子行程還活著——這正是那些握著整棵 Chrome 的孤兒的來源。")
+        "the child is still alive after Ctrl+C — this is exactly the source of "
+        "those orphans holding a whole Chrome tree.")
     log = log_path.read_text(encoding="utf-8", errors="replace")
     assert "CHILD-UP" in log, (
-        "Ctrl+C 之前子行程說過的話不見了；那段輸出正是事後要查的東西。")
+        "what the child said before Ctrl+C is gone; that output is exactly what "
+        "you investigate afterward.")
     assert "terminating" in log, (
-        "子行程沒在寬限期內收工，卻沒有走到 terminate；收屍是先禮後兵。")
+        "the child did not finish within the grace period yet terminate was never "
+        "reached; reaping is courtesy first, force after.")
     assert not [t for t in threading.enumerate() if t.name == "ki-pump"], (
-        "抽水執行緒沒有收掉。")
+        "the pump thread was not reaped.")
 
 
 def test_a_stdout_that_refuses_to_close_does_not_swallow_the_exit_code(
         tmp_path, monkeypatch):
-    """收尾時 `proc.stdout.close()` 失敗，不得把已經拿到的 rc 換成例外。
+    """When `proc.stdout.close()` fails on wrap-up, it must not turn the rc already
+    obtained into an exception.
 
-    這一行住在 `finally` 裡，所以它丟出來的例外會**取代** `return rc`——監督者拿
-    不到子行程的退出碼，rapid-fail giveup 與 `child_exit_is_fatal` 兩條判斷同時
-    失效，而真正的原因（子行程為什麼結束）已經被蓋掉了。
+    This line lives in `finally`, so an exception it throws **replaces**
+    `return rc` — the supervisor never gets the child's exit code, both rapid-fail
+    giveup and `child_exit_is_fatal` stop working at once, and the real reason (why
+    the child exited) has already been masked.
     """
     import _supervisor as sup
 
@@ -2328,7 +2573,7 @@ def test_a_stdout_that_refuses_to_close_does_not_swallow_the_exit_code(
 
         def close(self):
             self.attempts += 1
-            self._stream.close()        # 真的關掉，不然 fd 會漏
+            self._stream.close()        # really close it, or the fd leaks
             raise OSError(5, "Input/output error")
 
     class _StdoutCloseFails(_ProcWrapper):
@@ -2356,36 +2601,41 @@ def test_a_stdout_that_refuses_to_close_does_not_swallow_the_exit_code(
     with contextlib.redirect_stdout(console):
         rc = sup.stream_child([sys.executable, "-u", str(script)], None,
                               cwd=str(tmp_path), pump_name="close-pump")
-    assert rc == 9, f"收尾的 close 失敗把 rc 吃掉了（rc={rc}）"
+    assert rc == 9, f"the wrap-up close failure swallowed the rc (rc={rc})"
     assert holder["proc"].stdout.attempts == 1
 
 
 def test_the_spawn_hook_runs_before_the_child_is_waited_on(tmp_path):
-    """`on_spawn` 要在 `proc.wait()` **之前**跑到，而且拿得到真的 pid。
+    """`on_spawn` must run **before** `proc.wait()`, and get the real pid.
 
-    `start_webrunner._on_spawn` 在那裡寫 `webrunner.pid` 並放掉 Chrome 槽；晚一步
-    就會出現「槽空了、pid 還沒寫」的空窗，驗證端剛好在那一瞬間取槽就會判定沒人在
-    跑、開出第二個 Chrome stack。
+    `start_webrunner._on_spawn` writes `webrunner.pid` and releases the Chrome slot
+    there; a step late opens a "slot empty, pid not yet written" window, and if the
+    verifier takes the slot in that instant it judges nobody is running and opens a
+    second Chrome stack.
     """
     seen = []
     rc, log, _console = _run_child(tmp_path, "print('hi')\n",
                                    on_spawn=lambda proc: seen.append(proc.pid))
     assert rc == 0
-    assert seen and isinstance(seen[0], int), "on_spawn 沒被呼叫到"
+    assert seen and isinstance(seen[0], int), "on_spawn was not called"
     assert "hi" in log
 
 
 def test_a_failing_spawn_hook_does_not_leave_an_orphan(tmp_path):
-    """**真缺陷（2026-09-07 修）**：spawn hook 失敗會留下沒人收的子行程。
+    """**Real defect (fixed 2026-09-07)**: a spawn-hook failure leaves an unreaped
+    child.
 
-    `on_spawn` 做的是真的 I/O——`start_webrunner._on_spawn` 寫 `webrunner.pid`
-    ——磁碟滿了或權限不對就丟 `OSError`。修之前那個例外直接往上送，而子行程**已經
-    起來了**：stdout 是 PIPE、沒有人抽、也沒有人 `wait` 它。它下一次 print 就卡死
-    在滿掉的管線裡，而它手上握著整棵 Chrome。監督者自己死掉、批次還在那裡卡著
-    不動，是最難查的那種收場。
+    `on_spawn` does real I/O — `start_webrunner._on_spawn` writes `webrunner.pid` —
+    and a full disk or wrong permissions throw `OSError`. Before the fix that
+    exception was re-raised straight away, while the child **is already up**: its
+    stdout is a PIPE that nobody pumps and nobody `wait`s on. Its next print wedges
+    in the filled pipe, and it is holding a whole Chrome tree. The supervisor itself
+    dying while the batch sits there stuck is the hardest kind of ending to
+    diagnose.
 
-    例外照樣要往上送（寫不進 pid 檔是嚴重的事，吞掉會讓驗證端闖進正在跑的批次），
-    但**送出去之前要先收屍**。
+    The exception must still be re-raised (failing to write the pid file is serious,
+    and swallowing it would let the verifier barge into a running batch), but
+    **reap before re-raising**.
     """
     import contextlib
     import _supervisor as sup
@@ -2407,30 +2657,36 @@ def test_a_failing_spawn_hook_does_not_leave_an_orphan(tmp_path):
                                  pump_name="boom-pump", kill_sec=10.0)
     finally:
         proc = holder.get("proc")
-        if proc is not None and proc.poll() is None:   # 保險：絕不留孤兒
+        if proc is not None and proc.poll() is None:   # safety net: never leave an orphan
             proc.kill()
             proc.wait(timeout=30)
             pytest.fail(
-                "spawn hook 失敗之後子行程還活著。它的 stdout 是沒有人抽的 "
-                "PIPE，下一個 print 就會卡死，而它握著整棵 Chrome。")
+                "the child is still alive after the spawn hook failed. Its stdout "
+                "is a PIPE nobody pumps, its next print wedges, and it is holding a "
+                "whole Chrome tree.")
 
     assert holder["proc"].returncode is not None, (
-        "子行程沒有被收屍——`stream_child` 起了它就有責任把它收掉。")
+        "the child was not reaped — `stream_child` started it, so it is responsible "
+        "for reaping it.")
 
 
 def test_a_child_that_survives_reaping_does_not_wedge_the_shutdown(
         tmp_path, monkeypatch):
-    """收屍失敗、子行程還活著時，收尾那一行不得把監督者永久卡住。
+    """When reaping fails and the child is still alive, the wrap-up line must not
+    wedge the supervisor permanently.
 
-    實測（2026-09-07，本機 Windows 11 / CPython 3.14）：抽水執行緒卡在 `read()`
-    的時候呼叫 `proc.stdout.close()`，**不會**丟例外、也不會把串流從抽水手上抽走
-    ——它去搶同一把鎖，於是一路擋到那次 read 回來為止，量到 **19.05 秒**，正好是
-    子行程還活著的那段時間。
+    Measured (2026-09-07, local Windows 11 / CPython 3.14): calling
+    `proc.stdout.close()` while the pump thread is stuck in `read()` throws **no**
+    exception and does not wrest the stream away from the pump — it contends for the
+    same lock and blocks until that read returns, measured **19.05 seconds**,
+    exactly how long the child stayed alive.
 
-    正常路徑碰不到（`proc.wait()` 回來就代表子行程死了、管線 EOF、抽水立刻結束），
-    碰得到的是 Ctrl+C 之後 `reap_child` 自己失敗那條。那時候的下場最難查：啟動器
-    永遠停在收工的最後一行，**而且還握著單一實例鎖**，於是誰也重啟不了，主控台上
-    什麼訊息都沒有——會印訊息的那個東西就是卡住的那個。
+    The normal path never reaches this (`proc.wait()` returning means the child is
+    dead, pipe EOF, the pump ends immediately); what reaches it is the "reap_child
+    itself failed after Ctrl+C" path. Its outcome is the hardest to diagnose: the
+    launcher stops forever at the last line of wrapping up, **while still holding
+    the single-instance lock**, so nobody can restart and no message shows on the
+    console — the thing that would print the message is the thing that is stuck.
     """
     import contextlib
     import _supervisor as sup
@@ -2440,7 +2696,8 @@ def test_a_child_that_survives_reaping_does_not_wedge_the_shutdown(
     real_procs = []
 
     class _SurvivesReaping(_ProcWrapper):
-        """Ctrl+C 之後怎麼收都收不掉的子行程（terminate／kill 都失敗）。"""
+        """A child that cannot be reaped no matter what after Ctrl+C (both
+        terminate and kill fail)."""
 
         def __init__(self, proc):
             super().__init__(proc)
@@ -2463,8 +2720,9 @@ def test_a_child_that_survives_reaping_does_not_wedge_the_shutdown(
         return _SurvivesReaping(proc)
 
     _popen_shim(monkeypatch, _wrap)
-    # 把 join 的等待縮短，讓「有沒有卡住」的差距是 0.5 秒 vs 子行程的整段壽命，
-    # 而不是兩個相近的數字——時間斷言只有在差距夠大時才不會變成隨機紅的守門。
+    # Shorten the join wait so the "did it wedge" gap is 0.5 seconds vs the child's
+    # whole lifetime, rather than two close numbers — a timing assertion only avoids
+    # being a randomly-red guard when the gap is large enough.
     monkeypatch.setattr(sup, "_LOG_PUMP_JOIN_SEC", 0.5)
 
     console = io.StringIO()
@@ -2482,18 +2740,21 @@ def test_a_child_that_survives_reaping_does_not_wedge_the_shutdown(
                 proc.kill()
                 proc.wait(timeout=30)
     assert elapsed < 8.0, (
-        f"收工卡了 {elapsed:.1f} 秒（子行程活 30 秒）。抽水還在讀的時候關串流會"
-        "一路擋到那次 read 回來為止——監督者會永久停在這裡，而且還握著單一實例"
-        "鎖，誰也重啟不了。")
+        f"wrap-up wedged for {elapsed:.1f} seconds (the child lives 30). Closing "
+        "the stream while the pump is still reading blocks until that read returns "
+        "— the supervisor stops here forever, still holding the single-instance "
+        "lock, and nobody can restart.")
 
 
 def test_a_failing_reap_does_not_mask_why_the_spawn_hook_failed(tmp_path,
                                                                 monkeypatch):
-    """收屍自己也失敗時，往上送的必須還是**原本**那個例外。
+    """When reaping itself also fails, what is re-raised must still be the
+    **original** exception.
 
-    這是錯誤路徑上的經典壞法：清理程式碼丟出自己的例外，把真正的原因蓋掉。這裡
-    蓋掉的會是「pid 檔寫不進去」（要處理的事），換成「terminate 失敗」（處理不完
-    的表面現象），而讀 log 的人看不到前者存在過。
+    This is the classic error-path failure: cleanup code throws its own exception
+    and masks the real cause. Here it would mask "the pid file cannot be written"
+    (the thing to handle) with "terminate failed" (an unresolvable surface
+    symptom), and the log reader never sees that the former existed.
     """
     import contextlib
     import _supervisor as sup
@@ -2529,45 +2790,53 @@ def test_a_failing_reap_does_not_mask_why_the_spawn_hook_failed(tmp_path,
                                  cwd=str(tmp_path), on_spawn=_boom,
                                  pump_name="mask-pump", kill_sec=1.0)
         assert info.value.errno == 28, (
-            f"往上送的是收屍失敗的例外（errno={info.value.errno}），原本那個"
-            "「pid 檔寫不進去」被蓋掉了。")
+            f"what was re-raised is the reap-failure exception (errno={info.value.errno}); "
+            "the original 'pid file cannot be written' got masked.")
     finally:
-        for proc in real_procs:                 # 這支測試刻意讓收屍失敗，自己收
+        for proc in real_procs:                 # this test deliberately fails reaping, so reap them here
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=30)
 
 
 # ---------------------------------------------------------------------------
-# 讀不出 `webrunner.pid` 時，啟動器要走保守的那一邊（2026-09-07）
+# When `webrunner.pid` cannot be read, the launcher must fall to the conservative
+# side (2026-09-07)
 #
-# `start_webrunner._live_webrunner_pid` 原本把「檔案不存在」與「檔案在、但讀不出
-# 來」都回成 `None`，而 `None` 在呼叫端的意思是**「沒有批次在跑，可以起一個」**
-# ——判不出來卻走了樂觀的那一邊。代價是同一台機器上跑起第二個批次：兩個 webrunner
-# 搶同一份 `.chrome_profile/`、各自 nuclear sweep 把對方的 Chrome 殺掉、從同一組
-# `todo_*.md` 重複取件，而兩邊的紀錄看起來都正常。CLAUDE.md 的 Windows PID 存活
-# 硬規則對這一類判斷寫得很明白：問「我該不該不要啟動／讓位？」的地方，判不出來
-# 就要走保守的那一邊。姊妹函式 `verify_browser._live_webrunner_pid` 同日修成
-# `(pid, decided)`，這裡照同一個形狀。
+# `start_webrunner._live_webrunner_pid` used to return `None` for both "the file
+# does not exist" and "the file is there but cannot be read", and `None` at the
+# caller means **"no batch is running, you can start one"** — falling to the
+# optimistic side while unable to decide. The cost is a second batch starting on
+# the same machine: two webrunners fighting over the same `.chrome_profile/`, each
+# nuclear-sweeping the other's Chrome, picking the same `todo_*.md` items twice,
+# while both records look normal. CLAUDE.md's Windows PID-liveness hard rule is
+# explicit about this class of decision: where you ask "should I refuse to start /
+# stand aside?", when you cannot decide, fall to the conservative side. The sister
+# function `verify_browser._live_webrunner_pid` was fixed the same day to
+# `(pid, decided)`, and this follows the same shape.
 #
-# 順帶修掉的第二個洞：`UnicodeDecodeError` 是 `ValueError` 的子類、**不是**
-# `OSError`，所以 `except (FileNotFoundError, OSError)` 接不到它——pid 檔內容不是
-# 合法 UTF-8 時，兩支讀檔函式都會直接炸穿。`_clear_pid_if_ours` 的 docstring 還
-# 明寫著「永不 raise」，而它是在 `finally` 裡被呼叫的。
+# The second hole fixed along the way: `UnicodeDecodeError` is a subclass of
+# `ValueError`, **not** `OSError`, so `except (FileNotFoundError, OSError)` does
+# not catch it — when the pid file content is not valid UTF-8, both file-reading
+# functions blow straight through. `_clear_pid_if_ours`'s docstring even says
+# "never raises", and it is called inside `finally`.
 #
-# 這組測試**永遠不碰正式的 `webrunner.pid`**（本機常有跑了幾十小時的批次在用它），
-# 一律 monkeypatch 到 `tmp_path`；`_chrome_slot` 也一律換成替身，免得去動 repo root
-# 那把真的槽鎖。
+# This group of tests **never touches the production `webrunner.pid`** (this
+# machine often has a batch that has run for tens of hours using it), always
+# monkeypatching to `tmp_path`; `_chrome_slot` is always swapped for a stub too, to
+# avoid touching the real slot lock in the repo root.
 # ---------------------------------------------------------------------------
 
 WEBRUNNER_LAUNCHER = "start_webrunner.py"
 
 
 class _FakeSlot:
-    """夠像 `_chrome_slot` 的替身：一定拿得到槽、記錄釋放、pid 存活可控。
+    """A stub close enough to `_chrome_slot`: always gets the slot, records
+    releases, controllable pid liveness.
 
-    換掉它是**安全需求**而不是方便：真的 `_chrome_slot` 會去動 repo root 的
-    `chrome_slot.lock`，而正式批次正在用那把槽。
+    Swapping it is a **safety requirement**, not a convenience: the real
+    `_chrome_slot` touches the repo root's `chrome_slot.lock`, and the production
+    batch is using that slot.
     """
 
     def __init__(self, *, pid_alive=True):
@@ -2586,25 +2855,30 @@ class _FakeSlot:
 
 @pytest.fixture(autouse=True)
 def _no_real_network_probe(monkeypatch):
-    """這個檔案裡的 `_supervise` 不准碰真的網路。
+    """`_supervise` in this file must not touch the real network.
 
-    子行程以非零結束時，啟動器會先問「主機連得上網路嗎」，判成斷網就不計入放棄門檻、改成
-    **無限期**等網路回來。原本這裡沒有替身，於是每一支讓子行程失敗的測試都真的對外連線：
-    網路一抖、或主機忙到探測逾時，快速失敗就不被計入（2026-09-23 滿載時實際紅過一支），
-    真的斷網的話整個套件會卡在那裡。斷網那條路另有 `test_batch_recovery` 專門測。
-    換的是啟動器實際拿到的那個模組物件（`axiomatic._connectivity`）。
+    When the child exits non-zero, the launcher first asks "can the host reach the
+    network", and if it judges the network is down it excludes that from the
+    give-up threshold and instead waits **indefinitely** for the network to come
+    back. There used to be no stub here, so every test that fails the child really
+    connected outward: a network hiccup, or a host busy enough for the probe to time
+    out, would keep a fast failure from counting (one really went red under full
+    load on 2026-09-23), and a real outage would wedge the whole suite there. The
+    outage path has its own coverage in `test_batch_recovery`. What is swapped is
+    the actual module object the launcher holds (`axiomatic._connectivity`).
     """
     from axiomatic import _connectivity as launcher_connectivity  # noqa: PLC0415
 
     def _no_wait(*_args, **_kwargs):
-        raise AssertionError("啟動器以為斷網、開始等網路——這個檔案的測試不該走到這裡")
+        raise AssertionError("the launcher thought the network was down and began waiting — this file's tests should not reach here")
 
     monkeypatch.setattr(launcher_connectivity, "is_online", lambda *_a, **_k: True)
     monkeypatch.setattr(launcher_connectivity, "wait_until_online", _no_wait)
 
 
 def test_the_launcher_in_this_file_never_probes_the_real_network(monkeypatch, tmp_path):
-    """上面那個替身真的接到啟動器用的模組：底層連線全部失敗時，啟動器仍然回「有網路」。"""
+    """The stub above really hooks the module the launcher uses: even when every
+    low-level connection fails, the launcher still returns "network is up"."""
     import socket  # noqa: PLC0415
 
     def _refuse(*_args, **_kwargs):
@@ -2616,10 +2890,10 @@ def test_the_launcher_in_this_file_never_probes_the_real_network(monkeypatch, tm
 
 
 def _launcher_with_pid_file(monkeypatch, tmp_path, content, *, pid_alive=True):
-    """載入啟動器並把 `WEBRUNNER_PID_FILE` 指到 `tmp_path`。
+    """Load the launcher and point `WEBRUNNER_PID_FILE` at `tmp_path`.
 
-    `content` 是 bytes（刻意不是 str——要測得到「不是合法 UTF-8」那條路），
-    `None` ＝ 不建檔。回 `(module, fake_slot)`。
+    `content` is bytes (deliberately not str — so the "not valid UTF-8" path is
+    reachable), `None` = create no file. Returns `(module, fake_slot)`.
     """
     module = _load_launcher(WEBRUNNER_LAUNCHER)
     path = tmp_path / "webrunner.pid"
@@ -2633,7 +2907,8 @@ def _launcher_with_pid_file(monkeypatch, tmp_path, content, *, pid_alive=True):
 
 def test_a_missing_pid_file_means_there_is_really_no_batch(monkeypatch,
                                                            tmp_path):
-    """檔案不存在是**判定得出來**的答案：真的沒有批次，可以起一個。"""
+    """A missing file is a **decidable** answer: there really is no batch, you can
+    start one."""
     module, _ = _launcher_with_pid_file(monkeypatch, tmp_path, None)
     assert module._live_webrunner_pid() == (None, True)
 
@@ -2644,8 +2919,9 @@ def test_a_live_pid_is_reported_as_a_running_batch(monkeypatch, tmp_path):
 
 
 def test_a_dead_pid_reads_as_no_batch(monkeypatch, tmp_path):
-    """死掉的 pid 是**判定得出來**的「沒有批次」——被硬殺時會留下這種檔案，
-    這條不能跟「讀不出來」混在一起，否則一次硬殺就讓啟動器再也起不來。"""
+    """A dead pid is a **decidable** "no batch" — a hard kill leaves this kind of
+    file, and this must not be conflated with "cannot be read", or one hard kill
+    leaves the launcher unable to start again."""
     module, _ = _launcher_with_pid_file(monkeypatch, tmp_path, b"999999",
                                         pid_alive=False)
     assert module._live_webrunner_pid() == (None, True)
@@ -2653,29 +2929,34 @@ def test_a_dead_pid_reads_as_no_batch(monkeypatch, tmp_path):
 
 def test_an_undecodable_pid_file_is_undecidable_not_empty(monkeypatch,
                                                           tmp_path):
-    """內容不是合法 UTF-8 時，不得被當成「沒有批次在跑」。
+    """When the content is not valid UTF-8, it must not be treated as "no batch is
+    running".
 
-    兩件事一起釘：這個函式**不得 raise**（`UnicodeDecodeError` 不是 `OSError`），
-    而且回的必須是「判不出來」而不是「沒有批次」——後者會讓啟動器在正式批次旁邊
-    再起一個 webrunner。
+    Two things pinned together: this function **must not raise**
+    (`UnicodeDecodeError` is not `OSError`), and what it returns must be "cannot
+    decide" rather than "no batch" — the latter would make the launcher start
+    another webrunner next to the production batch.
     """
     module, _ = _launcher_with_pid_file(monkeypatch, tmp_path,
                                         b"\xff\xfe\x00\x80")
-    pid, decided = module._live_webrunner_pid()      # 不得 raise
+    pid, decided = module._live_webrunner_pid()      # must not raise
     assert pid is None
     assert decided is False, (
-        "讀不出內容卻回報「判定得出來、沒有批次」——啟動器會據此再起一個 webrunner")
+        "the content could not be read but it reported 'decidable, no batch' — the "
+        "launcher would start another webrunner on that basis")
 
 
 def test_a_non_numeric_pid_file_is_undecidable(monkeypatch, tmp_path):
-    """讀得出來但不是數字（含空字串），同樣是判不出來，不是「沒有批次」。"""
+    """Readable but not a number (including an empty string) is likewise "cannot
+    decide", not "no batch"."""
     module, _ = _launcher_with_pid_file(monkeypatch, tmp_path,
-                                        "不是數字".encode("utf-8"))
+                                        "not a number".encode("utf-8"))
     assert module._live_webrunner_pid() == (None, False)
 
 
 def test_an_unreadable_pid_file_is_undecidable(monkeypatch, tmp_path):
-    """讀取本身丟 `OSError`（權限、檔案被鎖）也要走保守的那一邊。"""
+    """A read that itself throws `OSError` (permissions, a locked file) must also
+    fall to the conservative side."""
     module, _ = _launcher_with_pid_file(monkeypatch, tmp_path, b"123")
     real = tmp_path / "webrunner.pid"
 
@@ -2688,15 +2969,16 @@ def test_an_unreadable_pid_file_is_undecidable(monkeypatch, tmp_path):
 
     monkeypatch.setattr(module, "WEBRUNNER_PID_FILE", _Locked())
     assert module._live_webrunner_pid() == (None, False)
-    assert real.exists()                              # 沒有動到真的檔案
+    assert real.exists()                              # the real file was not touched
 
 
 def _run_one_round(monkeypatch, tmp_path, content, *, pid_alive=True, rc=0):
-    """在替身槽底下跑一輪 `_supervise`，回 `(module, exit_code, 有沒有 spawn, slot)`。
+    """Run one round of `_supervise` under the stub slot, return
+    `(module, exit_code, whether it spawned, slot)`.
 
-    `stream_child` 換成間諜，所以**這支測試永遠不會真的起出一個 webrunner**——
-    webrunner 一啟動就無條件 nuclear sweep 掉全機 Chrome，測一個安全機制不該冒它
-    要防的那個險。
+    `stream_child` is swapped for a spy, so **this test never actually starts a
+    webrunner** — a webrunner on startup unconditionally nuclear-sweeps all Chrome,
+    and testing a safety mechanism should not risk the very thing it guards against.
     """
     module, slot = _launcher_with_pid_file(monkeypatch, tmp_path, content,
                                            pid_alive=pid_alive)
@@ -2716,103 +2998,125 @@ def _run_one_round(monkeypatch, tmp_path, content, *, pid_alive=True, rc=0):
 
 def test_an_undecidable_pid_file_never_spawns_a_webrunner(monkeypatch,
                                                           tmp_path):
-    """**這組修改真正要保證的性質**：判不出來就不准啟動。
+    """**The property this change actually guarantees**: when it cannot decide, do
+    not start.
 
-    刻意用行為測試而不是 AST 掃描。姊妹函式那邊的變異測試當場證明 AST 守門太弱：
-    只檢查「第二個回傳值有被接下來、那個名字有出現過」的話，把 `if not decided:`
-    改成 `if False and not decided:` 之後名字**仍然出現**，守門照樣全綠，而行為
-    已經退回「判不出來就啟動」。**能被恆假條件繞過的性質，只能用行為釘。**
+    Deliberately a behavioural test rather than an AST scan. The sister function's
+    mutation testing proved on the spot that an AST guard is too weak: if it only
+    checks "the second return value is consumed, and that name appears", then
+    changing `if not decided:` to `if False and not decided:` **still shows the
+    name**, the guard stays green, and the behaviour has already reverted to "start
+    when it cannot decide". **A property a constant-false condition can bypass can
+    only be pinned behaviourally.**
     """
     module, code, spawned, slot = _run_one_round(monkeypatch, tmp_path,
                                                  b"\xff\xfe\x00\x80")
-    assert not spawned, "pid 檔讀不出來，卻還是起了一個 webrunner"
-    assert code == 1, f"讓位應該回 rc=1，實際回 {code}"
+    assert not spawned, "the pid file could not be read but a webrunner was still started"
+    assert code == 1, f"standing aside should return rc=1, got {code}"
     assert slot.released == [module.SLOT_OWNER], (
-        f"沒有把 Chrome 槽放掉（或放了不只一次）：{slot.released}——"
-        "早退路徑漏放的話，槽會一直被佔到 staleness 逾時才回收。")
+        f"the Chrome slot was not released (or released more than once): {slot.released} — "
+        "if the early-exit path fails to release, the slot stays taken until the "
+        "staleness timeout reclaims it.")
 
 
 def test_a_live_batch_never_spawns_a_second_webrunner(monkeypatch, tmp_path):
-    """既有的讓位路徑也用行為釘一次（原本一支測試都沒有）。"""
+    """The existing stand-aside path is also pinned behaviourally (it had no test
+    at all)."""
     module, code, spawned, slot = _run_one_round(monkeypatch, tmp_path,
                                                  b"4242")
-    assert not spawned, "已經有批次在跑，卻還是起了第二個 webrunner"
+    assert not spawned, "a batch is already running but a second webrunner was still started"
     assert code == 1
     assert slot.released == [module.SLOT_OWNER]
 
 
 def test_a_clean_machine_really_does_spawn(monkeypatch, tmp_path):
-    """反方向，缺了會很糟：只釘「判不出來不准啟動」的話，把函式改成**永遠**回
-    「不要啟動」也會全綠——那樣啟動器再也起不來，比原本的缺陷更糟，而且症狀是
-    「按了沒反應」，沒人會往這裡找。"""
+    """The reverse direction, whose absence would be bad: if you pin only "do not
+    start when it cannot decide", changing the function to **always** return "do
+    not start" also stays green — and then the launcher can never start, worse than
+    the original defect, with the symptom "nothing happens when pressed" that
+    nobody would look here for."""
     module, code, spawned, slot = _run_one_round(monkeypatch, tmp_path, None,
                                                  rc=0)
-    assert spawned, "沒有批次在跑，卻沒有起 webrunner"
+    assert spawned, "no batch is running but no webrunner was started"
     assert code == 0
     assert slot.released == [module.SLOT_OWNER]
 
 
 def test_a_dead_pid_file_still_lets_the_launcher_start(monkeypatch, tmp_path):
-    """硬殺之後留下的 pid 檔不得把啟動器擋死——那是正常的復原情境。"""
+    """A pid file left after a hard kill must not block the launcher dead — that is
+    a normal recovery situation."""
     _module, code, spawned, _slot = _run_one_round(monkeypatch, tmp_path,
                                                    b"999999", pid_alive=False)
-    assert spawned, "殘留的死 pid 檔把啟動器擋住了（硬殺之後就再也起不來）"
+    assert spawned, "a leftover dead pid file blocked the launcher (unable to start after a hard kill)"
     assert code == 0
 
 
 def test_clearing_the_pid_file_only_touches_our_own_pid(monkeypatch, tmp_path):
-    """bot 也寫同一個檔；刪掉別人的存活訊號＝驗證端會闖進正在跑的批次。"""
+    """The bot writes the same file too; deleting someone else's liveness signal =
+    the verifier barges into a running batch."""
     module, _ = _launcher_with_pid_file(monkeypatch, tmp_path, b"4242")
     path = tmp_path / "webrunner.pid"
     module._clear_pid_if_ours(999)
-    assert path.exists(), "刪掉了別人寫的 pid"
+    assert path.exists(), "deleted a pid someone else wrote"
     module._clear_pid_if_ours(4242)
-    assert not path.exists(), "自己寫的 pid 沒有被收回"
+    assert not path.exists(), "our own pid was not reclaimed"
 
 
 def test_clearing_the_pid_file_never_raises_on_an_undecodable_file(monkeypatch,
                                                                    tmp_path):
-    """`_clear_pid_if_ours` 的 docstring 寫著「永不 raise」，那要是真的。
+    """`_clear_pid_if_ours`'s docstring says "never raises", and that must be
+    true.
 
-    它在 `finally` 裡被呼叫：從這裡丟出去的例外會蓋掉子行程真正的結束原因，
-    而讀紀錄的人看不到前者存在過。方向本來就對（讀不出來就不刪），缺的只是把
-    `UnicodeDecodeError` 接進來。
+    It is called inside `finally`: an exception thrown from here would mask the
+    child's real exit reason, and the record reader never sees that the former
+    existed. The direction was already right (do not delete if you cannot read it);
+    all that was missing was catching `UnicodeDecodeError`.
     """
     module, _ = _launcher_with_pid_file(monkeypatch, tmp_path,
                                         b"\xff\xfe\x00\x80")
-    module._clear_pid_if_ours(4242)                   # 不得 raise
-    assert (tmp_path / "webrunner.pid").exists(), "讀不出內容卻把檔案刪了"
+    module._clear_pid_if_ours(4242)                   # must not raise
+    assert (tmp_path / "webrunner.pid").exists(), "the content could not be read but the file was deleted"
 
 
 # ---------------------------------------------------------------------------
-# 兩支啟動器量「子行程活了多久」都要用單調時鐘（2026-09-07）
+# Both launchers must measure "how long the child lived" with a monotonic clock
+# (2026-09-07)
 #
-# `start_webrunner` 的 `alive_for` 與 `start_discord_bot` 的 `ran_for` 原本都是
-# `time.time() - start`。兩個都是純粹的**行程內間隔**——值不寫檔、不跟任何檔案
-# mtime 比對——所以判準（見 `_chrome_slot.acquire` 的 docstring）說得很清楚：該用
-# `time.monotonic()`。
+# `start_webrunner`'s `alive_for` and `start_discord_bot`'s `ran_for` used to both
+# be `time.time() - start`. Both are pure **in-process intervals** — the value is
+# not written to a file, nor compared against any file mtime — so the criterion
+# (see `_chrome_slot.acquire`'s docstring) is clear: use `time.monotonic()`.
 #
-# 牆鐘會被 NTP 的 step 修正、手動改時鐘、虛擬機快照還原**跳動**（換時區與日光
-# 節約時間不會，`time.time()` 回的是 UTC epoch 秒）。兩個方向都會壞：
+# The wall clock **jumps** under NTP step corrections, manual clock changes, and VM
+# snapshot restores (a timezone or daylight-saving change does not; `time.time()`
+# returns UTC epoch seconds). Both directions break:
 #
-# * 往回撥 → 間隔變小甚至變負 → 跑得好好的子行程被判成 rapid fail →
-#   webrunner 那支**提早放棄**，bot 那支把退避一路養大。
-# * 往前撥 → 看起來活很久 → rapid-fail 計數被重置、退避被重置 →
-#   監督者**無限重生**一個真的壞掉的子行程。
+# * Backward → the interval shrinks or even goes negative → a perfectly healthy
+#   child is judged a rapid fail → the webrunner one **gives up early**, the bot
+#   one grows its backoff all the way up.
+# * Forward → it looks like it lived a long time → the rapid-fail count is reset,
+#   the backoff is reset → the supervisor **respawns forever** a child that really
+#   is broken.
 #
-# 無人值守的機器上第二種特別糟：它把「放棄並留下紀錄」變成「安靜地一直重試」。
+# On an unattended machine the second is especially bad: it turns "give up and
+# leave a record" into "silently keep retrying".
 #
-# 這一組**全部是行為測試**：假時鐘讓兩個時鐘分岔，然後斷言監督者的判定沒有跟著
-# 牆鐘跑。單看原始碼有沒有寫 `monotonic` 是不夠的（同一份教訓見上一節的 M4/M5）。
+# This group is **all behavioural tests**: a fake clock forks the two clocks apart,
+# then asserts the supervisor's decisions did not follow the wall clock. Just
+# checking whether the source says `monotonic` is not enough (same lesson as the
+# M4/M5 in the previous section).
 # ---------------------------------------------------------------------------
 
 
 class _Clock:
-    """假時鐘：`monotonic` 只會往前走，`time`（牆鐘）可以被單獨跳。
+    """A fake clock: `monotonic` only moves forward, `time` (the wall clock) can be
+    jumped on its own.
 
-    **假時鐘一定要會走，不可以釘成常數。** 被量的那個間隔是「現在 − 一開始讀到
-    的值」，兩邊都釘死的話間隔永遠是 0，測試會為了錯的理由變綠（或變紅），而不是
-    因為它要驗的那件事。`sleep` 也推時鐘，否則退避那段時間在假時鐘裡等於沒發生。
+    **The fake clock must actually move; it must not be pinned to a constant.** The
+    measured interval is "now − the value first read", so pinning both ends makes
+    the interval always 0, and the test goes green (or red) for the wrong reason
+    rather than because of the thing it verifies. `sleep` advances the clock too, or
+    the backoff period counts as not having happened in the fake clock.
     """
 
     def __init__(self, *, wall=1_700_000_000.0, mono=1_000.0):
@@ -2831,27 +3135,30 @@ class _Clock:
         self.advance(seconds)
 
     def advance(self, seconds):
-        """時間真的過去了——兩個時鐘一起走（正常情況）。"""
+        """Time really passed — both clocks move together (the normal case)."""
         self.wall += seconds
         self.mono += seconds
 
     def step_wall(self, seconds):
-        """**只動牆鐘**：NTP step 修正／有人改了時鐘／虛擬機快照還原。"""
+        """**Move only the wall clock**: an NTP step correction / someone changed
+        the clock / a VM snapshot restore."""
         self.wall += seconds
 
 
 class _NoMoreRounds(Exception):
-    """腳本跑完了，用它把監督者的無限迴圈拆掉。
+    """The script is exhausted; use this to break the supervisor's infinite loop.
 
-    刻意丟例外而不是回一個 rc：回 rc 的話兩支監督者都會把它當成「要再重生一次」，
-    於是測試不是紅掉而是**掛住**（這個檔案上面那支鎖的測試就實際踩過）。
+    Deliberately raises rather than returning an rc: returning an rc would make both
+    supervisors treat it as "respawn once more", so the test would not go red but
+    **hang** (the lock test above in this file actually hit that).
     """
 
 
 def _clocked_child(clock, rounds, spawns):
-    """做一個假的 `stream_child`：照 `rounds` 推時鐘、回 rc。
+    """Make a fake `stream_child`: advance the clock per `rounds`, return the rc.
 
-    `rounds` 的每一筆是 `(這一輪真的過了幾秒, 牆鐘額外跳幾秒, rc)`。
+    Each entry of `rounds` is `(seconds that really passed this round, extra
+    seconds the wall clock jumped, rc)`.
     """
     script = list(rounds)
 
@@ -2869,9 +3176,11 @@ def _clocked_child(clock, rounds, spawns):
 
 def _supervise_with_clock(monkeypatch, tmp_path, rounds, *,
                           rapid_giveup=1, zero_progress_giveup=99):
-    """在假時鐘底下跑 `start_webrunner._supervise`，回 `(rc, clock, spawn 次數)`。
+    """Run `start_webrunner._supervise` under a fake clock, return `(rc, clock,
+    spawn count)`.
 
-    `rc is None` 代表腳本用完、迴圈還想再轉一輪（＝監督者**沒有**放棄）。
+    `rc is None` means the script is exhausted while the loop still wants another
+    round (= the supervisor did **not** give up).
     """
     module, _slot = _launcher_with_pid_file(monkeypatch, tmp_path, None)
     clock = _Clock()
@@ -2892,59 +3201,69 @@ def _supervise_with_clock(monkeypatch, tmp_path, rounds, *,
 
 def test_the_webrunner_launcher_still_judges_a_run_by_its_real_length(
         monkeypatch, tmp_path):
-    """沒有任何時鐘跳動時的基準：長跑算健康、短跑算 rapid fail。
+    """The baseline with no clock jump: a long run counts as healthy, a short one
+    as a rapid fail.
 
-    少了這一支，把 `alive_for` 寫死成任何一個常數都可能讓下面兩支「因為錯的理由」
-    變綠。
+    Without this test, pinning `alive_for` to any constant could make the two below
+    go green "for the wrong reason".
     """
     rc, _clock, spawns = _supervise_with_clock(
         monkeypatch, tmp_path, [(120.0, 0.0, 1), (0.0, 0.0, 0)])
-    assert (rc, spawns) == (0, 2), "活了 120 秒卻沒被算成健康"
+    assert (rc, spawns) == (0, 2), "lived 120 seconds but was not counted as healthy"
 
     rc, _clock, spawns = _supervise_with_clock(
         monkeypatch, tmp_path, [(2.0, 0.0, 1)])
-    assert (rc, spawns) == (1, 1), "2 秒就崩潰卻沒被算成 rapid fail"
+    assert (rc, spawns) == (1, 1), "crashed in 2 seconds but was not counted as a rapid fail"
 
 
 def test_a_backwards_clock_step_does_not_make_a_healthy_run_look_rapid(
         monkeypatch, tmp_path):
-    """牆鐘被往回撥時，一次健康的執行不得被誤判成 rapid fail。
+    """When the wall clock is turned back, one healthy run must not be misjudged as
+    a rapid fail.
 
-    子行程真的活了 120 秒（> `healthy_threshold_sec`），但期間牆鐘被往回撥 10 分鐘。
-    用 `time.time()` 量的話 `alive_for` 會變成 −480 秒——比任何門檻都小——於是
-    `rapid_fail_giveup_count=1` 當場觸發，監督者**在第一輪就放棄**，而那個子行程
-    其實好得很。
+    The child really lived 120 seconds (> `healthy_threshold_sec`), but during it
+    the wall clock was turned back 10 minutes. Measured with `time.time()`,
+    `alive_for` becomes −480 seconds — smaller than any threshold — so
+    `rapid_fail_giveup_count=1` fires on the spot and the supervisor **gives up on
+    the first round**, while that child is perfectly fine.
     """
     rc, _clock, spawns = _supervise_with_clock(
         monkeypatch, tmp_path, [(120.0, -600.0, 1), (0.0, 0.0, 0)])
     assert spawns == 2, (
-        "牆鐘往回撥之後監督者就放棄了——一次健康的執行被算成 rapid fail。"
-        "間隔要用 `time.monotonic()` 量，它不受時鐘調整影響。")
+        "the supervisor gave up after the wall clock was turned back — one healthy "
+        "run counted as a rapid fail. The interval must be measured with "
+        "`time.monotonic()`, which is unaffected by clock adjustments.")
     assert rc == 0
 
 
 def test_a_forwards_clock_step_does_not_reset_the_rapid_fail_counter(
         monkeypatch, tmp_path):
-    """牆鐘被往前撥時，一次真正的快速崩潰仍然要被算進 rapid-fail。
+    """When the wall clock is turned forward, one real fast crash must still count
+    toward rapid-fail.
 
-    **這是兩個方向裡比較危險的那一個**：子行程 2 秒就死，但牆鐘往前跳了 10 分鐘，
-    用 `time.time()` 量會得到 602 秒 ≥ `healthy_threshold_sec` → 判成健康 →
-    計數歸零 → 監督者**無限重生**一個真的壞掉的子行程。無人值守的機器上，這會把
-    「放棄並留下紀錄」變成「安靜地一直重試」。
+    **This is the more dangerous of the two directions**: the child dies in 2
+    seconds, but the wall clock jumped forward 10 minutes, so measured with
+    `time.time()` you get 602 seconds ≥ `healthy_threshold_sec` → judged healthy →
+    the count resets → the supervisor **respawns forever** a child that really is
+    broken. On an unattended machine, this turns "give up and leave a record" into
+    "silently keep retrying".
     """
     rc, _clock, spawns = _supervise_with_clock(
         monkeypatch, tmp_path, [(2.0, 600.0, 1)])
     assert spawns == 1, (
-        "牆鐘往前撥之後，一次 2 秒就死的崩潰被當成健康執行，監督者又重生了一輪。")
+        "after the wall clock was turned forward, a 2-second crash was treated as a "
+        "healthy run and the supervisor respawned another round.")
     assert rc == 1
 
 
 def _bot_launcher_with_clock(monkeypatch, tmp_path, rounds):
-    """在假時鐘底下跑 `start_discord_bot.main()`，回 `(每一輪睡了幾秒, spawn 次數)`。
+    """Run `start_discord_bot.main()` under a fake clock, return `(seconds slept
+    each round, spawn count)`.
 
-    這支啟動器的迴圈是 `while True` 且**沒有**放棄機制（刻意的：網路斷一下不該
-    讓 bot 永久離線），所以可觀察的結果是**退避序列**——健康的一輪會把它打回 5 秒，
-    崩潰的一輪會讓它翻倍。
+    This launcher's loop is `while True` with **no** give-up mechanism (deliberate:
+    a brief network outage should not take the bot permanently offline), so the
+    observable result is the **backoff sequence** — a healthy round resets it to 5
+    seconds, a crashing round doubles it.
     """
     module = _load_launcher("start_discord_bot.py")
     monkeypatch.setattr(module, "LOCK_FILE", tmp_path / "bot.lock")
@@ -2962,50 +3281,59 @@ def _bot_launcher_with_clock(monkeypatch, tmp_path, rounds):
 
 def test_the_bot_launcher_still_judges_a_run_by_its_real_length(monkeypatch,
                                                                 tmp_path):
-    """基準（沒有時鐘跳動）：第二輪活很久 → 退避打回 5 秒；活很短 → 翻倍成 10。"""
+    """The baseline (no clock jump): a long second round → backoff resets to 5
+    seconds; a short one → doubles to 10."""
     slept, _spawns = _bot_launcher_with_clock(
         monkeypatch, tmp_path, [(2.0, 0.0, 1), (120.0, 0.0, 1)])
-    assert slept == [5, 5], f"長跑之後退避沒有被打回最小值：{slept}"
+    assert slept == [5, 5], f"the backoff was not reset to the minimum after a long run: {slept}"
 
     slept, _spawns = _bot_launcher_with_clock(
         monkeypatch, tmp_path, [(2.0, 0.0, 1), (2.0, 0.0, 1)])
-    assert slept == [5, 10], f"連續兩次快速崩潰，退避沒有翻倍：{slept}"
+    assert slept == [5, 10], f"two fast crashes in a row and the backoff did not double: {slept}"
 
 
 def test_the_bot_launchers_backoff_ignores_a_backwards_clock_step(monkeypatch,
                                                                   tmp_path):
-    """牆鐘往回撥不得把一次健康的執行變成「又崩潰了」。
+    """A backward wall-clock step must not turn one healthy run into "crashed
+    again".
 
-    第二輪真的活了 120 秒，但牆鐘被往回撥 10 分鐘。用 `time.time()` 量會得到
-    −480 秒 → 判成不健康 → 退避繼續往上長（10 秒），而它其實應該被打回 5 秒。
+    The second round really lived 120 seconds, but the wall clock was turned back
+    10 minutes. Measured with `time.time()` you get −480 seconds → judged unhealthy
+    → the backoff keeps growing (10 seconds), when it should have reset to 5.
     """
     slept, _spawns = _bot_launcher_with_clock(
         monkeypatch, tmp_path, [(2.0, 0.0, 1), (120.0, -600.0, 1)])
     assert slept == [5, 5], (
-        f"退避序列被牆鐘的往回跳影響了：{slept}（預期 [5, 5]）。"
-        "一次活了 120 秒的執行是健康的，跟牆鐘怎麼跳沒有關係。")
+        f"the backoff sequence was affected by the backward wall-clock jump: {slept} "
+        "(expected [5, 5]). A run that lived 120 seconds is healthy, regardless of "
+        "how the wall clock jumps.")
 
 
 def test_the_bot_launchers_backoff_ignores_a_forwards_clock_step(monkeypatch,
                                                                  tmp_path):
-    """牆鐘往前撥不得把一次快速崩潰洗成健康執行。
+    """A forward wall-clock step must not launder a fast crash into a healthy run.
 
-    **危險的那個方向**：兩輪都是 2 秒就崩潰，但第二輪期間牆鐘往前跳 10 分鐘。用
-    `time.time()` 量會判成健康 → 退避被打回 5 秒，於是一個 token 壞掉的 bot 會以
-    近乎固定的 5 秒間隔一直重連——正是這段指數退避要避免的事。
+    **The dangerous direction**: both rounds crash in 2 seconds, but during the
+    second the wall clock jumps forward 10 minutes. Measured with `time.time()` it
+    is judged healthy → the backoff resets to 5 seconds, so a bot with a broken
+    token keeps reconnecting at a near-fixed 5-second interval — exactly what this
+    exponential backoff is meant to avoid.
     """
     slept, _spawns = _bot_launcher_with_clock(
         monkeypatch, tmp_path, [(2.0, 0.0, 1), (2.0, 600.0, 1)])
     assert slept == [5, 10], (
-        f"退避序列被牆鐘的往前跳影響了：{slept}（預期 [5, 10]）。"
-        "牆鐘往前跳會把快速崩潰洗成健康執行，退避因此被重置。")
+        f"the backoff sequence was affected by the forward wall-clock jump: {slept} "
+        "(expected [5, 10]). A forward wall-clock jump launders a fast crash into a "
+        "healthy run, and the backoff gets reset because of it.")
 
 
-# repo root 的**所有**腳本，不只兩支啟動器。這個缺陷會活下來的根本原因就是
-# 「沒有任何掃描器涵蓋這個目錄」：2026-09-06 那次全專案時鐘掃描的兩支 AST 守門
-# （`test_bot_helpers`、`test_webrunner_shared`）掃的都是 `axiomatic/`，而啟動器
-# 住在上一層。列表在 import 時從真的 repo root 算出來，所以之後新增的 repo root
-# 腳本會**自動**被納入，不必有人記得回來加名字。
+# **All** scripts in the repo root, not just the two launchers. The root reason
+# this defect could survive is "no scanner covers this directory": the two AST
+# guards of the 2026-09-06 project-wide clock scan (`test_bot_helpers`,
+# `test_webrunner_shared`) both scan `axiomatic/`, while the launchers live one
+# level up. The list is computed from the real repo root at import time, so a repo
+# root script added later is **automatically** included, without anyone having to
+# remember to come back and add the name.
 _ROOT_SCRIPTS = sorted(
     name for name in os.listdir(REPO_ROOT)
     if name.endswith(".py")
@@ -3015,19 +3343,24 @@ _ROOT_SCRIPTS = sorted(
 
 @pytest.mark.parametrize("launcher", _ROOT_SCRIPTS)
 def test_no_launcher_measures_an_interval_with_the_wall_clock(launcher):
-    """靜態補一刀：repo root 的腳本裡都不得出現 `time.time() - x` 這個形狀。
+    """A static second cut: no repo root script may contain the shape
+    `time.time() - x`.
 
-    上面那六支行為測試釘的是**現在這兩個**判定；這一支擋的是**下一個**被加進來的
-    牆鐘間隔——行為測試看不到還沒被寫出來的程式碼。這裡用 AST 是合適的，因為要
-    驗的本來就是「原始碼長什麼樣」這種性質（不像「這個判斷擋不擋得住事情」，那種
-    可以被恆假條件繞過，只能用行為釘）。
+    The six behavioural tests above pin the **current two** decisions; this one
+    blocks the **next** wall-clock interval that gets added — a behavioural test
+    cannot see code not yet written. AST is appropriate here, because what to verify
+    is precisely a "what the source looks like" property (unlike "does this decision
+    hold up against events", which a constant-false condition can bypass and can only
+    be pinned behaviourally).
 
-    寫時間戳（`time.time()` 單獨出現）不受影響——只有**相減**才是在量間隔。
+    Writing a timestamp (`time.time()` on its own) is unaffected — only a
+    **subtraction** measures an interval.
 
-    範圍是 repo root 的**每一支**腳本而不只兩支啟動器，因為這個缺陷能活下來的
-    根本原因就是這個目錄沒有任何掃描器涵蓋（2026-09-06 那次掃描的兩支守門都只掃
-    `axiomatic/`）。只修好兩支、守門也只看那兩支的話，下一支放在 repo root 的
-    腳本會重蹈覆轍。
+    The scope is **every** repo root script, not just the two launchers, because the
+    root reason this defect could survive is that no scanner covers this directory
+    (the two guards of the 2026-09-06 scan both scan `axiomatic/` only). Fix only the
+    two and have the guard look only at those two, and the next script placed in the
+    repo root repeats the mistake.
     """
     path = os.path.join(REPO_ROOT, launcher)
     with open(path, encoding="utf-8") as handle:
@@ -3046,41 +3379,49 @@ def test_no_launcher_measures_an_interval_with_the_wall_clock(launcher):
         and (_is_wall_clock(node.left) or _is_wall_clock(node.right))
     ]
     assert not offenders, (
-        f"{launcher} 用牆鐘量間隔：{offenders}。行程內的間隔要用 "
-        "`time.monotonic()`——`time.time()` 會被 NTP step 修正／改時鐘／快照還原"
-        "跳動，往前跳會讓監督者無限重生一個壞掉的子行程。")
+        f"{launcher} measures an interval with the wall clock: {offenders}. An "
+        "in-process interval must use `time.monotonic()` — `time.time()` jumps under "
+        "NTP step corrections / clock changes / snapshot restores, and a forward jump "
+        "makes the supervisor respawn a broken child forever.")
 
 
 # ---------------------------------------------------------------------------
-# DoD #5 的**行為**面：真的去呼叫 `python_command()`（2026-09-08）
+# DoD #5's **behavioural** side: actually call `python_command()` (2026-09-08)
 #
-# 上面那兩支守門（`test_the_interpreter_discovery_order_is_intact` /
-# `test_both_launchers_discover_the_interpreter_the_same_way`）掃的是 AST——它們
-# 看得到「候選的排列順序」，看不到「那個順序有沒有真的生效」。在這一節之前，
-# **沒有任何一支測試呼叫過 `python_command()`**，而 `CLAUDE.md` 的 DoD #5 把它列
-# 成硬規則：fresh clone 的「裝好就能跑」整個押在這個函式上。
+# The two guards above (`test_the_interpreter_discovery_order_is_intact` /
+# `test_both_launchers_discover_the_interpreter_the_same_way`) scan the AST — they
+# see "the order the candidates are arranged in" but not "whether that order
+# actually takes effect". Before this section, **no test had ever called
+# `python_command()`**, and `CLAUDE.md`'s DoD #5 lists it as a hard rule: a fresh
+# clone's "install and it runs" rests entirely on this function.
 #
-# AST 抓不到、只有實跑才抓得到的四種寫壞法：
+# Four ways to get it wrong that the AST cannot catch and only a real run can:
 #
-#   1. `venv_py.exists()` 被寫反（或那個路徑根本指錯地方）——`return [str(venv_py)]`
-#      這一行原封不動，AST 完全看不出差別。
-#   2. Windows／POSIX 挑錯子目錄（`Scripts` vs `bin`）。**這一半在這台機器上永遠
-#      不會執行到**，所以更需要被測；`os.name` 換成假的就跑得到（同一條教訓見
-#      上面的 POSIX flock 那一節）。
-#   3. `shutil.which("py")` 的結果沒被用進回傳值。
-#   4. `["py", "-3"]` 的 `-3` 掉了——fresh clone 會撞上系統預設的那個直譯器。
+#   1. `venv_py.exists()` written backwards (or that path pointing somewhere
+#      wrong) — the `return [str(venv_py)]` line is untouched, and the AST sees no
+#      difference at all.
+#   2. The Windows/POSIX wrong subdirectory (`Scripts` vs `bin`). **This half never
+#      executes on this machine**, so it needs testing all the more; swapping
+#      `os.name` for a fake reaches it (same lesson as the POSIX flock section
+#      above).
+#   3. `shutil.which("py")`'s result not used in the return value.
+#   4. The `-3` of `["py", "-3"]` dropped — a fresh clone hits the system default
+#      interpreter.
 #
-# **一律 monkeypatch `REPO_ROOT` 到暫存目錄**：這台機器上的 `.venv` 是正式行程正在
-# 用的那一份，測試連讀都不該讀到它，更不可能去建立或刪除。
+# **Always monkeypatch `REPO_ROOT` to a temp directory**: this machine's `.venv` is
+# the one the production process is using, and the test should not even read it, let
+# alone create or delete anything.
 # ---------------------------------------------------------------------------
 
 
 class _FakeOsName:
-    """只提供 `name` 的假 `os`。
+    """A fake `os` that provides only `name`.
 
-    刻意**不**寫 `setattr(os, "name", "posix")`：那會改到整個行程看到的 `os.name`，
-    而本檔還有 daemon 抽水執行緒在跑。換掉的是**啟動器模組自己的** `os` 名字繫結，
-    而且每一支測試都用 `_load_launcher` 重新載一份模組，所以影響範圍就是這一支。
+    Deliberately does **not** write `setattr(os, "name", "posix")`: that would
+    change the `os.name` the whole process sees, and this file still has daemon
+    pump threads running. What is swapped is **the launcher module's own** `os` name
+    binding, and every test reloads a fresh module copy via `_load_launcher`, so the
+    scope is just this one test.
     """
 
     def __init__(self, name: str):
@@ -3088,10 +3429,12 @@ class _FakeOsName:
 
 
 class _FakeShutil:
-    """假的 `shutil`：`which` 回固定值，並記下被問過什麼。
+    """A fake `shutil`: `which` returns a fixed value and records what it was
+    asked.
 
-    `asked` 是短路的證據——`.venv` 命中時這裡必須是空的，否則就代表 `.venv` 那一步
-    沒有真的排在前面（AST 守門看不出這件事）。
+    `asked` is the evidence of short-circuiting — on a `.venv` hit it must be empty
+    here, or it means the `.venv` step is not really first (which the AST guard
+    cannot see).
     """
 
     def __init__(self, which_result):
@@ -3112,14 +3455,17 @@ _FAKE_PY_LAUNCHER = os.path.join("C:\\", "Windows", "py.exe")
 
 @contextlib.contextmanager
 def _interpreter_probe(launcher, root, *, os_name, venv=None, which=None):
-    """載入啟動器，把 `REPO_ROOT` / `os` / `shutil` 換成假的，yield 出模組。
+    """Load the launcher, swap `REPO_ROOT` / `os` / `shutil` for fakes, and yield
+    the module.
 
-    `root` 一定是暫存目錄——真的 repo `.venv` 一根寒毛都不會被碰到。
-    `venv` 是要在 `root` 底下先建出來的假直譯器（相對路徑 tuple），`None` ＝ 這個
-    clone 沒有 `.venv`。`which` 是 `shutil.which("py")` 要回的東西。
+    `root` is always a temp directory — the real repo `.venv` is not touched in the
+    slightest. `venv` is the fake interpreter (a relative-path tuple) to be created
+    under `root` first, `None` = this clone has no `.venv`. `which` is what
+    `shutil.which("py")` should return.
 
-    用 `_Swapped` 而不是 `monkeypatch` fixture，理由與 POSIX flock 那一節相同：
-    本檔的 standalone runner 沒有 fixture，用 fixture 的話這幾支會整組消失。
+    Use `_Swapped` rather than the `monkeypatch` fixture, for the same reason as the
+    POSIX flock section: this file's standalone runner has no fixtures, and with a
+    fixture these tests would vanish entirely.
     """
     module = _load_launcher(launcher)
     root = pathlib.Path(root)
@@ -3127,7 +3473,7 @@ def _interpreter_probe(launcher, root, *, os_name, venv=None, which=None):
     if venv is not None:
         venv_py = root.joinpath(*venv)
         venv_py.parent.mkdir(parents=True, exist_ok=True)
-        venv_py.write_text("# 假的直譯器，只會被 exists() 看到，不會被執行\n",
+        venv_py.write_text("# fake interpreter, only seen by exists(), never executed\n",
                            encoding="utf-8")
     fake_shutil = _FakeShutil(which)
     with contextlib.ExitStack() as stack:
@@ -3141,37 +3487,42 @@ def _interpreter_probe(launcher, root, *, os_name, venv=None, which=None):
 @pytest.mark.parametrize("os_name", sorted(_VENV_LAYOUT))
 def test_a_clone_with_a_venv_runs_that_exact_interpreter(launcher, os_name,
                                                          tmp_path):
-    """`.venv` 在的時候要回**那個絕對路徑**，而且兩個平台的子目錄都要挑對。
+    """When `.venv` is present, return **that absolute path**, and pick the right
+    subdirectory on both platforms.
 
-    POSIX 那一半在這台 Windows 機器上永遠不會自然執行到，所以只有把 `os.name`
-    換掉才驗得到。挑錯子目錄的後果不是報錯而是**靜默降級**：`.venv/bin/python`
-    在 Windows 上不存在 → 落到 `py -3` → 正式行程換成系統直譯器在跑，而相依套件
-    的版本當場分岔（那正是「這台機器上有三組相依」那個陷阱的來源）。
+    The POSIX half never runs naturally on this Windows machine, so it can only be
+    verified by swapping `os.name`. Picking the wrong subdirectory does not report an
+    error but **silently degrades**: `.venv/bin/python` does not exist on Windows →
+    falls to `py -3` → the production process runs on the system interpreter, and
+    dependency versions fork on the spot (exactly the source of the "three
+    dependency sets on this machine" trap).
     """
     with _interpreter_probe(launcher, tmp_path, os_name=os_name,
                             venv=_VENV_LAYOUT[os_name],
                             which=_FAKE_PY_LAUNCHER) as (mod, venv_py, sh):
         got = mod.python_command()
     assert got == [str(venv_py)], (
-        f"{launcher} 在 os.name={os_name!r}、`.venv` 存在的情況下回了 {got}，"
-        f"應該是 [{str(venv_py)!r}]。DoD #5：本機 `.venv` 排第一。")
+        f"{launcher} with os.name={os_name!r} and `.venv` present returned {got}, "
+        f"should be [{str(venv_py)!r}]. DoD #5: the local `.venv` is first.")
     assert os.path.isabs(got[0]), (
-        f"{launcher} 回的不是絕對路徑（{got[0]!r}）——子行程的工作目錄是 repo "
-        "root，相對路徑只是剛好會動，換個地方就找不到。")
+        f"{launcher} returned a non-absolute path ({got[0]!r}) — the child's working "
+        "directory is the repo root, and a relative path only happens to work; move "
+        "it elsewhere and it is not found.")
     assert sh.asked == [], (
-        f"{launcher} 明明已經找到 `.venv` 了，卻還去問 `shutil.which({sh.asked})`"
-        "——代表 `.venv` 那一步沒有真的排在 `py -3` 前面（AST 守門看不出這件事，"
-        "因為兩個 return 的字面內容都沒變）。")
+        f"{launcher} already found `.venv` but still asked `shutil.which({sh.asked})` "
+        "— meaning the `.venv` step is not really before `py -3` (the AST guard "
+        "cannot see this, because neither return's literal content changed).")
 
 
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 @pytest.mark.parametrize("os_name", sorted(_VENV_LAYOUT))
 def test_the_other_platforms_venv_layout_is_not_accepted(launcher, os_name,
                                                          tmp_path):
-    """只有**另一個**平台的 `.venv` 佈局存在時，不得把它當成命中。
+    """When only the **other** platform's `.venv` layout exists, it must not be
+    treated as a hit.
 
-    這是上一支的反向。少了它，把兩個分支的子目錄對調照樣全綠——因為每一支測試都
-    只餵它自己那個佈局。
+    This is the reverse of the previous test. Without it, swapping the two branches'
+    subdirectories stays green — because each test is fed only its own layout.
     """
     other = "posix" if os_name == "nt" else "nt"
     with _interpreter_probe(launcher, tmp_path, os_name=os_name,
@@ -3179,101 +3530,122 @@ def test_the_other_platforms_venv_layout_is_not_accepted(launcher, os_name,
                             which=_FAKE_PY_LAUNCHER) as (mod, venv_py, _sh):
         got = mod.python_command()
     assert got == [_FAKE_PY_LAUNCHER, "-3"], (
-        f"{launcher} 在 os.name={os_name!r} 底下把 {other} 的佈局"
-        f"（{venv_py}）當成了可用的直譯器，回了 {got}。兩個分支的子目錄挑反了。")
+        f"{launcher} under os.name={os_name!r} treated the {other} layout "
+        f"({venv_py}) as a usable interpreter and returned {got}. The two branches' "
+        "subdirectories were picked backwards.")
 
 
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 def test_a_fresh_clone_without_a_venv_falls_back_to_the_py_launcher(launcher,
                                                                     tmp_path):
-    """沒有 `.venv` 的 fresh clone 要落到 `py -3`，而且 `-3` 不可以掉。
+    """A fresh clone with no `.venv` must fall to `py -3`, and `-3` must not be
+    dropped.
 
-    `-3` 是這一步唯一真正致命的部分：少了它，`py` 會挑系統預設的那一版——可能是
-    Python 2，也可能是別的 3.x——於是 `py -3 -m venv .venv` 都還沒跑的人第一次啟動
-    就會撞上一個看不懂的 import 失敗。AST 那支只確認「有一個 return 裡出現 `-3`」，
-    確認不了它真的被回傳出去。
+    `-3` is the only truly fatal part of this step: without it, `py` picks the
+    system default version — possibly Python 2, possibly another 3.x — so someone who
+    has not even run `py -3 -m venv .venv` hits an incomprehensible import failure on
+    their first launch. The AST test only confirms "some return contains `-3`", not
+    that it is actually returned.
     """
     with _interpreter_probe(launcher, tmp_path, os_name=os.name, venv=None,
                             which=_FAKE_PY_LAUNCHER) as (mod, _venv, sh):
         got = mod.python_command()
     assert got == [_FAKE_PY_LAUNCHER, "-3"], (
-        f"{launcher} 沒有 `.venv` 時回了 {got}，應該是 "
-        f"[{_FAKE_PY_LAUNCHER!r}, '-3']。")
+        f"{launcher} with no `.venv` returned {got}, should be "
+        f"[{_FAKE_PY_LAUNCHER!r}, '-3'].")
     assert sh.asked == ["py"], (
-        f"{launcher} 問的不是 `py`（實際問了 {sh.asked}）——DoD #5 指名的是 Windows "
-        "的 py 啟動器，它才會避開 Microsoft Store 那個殼。")
+        f"{launcher} did not ask for `py` (it asked {sh.asked}) — DoD #5 names the "
+        "Windows py launcher specifically, which is what avoids the Microsoft Store "
+        "stub.")
 
 
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 def test_without_a_venv_or_a_py_launcher_it_uses_the_current_interpreter(
         launcher, tmp_path):
-    """兩個都沒有時，用啟動這支啟動器的那個直譯器——最後一道保底，不能回空的。"""
+    """When neither is present, use the interpreter that started this launcher —
+    the last fallback, which must not return empty."""
     with _interpreter_probe(launcher, tmp_path, os_name=os.name, venv=None,
                             which=None) as (mod, _venv, _sh):
         got = mod.python_command()
     assert got == [sys.executable], (
-        f"{launcher} 在既沒有 `.venv` 也沒有 `py` 的機器上回了 {got}，"
-        f"應該是 [{sys.executable!r}]。這是保底那一步，回錯就等於根本啟動不了。")
+        f"{launcher} on a machine with neither `.venv` nor `py` returned {got}, "
+        f"should be [{sys.executable!r}]. This is the fallback step, and getting it "
+        "wrong means it cannot start at all.")
 
 
 @pytest.mark.parametrize("launcher", _LAUNCHERS)
 def test_the_venv_beats_the_py_launcher_when_both_are_available(launcher,
                                                                 tmp_path):
-    """**順序真的是順序**：兩個都在的時候必須選 `.venv`。
+    """**The order really is the order**: when both are present, `.venv` must be
+    chosen.
 
-    這台開發機正是「兩個都在」，所以這支測的就是正式行程每天實際走的那條路。
-    選錯的話 bot 與 webrunner 會跑在系統直譯器上——症狀不是啟動失敗，而是相依
-    套件的版本悄悄換了一組。
+    This dev machine is exactly "both present", so this test is the path the
+    production process actually takes every day. Getting it wrong makes the bot and
+    webrunner run on the system interpreter — the symptom is not a startup failure
+    but a quietly swapped set of dependency versions.
     """
     layout = _VENV_LAYOUT["nt" if os.name == "nt" else "posix"]
     with _interpreter_probe(launcher, tmp_path, os_name=os.name, venv=layout,
                             which=_FAKE_PY_LAUNCHER) as (mod, venv_py, sh):
         got = mod.python_command()
     assert got == [str(venv_py)], (
-        f"{launcher} 在 `.venv` 與 `py` 都存在時選了 {got}，應該選 `.venv`"
-        f"（{venv_py}）。")
-    assert sh.asked == [], "選到 `.venv` 之後不該再去問 `py`"
+        f"{launcher} with both `.venv` and `py` present chose {got}, should choose "
+        f"`.venv` ({venv_py}).")
+    assert sh.asked == [], "after choosing `.venv` it should not go on to ask for `py`"
 
 
 # ---------------------------------------------------------------------------
-# `python_command()` 一共有**三份**，第三份刻意不一樣
+# There are **three** copies of `python_command()`; the third is deliberately
+# different
 # ---------------------------------------------------------------------------
-# 兩支啟動器那兩份必須逐字相同（上面那支 AST 守門在盯）。`install_autostart.py`
-# 的第三份**刻意不同**，理由寫在它自己的 docstring 裡：工作排程器跑的時候 PATH 與
-# 環境變數跟互動 shell 不同，所以不走 `py -3` 而是寫死絕對路徑；也刻意不用
-# `pythonw.exe`（排程器啟動的 `pythonw` 沒有繼承標準控制代碼，`sys.stdout` 是
-# `None`，而這整套到處都在 `print()`，第一行就會炸成 `AttributeError`）。
+# The two launcher copies must be identical verbatim (the AST guard above watches
+# this). `install_autostart.py`'s third copy is **deliberately different**, for the
+# reason in its own docstring: when the task scheduler runs, PATH and environment
+# variables differ from an interactive shell, so it hardcodes an absolute path
+# rather than going through `py -3`; it also deliberately avoids `pythonw.exe` (a
+# scheduler-launched `pythonw` does not inherit the standard handles, `sys.stdout`
+# is `None`, and this whole stack `print()`s everywhere, so the first line blows up
+# as `AttributeError`).
 #
-# 少了下面這兩支，讀到「兩支啟動器要逐字相同」的人很容易把第三份當成**漏掉的**
-# 那一份而順手「統一」掉——那個改動看起來完全無害，代價是開機自動啟動的那一套
-# 再也起不來，而且沒有任何錯誤訊息。
-# **兩份名單要對得起來（2026-09-11 修）。** `_LAUNCHERS`（本檔上方）驅動十幾支
-# parametrize 過的守門——探索順序、逐字相同、單一實例鎖、降級措辭、單調時鐘、
-# `stream_child`……，而下面這份表只回答「這份複本有沒有人認領」。在此之前兩者**互不
-# 相干**：新增一支 `start_thing.py` 會讓下面那支變紅，而最便宜的修法是補一行字串；
-# 補完全綠，那支新啟動器的探索順序卻**一支守門都沒有**。紅燈還反過來教人「登記就算
-# 處理完了」，那比沒有那盞燈更糟。所以「啟動器」那一類現在**由 `_LAUNCHERS` 算出
-# 來**，不另抄一份——歸類即涵蓋。
+# Without the two tests below, a reader of "the two launchers must be identical
+# verbatim" easily treats the third copy as the **missing** one and "unifies" it out
+# of hand — a change that looks entirely harmless, at the cost of the autostart set
+# never starting again, with no error message.
+# **The two lists must line up (fixed 2026-09-11).** `_LAUNCHERS` (top of this
+# file) drives a dozen-plus parametrized guards — discovery order, verbatim
+# identity, single-instance lock, degraded wording, monotonic clock,
+# `stream_child`… — while the table below only answers "has this copy been claimed".
+# Before this the two were **unrelated**: adding a `start_thing.py` made the table
+# below go red, and the cheapest fix was to add one string; after that everything is
+# green while the new launcher's discovery order has **not one guard**. The red
+# light even taught "registering counts as handled", which is worse than not having
+# that light. So the "launcher" category is now **computed from `_LAUNCHERS`**, not
+# copied separately — classifying is covering.
 #
-# 例外名單：**只給「刻意做相反的事」的那幾份**，不是給新啟動器的逃生門。一筆過期的
-# 例外是 fail-open——檔案改名、或那個 `python_command()` 被拿掉之後，那個字串就再也
-# 對不到任何東西，守門照跑、測試全綠，而受檢集合已經悄悄少了一個（`CLAUDE.md` 對
-# `_OWNER_ONLY_SLASH` 記的是同一個形狀）。
+# The exemption list: **only for the copies that deliberately do the opposite**,
+# not an escape hatch for new launchers. A stale exemption is fail-open — after a
+# file is renamed or that `python_command()` is removed, the string matches nothing
+# any more, the guard runs, every test is green, and the checked set has quietly
+# lost one (the same shape `CLAUDE.md` records for `_OWNER_ONLY_SLASH`).
 _PYTHON_COMMAND_EXEMPT = {
     "install_autostart.py":
-        "工作排程器專用，**刻意分歧**。不走 `py -3`：`py.exe` 是轉接器，`-3` 要到"
-        "執行當下才去查登錄檔、`PY_PYTHON`、`py.ini` 與 shebang，登入工作拿到的環境"
-        "跟互動 shell 不一樣，而且它一定不會解析到 `.venv`。也只找 "
-        "`.venv/Scripts/`，因為 `main()` 在非 Windows 上就直接收工。"
-        "理由全文見該函式的 docstring。",
+        "Task-scheduler-specific, **deliberately divergent**. Does not go through "
+        "`py -3`: `py.exe` is a launcher, and `-3` only consults the registry, "
+        "`PY_PYTHON`, `py.ini` and the shebang at run time; the environment a login "
+        "task gets differs from an interactive shell, and it will definitely not "
+        "resolve to `.venv`. It also only looks in `.venv/Scripts/`, because "
+        "`main()` finishes outright on non-Windows. See the function's docstring "
+        "for the full reasoning.",
 }
 
 
 def _root_python_command_files() -> set:
-    """repo root 上**模組層**定義了 `python_command()` 的檔案，由 AST 算出來。
+    """The repo root files that define `python_command()` at **module level**,
+    computed by AST.
 
-    只看 `tree.body` 而不是 `ast.walk`：巢狀在函式或類別裡的同名定義不是 DoD #5
-    那個交接點，收進來只會製造誤報。
+    Look at `tree.body` only, not `ast.walk`: a same-named definition nested in a
+    function or class is not the DoD #5 handoff point, and including it only creates
+    false positives.
     """
     found = set()
     for name in _ROOT_SCRIPTS:
@@ -3288,67 +3660,84 @@ def _root_python_command_files() -> set:
 
 def _python_command_registration_errors(found, launchers, exempt, *,
                                         min_found=3, min_launchers=2) -> list:
-    """歸類表的對帳判準。**純函式**——理由同 `test_verify_browser._exemption_errors`：
-    現況是乾淨的，所以把主測試裡的斷言整條刪掉本來就不會紅，牙齒得長在一個合成語料
-    問得到的地方。
+    """The reconciliation criteria for the classification table. A **pure
+    function** — same reason as `test_verify_browser._exemption_errors`: the current
+    state is clean, so deleting the assertion in the main test would not go red on
+    its own, and the teeth must grow where a synthetic corpus can ask them.
     """
     errors = []
-    # (A) 族群下限。空的 `found` 會讓 (C)(D)(E) 三條**真空成立**，輸出跟「全部合規」
-    #     一模一樣；`_ROOT_SCRIPTS` 只要掃錯目錄就是這個下場。
+    # (A) Population floor. An empty `found` makes (C)(D)(E) all **vacuously
+    #     true**, with output identical to "everything compliant"; `_ROOT_SCRIPTS`
+    #     scanning the wrong directory is exactly this outcome.
     if len(found) < min_found:
         errors.append(
-            f"repo root 只掃到 {len(found)} 份 `python_command()`（下限 "
-            f"{min_found}）：{sorted(found)}。空的受檢集合會讓下面每一條對帳真空"
-            "通過，而輸出跟「全部合規」分不出來。")
-    # (B) `_LAUNCHERS` 的下限。它是十幾支 parametrize 守門的參數來源，而 pytest 對
-    #     **空的**參數集是 skipped、不是 error——清空它等於靜默關掉那十幾支。
+            f"the repo root scan found only {len(found)} `python_command()` copies "
+            f"(floor {min_found}): {sorted(found)}. An empty checked set makes every "
+            "reconciliation below pass vacuously, with output indistinguishable from "
+            "'everything compliant'.")
+    # (B) `_LAUNCHERS`'s floor. It is the parameter source for a dozen-plus
+    #     parametrized guards, and pytest treats an **empty** parameter set as
+    #     skipped, not error — emptying it silently switches those dozen off.
     if len(launchers) < min_launchers:
         errors.append(
-            f"`_LAUNCHERS` 只剩 {len(launchers)} 支（下限 {min_launchers}）："
-            f"{sorted(launchers)}。空的參數集在 pytest 只是少幾行輸出，不會紅。")
-    # (C) 每一份複本都要被歸類。新增一支啟動器時這條先紅。
+            f"`_LAUNCHERS` has only {len(launchers)} left (floor {min_launchers}): "
+            f"{sorted(launchers)}. An empty parameter set is just a few fewer output "
+            "lines in pytest, not red.")
+    # (C) Every copy must be classified. Adding a launcher goes red here first.
     unclaimed = set(found) - set(launchers) - set(exempt)
     if unclaimed:
         errors.append(
-            f"這幾份 `python_command()` 沒有被歸類：{sorted(unclaimed)}。它要嘛是"
-            "啟動器（加進 `_LAUNCHERS`，那十幾支守門就會自動涵蓋它，探索順序與逐字"
-            "相同都會被檢查），要嘛是刻意分歧（加進 `_PYTHON_COMMAND_EXEMPT` 並寫下"
-            "理由）。**只補一行登記是不夠的**——那正是這條在擋的事。")
-    # (D) 反方向：`_LAUNCHERS` 裡的名字必須還真的有 `python_command()`。
+            f"these `python_command()` copies are unclassified: {sorted(unclaimed)}. "
+            "Each is either a launcher (add it to `_LAUNCHERS`, and the dozen-plus "
+            "guards cover it automatically, checking discovery order and verbatim "
+            "identity) or deliberately divergent (add it to `_PYTHON_COMMAND_EXEMPT` "
+            "with a reason). **Adding one line of registration is not enough** — that "
+            "is exactly what this blocks.")
+    # (D) The reverse: a name in `_LAUNCHERS` must still really have a
+    #     `python_command()`.
     stale = set(launchers) - set(found)
     if stale:
         errors.append(
-            f"`_LAUNCHERS` 裡的 {sorted(stale)} 已經不是 `python_command()` 的"
-            f"所在地了（檔案改名、或那個函式被拿掉）。目前掃到的是：{sorted(found)}")
-    # (E) 反方向：例外名單的 fail-open 那一面，外加理由不得敷衍。
+            f"the {sorted(stale)} in `_LAUNCHERS` are no longer where "
+            f"`python_command()` lives (renamed file, or the function removed). "
+            f"Currently scanned: {sorted(found)}")
+    # (E) The reverse: the fail-open side of the exemption list, plus the reason
+    #     must not be perfunctory.
     for name, reason in exempt.items():
         if name not in found:
             errors.append(
-                f"例外名單裡的 {name!r} 已經沒有 `python_command()` 了（檔案改名、"
-                f"或那個函式被拿掉）。目前掃到的是：{sorted(found)}")
+                f"{name!r} in the exemption list no longer has a `python_command()` "
+                f"(renamed file, or the function removed). Currently scanned: "
+                f"{sorted(found)}")
         if len(str(reason).strip()) < 20:
-            errors.append(f"{name} 的例外沒有寫下夠具體的理由：{reason!r}")
-    # (F) 同一個檔案不得兩邊都列——那是兩種相反的處置，重疊時「該不該逐字相同」沒有
-    #     答案，而測試會照 `_LAUNCHERS` 那邊跑，等於例外被默默忽略。
+            errors.append(f"{name}'s exemption gives no specific enough reason: {reason!r}")
+    # (F) The same file must not be listed on both sides — those are two opposite
+    #     dispositions, and when they overlap "should it be identical verbatim" has
+    #     no answer; the test runs on the `_LAUNCHERS` side, so the exemption is
+    #     silently ignored.
     both = set(launchers) & set(exempt)
     if both:
         errors.append(
-            f"{sorted(both)} 同時列在 `_LAUNCHERS` 與 `_PYTHON_COMMAND_EXEMPT`。"
-            "那是兩種相反的處置（必須逐字相同／刻意分歧），挑一邊。")
+            f"{sorted(both)} is listed in both `_LAUNCHERS` and "
+            "`_PYTHON_COMMAND_EXEMPT`. Those are two opposite dispositions (must be "
+            "identical verbatim / deliberately divergent), pick one side.")
     return errors
 
 
 def test_every_copy_of_python_command_is_accounted_for():
-    """repo root 的每一份 `python_command()` 都要被**歸類**，不只是被登記。
+    """Every `python_command()` in the repo root must be **classified**, not just
+    registered.
 
-    fail-closed：第四份出現時這支會紅，而訊息會逼寫的人回答「它該跟誰一致」。沒有
-    這一層的話，一份沒人知道的複本可以帶著自己那套探索順序活很久。
+    Fail-closed: a fourth copy makes this go red, and the message forces the writer
+    to answer "who should it be identical to". Without this layer, an unknown copy
+    can live a long time carrying its own discovery order.
 
-    **2026-09-11 加強。** 以前它問的是「登記表有沒有這個名字」，而那可以用一行字串
-    滿足——字串是散文，沒有任何東西能從中判斷那個檔案該不該進 `_LAUNCHERS`。於是
-    「補一行登記」看起來就是完整的修法，新啟動器的探索順序一支守門都不會看，而紅燈
-    本身還背書了那個錯誤的修法。現在啟動器那一類由 `_LAUNCHERS` 算出來，**歸類即
-    涵蓋**。
+    **Strengthened 2026-09-11.** It used to ask "is this name in the registration
+    table", which one string could satisfy — a string is prose, and nothing about it
+    tells whether that file should go into `_LAUNCHERS`. So "add one line of
+    registration" looked like a complete fix, the new launcher's discovery order was
+    watched by no guard, and the red light itself endorsed that wrong fix. Now the
+    launcher category is computed from `_LAUNCHERS`, so **classifying is covering**.
     """
     problems = _python_command_registration_errors(
         _root_python_command_files(), _LAUNCHERS, _PYTHON_COMMAND_EXEMPT)
@@ -3356,15 +3745,17 @@ def test_every_copy_of_python_command_is_accounted_for():
 
 
 def test_the_python_command_registration_bites_on_a_synthetic_corpus():
-    """對照組：真實資料是乾淨的，所以上面那支**刪掉任何一條分支都不會紅**。
+    """The control: the real data is clean, so the test above **would not go red
+    on deleting any single branch**.
 
-    每一條各給一份**只違反它自己**的語料。用同一份語料的話兩條會互相遮蔽——刪掉其中
-    一條，另一條照樣把那份語料判成有問題，變異就活下來了（這一輪在
-    `_collect_codex_images` 上剛踩過同一個形狀）。
+    Each branch gets a corpus that **violates only itself**. Using one shared corpus
+    would let two branches mask each other — delete one and the other still flags
+    that corpus as a problem, and the mutation survives (the same shape was just hit
+    on `_collect_codex_images` this round).
     """
     clean_found = {"a.py", "b.py", "x.py"}
     clean_launchers = ("a.py", "b.py")
-    clean_exempt = {"x.py": "刻意分歧，這段理由寫得夠長，足以通過長度下限。"}
+    clean_exempt = {"x.py": "deliberately divergent, and this reason is written long enough to pass the length floor."}
 
     def _errors(found=None, launchers=None, exempt=None):
         return _python_command_registration_errors(
@@ -3373,95 +3764,108 @@ def test_the_python_command_registration_bites_on_a_synthetic_corpus():
             clean_exempt if exempt is None else exempt)
 
     assert _errors() == [], (
-        f"對照語料本身就該是乾淨的，否則下面每一條都證明不了是自己咬的：{_errors()}")
+        f"the control corpus should itself be clean, or none of the branches below "
+        f"can prove they bit on their own: {_errors()}")
 
     cases = [
-        ("A 族群下限", dict(found={"a.py", "b.py"}, exempt={}), "下限 3"),
-        ("B `_LAUNCHERS` 下限",
+        ("A population floor", dict(found={"a.py", "b.py"}, exempt={}), "floor 3"),
+        ("B `_LAUNCHERS` floor",
          dict(found={"a.py", "x.py", "y.py"}, launchers=("a.py",),
               exempt={"x.py": clean_exempt["x.py"],
-                      "y.py": clean_exempt["x.py"]}), "下限 2"),
-        ("C 新複本沒有被歸類",
+                      "y.py": clean_exempt["x.py"]}), "floor 2"),
+        ("C new copy is unclassified",
          dict(found=clean_found | {"start_thing.py"}), "start_thing.py"),
-        ("D `_LAUNCHERS` 裡有過期的名字",
+        ("D `_LAUNCHERS` has a stale name",
          dict(launchers=clean_launchers + ("gone.py",)), "gone.py"),
-        ("E1 例外名單裡有過期的名字",
+        ("E1 exemption list has a stale name",
          dict(exempt={**clean_exempt, "gone.py": clean_exempt["x.py"]}),
          "gone.py"),
-        ("E2 例外的理由太敷衍", dict(exempt={"x.py": "太短"}), "夠具體的理由"),
-        ("F 同一個檔案兩邊都列",
+        ("E2 the exemption reason is too perfunctory", dict(exempt={"x.py": "too short"}), "specific enough reason"),
+        ("F the same file is listed on both sides",
          dict(exempt={"a.py": clean_exempt["x.py"],
-                      "x.py": clean_exempt["x.py"]}), "挑一邊"),
+                      "x.py": clean_exempt["x.py"]}), "pick one side"),
     ]
     for label, corpus, needle in cases:
         got = _errors(**corpus)
         assert len(got) == 1, (
-            f"{label}：這份語料應該**只**觸發一條，實際 {len(got)} 條。兩條以上代表"
-            f"語料沒隔乾淨，刪掉其中一條分支仍然會被另一條遮住。\n{got}")
-        assert needle in got[0], f"{label}：訊息沒提到 {needle!r}：{got[0]}"
+            f"{label}: this corpus should trigger **only** one, got {len(got)}. Two "
+            f"or more means the corpus is not isolated, and deleting one branch would "
+            f"still be masked by another.\n{got}")
+        assert needle in got[0], f"{label}: the message does not mention {needle!r}: {got[0]}"
 
 
 def test_the_autostart_copy_is_deliberately_different_not_a_missed_one():
-    """第三份**不得**被「統一」成啟動器那一份。
+    """The third copy **must not** be "unified" into the launcher one.
 
-    斷言的是不相等，看起來反直覺，但這正是要保護的性質：把 `py -3` 塞回排程器那
-    條路，工作排程器的環境裡 PATH 不一樣，找到的可能是另一個直譯器甚至找不到；而
-    這種失敗只會在下次重新開機時出現，現場沒有人在看。
+    Asserting non-equality looks counterintuitive, but that is precisely the
+    property to protect: putting `py -3` back onto the scheduler path, where the task
+    scheduler's PATH differs, might find another interpreter or none at all — and
+    that failure only surfaces on the next reboot, with nobody watching.
     """
     autostart = ast.unparse(_python_command_node("install_autostart.py"))
     launcher = ast.unparse(_python_command_node("start_discord_bot.py"))
     assert autostart != launcher, (
-        "`install_autostart.python_command()` 被改成跟啟動器那份一樣了。那份是"
-        "**刻意分歧**，不是漏掉的複本：排程器的 PATH 與互動 shell 不同，所以它"
-        "寫死 `.venv/Scripts/` 的絕對路徑而不走 `py -3`。要改的話先讀它的 "
-        "docstring，再更新 `_PYTHON_COMMAND_EXEMPT` 的說明。")
+        "`install_autostart.python_command()` was changed to match the launcher "
+        "copy. That copy is **deliberately divergent**, not a missed copy: the "
+        "scheduler's PATH differs from an interactive shell, so it hardcodes the "
+        "`.venv/Scripts/` absolute path rather than going through `py -3`. To change "
+        "it, read its docstring first, then update `_PYTHON_COMMAND_EXEMPT`'s note.")
     assert "'-3'" not in autostart and '"-3"' not in autostart, (
-        f"`install_autostart.python_command()` 長出了 `py -3`：{autostart}")
+        f"`install_autostart.python_command()` grew a `py -3`: {autostart}")
 
 
 # ---------------------------------------------------------------------------
-# 兩支啟動器的收尾與失敗路徑（2026-09-08 補）
+# The two launchers' wrap-up and failure paths (added 2026-09-08)
 #
-# 量覆蓋率時發現：`_supervisor.py` 是 100%，但兩支啟動器不是——漏掉的整片都是
-# 「已經出事之後」才會執行的路徑。與 `_supervisor.py` 那一節同樣的判準：監督者
-# 存在的唯一理由就是別的東西壞掉的時候撐住，所以那些分支等於它最核心的職責。
+# Measuring coverage found: `_supervisor.py` is 100%, but the two launchers are
+# not — the whole missing swath is paths that only run "after something has gone
+# wrong". Same criterion as the `_supervisor.py` section: the supervisor's only
+# reason to exist is to hold up when other things break, so those branches are its
+# most central responsibility.
 #
-# 這一節的每一支都**不會真的起出 bot 或 webrunner**：`stream_child` 一律換成
-# 間諜或會丟例外的攔截器。webrunner 一啟動就無條件 nuclear sweep 掉全機 Chrome，
-# 而這台機器上通常有一個跑了好幾天的無人值守批次在用它。
+# Every test in this section **never actually starts a bot or webrunner**:
+# `stream_child` is always swapped for a spy or an interceptor that raises. A
+# webrunner on startup unconditionally nuclear-sweeps all Chrome, and this machine
+# usually has a multi-day unattended batch using it.
 #
-# **假子行程一律有上限**：超過預期輪數就丟 `_NoMoreRounds` 把迴圈拆掉。兩支監督者
-# 的迴圈都是 `while True`，而假時鐘的 `sleep` 不會真的等，所以「這條早退路徑被改壞
-# 了」的症狀會是**測試掛住**而不是紅掉——變異測試實際踩到：把 `child_exit_is_fatal`
-# 那個分支改成恆假之後，測試不是紅，是一路轉到 `attempt 7088727` 才被逾時砍掉。
-# 掛住的測試比紅掉的更糟：紅的會指出問題，掛住的只是讓整輪停在那裡。
+# **The fake child always has a cap**: over the expected number of rounds it throws
+# `_NoMoreRounds` to break the loop. Both supervisors' loops are `while True`, and
+# the fake clock's `sleep` does not really wait, so the symptom of "this early-exit
+# path was broken" is the **test hanging**, not going red — mutation testing hit it
+# for real: after changing the `child_exit_is_fatal` branch to constant-false, the
+# test was not red but spun all the way to `attempt 7088727` before being killed by
+# timeout. A hung test is worse than a red one: red points at the problem, hung just
+# leaves the whole run stuck there.
 # ---------------------------------------------------------------------------
 
 def _expect_no_extra_round(call, what):
-    """跑 `call()`，如果監督者又轉了一輪就以看得懂的訊息失敗。
+    """Run `call()`, and if the supervisor spun another round, fail with a legible
+    message.
 
-    假子行程的上限是用 `_NoMoreRounds` 做的（見本節開頭），而一個裸的
-    `_NoMoreRounds` 只說明「被呼叫太多次」，沒說為什麼那是錯的。把它翻譯回原本
-    要保護的性質，下一個看到紅燈的人才不用回頭讀測試的實作。
+    The fake child's cap is made with `_NoMoreRounds` (see the start of this
+    section), and a bare `_NoMoreRounds` only says "called too many times", not why
+    that is wrong. Translate it back to the property being protected, so the next
+    person seeing the red does not have to go read the test's implementation.
     """
     try:
         return call()
     except _NoMoreRounds:
         pytest.fail(
-            f"{what}——監督者卻又重生了一輪。這條早退路徑必須當場結束迴圈："
-            "照常退避的話它會一直重生一個註定用同樣方式失敗的子行程，而 "
-            "rapid-fail giveup 只看「活了多久」，看不出這件事。")
+            f"{what} — but the supervisor respawned another round. This early-exit "
+            "path must end the loop on the spot: with normal backoff it keeps "
+            "respawning a child doomed to fail the same way, and rapid-fail giveup "
+            "only looks at 'how long it ran' and cannot see this.")
 
 
 BOT_LAUNCHER_NAME = "start_discord_bot.py"
 
 
 class _SpyLock:
-    """假的單一實例鎖：記下被放掉幾次。
+    """A fake single-instance lock: records how many times it was released.
 
-    換掉真的那把是**安全需求**：真的會去動 repo root 的
-    `.discord_bot_supervisor.lock`／`.webrunner_supervisor.lock`，而正式的監督者
-    正握著它們。
+    Swapping the real one is a **safety requirement**: the real one touches the repo
+    root's `.discord_bot_supervisor.lock` / `.webrunner_supervisor.lock`, which the
+    production supervisors are holding.
     """
 
     def __init__(self, *, degraded=False):
@@ -3473,7 +3877,7 @@ class _SpyLock:
 
 
 class _CtrlCOnSleep(_Clock):
-    """退避睡到一半被 Ctrl+C。"""
+    """Ctrl+C partway through the backoff sleep."""
 
     def sleep(self, seconds):
         self.slept.append(seconds)
@@ -3482,9 +3886,10 @@ class _CtrlCOnSleep(_Clock):
 
 def _bot_launcher(monkeypatch, tmp_path, child, *, lock=None, clock=None,
                   log_path=None):
-    """把 `start_discord_bot` 架在替身上，回 `(module, lock, clock)`。
+    """Set up `start_discord_bot` on stubs, return `(module, lock, clock)`.
 
-    `child` 就是假的 `stream_child`。呼叫端自己決定什麼時候呼叫 `module.main()`。
+    `child` is the fake `stream_child`. The caller decides when to call
+    `module.main()`.
     """
     module = _load_launcher(BOT_LAUNCHER_NAME)
     monkeypatch.setattr(module, "LOCK_FILE", tmp_path / "bot.lock")
@@ -3503,44 +3908,57 @@ def _bot_launcher(monkeypatch, tmp_path, child, *, lock=None, clock=None,
 
 def test_the_bot_launcher_stops_instead_of_respawning_a_doomed_child(
         monkeypatch, tmp_path):
-    """bot 回報「已經有另一個實例在跑」時，啟動器要收工，不是退避重生。
+    """When the bot reports "another instance is already running", the launcher
+    must wrap up, not back off and respawn.
 
-    這條分支的註解自己說明了理由：bot 本體有它自己的一把鎖，被擋掉時每次都在一秒
-    內乾淨退出。照常退避的話這個迴圈會每 5～300 秒重生一次**註定被同一把鎖擋掉**
-    的子行程，而 rapid-fail giveup 只看「活了多久」，看不出這件事——它會永遠轉下去。
+    This branch's comment states the reason itself: the bot body has its own lock,
+    and when blocked it exits cleanly within a second every time. With normal
+    backoff this loop would respawn, every 5–300 seconds, a child **doomed to be
+    blocked by the same lock**, and rapid-fail giveup only looks at "how long it ran"
+    and cannot see this — it would spin forever.
     """
     spawns = []
 
     def _child(cmd, _log, **_kwargs):
         spawns.append(cmd)
         if len(spawns) > 1:
-            raise _NoMoreRounds          # 見下面「假子行程一律有上限」
+            raise _NoMoreRounds          # see "the fake child always has a cap" below
         return RC_ALREADY_RUNNING
 
     log_path = tmp_path / "bot.log"
     module, lock, clock = _bot_launcher(monkeypatch, tmp_path, _child,
                                         log_path=log_path)
     rc = _expect_no_extra_round(module.main,
-                                "bot 回報已經有另一個實例在執行")
+                                "the bot reports another instance is already running")
 
     assert rc == RC_ALREADY_RUNNING, (
-        f"致命 rc 應該原樣往外送（好讓外面的排程器也看得出來），實際回 {rc}")
+        f"the fatal rc should be passed straight out (so an outer scheduler can see "
+        f"it too), got {rc}")
     assert len(spawns) == 1, (
-        f"重生了 {len(spawns)} 次。這種失敗重試永遠不會成功，迴圈必須當場停下來。")
+        f"respawned {len(spawns)} times. This kind of failure retry never succeeds, "
+        "and the loop must stop on the spot.")
     assert clock.slept == [], (
-        f"還睡了退避 {clock.slept}——代表走的是一般的崩潰路徑，不是這條。")
-    assert lock.releases == 1, f"鎖沒有在收工時放掉（releases={lock.releases}）"
+        f"it still slept the backoff {clock.slept} — meaning it took the ordinary "
+        "crash path, not this one.")
+    assert lock.releases == 1, f"the lock was not released on wrap-up (releases={lock.releases})"
+    # The substring below is the launcher's Chinese "another instance" line, which
+    # lives in start_discord_bot.py (out of scope here), so it is intentionally left
+    # untranslated.
     assert "另一個實例" in log_path.read_text(encoding="utf-8"), (
-        "收工了卻沒有把原因寫進記錄檔。這條路上使用者看到的就是啟動器直接結束，"
-        "沒有那行說明的話沒人知道該去結束哪一個行程。（改了措辭就更新這支測試。）")
+        "it wrapped up but did not write the reason to the log. On this path the "
+        "user just sees the launcher exit directly, and without that line of "
+        "explanation nobody knows which process to end. (If the wording changes, "
+        "update this test.)")
 
 
 def test_the_bot_launcher_holds_the_lock_until_the_loop_is_over(monkeypatch,
                                                                 tmp_path):
-    """鎖要**整段**握著，而且離開時一定放得掉（`finally` 裡那一次）。
+    """The lock must be held the **whole time**, and always releasable on the way
+    out (the one in `finally`).
 
-    兩個方向一起釘：迴圈跑到一半就放掉的話，第二個監督者當場起得來；而 `release()`
-    如果不在 `finally` 裡，任何往外炸的例外都會讓它被跳過。
+    Two directions pinned together: releasing it partway through the loop lets a
+    second supervisor start on the spot; and if `release()` is not in `finally`, any
+    exception thrown outward would skip it.
     """
     held_during_run = []
 
@@ -3555,55 +3973,58 @@ def test_the_bot_launcher_holds_the_lock_until_the_loop_is_over(monkeypatch,
         module.main()
 
     assert held_during_run == [0], (
-        "子行程還在跑的時候鎖就被放掉了——這段期間第二個監督者起得來，"
-        "而兩套都會「看起來正常」。")
+        "the lock was released while the child was still running — during that "
+        "window a second supervisor can start, and both would 'look normal'.")
     assert lock.releases == 1, (
-        f"往外炸的例外把 `lock.release()` 跳過了（releases={lock.releases}）。"
-        "它必須在 `finally` 裡。")
+        f"an exception thrown outward skipped `lock.release()` (releases={lock.releases}). "
+        "It must be in `finally`.")
 
 
 def test_a_ctrl_c_while_the_bot_runs_exits_cleanly_without_respawning(
         monkeypatch, tmp_path):
-    """Ctrl+C 是**乾淨結束**（rc=0），不是一次崩潰——不得再重生一輪。"""
+    """Ctrl+C is a **clean exit** (rc=0), not a crash — no respawning another
+    round."""
     spawns = []
 
     def _child(cmd, _log, **_kwargs):
         spawns.append(cmd)
         if len(spawns) > 1:
-            raise _NoMoreRounds          # 見下面「假子行程一律有上限」
+            raise _NoMoreRounds          # see "the fake child always has a cap" below
         raise KeyboardInterrupt
 
     module, lock, clock = _bot_launcher(monkeypatch, tmp_path, _child)
-    rc = _expect_no_extra_round(module.main, "子行程執行中收到 Ctrl+C")
+    rc = _expect_no_extra_round(module.main, "Ctrl+C received while the child runs")
 
-    assert rc == 0, f"Ctrl+C 應該回 rc=0，實際 {rc}"
-    assert len(spawns) == 1, "Ctrl+C 之後又重生了一輪"
-    assert clock.slept == [], "Ctrl+C 之後還去睡退避"
-    assert lock.releases == 1, "Ctrl+C 之後鎖沒放掉"
+    assert rc == 0, f"Ctrl+C should return rc=0, got {rc}"
+    assert len(spawns) == 1, "respawned another round after Ctrl+C"
+    assert clock.slept == [], "still slept the backoff after Ctrl+C"
+    assert lock.releases == 1, "the lock was not released after Ctrl+C"
 
 
 def test_a_ctrl_c_during_the_backoff_sleep_also_exits_cleanly(monkeypatch,
                                                               tmp_path):
-    """等退避的那幾分鐘正是最可能被按 Ctrl+C 的時候——那條路要單獨有出口。
+    """The minutes of waiting for backoff are exactly when Ctrl+C is most likely —
+    that path needs its own exit.
 
-    這是兩個 Ctrl+C 出口裡比較容易被漏掉的一個：迴圈大部分時間其實停在這裡。
+    This is the more easily missed of the two Ctrl+C exits: the loop actually spends
+    most of its time here.
     """
     spawns = []
 
     def _child(cmd, _log, **_kwargs):
         spawns.append(cmd)
         if len(spawns) > 1:
-            raise _NoMoreRounds          # 見下面「假子行程一律有上限」
+            raise _NoMoreRounds          # see "the fake child always has a cap" below
         return 1
 
     module, lock, clock = _bot_launcher(monkeypatch, tmp_path, _child,
                                         clock=_CtrlCOnSleep())
-    rc = _expect_no_extra_round(module.main, "等退避的時候收到 Ctrl+C")
+    rc = _expect_no_extra_round(module.main, "Ctrl+C received while waiting for backoff")
 
-    assert rc == 0, f"睡到一半的 Ctrl+C 應該回 rc=0，實際 {rc}"
+    assert rc == 0, f"a Ctrl+C partway through the sleep should return rc=0, got {rc}"
     assert clock.slept == [5], (
-        f"第一次崩潰應該睡最小退避 5 秒（實際 {clock.slept}）")
-    assert len(spawns) == 1, "Ctrl+C 之後又重生了一輪"
+        f"the first crash should sleep the minimum backoff of 5 seconds (got {clock.slept})")
+    assert len(spawns) == 1, "respawned another round after Ctrl+C"
     assert lock.releases == 1
 
 
@@ -3611,11 +4032,13 @@ def test_a_ctrl_c_during_the_backoff_sleep_also_exits_cleanly(monkeypatch,
 def test_a_log_file_that_will_not_open_does_not_stop_the_launcher(launcher,
                                                                   tmp_path,
                                                                   monkeypatch):
-    """記錄檔開不起來只能降級成「只有主控台」，**不能**因此不啟動。
+    """A log file that will not open can only degrade to "console only"; it **must
+    not** stop startup.
 
-    判準寫在兩支啟動器的註解裡：監督者不該因為一個附屬功能而拒絕啟動 bot／整批
-    產圖。用一個**目錄**當記錄檔路徑來製造真的 `OSError`（實測 Windows 給
-    `PermissionError`），比替換 `open` 更貼近真實失敗。
+    The criterion is in both launchers' comments: the supervisor should not refuse
+    to start the bot / the whole image batch over an ancillary feature. Using a
+    **directory** as the log path to produce a real `OSError` (measured: Windows
+    gives `PermissionError`) is closer to a real failure than swapping `open`.
     """
     as_a_log = tmp_path / "log_is_a_directory"
     as_a_log.mkdir()
@@ -3645,22 +4068,25 @@ def test_a_log_file_that_will_not_open_does_not_stop_the_launcher(launcher,
         module.main()
 
     assert spawns == [None], (
-        f"{launcher} 在記錄檔開不起來時沒有降級成「只有主控台」"
-        f"（傳給 stream_child 的 log 是 {spawns}）——它應該照常啟動子行程，"
-        "只是不寫檔。")
+        f"{launcher} did not degrade to 'console only' when the log file would not "
+        f"open (the log passed to stream_child was {spawns}) — it should start the "
+        "child as usual, just without writing a file.")
 
 
 # ---------------------------------------------------------------------------
-# start_webrunner：Chrome 槽的短臨界區與早退路徑
+# start_webrunner: the Chrome slot's short critical section and early-exit paths
 # ---------------------------------------------------------------------------
 
 
 class _OrderingSlot(_FakeSlot):
-    """`_FakeSlot` 加一件事：每次 `release` 時記下 pid 檔當下的內容。
+    """`_FakeSlot` plus one thing: on each `release`, record the pid file's content
+    at that moment.
 
-    這是「**先寫 pid 再放槽**」那條順序契約唯一測得出來的方式——兩個動作都做了、
-    只是順序反過來的話，事後看不出任何差別，但中間那一瞬間槽是空的而 pid 還沒寫，
-    驗證端剛好在那時取槽就會判定沒人在跑，開出第二個 Chrome stack。
+    This is the only way to test the "**write the pid before releasing the slot**"
+    ordering contract — with both actions done, only the order reversed, nothing is
+    distinguishable afterward, but in that one instant the slot is empty and the pid
+    is not yet written, and if the verifier takes the slot right then it judges
+    nobody is running and opens a second Chrome stack.
     """
 
     def __init__(self, pid_file, *, acquired=True, pid_alive=True):
@@ -3680,10 +4106,11 @@ class _OrderingSlot(_FakeSlot):
 
 
 class _SpawnedProc:
-    """`stream_child` 交給 `on_spawn` 的那個 `Popen` 只被讀 `.pid`。
+    """The `Popen` that `stream_child` hands to `on_spawn` only has `.pid` read.
 
-    名字刻意不叫 `_FakeProc`——本檔上面收屍那一節已經有一個同名的類別，蓋掉它會
-    讓那五支測試以 `AttributeError` 紅掉（實際踩過）。
+    Deliberately not named `_FakeProc` — the reaping section above already has a
+    class by that name, and shadowing it would make those five tests go red with
+    `AttributeError` (hit for real).
     """
 
     def __init__(self, pid: int):
@@ -3691,10 +4118,11 @@ class _SpawnedProc:
 
 
 def _webrunner_module(monkeypatch, tmp_path, *, slot=None):
-    """載入 `start_webrunner`，把 pid 檔與 Chrome 槽都指到暫存目錄。
+    """Load `start_webrunner`, pointing both the pid file and the Chrome slot at a
+    temp directory.
 
-    **正式的 `webrunner.pid` 與 `chrome_slot.lock` 一律不碰**：這台機器上常有一個
-    跑了幾十小時的批次正在用它們。
+    **Never touch the production `webrunner.pid` and `chrome_slot.lock`**: this
+    machine often has a batch that has run for tens of hours using them.
     """
     module = _load_launcher(WEBRUNNER_LAUNCHER)
     pid_file = tmp_path / "webrunner.pid"
@@ -3715,11 +4143,14 @@ def _supervise_once(module, log=None, **overrides):
 
 def test_the_pid_is_on_disk_before_the_chrome_slot_is_released(monkeypatch,
                                                                tmp_path):
-    """短臨界區的順序契約：**取槽 → spawn → 寫 pid → 放槽**。
+    """The short critical section's ordering contract: **take slot → spawn → write
+    pid → release slot**.
 
-    反過來寫（先放槽再寫 pid）會留下一個空窗：槽是空的、pid 還沒寫，驗證端在那一
-    瞬間取槽就會判定「沒有批次在跑」，於是對著同一份登入 profile 開出第二個 Chrome
-    stack，接著被 webrunner 的 per-character 重啟掃掉。事後兩邊的紀錄都看起來正常。
+    Writing it in reverse (release the slot before writing the pid) leaves a window:
+    the slot is empty and the pid is not yet written, and if the verifier takes the
+    slot in that instant it judges "no batch is running", opens a second Chrome stack
+    against the same login profile, and is then swept by the webrunner's per-character
+    restart. Afterward both records look normal.
     """
     module, slot, pid_file = _webrunner_module(monkeypatch, tmp_path)
     rounds = []
@@ -3727,26 +4158,29 @@ def test_the_pid_is_on_disk_before_the_chrome_slot_is_released(monkeypatch,
     def _child(_cmd, _log, *, on_spawn=None, **_kwargs):
         rounds.append(1)
         if len(rounds) > 1:
-            raise _NoMoreRounds          # 見下面「假子行程一律有上限」
+            raise _NoMoreRounds          # see "the fake child always has a cap" below
         on_spawn(_SpawnedProc(4242))
         return 0
 
     monkeypatch.setattr(module, "stream_child", _child)
     assert _supervise_once(module) == 0
 
-    assert slot.pid_at_release, "根本沒有放槽——槽會被佔到 staleness 逾時"
+    assert slot.pid_at_release, "the slot was never released — it stays taken until the staleness timeout"
     assert slot.pid_at_release[0] == "4242", (
-        f"放槽的那一刻 pid 檔的內容是 {slot.pid_at_release[0]!r}，應該已經是 "
-        "'4242'。順序反了：槽空了、pid 還沒寫，驗證端會在那個空窗裡開出第二個 "
-        "Chrome stack。")
+        f"at the moment the slot was released the pid file content was "
+        f"{slot.pid_at_release[0]!r}, should already be '4242'. The order is "
+        "reversed: the slot is empty and the pid not yet written, and the verifier "
+        "would open a second Chrome stack in that window.")
 
 
 def test_the_liveness_signal_is_taken_back_when_the_child_is_gone(monkeypatch,
                                                                   tmp_path):
-    """子行程結束後要把 `webrunner.pid` 收回去（`finally` 裡那一步）。
+    """After the child exits, `webrunner.pid` must be reclaimed (the step in
+    `finally`).
 
-    漏掉的話，那個檔案會一直宣告「批次還在跑」，驗證端從此永遠讓位——而且症狀是
-    「驗證腳本一直 SKIP」，沒人會往這裡找。
+    Missing it, that file keeps declaring "the batch is still running" and the
+    verifier stands aside forever — and the symptom is "the verification script keeps
+    SKIPping", which nobody would look here for.
     """
     module, _slot, pid_file = _webrunner_module(monkeypatch, tmp_path)
     rounds = []
@@ -3754,46 +4188,51 @@ def test_the_liveness_signal_is_taken_back_when_the_child_is_gone(monkeypatch,
     def _child(_cmd, _log, *, on_spawn=None, **_kwargs):
         rounds.append(1)
         if len(rounds) > 1:
-            raise _NoMoreRounds          # 見下面「假子行程一律有上限」
+            raise _NoMoreRounds          # see "the fake child always has a cap" below
         on_spawn(_SpawnedProc(4242))
-        assert pid_file.exists(), "子行程在跑的時候 pid 檔就該在了"
+        assert pid_file.exists(), "the pid file should be there while the child runs"
         return 0
 
     monkeypatch.setattr(module, "stream_child", _child)
     assert _supervise_once(module) == 0
     assert not pid_file.exists(), (
-        "子行程已經結束，`webrunner.pid` 卻還留著——驗證端會永遠以為有批次在跑。")
+        "the child has exited but `webrunner.pid` still remains — the verifier would "
+        "forever think a batch is running.")
 
 
 def test_a_chrome_slot_that_never_frees_up_refuses_to_spawn(monkeypatch,
                                                             tmp_path):
-    """等不到槽就 rc=1 收工，**不是**重試迴圈。
+    """If the slot never frees up, wrap up with rc=1, **not** a retry loop.
 
-    等到逾時（300s > 驗證腳本自己的 240s 預算）還拿不到，代表不是「剛好排在驗證
-    中間」，而是有人卡住了——那需要人看一眼。重要的是這條路**什麼都沒動**：沒有
-    sweep、沒有 spawn。
+    Not getting it by the timeout (300s > the verification script's own 240s budget)
+    means it is not "just scheduled in the middle of verification" but someone stuck
+    — that needs a human to look. The important thing is that this path **touches
+    nothing**: no sweep, no spawn.
     """
     pid_file = tmp_path / "webrunner.pid"
     slot = _OrderingSlot(pid_file, acquired=False)
     module, _slot, _pid = _webrunner_module(monkeypatch, tmp_path, slot=slot)
 
     def _child(*_args, **_kwargs):
-        raise AssertionError("槽都還沒拿到就 spawn 了 webrunner")
+        raise AssertionError("spawned a webrunner before even getting the slot")
 
     monkeypatch.setattr(module, "stream_child", _child)
     assert _supervise_once(module) == 1
     assert slot.released == [], (
-        f"槽根本沒拿到卻去放了它：{slot.released}。`release` 只在本行程仍持有時"
-        "刪檔，但這裡連呼叫都不該有——放掉的可能是別人的槽。")
-    assert not pid_file.exists(), "沒有 spawn 卻寫了存活訊號"
+        f"the slot was never acquired but was still released: {slot.released}. "
+        "`release` only deletes the file while this process still holds it, but here "
+        "it should not even be called — what it releases could be someone else's slot.")
+    assert not pid_file.exists(), "no spawn but a liveness signal was written"
 
 
 def test_a_blocked_generation_stops_the_launcher_instead_of_respawning(
         monkeypatch, tmp_path):
-    """rc=4（站方擋住生成）要當場停下來，不得退避重生。
+    """rc=4 (the site blocked generation) must stop on the spot, not back off and
+    respawn.
 
-    重生只會看到同一個對話框，還會每一輪重跑一次登入 ＋ setup。這條與 rapid-fail
-    無關：被擋住的那一輪可能跑很久，rapid-fail 永遠不會響。
+    Respawning would only see the same dialog, and re-run login + setup every round.
+    This is unrelated to rapid-fail: the blocked round can run a long time, and
+    rapid-fail never fires.
     """
     module, _slot, _pid = _webrunner_module(monkeypatch, tmp_path)
     clock = _Clock()
@@ -3803,26 +4242,27 @@ def test_a_blocked_generation_stops_the_launcher_instead_of_respawning(
     def _child(cmd, _log, *, on_spawn=None, **_kwargs):
         spawns.append(cmd)
         if len(spawns) > 1:
-            raise _NoMoreRounds          # 見下面「假子行程一律有上限」
+            raise _NoMoreRounds          # see "the fake child always has a cap" below
         on_spawn(_SpawnedProc(4242))
         clock.advance(120.0)
         return 4
 
     monkeypatch.setattr(module, "stream_child", _child)
     assert _expect_no_extra_round(
-        lambda: _supervise_once(module), "站方擋住了生成（rc=4）") == 1
+        lambda: _supervise_once(module), "the site blocked generation (rc=4)") == 1
     assert len(spawns) == 1, (
-        f"生成被擋住卻還是重生了（spawn {len(spawns)} 次）——每一輪都會重跑一次"
-        "登入與 setup，然後看到同一個對話框。")
-    assert clock.slept == [], "被擋住之後還去睡退避"
+        f"generation was blocked but it still respawned (spawned {len(spawns)} times) "
+        "— every round re-runs login and setup, then sees the same dialog.")
+    assert clock.slept == [], "still slept the backoff after being blocked"
 
 
 def test_a_ctrl_c_during_a_batch_releases_the_slot_and_the_pid(monkeypatch,
                                                                tmp_path):
-    """Ctrl+C 回 rc=0，而且 `finally` 那兩件收尾都要做完。
+    """Ctrl+C returns rc=0, and both wrap-up steps in `finally` must complete.
 
-    漏掉任何一件，下一次啟動都會被自己上一次留下的東西擋住：槽要等 600 秒的
-    staleness backstop 才回收，pid 檔則會讓驗證端一直讓位。
+    Missing either, the next start is blocked by what the last one left behind: the
+    slot is not reclaimed until the 600-second staleness backstop, and the pid file
+    keeps the verifier standing aside.
     """
     module, slot, pid_file = _webrunner_module(monkeypatch, tmp_path)
 
@@ -3831,20 +4271,22 @@ def test_a_ctrl_c_during_a_batch_releases_the_slot_and_the_pid(monkeypatch,
         raise KeyboardInterrupt
 
     monkeypatch.setattr(module, "stream_child", _child)
-    assert _supervise_once(module) == 0, "Ctrl+C 應該回 rc=0"
-    assert not pid_file.exists(), "Ctrl+C 之後沒有收回存活訊號"
+    assert _supervise_once(module) == 0, "Ctrl+C should return rc=0"
+    assert not pid_file.exists(), "the liveness signal was not reclaimed after Ctrl+C"
     assert slot.released == [module.SLOT_OWNER] * 2, (
-        f"槽的釋放次數不對：{slot.released}（`_on_spawn` 一次、`finally` 一次；"
-        "`release` 只在本行程仍持有時刪檔，所以重複呼叫是安全的）")
+        f"the slot's release count is wrong: {slot.released} (`_on_spawn` once, "
+        "`finally` once; `release` only deletes the file while this process still "
+        "holds it, so repeated calls are safe)")
 
 
 def test_a_ctrl_c_during_the_webrunners_backoff_also_exits_cleanly(monkeypatch,
                                                                    tmp_path):
-    """webrunner 這一側的第二個 Ctrl+C 出口。
+    """The webrunner side's second Ctrl+C exit.
 
-    退避最長 300 秒，所以「按下 Ctrl+C 的那一刻迴圈停在哪裡」多半就是這裡，不是
-    子行程執行中。少了這個出口，KeyboardInterrupt 會直接往外炸成一段 traceback，
-    而 `finally` 已經跑完了——看起來像壞掉，其實只是沒有人接。
+    Backoff is up to 300 seconds, so "where the loop is stopped the moment Ctrl+C is
+    pressed" is most likely here, not mid-child. Without this exit, KeyboardInterrupt
+    blows straight out as a traceback while `finally` has already run — it looks
+    broken, but really nobody caught it.
     """
     module, slot, pid_file = _webrunner_module(monkeypatch, tmp_path)
     clock = _CtrlCOnSleep()
@@ -3854,7 +4296,7 @@ def test_a_ctrl_c_during_the_webrunners_backoff_also_exits_cleanly(monkeypatch,
     def _child(cmd, _log, *, on_spawn=None, **_kwargs):
         spawns.append(cmd)
         if len(spawns) > 1:
-            raise _NoMoreRounds          # 見下面「假子行程一律有上限」
+            raise _NoMoreRounds          # see "the fake child always has a cap" below
         on_spawn(_SpawnedProc(4242))
         clock.advance(2.0)
         return 1
@@ -3862,47 +4304,55 @@ def test_a_ctrl_c_during_the_webrunners_backoff_also_exits_cleanly(monkeypatch,
     monkeypatch.setattr(module, "stream_child", _child)
     assert _expect_no_extra_round(
         lambda: _supervise_once(module),
-        "等退避的時候收到 Ctrl+C") == 0, "睡到一半的 Ctrl+C 應該回 rc=0"
+        "Ctrl+C received while waiting for backoff") == 0, "a Ctrl+C partway through the sleep should return rc=0"
     assert clock.slept == [5.0], (
-        f"第一次崩潰應該睡最小退避 5 秒（實際 {clock.slept}）")
-    assert len(spawns) == 1, "Ctrl+C 之後又重生了一輪"
-    assert not pid_file.exists(), "Ctrl+C 之後沒有收回存活訊號"
+        f"the first crash should sleep the minimum backoff of 5 seconds (got {clock.slept})")
+    assert len(spawns) == 1, "respawned another round after Ctrl+C"
+    assert not pid_file.exists(), "the liveness signal was not reclaimed after Ctrl+C"
 
 
 def test_the_slow_zero_progress_gate_stops_what_rapid_fail_cannot(monkeypatch,
                                                                   tmp_path):
-    """連續「跑很久卻一張都沒產出」要放棄——rapid-fail 抓不到這種。
+    """Consecutive "ran a long time but saved not a single image" must give up —
+    rapid-fail cannot catch this kind.
 
-    兩半一起測，因為單看其中一半都會被錯的實作騙過去：
+    Both halves tested together, because looking at either half alone can be fooled
+    by a wrong implementation:
 
-    * 前半：每一輪都活 40 秒（> `rapid_fail_threshold_sec`，所以 rapid-fail 每輪
-      歸零、永遠不會響）並回 rc=3，兩輪之後要放棄。
-    * 後半：同樣的輸入、只是把 `zero_progress_giveup` 調高，就必須繼續重生——
-      否則「永遠放棄」也會讓前半變綠，而那比原本的缺陷更糟。
+    * First half: every round lives 40 seconds (> `rapid_fail_threshold_sec`, so
+      rapid-fail resets each round and never fires) and returns rc=3, and it must
+      give up after two rounds.
+    * Second half: the same input, only with `zero_progress_giveup` raised, must
+      keep respawning — otherwise "give up forever" would make the first half green
+      too, which is worse than the original defect.
     """
     rounds = [(40.0, 0.0, RC_ZERO_PROGRESS)] * 5
     rc, clock, spawns = _supervise_with_clock(
         monkeypatch, tmp_path, list(rounds), rapid_giveup=99,
         zero_progress_giveup=2)
     assert (rc, spawns) == (1, 2), (
-        f"連續兩輪零產出之後應該放棄（rc=1、spawn 2 次），實際 rc={rc}、"
-        f"spawn {spawns} 次。生成被擋住時每一輪都要跑完 consecutive_fail_abort "
-        "才結束，遠遠超過 rapid_fail_threshold_sec——那道閘永遠不會響。")
-    assert clock.slept, "放棄之前那一輪的退避沒有睡"
+        f"after two consecutive rounds of zero output it should give up (rc=1, "
+        f"spawned 2 times), got rc={rc}, spawned {spawns} times. When generation is "
+        "blocked, every round runs to consecutive_fail_abort before ending, far past "
+        "rapid_fail_threshold_sec — that gate never fires.")
+    assert clock.slept, "the backoff of the round before giving up was not slept"
 
     rc, _clock, spawns = _supervise_with_clock(
         monkeypatch, tmp_path, list(rounds), rapid_giveup=99,
         zero_progress_giveup=99)
     assert (rc, spawns) == (None, 6), (
-        f"門檻調高之後就該繼續重生（rc={rc}、spawn {spawns} 次）。少了這一半，"
-        "把這道閘寫成「永遠放棄」也會全綠。")
+        f"with the threshold raised it should keep respawning (rc={rc}, spawned "
+        f"{spawns} times). Without this half, writing the gate as 'give up forever' "
+        "would also be all green.")
 
 
 def test_a_good_run_clears_the_zero_progress_counter(monkeypatch, tmp_path):
-    """計數要求的是**連續**——中間插一輪有產出就要歸零。
+    """The count requires **consecutive** — one round with output in the middle
+    resets it.
 
-    不歸零的話，一台跑了好幾天、偶爾出現單輪零產出的機器會慢慢累積到門檻，然後
-    在完全正常的時候停下來。
+    Without resetting, a machine that has run for days with an occasional single
+    round of zero output slowly accumulates to the threshold and then stops while
+    everything is perfectly normal.
     """
     rc, _clock, spawns = _supervise_with_clock(
         monkeypatch, tmp_path,
@@ -3910,17 +4360,20 @@ def test_a_good_run_clears_the_zero_progress_counter(monkeypatch, tmp_path):
          (40.0, 0.0, RC_ZERO_PROGRESS), (40.0, 0.0, 0)],
         rapid_giveup=99, zero_progress_giveup=2)
     assert (rc, spawns) == (0, 4), (
-        f"中間那一輪不是零產出，計數卻沒有歸零（rc={rc}、spawn {spawns} 次）。")
+        f"the middle round was not zero output but the count did not reset (rc={rc}, "
+        f"spawned {spawns} times).")
 
 
 def test_a_backoff_config_with_max_below_min_is_refused_before_anything_spawns(
         monkeypatch, tmp_path):
-    """`max < min` 要在啟動時就擋下來，不能留到第一次崩潰才炸。
+    """`max < min` must be blocked at startup, not left to blow up on the first
+    crash.
 
-    `_bot_config._coerce_supervisor` 只保證每個值各自 > 0，所以這種設定載得進來、
-    啟動得起來，然後在**第一次崩潰時**讓 `restart_backoff` 丟 `ValueError` 把監督者
-    整支帶走——正好是它該接手的那一刻。訊息要同時點名兩個 key，不然使用者只知道
-    「設定壞了」卻不知道壞在哪一對。
+    `_bot_config._coerce_supervisor` only guarantees each value is > 0 on its own, so
+    a config like this loads and starts, then on the **first crash** makes
+    `restart_backoff` throw `ValueError` and take the whole supervisor down — exactly
+    the moment it is supposed to take over. The message must name both keys, or the
+    user only knows "the config is broken" without knowing which pair.
     """
     module = _load_launcher(WEBRUNNER_LAUNCHER)
     monkeypatch.setattr(sys, "argv", [WEBRUNNER_LAUNCHER])
@@ -3934,7 +4387,7 @@ def test_a_backoff_config_with_max_below_min_is_refused_before_anything_spawns(
     monkeypatch.setattr(module, "load_bot_config", lambda: {
         "webrunner_supervisor": {
             "respawn_backoff_min_sec": 300,
-            "respawn_backoff_max_sec": 5,       # 反過來了
+            "respawn_backoff_max_sec": 5,       # reversed
             "healthy_threshold_sec": 60,
             "rapid_fail_threshold_sec": 30,
             "rapid_fail_giveup_count": 3,
@@ -3942,19 +4395,21 @@ def test_a_backoff_config_with_max_below_min_is_refused_before_anything_spawns(
         }})
 
     def _must_not_run(*_args, **_kwargs):
-        raise AssertionError("設定是壞的，卻還是進了監督迴圈")
+        raise AssertionError("the config is broken but it still entered the supervise loop")
 
     monkeypatch.setattr(module, "_supervise", _must_not_run)
     monkeypatch.setattr(module, "stream_child", _must_not_run)
 
-    assert module.main() == 1, "壞掉的退避設定應該讓啟動器以 rc=1 收工"
+    assert module.main() == 1, "a broken backoff config should make the launcher wrap up with rc=1"
 
 
 def test_a_pid_file_deleted_mid_read_counts_as_no_batch(monkeypatch, tmp_path):
-    """`exists()` 與 `read_text()` 之間被刪掉：那等同「檔案不存在」，可以啟動。
+    """Deleted between `exists()` and `read_text()`: that is equivalent to "the
+    file does not exist", and you can start.
 
-    這條要跟「讀不出來」分清楚。合在一起走保守那邊的話，一次剛好撞上收尾的競態
-    就會讓啟動器拒絕啟動，而使用者手上那個 pid 檔早就不見了——沒有任何線索。
+    This must be kept distinct from "cannot be read". Lumping them onto the
+    conservative side means one race that happens to hit the wrap-up would make the
+    launcher refuse to start, while the user's pid file is long gone — with no clue.
     """
     module = _load_launcher(WEBRUNNER_LAUNCHER)
 
@@ -3963,12 +4418,12 @@ def test_a_pid_file_deleted_mid_read_counts_as_no_batch(monkeypatch, tmp_path):
             return True
 
         def read_text(self, *_args, **_kwargs):
-            raise FileNotFoundError("剛好在這一瞬間被收尾刪掉")
+            raise FileNotFoundError("deleted by the wrap-up in this very instant")
 
     monkeypatch.setattr(module, "WEBRUNNER_PID_FILE", _VanishingPidFile())
     assert module._live_webrunner_pid() == (None, True), (
-        "檔案在讀之前就被刪掉了，那是**判定得出來**的「沒有批次在跑」，"
-        "不是「判不出來」。")
+        "the file was deleted before it could be read, which is a **decidable** "
+        "'no batch is running', not 'cannot decide'.")
 
 
 if __name__ == "__main__":
