@@ -19257,6 +19257,79 @@ def test_the_dorossi_log_views_survive_junk_lines(monkeypatch, tmp_path):
     assert "queue_full" in sent[-1] and "error" in sent[-1], sent[-1]
 
 
+class _HealthEnv:
+    """`/dorossi health` 的最小環境：狀態、工作目錄、事件檔都換成測試的，事件不寫出去。"""
+
+    def __init__(self, monkeypatch, tmp_path, *, state=None, load_error=None, tools="off"):
+        self.sent: list = []
+
+        def _load():
+            if load_error is not None:
+                raise load_error
+            return state or {}
+
+        async def _reply(_message, content=None, **_kw):
+            self.sent.append(content)
+
+        monkeypatch.setattr(b, "_dorossi_load_state", _load)
+        monkeypatch.setattr(b, "safe_reply", _reply)
+        monkeypatch.setattr(b, "_dorossi_event", lambda *_a, **_k: None)
+        monkeypatch.setattr(b, "_dorossi_waiters", {})
+        monkeypatch.setattr(b, "_dorossi_loops", {})
+        monkeypatch.setattr(b, "DOROSSI_CC_WORKDIR", tmp_path / "ws")
+        monkeypatch.setattr(b, "DOROSSI_EVENTS_FILE", tmp_path / "events.ndjson")
+        monkeypatch.setattr(b, "DOROSSI_CC_TOOLS", tools)
+
+    def run(self, uid=None) -> str:
+        message = types.SimpleNamespace(
+            author=types.SimpleNamespace(id=b.DOROSSI_USER_ID if uid is None else uid))
+        _sr_run(b.mcmd_health(message, ""))
+        return self.sent[-1]
+
+
+def test_health_is_owner_only(monkeypatch, tmp_path):
+    env = _HealthEnv(monkeypatch, tmp_path)
+    assert env.run(uid=b.DOROSSI_USER_ID + 1) == "此指令僅限擁有者使用。"
+
+
+def test_health_reports_a_broken_session_store_without_its_error_text(monkeypatch, tmp_path):
+    """讀不到 session 存放區時照樣回報其餘項目，並標出問題；例外文字只進 stderr。"""
+    env = _HealthEnv(monkeypatch, tmp_path,
+                     load_error=RuntimeError(r"C:\secret\dorossi_session.json locked"))
+    reply = env.run()
+    assert "session store: error" in reply and "issues: session store read failed" in reply
+    assert "secret" not in reply and "locked" not in reply, reply
+
+
+def test_health_survives_an_event_log_it_cannot_stat(monkeypatch, tmp_path):
+    """事件檔在 `stat` 那一刻不在（輪替中）算 0；別的讀取錯誤另外標出來，不讓整個指令掛掉。"""
+    env = _HealthEnv(monkeypatch, tmp_path)
+    reply = env.run()
+    assert "event log `0 B`" in reply, reply
+    assert "issues" not in reply, reply
+
+    class _Unreadable(type(tmp_path)):
+        def stat(self, *args, **kwargs):
+            raise PermissionError("denied")
+
+    monkeypatch.setattr(b, "DOROSSI_EVENTS_FILE", _Unreadable(tmp_path / "events.ndjson"))
+    reply = env.run()
+    assert "issues: event log size failed" in reply and "denied" not in reply, reply
+
+
+@pytest.mark.parametrize("tools, warns", [("full", True), ("off", False)])
+def test_health_warns_only_when_full_agent_mode_is_on(monkeypatch, tmp_path, tools, warns):
+    stale_sess = {"sid": "s1"}
+    env = _HealthEnv(monkeypatch, tmp_path, tools=tools,
+                     state={str(b.DOROSSI_USER_ID): {"sessions": {"s1": stale_sess}}})
+    monkeypatch.setattr(b, "_dorossi_session_is_stale",
+                        lambda sess: (_ for _ in ()).throw(ValueError("bad")))
+    reply = env.run()
+    # 一格 session 的過期判斷丟例外：照樣回報（算不進過期），不讓整個指令掛掉。
+    assert "sessions `1`, stale `0`" in reply, reply
+    assert ("full-agent mode is enabled" in reply) is warns, reply
+
+
 def test_a_long_audit_view_is_cut_with_a_pointer_to_grep(monkeypatch, tmp_path):
     rows = [_audit_row(i, "x" * 40, "y" * 60) for i in range(50)]
     reply = _audit(monkeypatch, tmp_path, rows, "50")

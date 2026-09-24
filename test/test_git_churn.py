@@ -236,6 +236,48 @@ def test_scan_degrades_when_runner_raises(monkeypatch, tmp_path):
     assert rep.skipped == 1
 
 
+def test_an_unreadable_workspace_root_is_reported_not_read_as_quiet(monkeypatch, tmp_path):
+    """列不出工作區根目錄時只掃得到自己這個 repo。報告要說「有資料夾讀不到」——否則讀起來
+    就是「其他 repo 今天都沒有提交」。"""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    proj = _make_repo(ws, "TheBot")
+    monkeypatch.setattr(b, "PROJECT_ROOT", proj)
+    real_iterdir = Path.iterdir
+
+    def _iterdir(self):
+        if self == ws:
+            raise PermissionError("denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _iterdir)
+    rows = b._scan_workspace_churn("2026-09-24 00:00:00",
+                                   runner=lambda d: _repo_output(_commit("A", ("1", "0", "f"))))
+    assert rows == [("TheBot", rows[0][1]), ("workspace", None)], rows
+    rep = b._build_churn_report(rows)
+    assert rep.skipped == 1 and rep.total_commits == 1
+    assert "讀不到" in b._render_churn_report(rep)
+
+
+def test_a_folder_that_vanishes_mid_scan_is_not_counted_as_unreadable(monkeypatch, tmp_path):
+    """列舉途中消失的資料夾是常態，不算讀不到——否則「讀不到」天天出現、沒人會再看。"""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    proj = _make_repo(ws, "TheBot")
+    gone = _make_repo(ws, "Gone")
+    monkeypatch.setattr(b, "PROJECT_ROOT", proj)
+    real_is_dir = Path.is_dir
+
+    def _is_dir(self):
+        if self == gone:
+            raise FileNotFoundError("vanished")
+        return real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", _is_dir)
+    rows = b._scan_workspace_churn("2026-09-24 00:00:00", runner=lambda d: "")
+    assert rows == [("TheBot", "")], rows
+
+
 def test_local_midnight_since_shape():
     since = b._local_midnight_since()
     # 形如 YYYY-MM-DD 00:00:00

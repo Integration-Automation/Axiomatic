@@ -7817,14 +7817,24 @@ async def mcmd_health(message: discord.Message, rest: str = "") -> None:
         try:
             if _dorossi_session_is_stale(sess):
                 stale += 1
-        except Exception:  # pylint: disable=broad-except
-            pass
+        except Exception as error:  # pylint: disable=broad-except
+            print(f"dorossi health stale check failed: {type(error).__name__}",
+                  file=sys.stderr)
     try:
         workspace_size = _dir_size(DOROSSI_CC_WORKDIR) if DOROSSI_CC_WORKDIR.exists() else 0
     except Exception:  # pylint: disable=broad-except
         workspace_size = 0
         problems.append("workspace size failed")
-    event_size = DOROSSI_EVENTS_FILE.stat().st_size if DOROSSI_EVENTS_FILE.exists() else 0
+    # 不用 `exists()` 再 `stat()`：事件檔會被輪替整份改寫，兩步之間它可能不在，而這一行
+    # 丟出去的話整個健康檢查就只剩一句泛用的錯誤。
+    try:
+        event_size = DOROSSI_EVENTS_FILE.stat().st_size
+    except FileNotFoundError:
+        event_size = 0
+    except OSError as error:
+        print(f"dorossi health event log size failed: {error!r}", file=sys.stderr)
+        event_size = 0
+        problems.append("event log size failed")
     lines = [
         "**Dorossi health**",
         f"- backend `{_backend_display(DOROSSI_BACKEND)}`, tools `{DOROSSI_CC_TOOLS}`",
@@ -21940,6 +21950,37 @@ def _churn_git_output(repo_dir, since: str) -> str | None:
     return out
 
 
+def _churn_list_candidates(root: Path) -> tuple[list, bool]:
+    """PROJECT_ROOT 加上 `root` 的直屬子項目；回 `(清單, 列得完不完整)`。
+
+    列不出 `root` 時仍回 PROJECT_ROOT，並把「不完整」走在回傳值上——只寫進 stderr 的話，
+    報告會把「沒掃到別的 repo」讀成「別的 repo 今天都沒有提交」。"""
+    candidates = [PROJECT_ROOT]
+    try:
+        children = sorted(root.iterdir())
+    except OSError as error:
+        print(f"churn scan: 列不出 {root}: {error!r}", file=sys.stderr)
+        return candidates, False
+    return candidates + [c for c in children if c != PROJECT_ROOT], True
+
+
+def _churn_repo_row(d: Path, run) -> tuple | None:
+    """單一資料夾的 `(名稱, git 輸出或 None)`；不是 git repo（或讀的當下消失）回 None。
+
+    資料夾在列舉途中消失是常態，不算掃描失敗；是 repo 但 git 出錯才記成 `(名稱, None)`，
+    由報告計入「讀不到」。"""
+    try:
+        if not d.is_dir() or not (d / ".git").exists():
+            return None
+    except OSError:
+        return None
+    try:
+        return d.name, run(d)
+    except Exception as error:  # pylint: disable=broad-except
+        print(f"churn scan: {d} 出錯: {error!r}", file=sys.stderr)
+        return d.name, None
+
+
 def _scan_workspace_churn(since: str, runner=None) -> list:
     """掃工作區根目錄底下**每個是 git repo（含 `.git`）的直屬子目錄**，外加
     PROJECT_ROOT 自己，收集各 repo 今天的 git 輸出。回
@@ -21951,30 +21992,19 @@ def _scan_workspace_churn(since: str, runner=None) -> list:
     **不特別對待任何具名 repo**——工作區當成一般資料夾掃，沒活動的自然不列。"""
     run = runner or (lambda d: _churn_git_output(d, since))
     root = _churn_workspace_root()
-    candidates = [PROJECT_ROOT]
-    try:
-        for child in sorted(root.iterdir()):
-            if child != PROJECT_ROOT:
-                candidates.append(child)
-    except OSError as error:
-        print(f"churn scan: 列不出 {root}: {error!r}", file=sys.stderr)
+    candidates, complete = _churn_list_candidates(root)
     rows: list = []
     seen: set = set()
     for d in candidates:
-        try:
-            if not d.is_dir() or not (d / ".git").exists():
-                continue
-        except OSError:
+        if d.name in seen:
             continue
-        name = d.name
-        if name in seen:
-            continue
-        seen.add(name)
-        try:
-            rows.append((name, run(d)))
-        except Exception as error:  # pylint: disable=broad-except
-            print(f"churn scan: {d} 出錯: {error!r}", file=sys.stderr)
-            rows.append((name, None))
+        row = _churn_repo_row(d, run)
+        if row is not None:
+            seen.add(d.name)
+            rows.append(row)
+    if not complete:
+        # 整個工作區根目錄讀不到：以一個「讀不到」的資料夾計入，報告才會說有東西沒掃到。
+        rows.append((root.name or str(root), None))
     return rows
 
 
