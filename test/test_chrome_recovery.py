@@ -701,6 +701,60 @@ def test_the_snapshot_names_the_login_files_it_could_not_carry_over(
         "唯一看得見的形狀。")
 
 
+def _complete_profile(variant, root: Path) -> None:
+    """每一筆登入相關的檔案都在、每一個 LevelDB 都自洽的 profile。"""
+    for rel in variant._SESSION_CRITICAL:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text("x", encoding="utf-8")
+    for rel in variant._SESSION_CRITICAL_DIRS:
+        (root / rel).mkdir(parents=True, exist_ok=True)
+        (root / rel / "CURRENT").write_text("MANIFEST-000001\n", encoding="utf-8")
+        (root / rel / "MANIFEST-000001").write_bytes(b"\x00")
+
+
+def test_a_complete_snapshot_raises_no_logout_warning(variant, profile_dirs, capsys):
+    """「這一輪很可能要重新登入」只有在真的少了東西時才能出現。整套測試裡那個警告從來沒有
+    **不**出現過——每一支都是缺東西的情境——所以「永遠印」這種壞法不會有任何東西變紅，
+    而一個每輪都叫的警告很快就沒人看了。"""
+    assert variant._SESSION_CRITICAL and variant._SESSION_CRITICAL_DIRS
+    source, snap = profile_dirs
+    _complete_profile(variant, source)
+    assert variant._snapshot_chrome_profile() == snap
+    err = capsys.readouterr().err
+    assert "重新登入" not in err, err
+    for rel in variant._SESSION_CRITICAL:
+        assert (snap / rel).is_file(), rel
+
+
+def test_a_missing_source_profile_yields_an_empty_snapshot_and_says_so(
+        variant, profile_dirs, capsys):
+    """第一次執行（或 profile 被搬走）：snapshot 開成空的，並講一聲這一輪要登入——不是崩潰。"""
+    source, snap = profile_dirs
+    import shutil
+    shutil.rmtree(source)
+    assert variant._snapshot_chrome_profile() == snap
+    assert snap.is_dir() and not any(snap.iterdir())
+    assert "重新登入" in capsys.readouterr().out
+    assert not source.exists(), "快照不該反過來建出來源目錄"
+
+
+def test_sync_back_without_a_snapshot_leaves_the_login_profile_alone(
+        variant, profile_dirs, capsys):
+    """snapshot 不見了（被清掉、上一步失敗）時，寫回什麼都不做——尤其不能把「沒有」當成
+    「空的」寫回去，那會蓋掉唯一撐著登入態的那份。並講明這一輪什麼都沒寫回。"""
+    source, snap = profile_dirs
+    _complete_profile(variant, source)
+    before = sorted((p.relative_to(source).as_posix(), p.read_bytes())
+                    for p in source.rglob("*") if p.is_file())
+    assert not snap.exists()
+    variant._sync_chrome_profile_back(snap)
+    after = sorted((p.relative_to(source).as_posix(), p.read_bytes())
+                   for p in source.rglob("*") if p.is_file())
+    assert after == before
+    err = capsys.readouterr().err
+    assert f"0/{len(variant._SESSION_CRITICAL)}" in err and "重新登入" in err, err
+
+
 def test_sync_back_only_carries_the_session_critical_files(
         variant, profile_dirs):
     """寫回的範圍要窄。整棵樹寫回去等於把 snapshot 的快取／崩潰傾印也倒進登入
@@ -1297,6 +1351,43 @@ _MIRRORED_CANARY = frozenset({
     "_reclaim_dir_sync_residue",  # 同步回寫失敗後的殘留回收
     "_session_entry_present",     # session 還在不在的判讀
 })
+
+
+@pytest.mark.parametrize("variant", _VARIANTS, ids=lambda m: m.__name__)
+def test_a_leveldb_current_file_is_trusted_only_when_it_names_a_manifest_beside_it(
+        tmp_path, variant):
+    """`CURRENT` 是 Chrome 寫的一行檔名，這裡拿它接在 profile 目錄後面問「那份 MANIFEST 在不在」。
+
+    兩道檢查都沒被真的資料擋過：(1) 指的不是 MANIFEST（例如 `LOG`）——那份 DB 打不開，
+    不能算完整；(2) 以 `MANIFEST-` 開頭卻帶著 `../`——前綴檢查不是包含性檢查，
+    `MANIFEST-x/../../../secret` 會接到 profile **外面**的檔案，而那個檔案存在就讀成
+    「完整」。兩種都要回 False（便宜的方向：多登入一次）。最後三格是讀不到的 `CURRENT`。"""
+    db = tmp_path / "a" / "b" / "db"
+    db.mkdir(parents=True)
+    (tmp_path / "a" / "secret").write_text("x", encoding="utf-8")
+    (db / "LOG").write_text("x", encoding="utf-8")
+    (db / "MANIFEST-000007").write_bytes(b"\x00")
+    current = db / "CURRENT"
+
+    def verdict(content):
+        if content is None:
+            current.unlink(missing_ok=True)
+        elif isinstance(content, bytes):
+            current.write_bytes(content)
+        else:
+            current.write_text(content, encoding="utf-8")
+        return variant._leveldb_manifest_ok(db)
+
+    assert verdict("MANIFEST-000007\n") is True
+    assert verdict("MANIFEST-000008\n") is False, "指到的 MANIFEST 不在"
+    assert verdict("LOG\n") is False, "指的不是 MANIFEST"
+    escape = "MANIFEST-x/../../../secret"
+    assert (db / escape).is_file(), "前提：這個接合真的接得到 profile 外面的檔案"
+    assert verdict(escape + "\n") is False
+    assert verdict(escape.replace("/", "\\") + "\n") is False
+    assert verdict(None) is False
+    assert verdict(b"\xff\xfe\x00MANIFEST") is False
+    assert verdict("") is False
 
 
 def _canary_drift(mirrored, canary) -> tuple:

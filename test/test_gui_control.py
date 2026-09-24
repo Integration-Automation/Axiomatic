@@ -1159,6 +1159,71 @@ def test_locate_image_reports_missing_template_distinctly(monkeypatch, tmp_path)
     assert "讀取失敗" in str(excinfo.value)
 
 
+_LEAKY = RuntimeError(r"C:\Users\someone\AppData\engine\core.dll: access violation")
+
+
+class _FailingBackend:
+    """每個入口都丟一個訊息裡帶主機路徑的例外——也就是函式庫真的會丟的那種。"""
+
+    def __init__(self, error=_LEAKY, hits=None):
+        self.error, self.hits = error, hits
+
+    def match_template_all(self, *_args, **_kwargs):
+        if self.error is not None:
+            raise self.error
+        return self.hits or []
+
+    def read_text_in_region(self, *_args, **_kwargs):
+        raise self.error
+
+    @staticmethod
+    def group_lines(words):
+        return words
+
+
+def _generic_only(excinfo, expected: str) -> None:
+    """`GuiError` 的文字會**照原樣**送到聊天室（`_SAFE_EXCEPTION_TYPES` 的豁免），所以
+    被折起來的原始例外連一個字都不能漏進去。"""
+    assert str(excinfo.value) == expected
+    assert "someone" not in str(excinfo.value) and "dll" not in str(excinfo.value)
+
+
+def test_an_unexpected_match_failure_reaches_the_user_as_a_generic_line(
+        monkeypatch):
+    monkeypatch.setattr(gui, "load_ac", lambda: _FailingBackend())
+    with pytest.raises(GuiError) as excinfo:
+        gui.locate_image("tpl.png")
+    _generic_only(excinfo, "圖片比對失敗。")
+
+
+def test_an_unexpected_ocr_failure_reaches_the_user_as_a_generic_line(
+        monkeypatch):
+    """與「引擎沒裝」分開：那一句使用者補得了，這一句只能看 log。"""
+    monkeypatch.setattr(gui, "load_ac", lambda: _FailingBackend())
+    monkeypatch.setattr(gui, "_configure_ocr", lambda: None)
+    with pytest.raises(GuiError) as excinfo:
+        gui.read_text()
+    _generic_only(excinfo, "文字辨識失敗。")
+
+
+def test_no_match_on_screen_is_its_own_answer(monkeypatch):
+    """比對成功但一處都沒有：回「找不到」，而不是點在 `hits[0]`（空清單會 IndexError，
+    折成泛用的失敗句之後使用者分不出是找不到還是壞了）。"""
+    monkeypatch.setattr(gui, "load_ac", lambda: _FailingBackend(error=None))
+    with pytest.raises(GuiError) as excinfo:
+        gui.locate_image("tpl.png")
+    assert str(excinfo.value) == "畫面上找不到這張圖。"
+
+
+@pytest.mark.parametrize("parts", [[], ["500"], ["500", "300", "7"]])
+def test_a_point_needs_exactly_two_coordinates(parts):
+    """多給一個值時照舊取前兩個，會把使用者打錯的指令默默執行在另一個位置。"""
+    with pytest.raises(GuiError) as excinfo:
+        gui.parse_xy(parts)
+    assert "兩個座標值" in str(excinfo.value)
+    assert gui.parse_xy(["500", "300"]) == (500, 300)
+
+
 # --------------------------------------------------------------------------
 # 按住 / 放開
 # --------------------------------------------------------------------------

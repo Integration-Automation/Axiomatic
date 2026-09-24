@@ -282,6 +282,47 @@ def test_git_pull_auto_restarts_only_when_something_will_bring_the_bot_back(
     assert ("不重啟" in sent[0]) is (not closes), sent
 
 
+_LEAKY_GIT_ERR = ("fatal: unable to access 'https://user:ghp_notarealtoken@example.invalid/"
+                  "repo.git/': Could not resolve host\n")
+
+
+@pytest.mark.parametrize("status, pull, expected", [
+    ((128, "", _LEAKY_GIT_ERR), None, "git status 失敗（rc=128）"),
+    ((0, "", ""), (1, "", _LEAKY_GIT_ERR), "失敗（rc=1）"),
+    ((0, "", ""), (0, "Already up to date.\n", ""), "已是最新"),
+], ids=["status-failed", "pull-failed", "up-to-date"])
+def test_a_git_pull_that_brought_nothing_never_restarts(monkeypatch, status, pull, expected):
+    """三條提早離開的路都**不得**重啟：沒拉到東西就重啟，是讓 bot 無故斷線一次；拉失敗還
+    重啟，更可能讓一個半套的工作樹被載入。
+
+    git 的錯誤輸出只進 stderr：它常常帶著遠端網址，而網址裡可能就是憑證（這裡刻意放一個
+    假的）。`_git` 換成只認得預期那幾個指令的替身，任何其他 git 指令都會丟例外。"""
+    answers = {tuple(b._git_pull_status_args()): status}
+    if pull is not None:
+        answers[("pull", "--ff-only", "origin", "main")] = pull
+
+    def _fake_git(args, timeout=15.0):
+        return answers[tuple(args)]
+
+    closed: list = []
+    sent: list = []
+
+    async def _close():
+        closed.append(True)
+
+    async def _reply(_message, text=None, **_kw):
+        sent.append(text)
+
+    monkeypatch.setattr(b, "_git", _fake_git)
+    monkeypatch.setattr(b.client, "close", _close)
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    monkeypatch.setattr(b, "_find_bot_supervisor", lambda: (True, 30924))
+    asyncio.run(b.cmd_git_pull(types.SimpleNamespace(), ""))
+    assert closed == []
+    assert len(sent) == 1 and expected in sent[0], sent
+    assert "ghp_" not in sent[0] and "example.invalid" not in sent[0], sent
+
+
 def test_the_git_pull_dirty_check_ignores_only_the_queue_files(tmp_path, monkeypatch):
     """在一個真的 git 倉庫裡量 `_git_pull_status_args()`：批次一直在改的佇列檔不算改動，
     其他檔案照算。用真的 git 是因為 pathspec 的排除語法寫錯時 git 不會報錯，只會什麼都不排除
@@ -536,6 +577,33 @@ def _schedule_test_message(monkeypatch, channel_id=4242, author_id=7):
         channel=types.SimpleNamespace(id=channel_id),
         author=types.SimpleNamespace(id=author_id))
     return message, sent
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ("add sometime sh echo hi", "看不懂時間格式"),
+    ("add 25:99 sh echo hi", "看不懂時間格式"),
+    ("add 09:30 del C:\\x", "用法"),
+    ("add 09:30 sh", "用法"),
+    ("add 09:30", "看不懂時間格式"),
+], ids=["no-time", "bad-time", "unknown-kind", "no-command", "nothing"])
+def test_a_malformed_schedule_is_refused_before_anything_is_saved(
+        monkeypatch, tmp_path, payload, expected):
+    """排程是「之後在沒人看著時自己跑」的東西，所以壞的要在建立的這一刻擋掉：時間看不懂、
+    種類不是 `macro`／`sh`、沒給要跑什麼。存進去的話，它會在某個沒人預期的時刻失敗
+    （或更糟，被解讀成別的東西）。`_save_schedules` 換成記錄用的絆線。"""
+    monkeypatch.setattr(b, "SCHEDULE_FILE", tmp_path / "sched.json")
+    saves: list = []
+    monkeypatch.setattr(b, "_save_schedules", lambda data: saves.append(data))
+    message, sent = _schedule_test_message(monkeypatch)
+    asyncio.run(b.cmd_schedule(message, payload))
+    assert saves == [], saves
+    assert len(sent) == 1 and expected in sent[0], sent
+    assert "已建立" not in sent[0]
+
+    # 對照組：同一組替身，寫對的那一筆要存得進去。
+    sent.clear()
+    asyncio.run(b.cmd_schedule(message, "add 09:30 sh echo hi"))
+    assert len(saves) == 1 and "已建立排程" in sent[0], sent
 
 
 async def _one_schedule_tick(saved: asyncio.Event):
@@ -1429,6 +1497,43 @@ def test_an_unreadable_pid_file_is_never_deleted(monkeypatch, tmp_path):
     monkeypatch.setattr(b, "_pid_alive", lambda pid: False)
     _eq(b._load_pid(), (None, True), "刪不掉也要回得出答案")
     b._clear_pid()          # 不可以拋
+
+
+class _LiveChild:
+    pid = 31337
+
+    def __init__(self, exited=None):
+        self.exited = exited
+
+    def poll(self):
+        return self.exited
+
+
+def test_a_live_batch_counts_as_running_even_without_its_pid_file(monkeypatch, tmp_path):
+    """存活訊號只是**跨行程**的那一半；bot 自己開的子行程（或上一輪記下、還活著的 pid）
+    才是第一手答案。訊號檔沒寫成（寫檔失敗、剛被別人刪掉）時，只看磁碟會說「沒在跑」，
+    接著某條路徑就再開一套瀏覽器、跟正在跑的那一套搶同一份登入設定檔。
+
+    訊號檔刻意指到一個不存在的位置：磁碟那一條回「確定沒在跑」，答案只能來自前兩條。"""
+    monkeypatch.setattr(b, "WEBRUNNER_PID_FILE", tmp_path / "absent.pid")
+    alive_pids: list = []
+    monkeypatch.setattr(b, "_pid_alive", lambda pid: alive_pids.append(pid) or pid == 4242)
+
+    monkeypatch.setattr(b, "_webrunner_proc", _LiveChild())
+    monkeypatch.setattr(b, "_webrunner_pid", None)
+    _eq(b._webrunner_liveness(), (True, True), "自己的子行程還在跑")
+    _eq(b._active_pid(), 31337, "要終止的是那個子行程")
+
+    monkeypatch.setattr(b, "_webrunner_proc", _LiveChild(exited=0))
+    monkeypatch.setattr(b, "_webrunner_pid", 4242)
+    _eq(b._webrunner_liveness(), (True, True), "記下的 pid 還活著")
+    _eq(b._active_pid(), 4242, "子行程已經結束，改指那個 pid")
+
+    # 對照組：兩條都說沒在跑、磁碟也沒有訊號 → 真的沒在跑。
+    monkeypatch.setattr(b, "_webrunner_pid", 5151)
+    _eq(b._webrunner_liveness(), (False, True), "都不在")
+    _eq(b._active_pid(), None, "沒有東西可以終止")
+    assert 5151 in alive_pids
 
 
 def test_an_undecidable_pid_read_is_treated_as_still_running(
@@ -15754,6 +15859,47 @@ def test_a_crashed_watch_hides_the_raw_reason_from_a_non_owner(monkeypatch):
     assert "查看 log" in other_replies[-1], other_replies[-1]
 
 
+def test_a_stopped_watch_neither_checks_nor_fires(monkeypatch):
+    """`/watch stop` 只把監看從 `_WATCHES` 拿掉，不取消 task——停下來靠的是迴圈每次醒來
+    先看自己還在不在。少了那一句，被停掉的監看照樣在條件成立時 @ 人，還會跑它掛著的
+    動作（按鍵、點選、巨集），也就是擁有者剛剛叫它不要做的事。
+
+    條件刻意設成「一問就成立」，動作與條件判定都是記錄用的絆線：這支測試失敗時什麼都
+    不會真的發生。"""
+    replies: list = []
+    checked: list = []
+    ran: list = []
+
+    async def _rec(_message, content=None, **_kwargs):
+        replies.append(content)
+
+    async def _condition(*args):
+        checked.append(args)
+        return True
+
+    async def _action(*args):
+        ran.append(args)
+
+    monkeypatch.setattr(b, "safe_reply", _rec)
+    monkeypatch.setattr(b, "_watch_condition_met", _condition)
+    monkeypatch.setattr(b, "_watch_run_action", _action)
+    monkeypatch.setattr(b, "_WATCH_POLL", {"text": 0.0})
+    monkeypatch.setattr(b, "_WATCHES", {})       # 77 已經被 `/watch stop` 拿掉
+    author = types.SimpleNamespace(id=b.OWNER_USER_ID, mention="<@1>")
+    message = types.SimpleNamespace(author=author)
+    asyncio.run(asyncio.wait_for(
+        b._watch_loop(77, "text", "target", message, "測試監看",
+                      action={"kind": "key", "target": "enter"}), 5))
+    assert checked == [] and ran == [] and replies == []
+
+    # 對照組：同一組替身，監看還在時要成立、要跑動作——否則上面三個空清單證明不了什麼。
+    b._WATCHES[77] = {"label": "t", "started": time.monotonic(), "task": None}
+    asyncio.run(asyncio.wait_for(
+        b._watch_loop(77, "text", "target", message, "測試監看",
+                      action={"kind": "key", "target": "enter"}), 5))
+    assert len(checked) == 1 and len(ran) == 1 and "🔔" in replies[0]
+
+
 def test_a_watch_that_fires_normally_posts_no_crash_notice(monkeypatch):
     """反方向：條件正常成立時不得出現「異常結束」。
 
@@ -18674,6 +18820,351 @@ def test_a_job_failure_is_reported_in_the_libraries_own_generic_words(monkeypatc
     assert env.run("stop 9") == "❌ 找不到這個作業。"
 
 
+class _ImageQueueEnv:
+    """`/gen image_queue` 的替身：佇列與對照表換成新的，佔位訊息的編輯、幫浦、重算位置都只記錄。"""
+
+    def __init__(self, monkeypatch, ids=("r1", "r2", "r3"), history=()):
+        self.replies: list = []
+        self.edits: list = []
+        self.pumps = 0
+        self.resubmitted: list = []
+        env = self
+
+        async def _reply(_message, content=None, **_kw):
+            env.replies.append(content)
+
+        async def _edit(placeholder, text):
+            env.edits.append((placeholder, text))
+
+        async def _pump():
+            env.pumps += 1
+
+        async def _nothing():
+            return None
+
+        async def _generate(_message, text):
+            env.resubmitted.append(text)
+
+        self.reqs = [b._GenerateRequest(rid, {"prompt": rid}, {"submitted_mono": 0.0},
+                                        f"ph-{rid}") for rid in ids]
+        monkeypatch.setattr(b, "safe_reply", _reply)
+        monkeypatch.setattr(b, "_generate_edit_placeholder", _edit)
+        monkeypatch.setattr(b, "_generate_pump", _pump)
+        monkeypatch.setattr(b, "_generate_refresh_queue", _nothing)
+        monkeypatch.setattr(b, "mcmd_generate", _generate)
+        monkeypatch.setattr(b, "_generate_history_tail", lambda n: list(history)[-n:])
+        monkeypatch.setattr(b, "_generate_queue", list(self.reqs))
+        monkeypatch.setattr(b, "_single_image_pending", {r.request_id: r.ctx for r in self.reqs})
+        monkeypatch.setattr(b, "_generate_queue_undo", type(b._generate_queue_undo)(maxlen=10))
+        monkeypatch.setattr(b, "_generate_inflight", None)
+        self.message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.OWNER_USER_ID))
+
+    def run(self, rest):
+        _sr_run(b.mcmd_generate_queue(self.message, rest))
+        return self.replies[-1]
+
+    def order(self):
+        return [r.request_id for r in b._generate_queue]
+
+
+@pytest.mark.parametrize("rest, expected", [
+    ("remove", "用法"), ("remove x", "必須是整數"), ("remove 0", "只有 3 筆"),
+    ("remove 4", "只有 3 筆"), ("remove -1", "只有 3 筆"),
+    ("front", "用法"), ("front two", "必須是整數"), ("front 9", "只有 3 筆"),
+    ("undo", "沒有可復原"), ("retry", "用法"), ("retry nope", "找不到"),
+    ("explode", "用法"),
+])
+def test_an_image_queue_command_that_does_not_fit_changes_nothing(monkeypatch, rest,
+                                                                   expected):
+    env = _ImageQueueEnv(monkeypatch)
+    assert expected in env.run(rest)
+    assert env.order() == ["r1", "r2", "r3"] and env.edits == [] and env.resubmitted == []
+    assert set(b._single_image_pending) == {"r1", "r2", "r3"}
+
+
+def test_removing_and_promoting_move_the_right_request(monkeypatch):
+    """位置是從 1 算的——少了 `- 1` 會刪錯那一個人的請求。"""
+    env = _ImageQueueEnv(monkeypatch)
+    env.run("front 3")
+    assert env.order() == ["r3", "r1", "r2"]
+    env.run("rm 2")
+    assert env.order() == ["r3", "r2"]
+    assert env.edits == [("ph-r1", "已從產圖佇列取消。")]
+    assert "r1" not in b._single_image_pending
+
+
+def test_clearing_the_image_queue_can_be_undone_in_order(monkeypatch):
+    """清掉之後復原：同樣的順序回到**最前面**，對照表也要回來——少了對照表，那幾張圖
+    做完之後找不到要回給誰。"""
+    env = _ImageQueueEnv(monkeypatch)
+    assert "已取消 3 筆" in env.run("clear")
+    assert env.order() == [] and b._single_image_pending == {}
+    assert [p for p, _t in env.edits] == ["ph-r1", "ph-r2", "ph-r3"]
+    b._generate_queue.append(b._GenerateRequest("r9", {}, {}, None))
+    assert "已復原 3 筆" in env.run("undo")
+    assert env.order() == ["r1", "r2", "r3", "r9"]
+    assert set(b._single_image_pending) == {"r1", "r2", "r3"}
+    assert env.pumps == 1
+    assert "沒有可復原" in env.run("undo")
+
+
+def test_an_empty_clear_leaves_nothing_to_undo(monkeypatch):
+    env = _ImageQueueEnv(monkeypatch, ids=())
+    assert "已取消 0 筆" in env.run("clear")
+    assert "沒有可復原" in env.run("undo")
+
+
+def test_retry_resubmits_a_past_request_with_its_character_fields(monkeypatch):
+    history = [
+        {"request_id": "old", "main_prompt": "a cat", "char1": "", "char2": "",
+         "undesired": "", "ok": False, "ts": 1.0},
+        {"request_id": "full", "main_prompt": "a dog", "char1": "c1", "char2": "",
+         "undesired": "blurry", "ok": True, "ts": 2.0},
+    ]
+    env = _ImageQueueEnv(monkeypatch, history=history)
+    _sr_run(b.mcmd_generate_queue(env.message, "retry old"))
+    _sr_run(b.mcmd_generate_queue(env.message, "retry full"))
+    assert env.resubmitted == ["a cat", "a dog | c1 |  | blurry"], env.resubmitted
+
+
+def test_the_image_queue_status_lists_at_most_ten(monkeypatch):
+    env = _ImageQueueEnv(monkeypatch, ids=tuple(f"r{i}" for i in range(12)))
+    reply = env.run("")
+    assert "waiting: `12/" in reply and "id=`r9`" in reply and "id=`r10`" not in reply
+    assert "… 2 more" in reply
+
+
+def _eta(monkeypatch, queues, *, spi=60.0, rest_until=None, cfg=None):
+    """跑一次 `/eta`，回 `(文字回覆, embed 的欄位 dict, footer)`。佇列、設定、速率全是替身。"""
+    import time as _time
+    files = {b.TODO_PROMPT_FILE: queues[0], b.TODO_FILE_1: queues[1],
+             b.TODO_FILE_2: queues[2], b.TODO_UNDESIRED_FILE: queues[3]}
+    sent: list = []
+
+    async def _reply(_message, content=None, **kwargs):
+        sent.append((content, kwargs.get("embed")))
+
+    config = {"images_per_character": 10, "schedule_limit_hours": 1.0, "rest_hours": 2.0}
+    config.update(cfg or {})
+    monkeypatch.setattr(b, "read_todo_entries", lambda path: list(files[path]))
+    monkeypatch.setattr(b, "load_batch_config", lambda: config)
+    monkeypatch.setattr(b, "_seconds_per_image", lambda: (spi, True, "window", True))
+    monkeypatch.setattr(b, "_scheduled_rest_until",
+                        lambda: None if rest_until is None else _time.time() + rest_until)
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    _sr_run(b.cmd_eta(types.SimpleNamespace()))
+    content, embed = sent[-1]
+    if embed is None:
+        return content, {}, ""
+    return content, {f.name: f.value for f in embed.fields}, embed.footer.text
+
+
+def test_eta_with_nothing_queued_says_so(monkeypatch):
+    content, fields, _ = _eta(monkeypatch, ([], [], [], []))
+    assert "empty" in content and not fields
+    content, fields, _ = _eta(monkeypatch, (["end", "a"], ["x", "y"], [], []))
+    assert "`end`" in content and not fields
+
+
+def test_eta_adds_work_the_rests_ahead_and_the_rest_in_progress(monkeypatch):
+    """3 對 × 10 張 × 60 秒 ＝ 30 分鐘工作；每小時工作要休 2 小時，30 分鐘用不滿一個
+    週期，所以沒有未來的休息。此刻若正在休息（還剩 1 小時），那一小時要加進總時間——
+    少了它 ETA 會短報整段休息。"""
+    queues = (["p1", "p2", "p3"], ["a", "b", "c"], [], [])
+    _content, fields, _ = _eta(monkeypatch, queues)
+    assert fields["pairs"] == "3" and fields["rest periods"] == "0 × 2.0h"
+    assert fields["raw work"] == fields["total wall time"]
+    _content, resting, _ = _eta(monkeypatch, queues, rest_until=3600)
+    assert "resting now" in resting["rest periods"]
+    assert resting["total wall time"] != resting["raw work"]
+
+
+def test_eta_counts_one_rest_per_full_work_window(monkeypatch):
+    """6 對 × 10 張 × 60 秒 ＝ 1 小時；`schedule_limit_hours` 是 0.25 → 4 個完整窗口、4 次休息。"""
+    queues = ([f"p{i}" for i in range(6)], [f"c{i}" for i in range(6)], [], [])
+    _content, fields, _ = _eta(monkeypatch, queues, cfg={"schedule_limit_hours": 0.25})
+    assert fields["rest periods"] == "4 × 2.0h", fields
+    assert fields["raw work"] == b._format_duration(3600), fields
+    assert fields["total wall time"] == b._format_duration(3600 + 4 * 2 * 3600), fields
+
+
+def test_eta_says_where_an_end_marker_caps_the_estimate(monkeypatch):
+    queues = (["p1", "p2", "end", "p4"], ["a", "b", "c", "d"], [], [])
+    _content, fields, footer = _eta(monkeypatch, queues)
+    assert fields["pairs"] == "2" and "entry #3" in footer, (fields, footer)
+
+
+class _AllowdirEnv:
+    """`/dorossi allowdir` 的替身：工作階段狀態只在記憶體裡；目錄驗證用真的那一支（它只
+    問「是不是一個存在的目錄」），餵的都是 `tmp_path` 底下的目錄。"""
+
+    def __init__(self, monkeypatch):
+        self.uid = str(b.DOROSSI_USER_ID)
+        self.state = {self.uid: {"active": "s1", "sessions": {"s1": {}, "s2": {}}}}
+        self.replies: list = []
+        env = self
+
+        async def _reply(_message, content=None, **_kw):
+            env.replies.append(content)
+
+        async def _rmw(mutate):
+            return mutate(env.state)
+
+        monkeypatch.setattr(b, "safe_reply", _reply)
+        monkeypatch.setattr(b, "_dorossi_state_rmw", _rmw)
+        monkeypatch.setattr(b, "_dorossi_load_state", lambda: env.state)
+        self.message = types.SimpleNamespace(
+            author=types.SimpleNamespace(id=b.DOROSSI_USER_ID),
+            channel=types.SimpleNamespace(id=1))
+
+    def run(self, rest):
+        _sr_run(b.mcmd_allowdir(self.message, rest))
+        return self.replies[-1]
+
+    def extra(self, sid):
+        return self.state[self.uid]["sessions"][sid].get("cc_extra_dir")
+
+
+def test_allowdir_add_parses_a_trailing_session_and_a_path_with_spaces(monkeypatch, tmp_path):
+    """路徑本身可以有空白；最後一個詞只有在**是** session id 時才被拆成 session。"""
+    spaced = tmp_path / "my dir"
+    spaced.mkdir()
+    env = _AllowdirEnv(monkeypatch)
+    env.run(f"add {spaced} s2")
+    assert env.extra("s2") == str(spaced.resolve()) and env.extra("s1") is None
+    env.run(f'add "{spaced}"')
+    assert env.extra("s1") == str(spaced.resolve()), "帶引號的路徑沒有被剝掉引號"
+    odd = tmp_path / "dir s9x"
+    odd.mkdir()
+    env.run(f"add {odd}")
+    assert env.extra("s1") == str(odd.resolve()), "不是 session id 的尾巴被拆掉了"
+
+
+@pytest.mark.parametrize("rest", ["add", "add   ", "grant /", "explode"])
+def test_allowdir_with_nothing_usable_changes_nothing(monkeypatch, rest):
+    env = _AllowdirEnv(monkeypatch)
+    assert "用法" in env.run(rest)
+    assert env.extra("s1") is None and env.extra("s2") is None
+
+
+def test_allowdir_refuses_a_directory_that_does_not_exist_without_echoing_it(
+        monkeypatch, tmp_path):
+    """放行一個不存在的目錄沒有意義，而且回覆不回聲那串路徑——它也可能根本不是路徑。"""
+    env = _AllowdirEnv(monkeypatch)
+    missing = tmp_path / "nope-secret-name"
+    reply = env.run(f"add {missing}")
+    assert reply == "指定的目錄無法使用。"
+    assert env.extra("s1") is None
+    a_file = tmp_path / "file.txt"
+    a_file.write_text("x", encoding="utf-8")
+    assert env.run(f"add {a_file}") == "指定的目錄無法使用。"
+    assert env.extra("s1") is None
+
+
+def test_allowdir_remove_says_whether_there_was_anything(monkeypatch, tmp_path):
+    env = _AllowdirEnv(monkeypatch)
+    env.run(f"add {tmp_path}")
+    assert "已清除" in env.run("remove")
+    assert env.extra("s1") is None and "cc_extra_dir" not in env.state[env.uid]["sessions"]["s1"]
+    assert "確認沒有" in env.run("rm")
+    assert "沒有額外可存取目錄" in env.run("list")
+
+
+class _DorossiQueueCmdEnv:
+    """`/dorossi queue` 的失敗佇列與復原那幾支：磁碟上的兩份佇列換成記憶體，重新排入只記錄。"""
+
+    def __init__(self, monkeypatch, failed=(), undo=()):
+        self.failed = [dict(r) for r in failed]
+        self.scheduled: list = []
+        self.readded: list = []
+        self.replies: list = []
+        env = self
+
+        async def _reply(_message, content=None, **_kw):
+            env.replies.append(content)
+
+        def _remove(queue_id):
+            env.failed = [r for r in env.failed if r.get("id") != queue_id]
+
+        def _write(rows):
+            env.failed = list(rows)
+
+        monkeypatch.setattr(b, "safe_reply", _reply)
+        monkeypatch.setattr(b, "_dorossi_failed_queue_read", lambda: [dict(r) for r in env.failed])
+        monkeypatch.setattr(b, "_dorossi_failed_queue_remove", _remove)
+        monkeypatch.setattr(b, "_dorossi_failed_queue_write", _write)
+        monkeypatch.setattr(b, "_dorossi_schedule_requeued_groups",
+                            lambda grouped: env.scheduled.append(grouped))
+        monkeypatch.setattr(b, "_dorossi_queue_add", lambda row: env.readded.append(row))
+        monkeypatch.setattr(b, "_dorossi_event", lambda *_a, **_k: None)
+        undo_stack = type(b._dorossi_queue_undo)(maxlen=b._dorossi_queue_undo.maxlen)
+        for rows in undo:
+            undo_stack.append(list(rows))
+        monkeypatch.setattr(b, "_dorossi_queue_undo", undo_stack)
+        self.message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.DOROSSI_USER_ID))
+
+    def run(self, rest):
+        _sr_run(b.mcmd_queue(self.message, rest))
+        return self.replies[-1]
+
+
+_FAILED_ROWS = [
+    {"id": "q1", "uid": "7", "sid": "s1", "prompt": "a", "failed_at": 1.0, "error": "anchor"},
+    {"id": "q2", "uid": "7", "sid": "s2", "prompt": "b", "failed_at": 2.0, "error": "channel"},
+]
+
+
+def test_retrying_one_failed_restore_touches_only_that_row(monkeypatch):
+    """重新排入的列要把失敗的痕跡（`failed_at`／`error`）拿掉——留著的話它會以「失敗過」的
+    樣子再進一次還原，下一次 `detail` 也分不出新舊。其他失敗列不動。"""
+    env = _DorossiQueueCmdEnv(monkeypatch, failed=_FAILED_ROWS)
+    assert "已重新排入 1 筆" in env.run("retry_failed q2")
+    assert [r["id"] for r in env.failed] == ["q1"]
+    (grouped,) = env.scheduled
+    assert list(grouped) == [("7", "s2")]
+    (row,) = grouped[("7", "s2")]
+    assert "failed_at" not in row and "error" not in row and row["prompt"] == "b"
+
+
+def test_retrying_all_failed_restores_groups_them_by_session(monkeypatch):
+    env = _DorossiQueueCmdEnv(monkeypatch, failed=_FAILED_ROWS)
+    assert "已重新排入 2 筆" in env.run("retry_failed")
+    assert env.failed == [] and set(env.scheduled[0]) == {("7", "s1"), ("7", "s2")}
+
+
+@pytest.mark.parametrize("failed, rest, expected", [
+    ((), "retry_failed", "目前沒有"),
+    (_FAILED_ROWS, "retry_failed q9", "找不到"),
+    ((), "undo", "沒有可復原"),
+])
+def test_a_queue_retry_or_undo_with_nothing_to_act_on_changes_nothing(monkeypatch, failed,
+                                                                      rest, expected):
+    env = _DorossiQueueCmdEnv(monkeypatch, failed=failed)
+    assert expected in env.run(rest)
+    assert env.scheduled == [] and env.readded == [] and len(env.failed) == len(failed)
+
+
+def test_undo_puts_a_parked_row_back_to_wait_instead_of_running_it(monkeypatch):
+    """還沒到點的停放列（等用量重設）復原時要回磁碟繼續等；現在跑只會再撞一次同一面牆。
+    一般的列與已經到點的停放列照常重新排入。"""
+    import time as _time
+    later = {"id": "p1", "uid": "7", "sid": "s1", "prompt": "wait",
+             "status": b._DOROSSI_PARKED_STATUS, "run_at": _time.time() + 3600}
+    due = dict(later, id="p2", run_at=_time.time() - 5)
+    plain = {"id": "q3", "uid": "7", "sid": "s1", "prompt": "now"}
+    env = _DorossiQueueCmdEnv(monkeypatch, undo=[[later, due, plain]])
+    assert "已復原 3 筆" in env.run("undo")
+    assert [r["id"] for r in env.readded] == ["p1"]
+    (grouped,) = env.scheduled
+    assert [r["id"] for r in grouped[("7", "s1")]] == ["p2", "q3"]
+    assert "沒有可復原" in env.run("undo")
+
+
+def test_clearing_failed_restores_reports_how_many(monkeypatch):
+    env = _DorossiQueueCmdEnv(monkeypatch, failed=_FAILED_ROWS)
+    assert "已清除 2 筆" in env.run("failed_clear") and env.failed == []
+
+
 def _audit(monkeypatch, tmp_path, lines, payload=""):
     path = tmp_path / "audit.ndjson"
     if lines is not None:
@@ -19015,6 +19506,38 @@ def test_a_stale_record_watchdog_leaves_a_newer_recording_alone(_record_env, mon
         "rec1", seq=8, channel_id=_RW_CHANNEL, user_id=_RW_USER))
     assert stops == [1]
     assert b._MACRO_RECORDING is None
+
+
+@pytest.mark.parametrize("recording, running, name, expected", [
+    ("rec1", None, "rec2", "已經在錄 `rec1`"),
+    (None, "排程 #3", "rec2", "正在佔用鍵鼠"),
+    (None, None, "", "用法"),
+    (None, None, "stop", "目前沒有在錄製"),
+], ids=["already-recording", "gate-held", "no-name", "stop-when-idle"])
+def test_a_recording_that_cannot_start_or_stop_touches_nothing(
+        monkeypatch, recording, running, name, expected):
+    """錄製會在主機上掛全域的鍵鼠監聽。已經在錄時再開一次會蓋掉前一次的名字（兩次錄到的
+    東西存成同一個檔）；別的巨集／排程正在送合成輸入時開錄，會把那些輸入錄成使用者的操作。
+    兩條拒絕的訊息刻意分開斷言：「已經在錄」那一條拿掉的話，閘門那一條也會擋下，只是講錯
+    原因——只看有沒有擋，那一條拿掉會照樣綠。監聽的開與關都是記錄用的絆線。"""
+    replies: list = []
+    hooks: list = []
+
+    async def _reply(_message, content=None, **_kw):
+        replies.append(content)
+
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    monkeypatch.setattr(b, "_MACRO_RECORDING", recording)
+    monkeypatch.setattr(b, "_MACRO_RUNNING", running)
+    monkeypatch.setattr(b._gui, "record_start", lambda: hooks.append("start"))
+    monkeypatch.setattr(b._gui, "record_stop", lambda: hooks.append("stop") or [])
+    monkeypatch.setattr(b, "_schedule_coro", lambda coro, **_kw: hooks.append("watchdog"))
+    message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.OWNER_USER_ID),
+                                    channel=types.SimpleNamespace(id=_RW_CHANNEL))
+    _sr_run(b._macro_record(message, name))
+    assert hooks == [], hooks
+    assert len(replies) == 1 and expected in replies[0], replies
+    assert b._MACRO_RECORDING == recording and b._MACRO_RUNNING == running
 
 
 def test_starting_a_recording_hands_the_watchdog_its_channel_owner_and_sequence(

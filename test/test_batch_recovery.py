@@ -1120,6 +1120,20 @@ def test_a_process_that_is_already_gone_is_not_adopted():
     assert b._open_adopted_webrunner(pid) is None
 
 
+@pytest.mark.skipif(os.name != "nt", reason="握住 handle 問結束碼是 Windows 的做法")
+def test_a_process_that_has_exited_but_is_still_held_is_not_adopted():
+    """上面那支在 `del child` 之後 `Popen` 的 handle 已經關了，`OpenProcess` 當場失敗，
+    「開得到 handle、但行程早就結束了」那一條從來沒跑過——而那才是常態：還有別人（例如
+    它的父行程）握著 handle 時，結束的行程物件還在，開得到。收養一個已經結束的行程，
+    監督者會把它的結束碼當成「剛剛結束」處理，對一個早就停了的批次做重生與通知。"""
+    child = _sleeper(0.0, 5)
+    try:
+        child.wait(30)                      # 結束了，但 `child` 還握著它的 handle
+        assert b._open_adopted_webrunner(child.pid) is None
+    finally:
+        child.wait(30)
+
+
 # ===========================================================================
 # 七、獨立監督者（`start_webrunner.py`）：斷網不算進放棄閘
 # ===========================================================================

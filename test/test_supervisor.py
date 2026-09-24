@@ -1133,6 +1133,40 @@ def test_a_held_lock_stops_the_launcher_before_it_spawns_anything(
     assert rc != 0, f"{launcher} 被鎖擋下卻回報成功（rc={rc}）"
 
 
+@pytest.mark.parametrize("launcher", _LAUNCHERS)
+def test_a_missing_target_script_stops_the_launcher_before_anything_else(
+        launcher, tmp_path, monkeypatch, capsys):
+    """要監督的那支程式不在（搬走、改名、clone 不完整）：回非 0、講一聲，**在拿鎖、
+    修剪記錄檔、spawn 之前**就停。拿了鎖才發現，會讓另一個正常的啟動器以為已經有人在跑。
+    每一個後續步驟都換成會丟例外的絆線。"""
+    module = _load_launcher(launcher)
+    missing = tmp_path / "gone.py"
+    if "webrunner" in launcher:
+        monkeypatch.setattr(module, "SCRIPTS", {k: missing for k in module.SCRIPTS})
+    else:
+        monkeypatch.setattr(module, "BOT_SCRIPT", missing)
+    monkeypatch.setattr(sys, "argv", [launcher])
+
+    class _Reached(Exception):
+        pass
+
+    def _boom(*_a, **_k):
+        raise _Reached
+
+    hooks = [h for h in ("_supervise", "stream_child", "trim_log",
+                         "acquire_single_instance_lock", "load_bot_config")
+             if hasattr(module, h)]
+    assert "acquire_single_instance_lock" in hooks, hooks
+    for hook in hooks:
+        monkeypatch.setattr(module, hook, _boom)
+    try:
+        rc = module.main()
+    except _Reached:
+        pytest.fail(f"{launcher} 目標程式不在卻繼續往下走了")
+    assert rc == 1
+    assert "gone.py" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # Ctrl+C 之後的收屍（`reap_child`）
 #

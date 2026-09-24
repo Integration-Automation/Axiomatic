@@ -651,6 +651,39 @@ def test_stop_kills_the_launcher_before_sweeping_the_batch(monkeypatch, tmp_path
     assert any("獨立監督者" in (text or "") for text in replies)
 
 
+def test_stop_still_stops_when_the_chrome_slot_is_held(monkeypatch, tmp_path):
+    """Chrome 槽擋的是「全機掃瀏覽器會誤殺驗證用的那一套」。`/run` 拿不到槽就不動，但
+    `/stop` 反過來：使用者明確要求停止，不能被一個跑很久的驗證無限期擋住。所以只等一小段
+    （`CHROME_SLOT_STOP_TIMEOUT_SEC`），拿不到仍照常掃，最後照樣 release。"""
+    order: list = []
+    asked: list = []
+
+    async def fake_reply(message, content=None, **kwargs):
+        order.append("reply")
+
+    async def fake_terminate(proc, pid):
+        order.append("sweep")
+        return ["swept"]
+
+    async def busy_slot(label, timeout):
+        asked.append((label, timeout))
+        return False
+
+    monkeypatch.setattr(b, "safe_reply", fake_reply)
+    monkeypatch.setattr(b, "find_launcher_pids", lambda: ([], True))
+    monkeypatch.setattr(b, "_terminate_all_webrunner_instances", fake_terminate)
+    monkeypatch.setattr(b, "_acquire_chrome_slot", busy_slot)
+    monkeypatch.setattr(b, "_release_chrome_slot", lambda: order.append("release"))
+    monkeypatch.setattr(b, "_clear_pid", lambda: None)
+    monkeypatch.setattr(b, "SINGLE_IMAGE_REQUEST_FILE", tmp_path / "req.json")
+    monkeypatch.setattr(b, "_webrunner_fallback_task", None)
+    monkeypatch.setattr(b, "_webrunner_oneshot_reaper_task", None)
+    asyncio.run(b.cmd_stop(_fake_message(b.OWNER_USER_ID)))
+    assert asked == [("stop", b.CHROME_SLOT_STOP_TIMEOUT_SEC)], asked
+    assert order[:2] == ["sweep", "release"], order
+    assert "reply" in order
+
+
 def test_stop_says_so_when_it_could_not_check(monkeypatch, tmp_path):
     """掃不成就要講。
 

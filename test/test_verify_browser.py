@@ -2916,6 +2916,30 @@ def test_a_retry_that_succeeds_still_says_it_retried(monkeypatch, capsys):
         f"重試成功卻沒有說出來：\n{out}")
 
 
+def test_a_first_try_success_does_not_claim_a_retry(monkeypatch, capsys):
+    """反方向：一次就過的時候不可以出現「第 N 趟才過的」那一段（原文是 `第 N 趟**才過的`，中間夾著粗體記號，所以比對「才過」）。少了這一支，「永遠印那一段」也會讓
+    上面那支綠——而一個每次都出現的警告，很快就沒人會讀了。"""
+    calls = _stub_full_attempts(monkeypatch, [(True, "")])
+    rc = vb.run_full(generate=False)
+    out = capsys.readouterr().out
+    assert rc == vb.EXIT_OK and calls == [1], (rc, calls)
+    assert "才過" not in out and "瀏覽器中途不見" not in out, out
+    assert out.count(vb.RESULT_PREFIX) == 1
+
+
+def test_full_without_its_entry_script_fails_without_starting_anything(
+        monkeypatch, tmp_path, capsys):
+    """入口檔不在（搬走、改名）是**驗證失敗**：印 FAIL、回 1，而且在任何一趟之前就停——
+    不是 SKIP（那是「晚點再來」，看到的人會以為什麼都沒壞）。"""
+    calls = _stub_full_attempts(monkeypatch, [(True, "")])
+    monkeypatch.setattr(vb, "WEBRUNNER_SCRIPT", tmp_path / "gone.py")
+    rc = vb.run_full(generate=False)
+    out = capsys.readouterr().out
+    assert rc == vb.EXIT_FAIL and calls == [], (rc, calls)
+    assert f"{vb.RESULT_PREFIX} FAIL" in out and out.count(vb.RESULT_PREFIX) == 1, out
+    assert "gone.py" not in out and str(tmp_path) not in out, out
+
+
 def test_full_emits_exactly_one_verdict_line_even_after_a_retry(
         monkeypatch, capsys):
     """結果行是契約：不管跑幾趟，`VERIFY-BROWSER:` 只能出現一次。

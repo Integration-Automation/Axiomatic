@@ -92,6 +92,35 @@ def test_all_fallback_does_not_resurrect():
     print("  PASS\n")
 
 
+def test_an_empty_fallback_ends_the_run_instead_of_crashing():
+    """真實佇列全空、fallback「作用中」卻一筆都沒有（fallback 檔是空的）：`pair_todos` 算出
+    零批，這時要收工，不能去取 `pairs[0]`——那會讓整個批次以 IndexError 結束，而使用者看到
+    的是一次崩潰，不是「佇列空了」。"""
+    print("test_an_empty_fallback_ends_the_run_instead_of_crashing:")
+    for fb in ((True, False, False, False), (False, True, False, False),
+               (True, True, True, True)):
+        got = qc.decide([], [], [], [], [], [], [], [], *fb, skip=0, produced=0)
+        assert got.action == qc.ACTION_BREAK and got.batch is None, (fb, got)
+    # 對照組：fallback 有一筆時照樣產那一個 fallback 角色。
+    got = qc.decide([], [], [], [], ["FP"], [], [], [], True, False, False, False,
+                    skip=0, produced=0)
+    assert got.action == qc.ACTION_FALLBACK_SINGLE and got.batch[0] == "FP", got
+    print("  PASS\n")
+
+
+def test_an_empty_list_never_pops():
+    """一條已經空了的清單沒有東西可以 pop。游標算成 `min(skip, -1) = -1` 之後，最後一批的
+    `is_last` 會讓它回 True——呼叫端接著去刪第 -1 筆，也就是**別的清單的尾巴**被刪掉的那種
+    錯位。"""
+    print("test_an_empty_list_never_pops:")
+    for skip in (0, 1, 5):
+        for is_last in (False, True):
+            assert qc.should_pop_at(0, skip, is_last) is False, (skip, is_last)
+            assert qc.should_pop_at(-1, skip, is_last) is False, (skip, is_last)
+    assert qc.should_pop_at(1, 0, True) is True
+    print("  PASS\n")
+
+
 # ---------- below-threshold ------------------------------------------------
 
 def test_below_threshold_retained():

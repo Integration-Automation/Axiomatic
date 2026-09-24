@@ -575,6 +575,67 @@ def test_set_character2_enabled_removes_and_readds_slot():
     print("  PASS\n")
 
 
+_CHARACTER2_CASES = [
+    # (enabled, 依序的卡片數, 動作回報, 期望回傳, 動作次數, 快照次數)
+    # 已經是要的狀態：不動任何控制項（多點一次「加角色」會變出第三張卡）。
+    (True, [2], True, True, 0, 0),
+    (True, [3], True, True, 0, 0),
+    (False, [1], True, True, 0, 0),
+    (False, [0], True, True, 0, 0),
+    # 動作本身失敗。
+    (True, [1], False, False, 1, 0),
+    (False, [2], False, False, 1, 1),
+    # 動作回報成功，但卡片數沒有變成要的樣子——以**結果**為準，不以點選為準。
+    (True, [1, 1], True, False, 1, 1),
+    (False, [2, 2], True, False, 1, 1),
+    # 正常路徑。
+    (True, [1, 2], True, True, 1, 0),
+    (False, [2, 1], True, True, 1, 0),
+]
+
+
+def test_character2_enabled_reports_what_the_page_ended_up_with():
+    """回 False 的那幾條是呼叫端唯一的訊號：Character 2 的卡該拿掉卻還在，上一對的角色
+    提示詞會漏進下一張圖；該加卻沒加，char2 的提示詞會寫進不存在的卡片。
+
+    不用 `parametrize`／`monkeypatch`：這個檔案有自帶 runner，只餵得起 `tmp_path`。"""
+    print("test_character2_enabled_reports_what_the_page_ended_up_with")
+    names = ("count_characters", "click_add_character_control",
+             "remove_character_slot", "snap", "human_pause")
+    saved = {name: getattr(ws, name) for name in names}
+    try:
+        for case in _CHARACTER2_CASES:
+            enabled, counts, action_ok, expected, acted, snapped = case
+            seq = iter(counts)
+            last = [None]
+            actions: list = []
+            snaps: list = []
+
+            def _count(_port, seq=seq, last=last):
+                last[0] = next(seq, last[0])
+                return last[0]
+
+            ws.count_characters = _count
+            ws.click_add_character_control = (
+                lambda _port, gender, actions=actions, ok=action_ok:
+                actions.append(("add", gender)) or ok)
+            ws.remove_character_slot = (
+                lambda _port, label, actions=actions, ok=action_ok:
+                actions.append(("remove", label)) or ok)
+            ws.snap = lambda _port, name, snaps=snaps: snaps.append(name)
+            ws.human_pause = lambda *_a, **_k: None
+            assert ws.set_character2_enabled(object(), enabled) is expected, case
+            assert len(actions) == acted, (case, actions)
+            if actions:
+                assert actions[0] == (("add", "Female") if enabled
+                                      else ("remove", "Character 2")), case
+            assert len(snaps) == snapped, (case, snaps)
+    finally:
+        for name, value in saved.items():
+            setattr(ws, name, value)
+    print("  PASS\n")
+
+
 def test_expand_character_section_is_result_driven_not_click_driven():
     """展開角色卡是「以結果為準」的操作，不是「點固定次數」的操作。
 
@@ -1182,6 +1243,148 @@ def test_generate_loop_normal_saves_n():
     print("  PASS\n")
 
 
+class _ProbePort:
+    """只回答崩潰探測與關閉對話框需要的那幾個問題；每個動作都記下來。"""
+
+    def __init__(self, url="https://example.invalid/image", title="Image",
+                 url_error=None, native_error=None, script_error=None):
+        # 這兩個替身定義在檔案後段，所以在建構時才取，不放在類別屬性。
+        self.TRANSPORT_ERRORS = (_FakeReadTimeout, _FakeNoSuchWindow)
+        self.url, self.title = url, title
+        self.url_error = url_error
+        self.native_error, self.script_error = native_error, script_error
+        self.calls: list = []
+
+    def current_url(self):
+        if self.url_error is not None:
+            raise self.url_error
+        return self.url
+
+    def get_title(self):
+        return self.title
+
+    def click_native(self, element):
+        self.calls.append(("native", element))
+        if self.native_error is not None:
+            raise self.native_error
+
+    def execute_script(self, script, *args):
+        self.calls.append(("script", script))
+        if self.script_error is not None:
+            raise self.script_error
+
+
+def test_the_crash_page_is_recognised_by_its_url_or_its_title():
+    """認出崩潰頁，第一張失敗的圖就能交給監督者重生；認不出來就對著一個死掉的分頁
+    把重試預算慢慢燒完（四、五分鐘的空轉）。"""
+    print("test_the_crash_page_is_recognised_by_its_url_or_its_title")
+    cases = [
+        (_ProbePort(url="chrome-error://chromewebdata/"), True),
+        (_ProbePort(title="Aw, Snap!"), True),
+        (_ProbePort(title="He's dead, Jim!"), True),
+        (_ProbePort(), False),
+        (_ProbePort(url=None, title=None), False),
+        # 只是卡頓：當作沒崩，照舊回落到呼叫端的失敗計數器。
+        (_ProbePort(url_error=_FakeReadTimeout()), False),
+    ]
+    for port, expected in cases:
+        assert ws._is_chrome_crash_page(port) is expected, (
+            port.url, port.title, port.url_error)
+    gone = _ProbePort(url_error=_FakeNoSuchWindow())
+    try:
+        ws._is_chrome_crash_page(gone)
+    except ws.BrowserGoneError:
+        pass
+    else:
+        raise AssertionError("視窗真的沒了要升級成 BrowserGoneError，不是回「沒崩」")
+    print("  PASS\n")
+
+
+def test_a_dialog_click_that_finds_the_browser_gone_does_not_fall_back():
+    """真點選時發現瀏覽器已經沒了，就不要再試合成點選、也不要送 Escape——那些都是對著一個
+    死掉的 session 空轉，而那一輪該做的是立刻收掉、交給監督者。"""
+    print("test_a_dialog_click_that_finds_the_browser_gone_does_not_fall_back")
+    element = object()
+    for kind in ("native", "script"):
+        port = (_ProbePort(native_error=_FakeNoSuchWindow())
+                if kind == "native" else
+                _ProbePort(native_error=RuntimeError("element click intercepted"),
+                           script_error=_FakeNoSuchWindow()))
+        try:
+            ws._click_dismiss_target(port, element)
+        except ws.BrowserGoneError:
+            pass
+        else:
+            raise AssertionError(kind + "：瀏覽器沒了卻沒有往上拋")
+        expected = [("native", element)] if kind == "native" else [
+            ("native", element), ("script", "arguments[0].click();")]
+        assert port.calls == expected, (kind, port.calls)
+
+    # 對照組：一般的「被蓋住」只是退回合成點選，不是瀏覽器沒了。
+    port = _ProbePort(native_error=RuntimeError("element click intercepted"))
+    assert ws._click_dismiss_target(port, element) == "synthetic"
+    assert [c[0] for c in port.calls] == ["native", "script"]
+    port = _ProbePort()
+    assert ws._click_dismiss_target(port, element) == "real"
+    assert [c[0] for c in port.calls] == ["native"]
+    # JS 挑中了卻拿不到元素：什麼都不按，讓呼叫端改送 Escape。
+    port = _ProbePort()
+    assert ws._click_dismiss_target(port, None) == ""
+    assert port.calls == []
+    print("  PASS\n")
+
+
+def _serve_once_between_images(refill_ok: bool, refill=("P", "C1", "", "U")):
+    """跑一個三張圖的角色，第一張與第二張之間插播一次單圖請求。回
+    `(存了幾張, 重填收到的參數, 丟出的 RuntimeError 文字)`。"""
+    port = FakeBrowserPort()
+    refills: list = []
+    raised = ""
+    saved = None
+    with _GenHarness() as h:
+        served = iter([True])
+        ws.check_single_image_request = lambda port, in_band=True: next(served, False)
+
+        def _refill(_port, *args):
+            refills.append(args)
+            return refill_ok
+
+        ws._refill_character_fields = _refill
+        try:
+            saved = ws.generate_loop(port, "Alice", _cfg(images_per_character=3),
+                                     batch_start=0.0, out_dir=h.out_dir(),
+                                     resume_count=0, refill=refill,
+                                     minimize_fn=None)
+        except RuntimeError as error:
+            raised = str(error)
+        pngs = len(list(h.out_dir().glob("*.png")))
+    return saved, pngs, refills, raised
+
+
+def test_an_in_band_request_that_cannot_be_undone_stops_the_character():
+    """插播的單圖會覆寫主 prompt／角色／undesired 欄位。填不回去還繼續的話，這個角色剩下的
+    圖全部用 one-shot 的提示詞產出，存進這個角色的資料夾——沒有任何錯誤，只有一批錯的圖。
+    所以要往上拋，讓監督者重生並重跑 setup，而且在**下一張圖之前**就停。"""
+    saved, pngs, refills, raised = _serve_once_between_images(refill_ok=False)
+    assert "in-band request" in raised, raised
+    assert saved is None and pngs == 1, (saved, pngs)
+    assert refills == [("P", "C1", "", "U")]
+
+
+def test_an_in_band_request_that_is_undone_lets_the_character_finish():
+    """正面對照組：少了它，「一律往上拋」也會讓上面那支通過。"""
+    saved, pngs, refills, raised = _serve_once_between_images(refill_ok=True)
+    assert raised == "" and saved == 3 and pngs == 3, (saved, pngs, raised)
+    assert refills == [("P", "C1", "", "U")], "填回去的必須是**這個角色**的欄位"
+
+
+def test_an_in_band_request_without_a_refill_source_touches_nothing():
+    """je 變體與單獨呼叫沒有 `refill`：沒有可信的來源可填，硬填反而更糟。"""
+    saved, pngs, refills, raised = _serve_once_between_images(refill_ok=False,
+                                                              refill=None)
+    assert raised == "" and saved == 3 and refills == []
+
+
 def test_a_session_that_never_produced_an_image_reloads_early():
     """一張圖都沒出現過就放棄 → 立刻 reload ＋ 重填，不要慢慢爬到 abort。
 
@@ -1773,6 +1976,26 @@ def test_model_candidates_is_config_driven_in_both_variants():
     assert "model_candidates" not in db._BATCH_SETTERS, (
         "model_candidates 不可設成 bot 可改的鍵——`/config show` 會把值印給"
         "頻道看，那是外部服務的模型名")
+    print("  PASS\n")
+
+
+def test_a_reversed_or_negative_range_and_a_non_boolean_flag_fall_back():
+    """`(lo, hi)` 是 `random.uniform` 的兩端：反過來寫（`[30, 20]`）不會出錯，只會安靜地
+    在錯的範圍裡抽；負數會讓等待變成「不等」。開關寫成字串 `"false"` 時，照 Python 的真假值
+    它是 **True**——使用者寫了關，實際是開。這三種都退回預設，交給載入端出聲。"""
+    print("test_a_reversed_or_negative_range_and_a_non_boolean_flag_fall_back")
+    import _batch_config as bc
+    default = (20.0, 30.0)
+    for bad in ([30, 20], (5.0, 4.999), [-1, 5], [-5, -1], [1], [1, 2, 3], ["1", "2"],
+                [True, 2], "20,30", None):
+        assert bc._coerce_pair(bad, default) == default, bad
+    for good, want in (([0, 0], (0.0, 0.0)), ([2, 2], (2.0, 2.0)), ((1, 5.5), (1.0, 5.5))):
+        assert bc._coerce_pair(good, default) == want, good
+    for bad in ("false", "true", 0, 1, None, [], "no"):
+        assert bc._coerce_bool(bad, True) is True, bad
+        assert bc._coerce_bool(bad, False) is False, bad
+    assert bc._coerce_bool(False, True) is False
+    assert bc._coerce_bool(True, False) is True
     print("  PASS\n")
 
 
@@ -3481,6 +3704,30 @@ def test_hot_path_readers_escalate_gone_but_absorb_stalls():
     print("  PASS\n")
 
 
+def test_a_download_that_brought_back_nothing_usable_writes_no_file(tmp_path):
+    """頁面裡的 fetch 失敗時回 null；站方回了不是圖的東西時可能連逗號都沒有。兩種都要回
+    False 交給下載重試，**而且不留下檔案**——留下一個空檔或半個檔，存檔計數與續跑都會把它
+    當成一張圖。"""
+    print("test_a_download_that_brought_back_nothing_usable_writes_no_file")
+
+    class _Answers(FakeBrowserPort):
+        def __init__(self, answer):
+            super().__init__()
+            self.answer = answer
+
+        def execute_async_script(self, script, *args):
+            return self.answer
+
+    target = tmp_path / "out" / "001.png"
+    for answer in (None, "", "data:image/png;base64", "not a data url"):
+        assert ws.download_image(_Answers(answer), "blob:x", target) is False, answer
+        assert not target.exists() and not target.parent.exists(), answer
+    good = "data:image/png;base64," + _base64.b64encode(b"PNGDATA").decode()
+    assert ws.download_image(_Answers(good), "blob:x", target) is True
+    assert target.read_bytes() == b"PNGDATA"
+    print("  PASS\n")
+
+
 def test_with_retry_does_not_retry_a_gone_browser():
     print("test_with_retry_does_not_retry_a_gone_browser")
     calls = []
@@ -3505,6 +3752,17 @@ def test_with_retry_does_not_retry_a_gone_browser():
 
     assert ws.with_retry("x", _flaky, max_attempts=3, sleep_range=(0, 0)) is False
     assert len(calls) == 3, calls
+    # 一般例外（不是瀏覽器沒了）是**可重試**的：下一次成功就算成功，不往上拋。
+    calls.clear()
+
+    def _recovers():
+        calls.append(1)
+        if len(calls) == 1:
+            raise _FakeReadTimeout()
+        return True
+
+    assert ws.with_retry("x", _recovers, max_attempts=3, sleep_range=(0, 0)) is True
+    assert len(calls) == 2, calls
     print("  PASS\n")
 
 

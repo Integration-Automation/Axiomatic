@@ -1225,6 +1225,49 @@ def test_the_outbox_is_not_sent_where_the_owner_did_not_ask(outbox, monkeypatch)
     assert "答案" not in notice.sent[0]
 
 
+@pytest.mark.parametrize("case", ["no-chunks", "no-channel", "no-anchor", "lookup-broke"])
+def test_an_answer_that_cannot_go_back_where_it_came_from_is_dropped_out_loud(
+        outbox, monkeypatch, case):
+    """送不回原處的答案（頻道沒了、原本那則提問被刪了、存的東西不能用）不要一直停著——
+    每次重連都再試一次、永遠不會成功——也不要改送到別的地方；拿掉，並在設定檔的頻道講一聲，
+    **不含內容**。"""
+    _park(outbox, chunks=[None, ""] if case == "no-chunks" else ["答案"])
+    channel = _SendChannel()
+    notice = _flush_env(monkeypatch, channel, b.DOROSSI_USER_ID)
+    if case == "no-channel":
+        async def _gone(_cid):
+            return None
+        monkeypatch.setattr(b, "_dorossi_restore_channel", _gone)
+    elif case == "no-anchor":
+        async def _deleted(_channel, _mid, *, label=""):
+            return None
+        monkeypatch.setattr(b, "_resolve_trigger_message", _deleted)
+    elif case == "lookup-broke":
+        async def _broke(_channel, _mid, *, label=""):
+            raise RuntimeError("403 Forbidden")
+        monkeypatch.setattr(b, "_resolve_trigger_message", _broke)
+    asyncio.run(b._dorossi_outbox_flush())
+    assert channel.sent == []
+    assert _box(outbox) is None
+    assert len(notice.sent) == 1 and "〔s1〕" in notice.sent[0]
+    assert "答案" not in notice.sent[0]
+
+
+def test_a_platform_drop_during_the_anchor_lookup_keeps_the_answer(outbox, monkeypatch):
+    """查原本那則提問時平台又斷了：那不是「送不回去」，是「現在送不了」——留著等下次。"""
+    _park(outbox)
+    channel = _SendChannel()
+    notice = _flush_env(monkeypatch, channel, b.DOROSSI_USER_ID)
+
+    async def _down(_channel, _mid, *, label=""):
+        raise aiohttp.ClientConnectionError("down")
+
+    monkeypatch.setattr(b, "_resolve_trigger_message", _down)
+    asyncio.run(b._dorossi_outbox_flush())
+    assert channel.sent == [] and notice.sent == []
+    assert len(_box(outbox)) == 1
+
+
 def test_a_single_turn_answer_goes_to_the_outbox_when_the_platform_is_down(
         outbox, monkeypatch):
     """走真的 `_dorossi_run_turn`：答案已經存進工作階段，送不出去就停著，不當成失敗。"""

@@ -661,3 +661,206 @@ def test_a_forbidden_channel_drops_the_announcement(monkeypatch):
 
 async def _boom(*_args, **_kwargs):
     raise AssertionError("關掉了還去探測")
+
+
+# ---------------------------------------------------------------------------
+# 探測本身：真的起一個子行程（一支假的 CLI），讀到答案就砍掉
+# ---------------------------------------------------------------------------
+# 兩支探測的「怎麼判斷那一行」早就有測試（`_dorossi_model_from_init_line` ／
+# `_dorossi_model_from_header_line`），但「起行程、寫 stdin、逐行讀、讀到就砍、
+# 讀不到就逾時」那一層在整套測試裡一次都沒跑過（2026-09-24 單行程覆蓋率：
+# 各 34 行裡 33 行沒跑）——而那正是昨天在正式 bot 上真的跑了、找到新模型的那一段。
+# 假 CLI 是 `sys.executable` 跑的小腳本，不碰網路、不花錢。
+
+_INIT = json.dumps({"type": "system", "subtype": "init", "model": "claude-opus-9-9"})
+
+
+def _fake_claude(monkeypatch, script: str) -> None:
+    import os
+    monkeypatch.setattr(db, "_dorossi_model_probe_argv",
+                        lambda exe, family: [sys.executable, "-c", script])
+    monkeypatch.setattr(db, "_dorossi_cc_child_env",
+                        lambda _timeout: {**os.environ, "PYTHONIOENCODING": "utf-8"})
+
+
+def _timed(coro):
+    import time as _time
+    started = _time.monotonic()
+    result = asyncio.run(asyncio.wait_for(coro, 60))
+    return result, _time.monotonic() - started
+
+
+def test_the_family_probe_returns_the_model_and_does_not_wait_for_the_cli(
+        monkeypatch, tmp_path):
+    """init 事件在請求之前就到，讀到就收工：假 CLI 之後睡一分鐘，探測不得等它。前面那幾行
+    不是 init（雜訊、別的事件），要跳過繼續讀。"""
+    _fake_claude(monkeypatch, (
+        "import sys, time\n"
+        "sys.stdin.readline()\n"
+        "print('warming up', flush=True)\n"
+        "print('{\"type\": \"system\", \"subtype\": \"hook\"}', flush=True)\n"
+        f"print({_INIT!r}, flush=True)\n"
+        "time.sleep(60)\n"))
+    model, elapsed = _timed(db._dorossi_probe_claude_family(
+        "claude", "opus", str(tmp_path), 30.0))
+    assert model == "claude-opus-9-9"
+    assert elapsed < 20, f"探測等到假 CLI 自己結束才回來（{elapsed:.1f}s）"
+
+
+@pytest.mark.parametrize("script", [
+    "import sys\nsys.stdin.readline()\nprint('no init here', flush=True)\n",
+    "import sys\nsys.exit(3)\n",
+], ids=["no-init", "crash"])
+def test_the_family_probe_gives_up_quietly_when_there_is_no_init(monkeypatch, tmp_path,
+                                                                 script):
+    _fake_claude(monkeypatch, script)
+    model, _elapsed = _timed(db._dorossi_probe_claude_family(
+        "claude", "opus", str(tmp_path), 30.0))
+    assert model is None
+
+
+def test_a_family_probe_that_hears_nothing_times_out(monkeypatch, tmp_path, capsys):
+    """什麼都不印的 CLI（卡在登入、卡在網路）：到點就放棄，不會把每日檢查整個卡住。"""
+    _fake_claude(monkeypatch, "import time\ntime.sleep(60)\n")
+    model, elapsed = _timed(db._dorossi_probe_claude_family(
+        "claude", "opus", str(tmp_path), 1.5))
+    assert model is None and elapsed < 20, elapsed
+    assert "timed out" in capsys.readouterr().err
+
+
+def test_the_codex_probe_reads_the_header_from_stderr(tmp_path):
+    """另一個 CLI 把表頭印在 **stderr**、而且要先讀完 stdin 才印——兩件都是實測才知道的，
+    寫錯任何一件探測就一路等到逾時。探測跑的是 `[exe, "exec", …]`、工作目錄是 `cwd`，
+    所以用 `sys.executable` 當 exe、在 cwd 放一支叫 `exec` 的腳本，就是真的那條起行程的路。"""
+    (tmp_path / "exec").write_text(
+        "import sys, time\n"
+        "sys.stdin.read()\n"
+        "print('answer on stdout', flush=True)\n"
+        "sys.stderr.write('workdir: x\\nmodel: gpt-9.9-sol\\n'); sys.stderr.flush()\n"
+        "time.sleep(60)\n", encoding="utf-8")
+    model, elapsed = _timed(db._dorossi_probe_codex_default(
+        sys.executable, str(tmp_path), 30.0))
+    assert model == "gpt-9.9-sol"
+    assert elapsed < 20, elapsed
+
+
+def test_the_catalog_probe_asks_each_family_only_without_the_api_route(monkeypatch):
+    """有 API 那條路就不必起 CLI；沒有才逐族問。另一個後端的答案按族名歸位，讀不到就不寫。"""
+    asked: list = []
+
+    async def _probe_family(exe, family, cwd, timeout):
+        asked.append(family)
+        return f"claude-{family}-9-9"
+
+    async def _codex(exe, cwd, timeout):
+        return "gpt-9.9-sol"
+
+    monkeypatch.setattr(db, "_dorossi_probe_claude_family", _probe_family)
+    monkeypatch.setattr(db, "_dorossi_probe_codex_default", _codex)
+    monkeypatch.setattr(db, "_dorossi_model_probe_dir", lambda: Path("."))
+    monkeypatch.setattr(db._shutil, "which", lambda name: "claude.exe")
+    monkeypatch.setattr(db, "find_codex_executable", lambda: "codex.exe")
+
+    async def _api_empty(timeout):
+        return {}
+
+    monkeypatch.setattr(db, "_dorossi_probe_api_catalog", _api_empty)
+    got = asyncio.run(db.dorossi_probe_model_catalog(5.0))
+    assert asked == list(db.DOROSSI_MODEL_PROBE_FAMILIES)
+    assert got["claude"] == {f: f"claude-{f}-9-9" for f in db.DOROSSI_MODEL_PROBE_FAMILIES}
+    assert got["codex"] == {"sol": "gpt-9.9-sol"}
+
+    asked.clear()
+
+    async def _api_full(timeout):
+        return {"opus": "claude-opus-9-9"}
+
+    monkeypatch.setattr(db, "_dorossi_probe_api_catalog", _api_full)
+    monkeypatch.setattr(db, "find_codex_executable", lambda: None)
+    got = asyncio.run(db.dorossi_probe_model_catalog(5.0))
+    assert asked == [] and got == {"claude": {"opus": "claude-opus-9-9"}}
+
+
+@pytest.mark.parametrize("override_shape", ["plain", "single-quoted", "double-quoted"])
+def test_the_codex_override_wins_even_when_quoted(monkeypatch, tmp_path, override_shape):
+    """`CODEX_CLI_PATH` 是操作者明確指定的那一支，排在 PATH 前面。從 shell 設的值常常帶著
+    引號——2026-09-10 以前單引號版本會安靜地被忽略、退回 PATH。"""
+    exe = tmp_path / "my codex.exe"
+    exe.write_bytes(b"")
+    other = tmp_path / "other.exe"
+    other.write_bytes(b"")
+    value = {"plain": str(exe), "single-quoted": f"'{exe}'",
+             "double-quoted": f'"{exe}"'}[override_shape]
+    monkeypatch.setenv("CODEX_CLI_PATH", value)
+    monkeypatch.setattr(db._shutil, "which", lambda name: str(other))
+    assert db.find_codex_executable() == str(exe.resolve())
+
+
+def test_a_codex_override_that_is_not_a_file_falls_back_to_path(monkeypatch, tmp_path):
+    """指到不存在的檔或一個資料夾：不回那個值（回了等於叫起行程時才爆），照順序往下找。"""
+    found = tmp_path / "codex.exe"
+    found.write_bytes(b"")
+    monkeypatch.setattr(db._shutil, "which", lambda name: str(found))
+    for bad in (str(tmp_path / "gone.exe"), str(tmp_path)):
+        monkeypatch.setenv("CODEX_CLI_PATH", bad)
+        assert db.find_codex_executable() == str(found.resolve()), bad
+
+
+def test_codex_is_found_in_the_desktop_install_when_path_is_stale(monkeypatch, tmp_path):
+    """長命的監督行程拿的是開機時的 PATH；桌面安裝版在 LocalAppData 底下，最後才找。"""
+    monkeypatch.delenv("CODEX_CLI_PATH", raising=False)
+    monkeypatch.setattr(db._shutil, "which", lambda name: None)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    if db.os.name != "nt":
+        assert db.find_codex_executable() is None
+        return
+    assert db.find_codex_executable() is None, "安裝位置還沒有檔案"
+    exe = tmp_path / "Programs" / "OpenAI" / "Codex" / "bin" / "codex.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"")
+    assert db.find_codex_executable() == str(exe.resolve())
+
+
+class _Model:
+    def __init__(self, model_id):
+        self.id = model_id
+
+
+def _api_client(monkeypatch, *, ids=None, error=None):
+    class _Models:
+        async def list(self, limit):
+            if error is not None:
+                raise error
+            return type("Page", (), {"data": [_Model(i) for i in ids or []]})()
+
+    monkeypatch.setattr(db, "_dorossi_api_credentials_present", lambda: True)
+    monkeypatch.setattr(db, "_get_dorossi_client",
+                        lambda: type("Client", (), {"models": _Models()})())
+
+
+def test_the_api_catalog_keeps_the_newest_of_each_known_family(monkeypatch):
+    """清單是新的在前：每一族取第一筆；內建表沒有的族（別的產品線）不收。"""
+    families = list(db.DOROSSI_MODEL_PROBE_FAMILIES)
+    first = families[0]
+    ids = [f"claude-{first}-9-9", f"claude-{first}-9-1", "claude-unknownfam-1-0",
+           "not-a-model-id", None]
+    _api_client(monkeypatch, ids=ids)
+    got = asyncio.run(db._dorossi_probe_api_catalog(5.0))
+    assert got == {first: f"claude-{first}-9-9"}, got
+
+
+@pytest.mark.parametrize("case", ["no-credentials", "no-client", "api-error"])
+def test_the_api_catalog_steps_aside_so_the_cli_probe_can_run(monkeypatch, capsys, case):
+    """沒憑證、SDK 不在、清單拿不到——都回空字典，呼叫端才會退回 CLI 探測。失敗的原因只印
+    例外的型別（訊息可能帶金鑰前綴或網址）。"""
+    _api_client(monkeypatch, ids=["claude-opus-9-9"],
+                error=RuntimeError("key sk-secret rejected") if case == "api-error" else None)
+    if case == "no-credentials":
+        monkeypatch.setattr(db, "_dorossi_api_credentials_present", lambda: False)
+    if case == "no-client":
+        monkeypatch.setattr(db, "_get_dorossi_client", lambda: None)
+    assert asyncio.run(db._dorossi_probe_api_catalog(5.0)) == {}
+    err = capsys.readouterr().err
+    assert "sk-secret" not in err
+    if case == "api-error":
+        assert "RuntimeError" in err

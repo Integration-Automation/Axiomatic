@@ -322,6 +322,36 @@ def test_a_clamp_that_cannot_be_installed_does_not_take_the_backend_down(
     assert "clamp could not be installed" in err and "AttributeError" in err, err
 
 
+def test_the_client_is_built_once_and_reused(monkeypatch):
+    """client 帶著連線池；每一輪都新建一個，舊的那個連同它的連線就沒人關，一個跑整夜的
+    自走任務會一路累積。`_http_client` 換成 None，這支不需要真的 SDK。"""
+    built: list = []
+
+    class _Recorder:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+    monkeypatch.setattr(db, "AsyncAnthropic", _Recorder)
+    monkeypatch.setattr(db, "_dorossi_client", None)
+    monkeypatch.setattr(db, "_dorossi_api_http_client", lambda: None)
+    first = db._get_dorossi_client()
+    assert first is not None and db._get_dorossi_client() is first
+    assert len(built) == 1, built
+
+
+def test_without_the_sdk_the_api_backend_refuses_before_sending_anything(monkeypatch, capsys):
+    """SDK 沒裝（它是可選相依）：拿不到 client，這一輪以一個具名的錯誤結束，不去組請求。
+
+    「沒裝」是設定狀態，不是建構失敗：拿 `None` 去呼叫也會落進建構那層的寬 except、同樣回 None，
+    差別只在每一輪都多印一行誤導的「client init failed」——所以連 stderr 一起看。"""
+    monkeypatch.setattr(db, "AsyncAnthropic", None)
+    monkeypatch.setattr(db, "_dorossi_client", None)
+    assert db._get_dorossi_client() is None
+    with pytest.raises(RuntimeError, match="client unavailable"):
+        asyncio.run(db._dorossi_via_api("hi", []))
+    assert "init failed" not in capsys.readouterr().err
+
+
 def test_without_the_sdk_factory_the_client_is_plain(monkeypatch):
     monkeypatch.setattr(db, "anthropic", types.SimpleNamespace())
     assert db._dorossi_api_http_client() is None

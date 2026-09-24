@@ -240,6 +240,41 @@ def test_the_undo_refuses_an_undecodable_backup(tmp_path, monkeypatch, capsys):
     assert "undo read backup failed" in capsys.readouterr().err
 
 
+def test_undo_with_a_vanished_backup_skips_it_and_leaves_the_file_alone(
+        tmp_path, monkeypatch, capsys):
+    """備份檔被手動刪掉（或被清理掉）時，那一筆 undo 做不到：跳過、講一聲、**不碰原檔**，
+    也不把它當成「原本不存在」去刪原檔。備份檔名只進 stderr（Layer 1：`.bak` 的名字就是
+    佇列檔名）。下一次 undo 要能接著處理下一筆。"""
+    original = tmp_path / "todo_prompt.md"
+    original.write_text("keep me\n", encoding="utf-8")
+    older = tmp_path / "todo_prompt.older.bak"
+    older.write_text("older\n", encoding="utf-8")
+    replies: list = []
+
+    async def _fake_reply(_message, content=None, **_kwargs):
+        replies.append(content)
+
+    monkeypatch.setattr(b, "safe_reply", _fake_reply)
+    monkeypatch.setattr(b, "_UNDO_STACK", type(b._UNDO_STACK)(maxlen=50))
+    monkeypatch.setattr(b, "BACKUP_DIR", tmp_path / "no-backups-here")
+    b._UNDO_STACK.append((original, older))
+    b._UNDO_STACK.append((original, tmp_path / "todo_prompt.gone.bak"))
+    message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.OWNER_USER_ID + 1))
+
+    asyncio.run(b.cmd_undo(message))
+    assert original.read_text(encoding="utf-8") == "keep me\n"
+    assert "剩 1 筆" in replies[-1] and "todo_prompt" not in replies[-1], replies
+    assert "todo_prompt.gone.bak" in capsys.readouterr().err
+
+    asyncio.run(b.cmd_undo(message))
+    assert original.read_text(encoding="utf-8") == "older\n", "下一筆沒有接著做"
+
+    # 堆疊空了、`.backup/` 也沒有東西可重建：說沒有可 undo，不動任何檔案。
+    asyncio.run(b.cmd_undo(message))
+    assert "nothing to undo" in replies[-1]
+    assert original.read_text(encoding="utf-8") == "older\n"
+
+
 def _safe_write_env(tmp_path, monkeypatch):
     """把 `.backup/` 與 undo stack 指到 tmp，回傳要寫的目標檔。"""
     monkeypatch.setattr(b, "BACKUP_DIR", tmp_path / ".backup")

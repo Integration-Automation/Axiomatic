@@ -495,6 +495,22 @@ def test_the_replace_mode_degradation_emits_a_new_message_instead():
     assert transport.sent == ["新的"]
 
 
+def test_an_identical_edit_in_replace_mode_sends_nothing():
+    """上面那支去重測的是基底類別；降級那一支**覆寫**了 `edit`，所以要自己去重。在不能編輯的
+    平台上，一次內容相同的「編輯」就是一則一模一樣的新訊息——串流預覽每次重貼同一段文字，
+    就是洗版。節流窗刻意設成 0，這樣擋下它的只能是去重，不是節流。"""
+    transport, channel = _stub(edit_message=False)
+
+    async def _go():
+        sent = cp.ReplaceOnEditMessage(channel, "1", "一樣", min_interval_sec=0.0)
+        await sent.edit("一樣")
+        await sent.edit("新的")
+        await sent.edit("新的")
+        return list(transport.sent)
+
+    assert asyncio.run(_go()) == ["新的"]
+
+
 def test_the_replace_mode_throttles_intermediate_updates():
     """串流每個 token 送一則新訊息是洗版，不是即時預覽。"""
     transport, channel = _stub(edit_message=False)
@@ -630,6 +646,18 @@ def test_a_partly_broken_id_list_keeps_the_usable_entries(tmp_path, monkeypatch,
         "owner_user_ids": ["777", None, "  "]}}})
     assert cfg["platforms"]["telegram"]["owner_user_ids"] == ["777"]
     assert "owner_user_ids" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("key", ["owner_user_ids", "allowed_chat_ids"])
+@pytest.mark.parametrize("value", ["4409", 4409, {"4409": True}])
+def test_an_id_list_written_as_a_bare_value_is_refused_not_iterated(
+        tmp_path, monkeypatch, capsys, key, value):
+    """忘了中括號是最自然的寫錯法。照樣疊代下去的話，字串 `"4409"` 會變成 `4`、`0`、`0`、`9`
+    四個擁有者——任何 id 是個位數的帳號都拿到主機控制；dict 則會把它的**鍵**當成清單。
+    整個鍵退回預設（空＝沒有人），並且說一聲。"""
+    cfg = _load(tmp_path, monkeypatch, {"platforms": {"telegram": {key: value}}})
+    assert cfg["platforms"]["telegram"][key] == []
+    assert f"platforms.telegram.{key}" in capsys.readouterr().err
 
 
 def test_the_platform_section_does_not_share_state_with_the_defaults(
@@ -838,6 +866,39 @@ def test_a_long_running_command_does_not_stop_polling(monkeypatch, tmp_path):
     assert started == ["!slow", "!abort"], (started, polls)
 
 
+def test_a_junk_entry_does_not_cost_the_rest_of_its_batch(monkeypatch, tmp_path):
+    """一筆不是 dict 的更新跳過就好：同一批裡後面那筆照樣收、offset 照樣前進、不退避。"""
+    transport = _built(monkeypatch, tmp_path)
+    seen: list = []
+    polls: list = []
+    slept: list = []
+
+    async def _handle(message):
+        seen.append(message.content)
+
+    good = _update(text="!status")
+    good["update_id"] = 41
+
+    async def _api(method, payload=None, *, data=None):
+        del data
+        polls.append(dict(payload or {}))
+        if len(polls) > 1:
+            raise asyncio.CancelledError
+        return ["junk", 5, good]
+
+    async def _fake_sleep(seconds):
+        slept.append(seconds)
+
+    transport._context.handle_message = _handle
+    transport._api = _api
+    monkeypatch.setattr(tg.asyncio, "sleep", _fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(transport.run())
+    assert polls[1]["offset"] == 42
+    assert slept == []
+    assert seen == ["!status"]
+
+
 @pytest.mark.parametrize("batch", [
     # 最後兩格不是清單：字串照樣疊代得下去（每個字元都不是 dict），整數則會讓迴圈直接
     # 死在 `for` 上——擋那一格的是「不是清單就當成失敗」那一道。
@@ -956,6 +1017,39 @@ def test_a_failed_download_never_carries_the_token(monkeypatch, tmp_path, kind):
     assert caught.value.__cause__ is None and caught.value.__suppress_context__
 
 
+class _TripwireSession:
+    """任何下載嘗試都記下來。網址裡就是憑證，所以「沒去下載」要真的量到，不是推論。"""
+    closed = False
+
+    def __init__(self):
+        self.urls: list = []
+
+    def get(self, url):
+        self.urls.append(url)
+        raise AssertionError("不該去下載")
+
+
+@pytest.mark.parametrize("answer", [None, {}, {"file_path": ""}, ["documents/x.bin"],
+                                    "documents/x.bin"])
+def test_an_attachment_the_platform_will_not_hand_over_is_never_fetched(
+        monkeypatch, tmp_path, answer):
+    """平台不給檔案位置時，丟一句自己寫的話，而且**根本不去組那個帶憑證的網址**。
+    最後兩格不是 dict：字串也有長度，只看真假值的寫法會把它當成位置。"""
+    transport = _built(monkeypatch, tmp_path)
+
+    async def _file(method, payload=None, *, data=None):
+        del method, payload, data
+        return answer
+
+    session = _TripwireSession()
+    transport._api = _file
+    transport._session = session
+    with pytest.raises(OSError) as caught:
+        asyncio.run(transport._download("f"))
+    assert str(caught.value) == "attachment is not retrievable"
+    assert session.urls == []
+
+
 def test_a_non_200_download_is_refused_with_its_status(monkeypatch, tmp_path):
     transport = _download_env(monkeypatch, tmp_path,
                               _Session(_Response(status=404, body=b"nope")))
@@ -1023,6 +1117,18 @@ def test_a_strangers_command_in_the_group_still_reaches_the_gates(monkeypatch):
     """`!` 指令照舊交給既有的派發與閘門，拒不拒絕由那裡決定。"""
     assert _dispatch(monkeypatch, text="!status", is_owner=False,
                      is_direct=False) == [("bang", "!status")]
+
+
+@pytest.mark.parametrize("chat", [None, {}, {"type": "private"}, "-100", ["-100"]])
+def test_an_update_without_a_usable_chat_never_reaches_the_dispatcher(
+        monkeypatch, tmp_path, chat):
+    """寄件者是擁有者也一樣：沒有對話 id 就沒有地方回話，而對話 id 同時是頻道閘的輸入。"""
+    transport = _built(monkeypatch, tmp_path)
+    update = _update()
+    update["message"]["chat"] = chat
+    assert _drive(transport, update) == []
+    control = _update()
+    assert len(_drive(transport, control)) == 1, "同一個 transport 收正常的那一則要收得到"
 
 
 def test_another_bot_is_ignored(monkeypatch, tmp_path):
@@ -1109,6 +1215,23 @@ def test_a_non_image_goes_out_as_a_document(monkeypatch, tmp_path):
     asyncio.run(transport.deliver(channel, None,
                                   file=_FakeFile("a.txt", b"123")))
     assert [c[0] for c in api.calls] == ["sendDocument"]
+
+
+@pytest.mark.parametrize("answer", [None, {}, {"message_id": None}, [101]])
+def test_a_file_the_platform_did_not_confirm_is_not_reported_as_sent(
+        monkeypatch, tmp_path, answer):
+    """平台沒回訊息 id 就沒有東西可以編輯；回一個假的已送出物件，之後的編輯會打到不存在的訊息。"""
+    transport, api, channel = _wired(monkeypatch, tmp_path)
+
+    async def _unconfirmed(method, payload=None, *, data=None):
+        api.calls.append((method, payload, data))
+        return answer
+
+    transport._api = _unconfirmed
+    sent = asyncio.run(transport.deliver(channel, None,
+                                         file=_FakeFile("a.txt", b"123")))
+    assert [c[0] for c in api.calls] == ["sendDocument"]
+    assert sent is None
 
 
 def test_an_oversized_attachment_degrades_to_a_generic_notice(monkeypatch,

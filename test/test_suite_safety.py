@@ -276,6 +276,25 @@ def test_the_runtime_backstop_refuses_taskkill():
     assert "taskkill" in str(caught.value)
 
 
+@pytest.mark.parametrize("argv", [
+    ["taskkill", "/F", "/IM", "definitely-not-real.exe"],
+    ("TASKKILL.EXE", "/F", "/IM", "definitely-not-real.exe"),
+    r"C:\Windows\System32\taskkill.exe /F /IM definitely-not-real.exe",
+    "C:/Windows/System32/TaskKill /F /IM definitely-not-real.exe",
+])
+def test_the_runtime_backstop_refuses_taskkill_at_popen_too(argv):
+    """`Popen` 那一層是**另一道**，不是 `run` 的影子：測試常把 `subprocess.run` 換成自己的
+    替身，那時直接 `Popen` 的呼叫只剩這一層擋。`run` 內部也會建 `Popen`，所以只測 `run`
+    時這一層永遠輪不到——量過：整套測試裡它從來沒有擋下過任何東西。
+
+    後三格是命令名的另外三種寫法：大寫、帶副檔名、帶路徑（兩種分隔符）。目標照舊是一個
+    不存在的 image，防線沒生效時也傷不到東西。"""
+    import subprocess  # noqa: S404 — 只用來確認它被擋下來
+    with pytest.raises(AssertionError) as caught:
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert "taskkill" in str(caught.value)
+
+
 def test_the_runtime_backstop_still_allows_ordinary_processes():
     """會亂叫的守門是會被關掉的守門。
 

@@ -256,6 +256,37 @@ def _abort_mid_round(answer="被中止那一輪的輸出"):
     return _step
 
 
+def _abort_then_raise(make_error):
+    """`/dorossi abort` 殺掉正在跑的後端行程；那一輪接著以**某種錯誤**的樣子結束——
+    殺掉的行程沒有輸出（看起來像卡住）、非 0 結束（看起來像一般錯誤），視當下在做什麼
+    也可能被分類成暫時性故障或斷網。"""
+    def _step(st):
+        st.abort = True
+        return make_error()
+    return _step
+
+
+@pytest.mark.parametrize("make_error", [
+    lambda: b._DorossiLoopSilence("killed"),
+    lambda: b._DorossiUsageLimitError("limit", None, session_id="cc-mid"),
+    lambda: b._DorossiTransientError("overloaded", status=529, session_id="cc-mid"),
+    lambda: db._DorossiOfflineError("ENOTFOUND", backend="claude_code"),
+    lambda: RuntimeError("exited 1"),
+], ids=["silence", "usage", "transient", "offline", "other"])
+def test_an_abort_that_ends_a_round_as_an_error_is_not_retried(loop_env, make_error):
+    """每一條錯誤分支都有自己的重試（重生、等額度、退避、等網路、泛用重試），而每一條都
+    **先**問一次 abort。少了那一句，擁有者按下中止之後會看到「這一輪沒有進展，稍後自動
+    重試」之類的訊息，然後那個任務在等待結束時又自己跑起來——中止被當成了一次故障。"""
+    loop_env.rounds = [_abort_then_raise(make_error)]
+    _run(loop_env)
+    assert not loop_env.halted, "中止之後迴圈又要了下一輪"
+    assert len(loop_env.played) == 1
+    assert loop_env.waits == [], "中止之後還進了等待"
+    said = _said(loop_env)
+    assert "重試" not in said and "已停止" not in said and "已暫停" not in said, said
+    assert "中斷" not in said, said
+
+
 def _record_slot_id(env, into, then=None):
     """下一輪開跑時記下 slot 當下的 `cc_session_id`。
 
