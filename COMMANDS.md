@@ -15,7 +15,7 @@
 🔑 **限擁有者**：操作 bot 那台機器的指令，閘門在派發前且**不看 `user_roles`**
 ——`/input`、`/screen`、`/win`、`/clip`、`/locate`、`/macro`、`/watch`、
 `/proc`、`/host` 整群，加上 `/sys restart|git_pull|undo|audit|cleanup_debug`
-`|introspect_dom|dashboard`、`/config set|reset|reload`、`/log clear`、
+`|introspect_dom|dashboard`、`/out debug_show`、`/config set|reset|reload`、`/log clear`、
 `/schedule`、`/launcher` 全部、`/gen image|image_queue`。
 
 回覆一律泛用：不提服務名稱、不露出主機路徑、不回傳原始錯誤字串，完整細節
@@ -119,7 +119,7 @@
 
 產出圖檔：統計 / 抽樣 / 歷史 / 吞吐量
 
-- `/out debug_show [name]` — 列出或上傳除錯截圖
+- `/out debug_show [name]` — 列出或上傳除錯截圖（限擁有者）
 - `/out history [n]` — 近期產出時間表
 - `/out latest_for [character]` — 指定角色的最新一張
 - `/out rate` — 產圖吞吐量（近 1、6、24 小時的張數與平均）

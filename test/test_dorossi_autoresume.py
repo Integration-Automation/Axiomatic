@@ -354,6 +354,60 @@ def test_a_repeated_scan_never_resumes_the_same_loop_twice(monkeypatch):
     assert len(scheduled) == 1
 
 
+class _SlowChannel(_StubChannel):
+    """抓錨點訊息要等網路。`during` 在那段空檔裡執行——模擬同一時間發生的另一件事。"""
+
+    def __init__(self, author_id, during):
+        super().__init__(author_id)
+        self._during = during
+
+    async def fetch_message(self, mid):
+        await asyncio.sleep(0)
+        self._during()
+        await asyncio.sleep(0)
+        return await super().fetch_message(mid)
+
+
+_KEY = (str(OWNER), "s1")
+
+
+@pytest.mark.parametrize("claim", [
+    lambda: b._dorossi_resume_inflight.add(_KEY),     # `continue all` 排定了它
+    lambda: b._dorossi_loops.__setitem__(_KEY, object()),  # 手動接續已經在跑
+], ids=["continue-all", "manual"])
+def test_a_resume_claimed_while_the_anchor_is_fetched_is_not_scheduled_again(
+        monkeypatch, claim):
+    """重啟之後擁有者最常做的事是 `/dorossi session continue all`，而那正是這個掃描在
+    抓錨點（好幾個網路往返）的時候。迴圈開頭查過一次「沒人在接」，那個答案在空檔之後
+    已經過時；照舊答案排下去，同一個 session 會被排兩次——第二個被迴圈的單一登記擋下、
+    對擁有者貼一則「已有任務進行中」，斷路器的計數還白白多算一格。
+
+    另一種重疊（兩次掃描同時跑）由 `_dorossi_resume_scan` 的忙碌旗標序列化掉了，
+    正式路徑上碰不到，所以這裡測的是碰得到的那一種。"""
+    scheduled, saved = _install(monkeypatch, _store(_marker()))
+    monkeypatch.setattr(b, "client", _StubClient(_SlowChannel(OWNER, claim)))
+    _run_scan()
+    assert scheduled == []
+    assert "auto_tries" not in saved["state"][str(OWNER)]["sessions"]["s1"][
+        "loop_pending"], "沒有排定卻消耗了斷路器的額度"
+    held = _KEY in b._dorossi_resume_inflight or _KEY in b._dorossi_loops
+    assert held, "把別人的登記拿掉了"
+
+
+def test_a_failed_count_releases_the_claim(monkeypatch):
+    """計數寫不進去就不排定；那一格登記也要拿掉，否則這個 session 在這個行程裡再也不會
+    被自動接回去（登記只有排定出去的那個迴圈結束時才會解除）。"""
+    scheduled, _ = _install(monkeypatch, _store(_marker()))
+
+    async def _broken_rmw(_mutate):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(b, "_dorossi_state_rmw", _broken_rmw)
+    _run_scan()
+    assert scheduled == []
+    assert _KEY not in b._dorossi_resume_inflight
+
+
 def test_a_loop_already_running_is_not_resumed_twice(monkeypatch):
     scheduled, _ = _install(monkeypatch, _store(_marker()))
     monkeypatch.setattr(b, "_dorossi_loops", {(str(OWNER), "s1"): object()})

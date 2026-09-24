@@ -16,7 +16,7 @@ log 警告計數 / favorites 合法性 / `.backup` 累積 / presence 狀態。
 1. `/gen current` — 看當前角色與「最新一張多久前」。
 2. `/out rate` — 若「最新一張」超過 1 小時前會標 ⚠️。
 3. `/log errors` / `/log tail 50` — 看 log 尾巴與錯誤行。
-4. 必要時 `/out debug_show` 看最近的除錯截圖（需先把 `debug_screenshots` 設為
+4. 必要時 `/out debug_show`（限擁有者）看最近的除錯截圖（需先把 `debug_screenshots` 設為
    `true` 並 `/stop` + `/run`）。
 
 ## Chrome 一直崩潰 / OOM

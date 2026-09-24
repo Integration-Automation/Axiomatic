@@ -498,7 +498,7 @@ _VIEWER_COMMANDS = {
     "!status", "!current", "!probe_status", "!ps", "!metrics",
     "!introspect_dom", "!audit", "!health", "!doctor", "!tail",
     "!log_grep", "!errors", "!queue", "!eta", "!config", "!cfg",
-    "!output_stats", "!rate", "!latest", "!progress", "!debug_show",
+    "!output_stats", "!rate", "!latest", "!progress",
     "!preview", "!plan", "!disk", "!history", "!find", "!dashboard", "!fav",
     "!fav_show", "!help",
     # 唯讀的桌面查詢：只是看畫面 / 找座標，不動主機狀態。
@@ -553,6 +553,10 @@ _OWNER_ONLY_SLASH = frozenset({
     "sys restart", "sys git_pull", "sys undo", "sys audit",
     "sys cleanup_debug", "sys introspect_dom", "sys dashboard",
     "sys backfill_paths",
+    # 除錯截圖（2026-09-24）：清單印的是專案根目錄的檔名，上傳的是外部服務網頁的畫面
+    # ——兩樣都是 Layer 1 對非擁有者禁止的東西，而這個指令原本在「檢視」那一級，
+    # `user_roles` 沒設定時等於頻道裡任何人都拿得到。
+    "out debug_show",
     "config set", "config reset", "config reload",
     "log clear",
     "gen image", "gen image_queue",
@@ -560,7 +564,7 @@ _OWNER_ONLY_SLASH = frozenset({
 _OWNER_ONLY_BANGS = frozenset({
     "!audit", "!cfg_reset", "!cfg_set", "!cleanup_debug", "!click",
     "!click_image", "!click_text", "!clip", "!config_reload", "!config_reset",
-    "!config_set", "!dashboard", "!find_image", "!find_text", "!focus",
+    "!config_set", "!dashboard", "!debug_show", "!find_image", "!find_text", "!focus",
     "!get", "!git_pull", "!hotkey", "!introspect_dom", "!job", "!key",
     "!kill", "!launch", "!launcher", "!log_clear", "!macro", "!mouse",
     "!panic", "!pixel",
@@ -3057,17 +3061,25 @@ async def cmd_latest_for(message: discord.Message, payload: str) -> None:
         _remember_image_msg(sent.id, [p])
 
 
-async def cmd_sample(message: discord.Message, payload: str) -> None:
+def _split_trailing_count(payload: str, cap: int) -> tuple[str, int]:
+    """把 `<名稱> [N]` 拆成 `(名稱, N)`；N 夾在 1..cap，沒給就是 1。
+
+    只收 ASCII 數字：`isdigit()` 對上標數字（`²`）也是 True，`int()` 卻吃不下，
+    於是整個指令變成一個例外。名稱可能是空字串（只給了數字）——呼叫端要把它當
+    成「沒給名稱」，因為 `_is_unsafe_folder_name("")` 刻意放行空字串，
+    `OUTPUT_ROOT / ""` 就是產出根目錄本身。
+    """
     parts = payload.strip().split()
-    if not parts:
+    if parts and parts[-1].isascii() and parts[-1].isdigit():
+        return " ".join(parts[:-1]), max(1, min(int(parts[-1]), cap))
+    return " ".join(parts), 1
+
+
+async def cmd_sample(message: discord.Message, payload: str) -> None:
+    name, n = _split_trailing_count(payload, 5)
+    if not name:
         await safe_reply(message, "usage: `/out sample <character> [N]` (N max 5)")
         return
-    if parts[-1].isdigit():
-        n = max(1, min(int(parts[-1]), 5))
-        name = " ".join(parts[:-1])
-    else:
-        n = 1
-        name = " ".join(parts)
     if _is_unsafe_folder_name(name):
         await safe_reply(message, "invalid name")
         return
@@ -4292,6 +4304,25 @@ GRID_DOWNLOAD_TIMEOUT_SEC = 30.0
 # 挑我們方便的時候出現）。
 GRID_ALLOWED_IMAGE_FORMATS = ("JPEG", "PNG", "WEBP", "GIF", "BMP")
 
+# 像素上限（2026-09-24）。位元組上限擋不住「壓縮得很小、宣告的尺寸很大」的圖：一張
+# 9000×9000 的單色 PNG 只有幾百 KB，Pillow 的預設門檻（約 8950 萬像素）以下連警告都
+# 沒有，而 `convert("RGB")` 會配出約 240 MB——一張拼圖四格就是 1 GB，跑在 bot 自己的
+# 行程裡。每格只有 512×512，sample 圖不會碰到這個數字；原圖退路才可能，而那種就跳過。
+GRID_MAX_IMAGE_PIXELS = 25_000_000
+
+
+def _grid_open_image(data: bytes):
+    """把下載回來的位元組開成 RGB 圖；格式不在白名單丟 Pillow 的例外，尺寸超過
+    `GRID_MAX_IMAGE_PIXELS` 回 None。**尺寸在解碼之前判斷**——`Image.open` 只讀表頭，
+    真正配記憶體的是 `convert`。"""
+    from PIL import Image
+    img = Image.open(io.BytesIO(data), formats=GRID_ALLOWED_IMAGE_FORMATS)
+    width, height = img.size
+    if width * height > GRID_MAX_IMAGE_PIXELS:
+        img.close()
+        return None
+    return img.convert("RGB")
+
 
 async def _send_danbooru_grid(
     message: discord.Message, tags: str, *, latest: bool = True
@@ -4376,9 +4407,11 @@ async def _send_danbooru_grid(
                             print(f"grid download exceeded cap for post "
                                   f"{p.get('id')}", file=sys.stderr)
                             continue
-                        img = Image.open(
-                            io.BytesIO(data),
-                            formats=GRID_ALLOWED_IMAGE_FORMATS).convert("RGB")
+                        img = _grid_open_image(data)
+                        if img is None:
+                            print(f"grid image too large in pixels for post "
+                                  f"{p.get('id')}", file=sys.stderr)
+                            continue
                         images_pil.append(img)
                         pids.append(p.get("id", 0))
                 except Exception as error:  # pylint: disable=broad-except
@@ -5752,12 +5785,53 @@ _REDACT_REL_PATH_RE = re.compile(
     r"|webrunner_[\w-]*\.py"
     r"|todo_[\w-]*\.md"
     r"|(?:prompt|default_prompt|undesired|character2)\.md"
-    r"|[\w.-]*_config\.json"
-    r"|[\w.-]+\.(?:log|ndjson|pid)\b",
+    # 這兩支前面的 `(?<![\w.-])` 不改變比對結果（字元類本來就涵蓋整段連續的字），只讓
+    # 每一段連續的字**從頭試一次**。少了它，一段 2 萬字的連續英數字會被每一個起點各掃
+    # 一遍到尾——實測 4 秒，而這支跑在事件迴圈上（2026-09-24）。
+    r"|(?<![\w.-])[\w.-]*_config\.json"
+    r"|(?<![\w.-])[\w.-]+\.(?:log|ndjson|pid)\b",
     re.IGNORECASE,
 )
 _REDACT_BRAND_RE = re.compile(r"novelai|\bnai\b", re.IGNORECASE)
 _REDACT_WEBRUNNER_RE = re.compile(r"webrunner", re.IGNORECASE)
+# 出圖服務**自己的用語**（2026-09-24）。只刷品牌字不夠：批次把付費對話框的原文記進 log
+# （`[blocked] dialog text: '… purchase Anlas … Tablet $10 /mo …'`，量到 182 行），而
+# 點數的名字與方案名一樣認得出是哪一家；`/log tail` 在檢視那一級，頻道裡誰都叫得到。
+# 對話框原文整段換掉（那一段本來就沒有診斷價值，診斷看的是前後那兩行）；點數名單獨刷，
+# 因為它也出現在比對規則的字面裡（`matched '/(purchase|buy) (more )?(anlas|credits)/i'`）。
+_REDACT_DIALOG_TEXT_RE = re.compile(
+    r"(dialog (?:inner)?text:\s*)(['\"]).*?(?:\2|$)", re.IGNORECASE)
+_REDACT_SERVICE_WORDS_RE = re.compile(r"\banlas\b", re.IGNORECASE)
+# 品牌刷掉之後網址還留著形狀（`https://[svc].net/stories`）；整段換掉。其他網址照留——
+# 它們是診斷的一部分（見 `test_a_url_is_not_mistaken_for_a_host_path`）。
+# **用切詞而不是一條正規式**：`[a-z][a-z0-9+.-]*://…` 會從一段連續英文字的每一個字母
+# 各起一次頭，2 萬字就是 3 秒（實測）。切詞是線性的，而且整段沒有 `[svc]` 時直接跳過。
+_REDACT_TOKEN_RE = re.compile(r"[^\s'\"<>]+")
+_URL_SCHEME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789+.-")
+
+
+def _redact_svc_urls(text: str) -> str:
+    """把「主機名被刷成 `[svc]` 的網址」整段換成 `[svc url]`，網址前面的字（`src=blob:`）照留。"""
+    if "[svc]" not in text:
+        return text
+
+    def _one(match: re.Match) -> str:
+        token = match.group(0)
+        at = token.find("://")
+        if at <= 0 or "[svc]" not in token[at:]:
+            return token
+        start = at
+        while start > 0 and token[start - 1].lower() in _URL_SCHEME_CHARS:
+            start -= 1
+        if start == at or not token[start].isalpha():
+            return token
+        return token[:start] + "[svc url]"
+
+    return _REDACT_TOKEN_RE.sub(_one, text)
+# 行程編號（Layer 1 禁止）。啟動器的「已經有另一個實例」那一句把 pid 寫進 log。
+# `\b` 讓 `rapid` 之類的字不會被當成 pid。
+_REDACT_PID_RE = re.compile(r"\b(pids?)(\s*[:=]\s*|\s+)\[?\d+(?:\s*,\s*\d+)*\]?",
+                            re.IGNORECASE)
 
 
 _SCRUB_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
@@ -5789,11 +5863,17 @@ def _redact_for_discord(text: str) -> str:
     the Discord-bound assembly — stderr / on-disk writes stay raw.
 
     Scrubs, in order: host file paths (Windows-absolute + known project-relative
-    names) → `[path]`; the image-service brand → `[svc]`; the user-facing noun
+    names) → `[path]`; the image service's dialog text → `[dialog]`; the
+    image-service brand and its own vocabulary → `[svc]`; a URL whose host was
+    the brand → `[svc url]`; process ids → `pid [n]`; the user-facing noun
     `webrunner` → a neutral term."""
     text = _REDACT_WIN_PATH_RE.sub("[path]", text)
     text = _REDACT_REL_PATH_RE.sub("[path]", text)
+    text = _REDACT_DIALOG_TEXT_RE.sub(r"\1[dialog]", text)
     text = _REDACT_BRAND_RE.sub("[svc]", text)
+    text = _REDACT_SERVICE_WORDS_RE.sub("[svc]", text)
+    text = _redact_svc_urls(text)
+    text = _REDACT_PID_RE.sub(r"\1 [n]", text)
     text = _REDACT_WEBRUNNER_RE.sub("背景程式", text)
     return text
 
@@ -7605,6 +7685,21 @@ async def mcmd_queue(message: discord.Message, rest: str = "") -> None:
     )
 
 
+def _log_clock(ts) -> str:
+    """記錄檔裡的時間戳 → `MM-DD HH:MM:SS`；不是可用的時間戳就回 `?`。
+
+    記錄檔是手改得動的，而 `time.localtime` 對字串丟 `TypeError`、對超出範圍的數字
+    丟 `OverflowError`／`OSError`——三個顯示記錄的指令（`/sys audit`、`/dorossi logs`、
+    `/dorossi errors`）原本都直接呼叫它，一行壞掉的時間戳就讓整個檢視掛掉，而那正是
+    看得到那一行的唯一途徑（2026-09-24）。"""
+    if not _is_finite_ts(ts) or ts <= 0:
+        return "?"
+    try:
+        return time.strftime("%m-%d %H:%M:%S", time.localtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return "?"
+
+
 def _dorossi_read_events_tail(n: int) -> list[dict]:
     if not DOROSSI_EVENTS_FILE.exists():
         return []
@@ -7613,9 +7708,12 @@ def _dorossi_read_events_tail(n: int) -> list[dict]:
         with DOROSSI_EVENTS_FILE.open("r", encoding="utf-8") as fh:
             for line in fh:
                 try:
-                    rows.append(_json.loads(line))
+                    item = _json.loads(line)
                 except Exception:  # pylint: disable=broad-except
                     continue
+                # 合法 JSON 但不是物件的也跳過：兩個讀它的指令都對每一筆 `.get`。
+                if isinstance(item, dict):
+                    rows.append(item)
     except OSError as error:
         print(f"dorossi event read failed: {error!r}", file=sys.stderr)
         return []
@@ -7637,7 +7735,7 @@ async def mcmd_logs(message: discord.Message, rest: str = "") -> None:
         return
     lines = [f"**Dorossi logs** — last {len(rows)}"]
     for e in rows:
-        when = time.strftime("%m-%d %H:%M:%S", time.localtime(e.get("ts", 0)))
+        when = _log_clock(e.get("ts"))
         bits = [f"`{when}`", f"`{e.get('type', '?')}`"]
         for k in ("sid", "count", "index", "prompt_len", "waiters", "status"):
             if k in e:
@@ -7711,7 +7809,7 @@ async def mcmd_dorossi_errors(message: discord.Message, rest: str = "") -> None:
         return
     lines = [f"**Dorossi errors** — last {min(len(noisy), 20)}"]
     for e in noisy[-20:]:
-        when = time.strftime("%m-%d %H:%M:%S", time.localtime(e.get("ts", 0)))
+        when = _log_clock(e.get("ts"))
         bits = [f"`{when}`", f"`{e.get('type', '?')}`"]
         for k in ("sid", "status", "count", "waiters"):
             if k in e:
@@ -10844,6 +10942,17 @@ async def _dorossi_autoresume_pending_loops() -> None:
         trigger = (_DorossiInteractionTrigger(anchor, invoker, mid, channel)
                    if via_interaction else anchor)
 
+        # **再查一次、當場登記，中間不得有 await**（2026-09-24）。迴圈開頭那一次查詢之後
+        # 隔了抓頻道、抓錨點好幾個網路往返，而擁有者在重啟後最常做的事正是
+        # `/dorossi session continue all`：它在那段空檔裡登記並排定同一個 session，這裡
+        # 若照開頭的舊答案繼續，就會再排一次——第二個被迴圈的單一登記擋下、對擁有者貼一則
+        # 「已有任務進行中」，斷路器的計數還白白多算一格。登記一定要在計數**之前**：計數
+        # 本身也是一次 await。拿掉登記的地方在 `_dorossi_resume_loop` 的 `finally`（不論
+        # 成敗），計數失敗沒有排定時就在這裡自己拿掉。
+        if key in _dorossi_loops or key in _dorossi_resume_inflight:
+            continue
+        _dorossi_resume_inflight.add(key)
+
         # 計數**先落地再起跑**：若接續本身就會把 bot 弄死，這一次也已經算進去了，
         # 否則重啟→接續→死掉→重啟…會是一個無限迴圈。任何一輪真的跑完就會歸零。
         def _count_mut(state_: dict, _uid=uid, _sid=sid) -> None:
@@ -10853,13 +10962,11 @@ async def _dorossi_autoresume_pending_loops() -> None:
         try:
             await _dorossi_state_rmw(_count_mut)
         except Exception:  # pylint: disable=broad-except
+            _dorossi_resume_inflight.discard(key)
             traceback.print_exc()
             continue
         print(f"[dorossi] autoresume {sid} (try {tries + 1}"
               f"/{DOROSSI_LOOP_AUTORESUME_MAX_TRIES or '∞'})", file=sys.stderr)
-        # 排定到真的起跑之間有一段空檔；這份登記讓同一時間的另一次掃描不會再排一次。
-        # 拿掉的地方在 `_dorossi_resume_loop` 的 `finally`（不論成敗）。
-        _dorossi_resume_inflight.add(key)
         _schedule_coro(
             _dorossi_resume_loop(
                 trigger, sid,
@@ -16407,9 +16514,16 @@ async def cmd_probe_status(message: discord.Message) -> None:
     lines.append("__SMTC（本機正在 Playing 的 media session）__")
     if raw_smtc:
         accepted = "✅ accepted" if filtered_smtc else "❌ rejected by source whitelist"
-        lines.append(f"- title : `{raw_smtc['title']}`")
-        lines.append(f"- artist: `{raw_smtc['artist']}`")
-        lines.append(f"- source: `{raw_smtc['source']}` — {accepted}")
+        # 媒體工作階段的原文只給擁有者（2026-09-24）：被白名單擋下的那些（本機播放器、
+        # 瀏覽器分頁、檔名當標題的影片）正是擁有者不打算公開的東西——核准的串流音樂本來就
+        # 會出現在 bot 的公開狀態上，擋掉的不會。判斷結果（accepted／rejected）照樣給大家看。
+        hidden = "（只有擁有者看得到）"
+        lines.append("- title : " + _owner_detail(
+            message, lambda: f"`{raw_smtc['title']}`", hidden))
+        lines.append("- artist: " + _owner_detail(
+            message, lambda: f"`{raw_smtc['artist']}`", hidden))
+        lines.append("- source: " + _owner_detail(
+            message, lambda: f"`{raw_smtc['source']}`", hidden) + f" — {accepted}")
         if not filtered_smtc:
             lines.append(
                 "  → source 不在串流音樂白名單。本機檔案播放器會刻意略過；"
@@ -16419,7 +16533,11 @@ async def cmd_probe_status(message: discord.Message) -> None:
         lines.append("- *沒有任何 SMTC session 在 Playing*")
     lines.append("")
     lines.append("__前景視窗（音樂 pattern 備援）__")
-    lines.append(f"- title: `{fg_title or '(empty)'}`")
+    # 前景視窗的標題是擁有者桌面上正在開的東西，常常直接帶著主機路徑與程式名
+    # （「…\discord_bot.py - Visual Studio Code」）。這個指令在檢視那一級，頻道裡誰都叫得到，
+    # 所以原文只給擁有者；其他人只知道有這一格（2026-09-24）。
+    lines.append("- title: " + _owner_detail(
+        message, lambda: f"`{fg_title or '(empty)'}`", "（只有擁有者看得到）"))
     if fg_music:
         lines.append(f"- music pattern: ✅ `{fg_music['title']} – {fg_music['artist']}`")
     else:
@@ -19788,7 +19906,7 @@ def _schedule_when_text(entry: dict) -> str:
             days_raw, _, hhmm = value.partition("|")
             labels = "、".join(
                 f"週{_WEEKDAY_LABELS[int(d)]}"
-                for d in days_raw.split(",") if d.strip().isdigit())
+                for d in days_raw.split(",") if d.strip().isdecimal())
             return f"{labels} {hhmm}"
     except (ValueError, IndexError):
         return "（時間設定損毀）"
@@ -19801,7 +19919,7 @@ def _schedule_late_seconds(entry: dict, now: float) -> float | None:
     value = str(entry.get("when_value") or "")
     if entry.get("when_kind") == "weekly":
         days_raw, _, hhmm = value.partition("|")
-        days = {int(d) for d in days_raw.split(",") if d.strip().isdigit()}
+        days = {int(d) for d in days_raw.split(",") if d.strip().isdecimal()}
         if stamp.tm_wday not in days:
             return None
     else:
@@ -20304,7 +20422,9 @@ async def cmd_panic(message: discord.Message) -> None:
 #    路徑、帳號、外部服務名。原文只進 stderr。
 # 3. **逾時 ＋ 砍整棵行程樹。** 預設 60 秒；`powershell -Command foo.exe` 真正
 #    在跑的是孫行程，只殺直接子行程等於逾時沒生效。
-_SH_TIMEOUT_RE = re.compile(r"^--timeout[= ]\s*([0-9]+(?:\.[0-9]+)?)\s+", re.IGNORECASE)
+# 數字後面是空白**或字串結尾**：只打了 `--timeout 5` 沒給指令時，整段在進來之前就被 strip 掉
+# 尾巴的空白，只認空白的版本會對不上，於是把 `--timeout 5` 本身當成指令送進 shell（2026-09-24）。
+_SH_TIMEOUT_RE = re.compile(r"^--timeout[= ]\s*([0-9]+(?:\.[0-9]+)?)(?:\s+|$)", re.IGNORECASE)
 
 
 async def cmd_sh(message: discord.Message, payload: str) -> None:
@@ -20522,8 +20642,13 @@ async def cmd_job(message: discord.Message, payload: str) -> None:
             return
 
         if sub == "stop":
+            if not rest.split():
+                # 沒給編號：以前當成 `#0`，回一句「早就結束了」——忘了打編號的人會以為
+                # 自己要停的那個已經停了（2026-09-24）。
+                await safe_reply(message, "用法：`/host job stop <編號>`")
+                return
             try:
-                job_id = int(rest.split()[0]) if rest.split() else 0
+                job_id = int(rest.split()[0])
             except ValueError:
                 await safe_reply(message, "❌ 作業編號必須是整數")
                 return
@@ -20593,9 +20718,14 @@ async def cmd_audit(message: discord.Message, payload: str) -> None:
                 if not line:
                     continue
                 try:
-                    entries.append(_json.loads(line))
+                    entry = _json.loads(line)
                 except Exception:  # pylint: disable=broad-except
                     continue
+                # 合法 JSON 但不是物件（`[]`、數字、字串）也要跳過：下面每一筆都走 `.get`，
+                # 一行這樣的資料會讓整個 `/sys audit` 丟例外，之後再也看不了稽核記錄，
+                # 直到有人手動改檔（2026-09-24）。
+                if isinstance(entry, dict):
+                    entries.append(entry)
     except OSError as error:
         print(f"audit read failed: {error!r}", file=sys.stderr)
         await safe_reply(message, _owner_error(
@@ -20617,8 +20747,7 @@ async def cmd_audit(message: discord.Message, payload: str) -> None:
         header = f"**audit log** — 最近 {len(shown)} 筆（共 {len(entries)} 筆）"
     lines = [header]
     for e in shown:
-        ts = e.get("ts", 0)
-        when = time.strftime("%m-%d %H:%M:%S", time.localtime(ts)) if ts else "?"
+        when = _log_clock(e.get("ts"))
         user = e.get("user_name") or f"id:{e.get('user_id', '?')}"
         head = e.get("head", "?")
         rest = (e.get("rest") or "").strip()
@@ -21327,9 +21456,13 @@ async def cmd_doctor(message: discord.Message) -> None:
             "running interpreter; see the log.")
     elif missing:
         ok = False
+        # 套件名只給擁有者（2026-09-24）：清單裡有對話後端的 SDK 與瀏覽器自動化函式庫，
+        # 名字本身就說明了這台機器在跑什麼；其他人只看得到筆數。
+        names = _owner_detail(
+            message, lambda: ": `" + "`, `".join(missing) + "`", "")
         findings.append(
             f"- WARN {len(missing)} declared dependenc(ies) missing from the "
-            f"running interpreter: `{'`, `'.join(missing)}`. Install them for "
+            f"running interpreter{names}. Install them for "
             "this interpreter — the commands that need them currently reply "
             "\"not installed\" and nothing else reports it.")
     if ok:
@@ -21827,16 +21960,10 @@ async def cmd_unfav(message: discord.Message, payload: str) -> None:
 async def cmd_fav_show(message: discord.Message, payload: str) -> None:
     """`/fav show <character> [N]` — 上傳該角色前 N 張收藏圖（N 上限 5、
     預設 1）。檔案大於上傳上限（`_upload_limit_bytes`）會被略過。"""
-    parts = payload.strip().split()
-    if not parts:
+    character, n = _split_trailing_count(payload, 5)
+    if not character:
         await safe_reply(message, "usage: `/fav show <character> [N]`（N 上限 5）")
         return
-    if parts[-1].isdigit():
-        n = max(1, min(5, int(parts[-1])))
-        character = " ".join(parts[:-1])
-    else:
-        n = 1
-        character = " ".join(parts)
     # 這裡原本沒有守衛，安全性完全靠「`character` 必須命中 `favorites.json`
     # 的一個 key，而那些 key 只有 `_react_fav` 從 bot 自己送出過的路徑寫進去」。
     # 那是**碰巧安全**，不是宣告出來的安全：只要哪天有別的路徑寫得進那個檔，
@@ -22147,7 +22274,7 @@ def _rpc_self_application_id() -> int | None:
     if not cfg.get("mirror_ignore_own_rpc", True):
         return None
     cid = (cfg.get("client_id") or "").strip()
-    return int(cid) if cid.isdigit() else None
+    return int(cid) if cid.isdecimal() else None
 
 
 def _activity_for_mirror(activities) -> discord.BaseActivity | None:
@@ -22236,7 +22363,7 @@ def _rpc_broadcast_state(expect_activity: bool) -> dict | None:
     except Exception:  # pylint: disable=broad-except
         return None
     cid = (cfg.get("client_id") or "").strip()
-    if not cid.isdigit():
+    if not cid.isdecimal():
         return None
     app_id = int(cid)
     member = _find_target_member()

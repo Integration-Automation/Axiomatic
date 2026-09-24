@@ -1664,6 +1664,20 @@ def test_the_doctor_reply_says_how_many_findings_it_dropped():
     assert len(b._join_findings_within(findings, limit=10)) <= 10
 
 
+@pytest.mark.parametrize("asker, named", [(None, False), ("owner", True), ("other", False)])
+def test_doctor_names_missing_dependencies_only_to_the_owner(monkeypatch, tmp_path,
+                                                             asker, named):
+    """缺哪些套件：擁有者看得到名字，其他人只看得到筆數——清單裡有對話後端的 SDK 與瀏覽器
+    自動化函式庫，名字本身就說明了這台機器在跑什麼。"""
+    _quiet_doctor(monkeypatch, tmp_path)
+    monkeypatch.setattr(b, "_missing_dependencies", lambda: ["anthropic", "selenium"])
+    message = (object() if asker is None else types.SimpleNamespace(author=types.SimpleNamespace(
+        id=b.OWNER_USER_ID if asker == "owner" else b.OWNER_USER_ID + 1)))
+    text = _run_reply(monkeypatch, lambda: b.cmd_doctor(message))
+    assert "2 declared dependenc(ies) missing" in text, text
+    assert ("anthropic" in text) is named and ("selenium" in text) is named, text
+
+
 def test_an_overlong_doctor_report_says_it_was_cut(monkeypatch, tmp_path):
     """同一件事在 handler 那一層量一次：接上的是那支 helper，不是另一段切片。"""
     _quiet_doctor(monkeypatch, tmp_path)
@@ -1673,7 +1687,9 @@ def test_an_overlong_doctor_report_says_it_was_cut(monkeypatch, tmp_path):
     # 一行就超過單則訊息上限的發現，而且排在最後——舊寫法會把它切在字中間。
     monkeypatch.setattr(b, "_missing_dependencies",
                         lambda: [f"dep_{i:03d}" for i in range(300)])
-    text = _run_reply(monkeypatch, lambda: b.cmd_doctor(object()))
+    # 套件名只給擁有者看，所以要擁有者問，那一行才會長到放不下。
+    owner = types.SimpleNamespace(author=types.SimpleNamespace(id=b.OWNER_USER_ID))
+    text = _run_reply(monkeypatch, lambda: b.cmd_doctor(owner))
     assert len(text) <= 2000, len(text)
     assert "pause marker exists" in text, "截斷點之前的發現不見了"
     assert text.splitlines()[-1] == b._doctor_omitted_line(1), text[-200:]
@@ -5295,6 +5311,28 @@ def test_external_image_decoding_pins_the_format_allowlist():
         "Pillow 12.0.0–12.2.0 的 EPS 解析器碰到負的 byte count 會就地無限迴圈"
         "（CVE-2026-59203），而這是同步呼叫、跑在事件迴圈上，卡住的是整個 bot。"
         "用 `GRID_ALLOWED_IMAGE_FORMATS`。")
+
+
+def test_a_tiny_file_declaring_a_huge_image_is_refused_before_decoding():
+    """位元組上限擋不住壓縮得很小、宣告尺寸很大的圖。9000×9000 的單色 PNG 只有幾百 KB，
+    在 Pillow 的預設門檻以下，`convert("RGB")` 卻要約 240 MB。判斷要在解碼之前做。"""
+    import io
+
+    from PIL import Image
+
+    def _png(size):
+        buffer = io.BytesIO()
+        Image.new("L", size, 0).save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+
+    bomb = _png((9000, 9000))
+    assert len(bomb) < b.GRID_MAX_IMAGE_BYTES, "前提：位元組上限擋不住它"
+    assert 9000 * 9000 < Image.MAX_IMAGE_PIXELS, "前提：Pillow 自己的門檻也不會擋"
+    assert b._grid_open_image(bomb) is None
+    ok = b._grid_open_image(_png((600, 400)))
+    assert ok is not None and ok.mode == "RGB" and ok.size == (600, 400)
+    edge = int(b.GRID_MAX_IMAGE_PIXELS ** 0.5)
+    assert b._grid_open_image(_png((edge, edge))) is not None, "剛好在上限內要收"
 
 
 def test_the_format_allowlist_really_shuts_the_eps_plugin_out():
@@ -18264,6 +18302,336 @@ def test_the_record_watchdog_logs_what_the_step_cap_cut(_record_env, monkeypatch
 # 也不知道上限截掉了多少（兩個數字只寫 stderr）。開始錄製時記下頻道與發起人，
 # 到點時送一句泛用的話；找不到頻道就退回設定的頻道，都找不到只寫 stderr。
 # ---------------------------------------------------------------------------
+class _ShellEnv:
+    """`/host sh run` 的替身：`_gui` 的四個入口全換成記錄用的，**絕不真的跑指令**。"""
+
+    def __init__(self, monkeypatch, output="", rc=0, timed_out=False):
+        self.runs: list = []
+        self.stops = 0
+        self.cwds: list = []
+        self.replies: list = []
+        self.files: list = []
+        self.deleted = 0
+        env = self
+
+        class _Status:
+            async def delete(self):
+                env.deleted += 1
+
+        async def _reply(_message, content=None, **kwargs):
+            env.replies.append(content)
+            if kwargs.get("file") is not None:
+                env.files.append(kwargs["file"])
+            return _Status()
+
+        def _run(command, *, timeout):
+            env.runs.append((command, timeout))
+            return {"rc": rc, "timed_out": timed_out, "elapsed": 0.5, "output": output}
+
+        def _stop_all():
+            env.stops += 1
+            return 2
+
+        monkeypatch.setattr(b, "safe_reply", _reply)
+        monkeypatch.setattr(b._gui, "run_shell", _run)
+        monkeypatch.setattr(b._gui, "shell_stop_all", _stop_all)
+        monkeypatch.setattr(b._gui, "set_shell_cwd", lambda target: env.cwds.append(target))
+        self.message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.OWNER_USER_ID))
+
+    def run(self, payload):
+        _sr_run(b.cmd_sh(self.message, payload))
+        return self.replies[-1]
+
+
+@pytest.mark.parametrize("payload, command, timeout", [
+    ("echo hi", "echo hi", "default"),
+    ("--timeout 5 echo hi", "echo hi", 5.0),
+    ("--timeout=7.5 echo hi", "echo hi", 7.5),
+    ("--TIMEOUT 5 echo hi", "echo hi", 5.0),
+    ("--timeout 999999 echo hi", "echo hi", "max"),
+    ("--timeout5 echo hi", "--timeout5 echo hi", "default"),   # 沒有分隔 → 那是指令的一部分
+])
+def test_the_shell_command_timeout_is_parsed_and_capped(monkeypatch, payload, command, timeout):
+    env = _ShellEnv(monkeypatch, output="ok")
+    env.run(payload)
+    expected = {"default": b._gui.SHELL_DEFAULT_TIMEOUT_SEC,
+                "max": b._gui.SHELL_MAX_TIMEOUT_SEC}.get(timeout, timeout)
+    assert env.runs == [(command, expected)], env.runs
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ("", "用法"), ("   ", "用法"), ("--timeout 5 ", "用法"),
+])
+def test_a_shell_command_with_nothing_to_run_runs_nothing(monkeypatch, payload, expected):
+    env = _ShellEnv(monkeypatch)
+    assert expected in env.run(payload)
+    assert env.runs == [] and env.stops == 0 and env.cwds == []
+
+
+def test_stop_and_cd_are_handled_by_the_bot_not_by_a_shell(monkeypatch):
+    """`stop` 中止執行中的指令；`cd` 要「記住」才有意義（每次都是獨立行程，真的跑下去等於
+    沒發生），回覆不含路徑。兩個都**不得**變成一次真的指令執行。"""
+    env = _ShellEnv(monkeypatch)
+    assert "已中止 2 個" in env.run("STOP")
+    reply = env.run(r"cd C:\Users\someone\secret")
+    assert env.cwds == [r"C:\Users\someone\secret"]
+    assert "someone" not in reply and "已切換" in reply
+    assert "回到專案目錄" in env.run("cd")
+    assert env.runs == [] and env.stops == 1
+
+
+def test_shell_output_is_scrubbed_before_it_is_sent(monkeypatch):
+    """輸出原文只進 stderr；送出去的是刷過的版本（主機路徑、帳號信箱）。"""
+    leaky = "done\nC:\\Users\\someone\\secret.txt\nuser someone@example.com\n"
+    env = _ShellEnv(monkeypatch, output=leaky, rc=3)
+    reply = env.run("type secret.txt")
+    assert reply.startswith("⚠️ rc=3"), reply
+    assert "someone" not in reply and "done" in reply, reply
+    assert env.deleted == 1, "「執行中…」那一則沒有收掉"
+
+
+def test_shell_output_cannot_break_out_of_its_code_block(monkeypatch):
+    env = _ShellEnv(monkeypatch, output="```\n@everyone\n```")
+    reply = env.run("echo")
+    assert reply.count("```") == 2, reply
+
+
+@pytest.mark.parametrize("output, timed_out, head, attached", [
+    ("", False, "✅ rc=0", False),
+    ("x" * 1800, False, "✅ rc=0", True),
+    ("partial", True, "⏱️ rc=0", False),
+])
+def test_shell_results_are_shaped_by_size_and_outcome(monkeypatch, output, timed_out,
+                                                       head, attached):
+    """沒有輸出要講「沒有輸出」；長輸出改附檔（切成一堆程式碼區塊會洗版、撞速率限制）；
+    逾時要講明已中止。"""
+    env = _ShellEnv(monkeypatch, output=output, timed_out=timed_out)
+    reply = env.run("do it")
+    assert reply.startswith(head), reply
+    assert bool(env.files) is attached
+    if not output:
+        assert "沒有輸出" in reply
+    if timed_out:
+        assert "逾時已中止" in reply
+
+
+class _JobEnv:
+    """`/host job` 的替身：`_gui` 的背景作業入口全換成記錄用的，**絕不真的起行程**。"""
+
+    def __init__(self, monkeypatch, *, rows=(), log=None, fail=None):
+        self.calls: list = []
+        self.replies: list = []
+        self.files: list = []
+        env = self
+
+        async def _reply(_message, content=None, **kwargs):
+            env.replies.append(content)
+            if kwargs.get("file") is not None:
+                env.files.append(kwargs["file"])
+
+        def _rec(name, result):
+            def _fn(*args, **kwargs):
+                env.calls.append((name, args, kwargs))
+                if fail is not None:
+                    raise fail
+                return result
+            return _fn
+
+        monkeypatch.setattr(b, "safe_reply", _reply)
+        monkeypatch.setattr(b, "_is_owner", lambda _m: True)
+        for name, result in (("job_start", 7), ("job_send", None),
+                             ("job_close_input", None), ("job_list", list(rows)),
+                             ("job_log", log), ("job_stop", True), ("job_clear", 3)):
+            monkeypatch.setattr(b._gui, name, _rec(name, result))
+        self.message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.OWNER_USER_ID))
+
+    def run(self, payload):
+        _sr_run(b.cmd_job(self.message, payload))
+        return self.replies[-1]
+
+
+@pytest.mark.parametrize("payload, expected_call, reply_has", [
+    ("run pip install x", ("job_start", ("pip install x",), {"interactive": False}), "#7"),
+    ("run --stdin python -i", ("job_start", ("python -i",), {"interactive": True}), "job send 7"),
+    ("run --STDIN python -i", ("job_start", ("python -i",), {"interactive": True}), "job send 7"),
+    ("run", None, "用法"),
+    ("run --stdin", None, "用法"),
+    ("send 3 yes please", ("job_send", (3, "yes please"), {}), "已送出 10 字"),
+    ("send 3", None, "用法"),
+    ("send x hi", None, "必須是整數"),
+    ("send", None, "用法"),
+    ("eof 3", ("job_close_input", (3,), {}), "輸入端已關閉"),
+    ("eof x", None, "必須是整數"),
+    ("stop 3", ("job_stop", (3,), {}), "已中止"),
+    ("stop", None, "用法"),
+    ("stop x", None, "必須是整數"),
+    ("log x", None, "必須是整數"),
+    ("log 3 many", None, "必須是整數"),
+    ("log", None, "用法"),
+    ("clear", ("job_clear", (), {}), "3 筆"),
+    ("", None, "用法"),
+    ("launch rockets", None, "用法"),
+])
+def test_background_jobs_only_act_on_a_well_formed_request(monkeypatch, payload,
+                                                           expected_call, reply_has):
+    """每一個子指令：格式對才動到背景作業，格式不對只回用法或原因——尤其不能把 `stop`
+    沒給編號當成 `#0`（以前會回一句「早就結束了」，忘了打編號的人以為要停的已經停了）。"""
+    env = _JobEnv(monkeypatch)
+    reply = env.run(payload)
+    assert env.calls == ([expected_call] if expected_call else []), env.calls
+    assert reply_has in reply, reply
+
+
+def test_the_job_list_scrubs_and_labels_each_job(monkeypatch):
+    rows = [
+        {"id": 1, "running": True, "stopped": False, "rc": None, "elapsed": 5,
+         "lines": 2, "command": r"type C:\Users\someone\secret.txt"},
+        {"id": 2, "running": False, "stopped": True, "rc": None, "elapsed": 9,
+         "lines": 0, "command": "sleep 100"},
+        {"id": 3, "running": False, "stopped": False, "rc": 4, "elapsed": 1,
+         "lines": 1, "command": "x" * 200},
+    ]
+    env = _JobEnv(monkeypatch, rows=rows)
+    reply = env.run("list")
+    assert "執行中" in reply and "已中止" in reply and "結束 rc=4" in reply, reply
+    assert "someone" not in reply, "作業的指令列原文進了回覆"
+    assert "x" * 61 not in reply, "指令列沒有截短"
+    assert "目前沒有背景作業" in _JobEnv(monkeypatch).run("list")
+
+
+@pytest.mark.parametrize("text, dropped, attached, expect", [
+    ("", 0, False, "目前沒有輸出"),
+    ("C:\\Users\\someone\\a.txt done", 0, False, "done"),
+    ("```\n@everyone", 0, False, "@everyone"),
+    ("y" * 1800, 0, True, "改以檔案附上"),
+    ("tail", 12, False, "前 12 行已因長度捨棄"),
+])
+def test_a_job_log_is_scrubbed_fenced_and_shaped(monkeypatch, text, dropped, attached, expect):
+    log = {"id": 3, "running": False, "stopped": False, "rc": 0, "elapsed": 2,
+           "shown": 1, "total": 1, "dropped": dropped, "text": text}
+    env = _JobEnv(monkeypatch, log=log)
+    reply = env.run("log 3 5")
+    assert env.calls == [("job_log", (3, 5), {})]
+    assert expect in reply and "someone" not in reply, reply
+    assert bool(env.files) is attached
+    if not attached and text:
+        assert reply.count("```") == 2, reply
+
+
+def test_a_job_failure_is_reported_in_the_libraries_own_generic_words(monkeypatch):
+    env = _JobEnv(monkeypatch, fail=b._GuiError("找不到這個作業。"))
+    assert env.run("stop 9") == "❌ 找不到這個作業。"
+
+
+def _audit(monkeypatch, tmp_path, lines, payload=""):
+    path = tmp_path / "audit.ndjson"
+    if lines is not None:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setattr(b, "AUDIT_FILE", path)
+    sent: list = []
+
+    async def _reply(_message, content=None, **_kw):
+        sent.append(content)
+
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    _sr_run(b.cmd_audit(types.SimpleNamespace(author=types.SimpleNamespace(id=5)), payload))
+    return sent[-1]
+
+
+def _audit_row(i, head="run", rest=""):
+    return json.dumps({"ts": 1_789_000_000 + i, "user_id": 5, "user_name": f"u{i}",
+                       "channel_id": 1, "head": head, "rest": rest})
+
+
+def test_the_audit_view_scrubs_what_people_typed(monkeypatch, tmp_path):
+    """稽核記錄存的是原樣打的參數（`/host sh run` 的指令、`/host get` 的主機路徑）。存在磁碟上
+    沒問題，貼回頻道就是外洩——送出前要刷過。"""
+    reply = _audit(monkeypatch, tmp_path, [
+        _audit_row(1, "sh", r"type C:\Users\someone\secret.txt"),
+        _audit_row(2, "get", "mail someone@example.com"),
+    ])
+    assert "someone" not in reply, reply
+    assert "`sh`" in reply and "`get`" in reply
+
+
+@pytest.mark.parametrize("payload, shown", [("", 20), ("3", 3), ("0", 1), ("-4", 1),
+                                           ("999", 50)])
+def test_the_audit_view_shows_a_clamped_number_of_recent_entries(monkeypatch, tmp_path,
+                                                                  payload, shown):
+    reply = _audit(monkeypatch, tmp_path, [_audit_row(i) for i in range(60)], payload)
+    assert f"最近 {shown} 筆（共 60 筆）" in reply, reply
+    assert "u59" in reply, "顯示的不是最近的那幾筆"
+
+
+def test_audit_grep_filters_on_the_command_head_only(monkeypatch, tmp_path):
+    rows = [_audit_row(1, "run", "stop"), _audit_row(2, "stop"), _audit_row(3, "Stop")]
+    reply = _audit(monkeypatch, tmp_path, rows, "grep STOP")
+    assert "共 2 筆 match" in reply and "u1" not in reply, reply
+    assert "沒有 head 含" in _audit(monkeypatch, tmp_path, rows, "grep nothing")
+    assert "usage" in _audit(monkeypatch, tmp_path, rows, "grep")
+    assert "usage" in _audit(monkeypatch, tmp_path, rows, "many")
+
+
+def test_the_audit_view_survives_junk_lines_and_a_missing_file(monkeypatch, tmp_path):
+    """一行壞掉的記錄不得讓整個稽核檢視掛掉——那是唯一看得到它的指令。合法 JSON 但不是
+    物件的那幾種（`[]`、數字、字串）以前會讓下面的 `.get` 丟例外。"""
+    reply = _audit(monkeypatch, tmp_path,
+                   ["{not json", "", _audit_row(1), "[]", "5", '"text"', "null"])
+    assert "共 1 筆" in reply, reply
+    assert "還不存在" in _audit(monkeypatch, tmp_path / "gone", None)
+
+
+@pytest.mark.parametrize("ts", ["yesterday", 1e30, -5, 0, float("nan"), None, True, [1]])
+def test_a_log_view_survives_a_timestamp_it_cannot_read(monkeypatch, tmp_path, ts):
+    """時間戳壞掉的那一行照樣列出來，時間印 `?`——`time.localtime` 對字串丟 `TypeError`、
+    對超出範圍的數字丟 `OverflowError`／`OSError`，以前整個檢視就跟著掛掉。"""
+    bad = json.dumps({"ts": ts, "user_name": "u9", "head": "run"}) if ts == ts else (
+        '{"ts": NaN, "user_name": "u9", "head": "run"}')
+    reply = _audit(monkeypatch, tmp_path, [_audit_row(1), bad])
+    assert "`?` `u9`" in reply, reply
+    assert b._log_clock(1_789_000_000).count(":") == 2
+
+
+def test_the_dorossi_log_views_survive_junk_lines(monkeypatch, tmp_path):
+    """`/dorossi logs` 與 `/dorossi errors` 讀同一份事件檔：合法 JSON 但不是物件的行、時間戳
+    壞掉的行，都不得讓整個檢視丟例外。"""
+    path = tmp_path / "dorossi_events.ndjson"
+    path.write_text("\n".join([
+        "[]", "5", '"text"', "null", "{broken",
+        json.dumps({"ts": "later", "type": "error", "sid": "s1"}),
+        json.dumps({"ts": 1_789_000_000, "type": "queue_full", "sid": "s2"}),
+    ]) + "\n", encoding="utf-8")
+    monkeypatch.setattr(b, "DOROSSI_EVENTS_FILE", path)
+    sent: list = []
+
+    async def _reply(_message, content=None, **_kw):
+        sent.append(content)
+
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.DOROSSI_USER_ID))
+    _sr_run(b.mcmd_logs(message, "50"))
+    assert "last 2" in sent[-1] and "`?` `error`" in sent[-1], sent[-1]
+    _sr_run(b.mcmd_dorossi_errors(message, ""))
+    assert "queue_full" in sent[-1] and "error" in sent[-1], sent[-1]
+
+
+def test_a_long_audit_view_is_cut_with_a_pointer_to_grep(monkeypatch, tmp_path):
+    rows = [_audit_row(i, "x" * 40, "y" * 60) for i in range(50)]
+    reply = _audit(monkeypatch, tmp_path, rows, "50")
+    assert len(reply) < 2000 and "截斷" in reply, len(reply)
+
+
+def test_debug_screenshots_are_owner_only_on_every_surface():
+    """除錯截圖的清單印的是專案根目錄的檔名，上傳的是外部服務網頁的畫面——兩樣都是 Layer 1
+    對非擁有者禁止的。它原本在「檢視」那一級，而 `user_roles` 沒設定時那一級等於頻道裡的
+    任何人。閘在派發前，斜線與 `!` 兩個表面都要鎖（mention 面沒有這個指令）。"""
+    assert b._is_owner_only_slash("out debug_show")
+    assert "!debug_show" in b._OWNER_ONLY_BANGS
+    assert "!debug_show" not in b._VIEWER_COMMANDS
+    # 同一群的其他檢視指令不受影響（群組規則以外，逐一列舉的閘不外溢）。
+    assert not b._is_owner_only_slash("out latest_for")
+
+
 _RW_CHANNEL = 4242
 _RW_USER = 77
 
@@ -18554,6 +18922,88 @@ def test_latest_for_refuses_a_folder_outside_the_output_root(monkeypatch, tmp_pa
     sent.clear()
     asyncio.run(b.cmd_latest_for(message, "alice"))
     assert len(sent) == 1 and sent[0][1] is not None, sent
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ("alice", ("alice", 1)),
+    ("alice 3", ("alice", 3)),
+    ("alice 99", ("alice", 5)),
+    ("alice 0", ("alice", 1)),
+    ("a b 2", ("a b", 2)),
+    ("3", ("", 3)),
+    ("", ("", 1)),
+    ("alice \u00b2", ("alice \u00b2", 1)),
+    ("alice \u0663", ("alice \u0663", 1)),
+])
+def test_split_trailing_count(payload, expected):
+    """結尾是 ASCII 數字才算張數；上標或其他文字的數字不算，否則 `int()` 會丟例外。"""
+    assert b._split_trailing_count(payload, 5) == expected
+
+
+def test_isdigit_is_never_the_gate_in_front_of_int():
+    """`'²'.isdigit()` 是 True、`int('²')` 丟 ValueError。守門用 `isdecimal()`
+    （或先 `isascii()`）——前者保證 `int()` 吃得下。以 AST 找「同一個函式裡既有
+    `X.isdigit()` 又有 `int(...)`」的地方。"""
+    import ast
+    tree = ast.parse(Path(b.__file__).read_text(encoding="utf-8"))
+    offenders = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+        has_int = any(isinstance(c.func, ast.Name) and c.func.id == "int" for c in calls)
+        bare_isdigit = [
+            c for c in calls
+            if isinstance(c.func, ast.Attribute) and c.func.attr == "isdigit"]
+        if has_int and bare_isdigit:
+            guarded = any(
+                isinstance(c.func, ast.Attribute) and c.func.attr == "isascii"
+                for c in calls)
+            if not guarded:
+                offenders.append(fn.name)
+    assert offenders == [], offenders
+
+
+def test_fav_show_needs_a_character(monkeypatch):
+    """`!fav show 3` 的名稱是空的：回用法，而不是「`` 沒有收藏」。"""
+    sent: list = []
+
+    async def _recorder(_message, content=None, **_kw):
+        sent.append(content)
+
+    monkeypatch.setattr(b, "safe_reply", _recorder)
+    monkeypatch.setattr(b, "_load_favorites", lambda: {"": ["x.png"]})
+    asyncio.run(b.cmd_fav_show(types.SimpleNamespace(guild=None), "3"))
+    assert len(sent) == 1 and sent[0].startswith("usage"), sent
+
+
+def test_sample_needs_a_character_and_reads_only_ascii_counts(monkeypatch, tmp_path):
+    """`!sample 3` 的名稱是空字串，而空字串被 `_is_unsafe_folder_name` 刻意放行——
+    不擋的話抽的是產出根目錄本身。`²` 讓 `isdigit()` 回 True、`int()` 丟例外。"""
+    out_root = tmp_path / "output"
+    (out_root / "alice").mkdir(parents=True)
+    (out_root / "alice" / "a.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (out_root / "stray.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr(b, "OUTPUT_ROOT", out_root)
+    monkeypatch.setattr(b, "_remember_image_msg", lambda *_a, **_k: None)
+    sent: list = []
+
+    async def _recorder(_message, content=None, **kw):
+        files = kw.get("files") or []
+        sent.append((content, len(files)))
+        for f in files:
+            f.close()
+
+    monkeypatch.setattr(b, "safe_reply", _recorder)
+    message = types.SimpleNamespace(guild=None)
+    asyncio.run(b.cmd_sample(message, "3"))
+    assert len(sent) == 1 and sent[0][1] == 0 and "usage" in sent[0][0], sent
+    sent.clear()
+    asyncio.run(b.cmd_sample(message, "alice \u00b2"))
+    assert sent == [("folder `alice ²/` not found", 0)], sent
+    sent.clear()
+    asyncio.run(b.cmd_sample(message, "alice 2"))
+    assert len(sent) == 1 and sent[0][1] == 1, sent
 
 
 # ---------------------------------------------------------------------------

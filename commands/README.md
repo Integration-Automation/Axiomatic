@@ -67,7 +67,7 @@
 `/watch`、`/proc`、`/host`、`/schedule`、
 `/launcher` **整群**（群組制，所以新增子指令會自動受閘），
 加上 `/sys restart|git_pull|undo|audit|cleanup_debug|introspect_dom|dashboard|backfill_paths`、
-`/config set|reset|reload`、`/log clear`、
+`/out debug_show`、`/config set|reset|reload`、`/log clear`、
 `/gen image|image_queue`。各檔標成「限擁有者」的就是這些。
 
 產圖佇列、批次控制與唯讀診斷（`/todo`、`/preset`、`/run`、`/stop`、

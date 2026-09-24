@@ -528,6 +528,43 @@ def probe_status(tmp_path, monkeypatch):
     return _run
 
 
+@pytest.mark.parametrize("asker, shows_title", [(None, False), ("owner", True), ("other", False)])
+def test_probe_status_shows_the_window_title_only_to_the_owner(probe_status, monkeypatch,
+                                                              asker, shows_title):
+    """前景視窗的標題常帶主機路徑與程式名，而這個指令在誰都叫得到的檢視那一級。原文只給
+    擁有者（`_owner_detail`，身分閘）；取不到提問者一律當成不是擁有者。"""
+    title = r"D:\Codes\secret\notes.txt - Notepad"
+    monkeypatch.setattr(b.presence_probe, "probe_foreground_window_raw", lambda: title)
+    if asker is not None:
+        uid = b.OWNER_USER_ID if asker == "owner" else b.OWNER_USER_ID + 1
+        monkeypatch.setattr(_ProbeStatusMsg, "author",
+                            types.SimpleNamespace(id=uid), raising=False)
+    text = probe_status({})
+    assert ("notes.txt" in text) is shows_title, text
+    if not shows_title:
+        assert "只有擁有者看得到" in text
+
+
+@pytest.mark.parametrize("asker, shows", [(None, False), ("owner", True), ("other", False)])
+def test_probe_status_shows_the_media_session_only_to_the_owner(probe_status, monkeypatch,
+                                                               asker, shows):
+    """被白名單擋下的媒體工作階段（本機播放器、瀏覽器分頁、檔名當標題的影片）是擁有者不打算
+    公開的東西。原文只給擁有者；accepted／rejected 的判斷大家都看得到。"""
+    async def _smtc():
+        return {"title": "family_trip_2026.mp4", "artist": "home",
+                "source": "VLC.exe"}
+
+    monkeypatch.setattr(b.presence_probe, "probe_smtc_raw_async", _smtc)
+    if asker is not None:
+        uid = b.OWNER_USER_ID if asker == "owner" else b.OWNER_USER_ID + 1
+        monkeypatch.setattr(_ProbeStatusMsg, "author",
+                            types.SimpleNamespace(id=uid), raising=False)
+    text = probe_status({})
+    for raw in ("family_trip_2026", "VLC.exe"):
+        assert (raw in text) is shows, (raw, text)
+    assert "rejected by source whitelist" in text
+
+
 def test_probe_status_does_not_mask_a_broken_comment_rule(probe_status):
     """`_` 前面帶空白的說明 key，只有 `_is_comment_key` 的 `.strip()` 擋得住。
 

@@ -1908,6 +1908,63 @@ def test_a_host_path_never_survives_redaction(text, banned):
     assert "[path]" in out, f"整段都沒被認出來是路徑：{out!r}"
 
 
+# 2026-09-24：只刷品牌字留下了三個洞，三個都在 `/log tail` 的預設 20 行裡量到過。
+_MUST_REDACT_VOCAB = [
+    # (真實形狀的輸入, 不得殘留的字串)
+    ("[09-24 07:51:10]   [blocked] dialog text: 'The paint\u2019s run dry. You need a "
+     "subscription or to purchase Anlas to continue. Tablet $10 /mo USD Opus $25 /mo USD'",
+     "paint"),
+    ("[09-24 07:51:10]   [blocked] dialog text: 'The paint\u2019s run dry. You need a "
+     "subscription or to purchase Anlas", "subscription"),       # 被截斷、沒有收尾引號
+    ("  [blocked] generation is blocked by a purchase/account dialog; matched "
+     "'/(purchase|buy) (more )?(anlas|credits)/i'", "anlas"),
+    ("session restored — redirected to https://novelai.net/stories", ".net"),
+    ("timed out waiting for new image (last src=blob:https://novelai.net/0f1e)", ".net"),
+    ("redirect chain: http://a.example/x -> https://novelai.net/stories", ".net"),
+    ("supervisor: 已經有另一個批次監督者在執行（既有 pid: 27240），這次不啟動。", "27240"),
+    ("reaped orphan chrome pid=31337 after restart", "31337"),
+    ("terminate: chrome survivors pids=[101, 202]", "202"),
+]
+
+
+@pytest.mark.parametrize("text,banned", _MUST_REDACT_VOCAB,
+                         ids=[t[:30] for t, _ in _MUST_REDACT_VOCAB])
+def test_the_services_own_words_and_process_ids_never_survive_redaction(text, banned):
+    out = BOT._redact_for_discord(text)
+    assert banned.lower() not in out.lower(), (
+        f"刷除之後還看得到 {banned!r}：{out!r}。`/log tail` 在檢視那一級，頻道裡誰都叫得到。")
+
+
+@pytest.mark.parametrize("shape", [
+    "a" * 60_000, "dialog text: '" + "x" * 60_000, "ab://" * 12_000,
+    "a:" * 30_000, "x_config" * 7_500, "pid " * 15_000,
+], ids=["letters", "open-quote", "scheme-like", "colons", "config-like", "pid-words"])
+def test_redaction_stays_linear_on_hostile_input(shape):
+    """刷除跑在事件迴圈上，送出去之前每一段 log／指令輸出都過它。一條會從每個起點各掃一次
+    的正規式，對一段長的連續字就是平方時間——實測 2 萬字母 4 秒（舊的相對路徑規則）與 3 秒
+    （品牌網址規則），6 萬就是半分鐘以上，整個 bot 卡在那裡。這裡給 5 秒：線性的版本在這些
+    輸入上是幾十毫秒，平方的版本會超過一個數量級。"""
+    import time as _time
+    started = _time.perf_counter()
+    BOT._redact_for_discord(shape)
+    assert _time.perf_counter() - started < 5.0
+
+
+@pytest.mark.parametrize("text, kept", [
+    ("rapid 5 fails in a row; giving up", "rapid 5"),
+    ("see https://www.selenium.dev/documentation for the driver", "https://www.selenium.dev"),
+    ("[blocked] dialog innerText full length 870 chars (margin 330)", "870 chars"),
+    ("pidgin is not a pid", "pidgin"),
+    # 同一行裡既有品牌網址又有別家網址：只換掉前者；網址前面的字（`src=blob:`）照留。
+    ("redirect http://a.example/x -> https://novelai.net/stories", "http://a.example/x"),
+    ("(last src=blob:https://novelai.net/0f1e)", "src=blob:[svc url]"),
+])
+def test_the_vocabulary_redaction_leaves_ordinary_diagnostics_alone(text, kept):
+    """反向邊界：pid 規則不得吃掉 `rapid 5`；別家的網址照留；只講長度、不含原文的那一行
+    不需要刷。"""
+    assert kept in BOT._redact_for_discord(text)
+
+
 @pytest.mark.parametrize("text", [
     "https://novelai.net/03d1f67f-4576-42d5-baae-c3bbb1452f32",
     "see http://example.com/a/b and https://x.y/z.png for details",
