@@ -1014,6 +1014,7 @@ corpus.
   comment marker first; without that step the rule's own named example is the
   one shape the scan cannot see.
 - Commit subjects describe what changed, not who wrote it.
+- **Commit and push frequently; do not batch.** After each big feature — a self-contained stage that passes this project's checks — commit and push to the remote; do not pile up a large batch of work before committing or pushing. Smaller batches collide less with other sessions, let CI catch problems earlier, and are easier to revert. Follow this project's normal branch flow.
 - **Stage files individually** (`git add path/to/file`), never `git add -A`.
   A wildcard add sweeps up whatever happens to be sitting in the tree — build
   artefacts, a stray screenshot, an editor's scratch file — and the one time it
