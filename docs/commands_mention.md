@@ -72,7 +72,7 @@ token 不接問題就只是改設定，不會送出一輪。
 - `/dorossi queue detail` — 列出等待中的提問（含內容）
 - `/dorossi queue failed_clear` — 清掉失敗佇列
 - `/dorossi queue move <source> <target> [session]` — 調整等待中提問的順序
-- `/dorossi queue remove <index> [session]` — 取消第 N 筆等待中的提問
+- `/dorossi queue remove [index] [session] [id]` — 取消第 N 筆（或指定 id）等待中的提問
 - `/dorossi queue retry_failed` — 重試失敗的提問
 - `/dorossi queue show` — 列出等待中的提問
 - `/dorossi queue undo` — 復原上一次佇列操作

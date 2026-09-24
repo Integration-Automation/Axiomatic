@@ -621,6 +621,73 @@ def test_undoing_a_cancel_puts_a_park_back_instead_of_running_it(monkeypatch):
     assert [r["id"] for r in b._dorossi_queue_read()] == ["p1"]
 
 
+def _queue_cmd(monkeypatch, rest: str) -> list:
+    said: list = []
+    monkeypatch.setattr(b, "safe_reply",
+                        lambda _m, content=None, **_k: _async_value(
+                            said.append(content)))
+    asyncio.run(b.mcmd_queue(FakeMessage(b.DOROSSI_USER_ID), rest))
+    return said
+
+
+def test_queue_remove_reaches_a_single_parked_turn_by_id(monkeypatch):
+    """`/dorossi queue remove <id>` 取消**那一筆**停放列，其他的不動，而且收進 undo。
+
+    停放列的等待者在磁碟上，編號是對著記憶體裡的等待者算的，所以只能用 id 指到它。"""
+    _state_with_session(monkeypatch)
+    b._dorossi_queue_write([_parked_row(id="p1"), _parked_row(id="p2")])
+    b._dorossi_queue_undo.clear()
+    said = _queue_cmd(monkeypatch, "remove p2")
+    assert [r["id"] for r in b._dorossi_queue_read()] == ["p1"]
+    assert [r["id"] for r in b._dorossi_queue_undo[-1]] == ["p2"]
+    assert any("p2" in str(x) for x in said), said
+    b._dorossi_queue_undo.clear()
+
+
+def test_queue_remove_by_id_ignores_another_users_parked_turn(monkeypatch):
+    _state_with_session(monkeypatch)
+    b._dorossi_queue_write([_parked_row(id="p1", uid="12345")])
+    said = _queue_cmd(monkeypatch, "remove p1")
+    assert [r["id"] for r in b._dorossi_queue_read()] == ["p1"]
+    assert any("找不到" in str(x) for x in said), said
+
+
+def test_queue_remove_by_id_reaches_a_live_waiter(monkeypatch):
+    """`detail` 列出的一般排隊中的列也有 id，同一個參數要指得到它（任何一個工作階段）。"""
+    _state_with_session(monkeypatch)
+    canceled: list = []
+
+    async def _cancel(waiter, _text):
+        canceled.append(waiter.queue_id)
+
+    async def _refresh(_key):
+        return None
+
+    monkeypatch.setattr(b, "_dorossi_cancel_waiter", _cancel)
+    monkeypatch.setattr(b, "_dorossi_refresh_waiters", _refresh)
+    key = b._dorossi_session_key(UID, "s7")
+    keep = types.SimpleNamespace(canceled=False, queue_id="q1")
+    drop = types.SimpleNamespace(canceled=False, queue_id="q2")
+    monkeypatch.setitem(b._dorossi_waiters, key, [keep, drop])
+    _queue_cmd(monkeypatch, "remove q2")
+    assert canceled == ["q2"]
+    assert b._dorossi_waiters[key] == [keep]
+
+
+def test_the_slash_remove_passes_the_id_ahead_of_the_index(monkeypatch):
+    seen: list = []
+
+    async def _fake_run(_interaction, _handler, rest, **_k):
+        seen.append(rest)
+
+    monkeypatch.setattr(b, "_slash_run", _fake_run)
+    callback = b.slash_dorossi_queue_remove.callback
+    asyncio.run(callback(None, index=3, session="s2", id=" p9 "))
+    asyncio.run(callback(None, index=3, session=""))
+    asyncio.run(callback(None))
+    assert seen == ["remove p9 s2", "remove 3", "remove"]
+
+
 # ===========================================================================
 # 六、迴圈那條路沒有被改到
 # ===========================================================================

@@ -7363,6 +7363,46 @@ def _dorossi_schedule_requeued_groups(grouped: dict) -> None:
                        label="dorossi-restore")
 
 
+async def _dorossi_queue_remove_by_id(message: discord.Message, uid: str,
+                                      queue_id: str) -> None:
+    """`/dorossi queue remove <id>`：取消 `detail` 印出的那一筆。
+
+    先找這個行程手上的等待者（任何一個工作階段），再找磁碟上的停放列——停放列的等待者
+    在磁碟上而不是記憶體裡，用編號是指不到它的。正在跑的那一筆兩邊都不在，要停它用
+    `/dorossi abort`。取消的列收進 `/dorossi queue undo`；停放列放回去之後繼續等它的時刻。
+    回覆不回聲使用者打的字串，只講磁碟上那一列自己的 id。
+    """
+    for key, queue in list(_dorossi_waiters.items()):
+        if key[0] != uid:
+            continue
+        waiter = next((w for w in queue
+                       if not w.canceled and w.queue_id == queue_id), None)
+        if waiter is None:
+            continue
+        undo_rows = _dorossi_persisted_records_by_ids([queue_id])
+        queue.remove(waiter)
+        await _dorossi_cancel_waiter(waiter, "已從 Dorossi 佇列取消。")
+        if undo_rows:
+            _dorossi_queue_undo.append(undo_rows)
+        await _dorossi_refresh_waiters(key)
+        await safe_reply(message, f"已取消 `{key[1]}` 佇列裡的 `{waiter.queue_id}`。")
+        _dorossi_event("queue_remove", uid=uid, sid=key[1], queue_id=waiter.queue_id)
+        return
+    parked = [r for r in _dorossi_parked_rows(uid) if str(r.get("id")) == queue_id]
+    if not parked:
+        await safe_reply(message, "找不到那個 id 的等待中提問（`/dorossi queue detail` "
+                                  "看得到 id；正在跑的那一筆用 `/dorossi abort`）。")
+        return
+    for row in parked:
+        _dorossi_queue_remove(row.get("id"))
+    _dorossi_queue_undo.append(parked)
+    row = parked[0]
+    await safe_reply(message, f"已取消停放中的提問 `{row.get('id')}`"
+                              "（`/dorossi queue undo` 可以放回去繼續等）。")
+    _dorossi_event("queue_remove", uid=uid, sid=str(row.get("sid") or ""),
+                   queue_id=row.get("id"), parked=True)
+
+
 async def mcmd_queue(message: discord.Message, rest: str = "") -> None:
     if not _dorossi_owner_only(message):
         await safe_reply(message, "此指令僅限擁有者使用。")
@@ -7495,12 +7535,12 @@ async def mcmd_queue(message: discord.Message, rest: str = "") -> None:
         return
     if action in ("remove", "rm", "cancel"):
         if len(args) < 2:
-            await safe_reply(message, "用法：`/dorossi queue remove <N> [session]`")
+            await safe_reply(message, "用法：`/dorossi queue remove <N|id> [session]`")
             return
         try:
             idx = int(args[1])
         except ValueError:
-            await safe_reply(message, "N 必須是整數。")
+            await _dorossi_queue_remove_by_id(message, uid, args[1])
             return
         sid, err = _dorossi_active_or_named_sid(uid, args[2] if len(args) > 2 else "")
         if err:
@@ -7560,7 +7600,7 @@ async def mcmd_queue(message: discord.Message, rest: str = "") -> None:
     await safe_reply(
         message,
         "用法：`/dorossi queue show`、`/dorossi queue clear [session|all]`、"
-        "`/dorossi queue remove <N> [session]`、"
+        "`/dorossi queue remove <N|id> [session]`、"
         "`/dorossi queue move <from> <to> [session]`",
     )
 
@@ -25028,15 +25068,18 @@ async def slash_dorossi_queue_clear(interaction: discord.Interaction,
     await _slash_run(interaction, mcmd_queue, f"clear {session}".strip())
 
 
-@dorossi_queue.command(name="remove", description="取消第 N 筆等待中的提問",
+@dorossi_queue.command(name="remove", description="取消第 N 筆（或指定 id）等待中的提問",
                        extras={"public": True})
-@discord.app_commands.describe(index="編號", session="工作階段代號（可省略）")
+@discord.app_commands.describe(
+    index="編號", session="工作階段代號（可省略）",
+    id="detail 印出的 id，填了就不看編號；停放中的提問只能用這個")
 async def slash_dorossi_queue_remove(
         interaction: discord.Interaction,
-        index: discord.app_commands.Range[int, 1, 9999],
-        session: str = "") -> None:
+        index: discord.app_commands.Range[int, 1, 9999] | None = None,
+        session: str = "", id: str = "") -> None:  # pylint: disable=redefined-builtin
+    target = id.strip() or (str(index) if index is not None else "")
     await _slash_run(interaction, mcmd_queue,
-                     f"remove {index} {session}".strip())
+                     f"remove {target} {session}".strip())
 
 
 @dorossi_queue.command(name="move", description="調整等待中提問的順序",

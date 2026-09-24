@@ -277,16 +277,17 @@ session list` 也會標出來，換回來就自動生效——不會安靜失效
 | `target` | 整數（1–9999） | ✅ | 要移到的編號 |
 | `session` | 文字 | — | 工作階段代號（可省略） |
 
-### `/dorossi queue remove <index> [session]`
+### `/dorossi queue remove [index] [session] [id]`
 
-取消第 N 筆等待中的提問
+取消第 N 筆（或指定 id）等待中的提問
 
 **限擁有者**（閘門在指令內部）
 
 | 參數 | 型別 | 必填 | 說明 |
 |---|---|:--:|---|
-| `index` | 整數（1–9999） | ✅ | 編號 |
+| `index` | 整數（1–9999） | — | 編號 |
 | `session` | 文字 | — | 工作階段代號（可省略） |
+| `id` | 文字 | — | detail 印出的 id，填了就不看編號；停放中的提問只能用這個 |
 
 ### `/dorossi queue retry_failed`
 
