@@ -29,6 +29,7 @@ transport 模組加一段設定；移除一個平台是一個 `false`。工作�
 - [指令](#指令)
 - [批次行為](#批次行為)
 - [監督與重啟](#監督與重啟)
+- [實際操作範例](#實際操作範例)
 - [更深入的文件在哪](#更深入的文件在哪)
 - [開發](#開發)
 
@@ -438,6 +439,63 @@ py -3 install_autostart.py --remove
 | `.webrunner_supervisor.lock` | 第二個批次監督者 |
 | `.batch_supervisor.lock` | 決定哪一個 bot 行程監督批次 |
 | `chrome_slot.lock` | 跨行程的瀏覽器槽，讓批次與驗證腳本不會同時開兩套瀏覽器 |
+
+---
+
+<!-- section: worked-examples -->
+## 實際操作範例
+
+幾個小情境，示範這個 bot 平常怎麼操作。更完整、逐步註解的走查（一個情境一個檔）在
+[`Examples/`](Examples/README.md)。以下指令以**有斜線選單的平台**為例；沒有選單的
+平台，同一組指令改用文字輸入（見 [`docs/platforms.md`](docs/platforms.md)）。下面每一個
+id 都是佔位值。
+
+**設定並開始一次批次。** 填佇列（一行一筆，跑到一半改的會在下一對生效）、標好要停在
+哪裡、預覽，再開始並盯著它：
+
+```
+/todo prompt add    scenery, wide shot, soft light
+/todo char1 add     example-character
+/todo prompt end          # 停止標記：批次跑到這裡結束
+/gen plan                 # 預覽真正會跑的配對
+/run                      # 開始（也可以 /run in 90m、/run at 02:00）
+/gen current              # 正在跑的那一對
+/gen progress             # 已完成／還剩幾張
+/eta                      # 預估完成時間（算到停止標記為止）
+/gen pause                # 以及 /gen resume——檢查點會留著
+```
+
+**問對話後端。** 帶自由文字的 mention 就是提問入口，其餘是限擁有者的工作階段管理：
+
+```
+@bot <你的問題，例如：幫我摘要上一次批次產出了什麼、有沒有哪裡怪>
+```
+
+`/dorossi session continue all` 會一次接回所有中斷的自走任務——**包含你自己中止過
+的**；要讓某個工作階段連這個都不接，用 `/dorossi session delete` 把它封存。
+`/dorossi ai` 換後端，`@bot /model <別名> …` 換這個工作階段的模型。撞到方案用量上限
+的那一輪會**自己停進佇列**、帶一個牆上時鐘的重跑時刻，時間到自動回來——
+`/dorossi queue show` 看得到停放中的提問，`/dorossi queue remove`（用 id）取消其中一筆。
+
+**看看這台機器現在在忙什麼。** 一次長批次跑著的時候，這會顯示瀏覽器吃了多少記憶體、
+批次跑了多久、整機還剩多少記憶體與磁碟——那是 `/gen current` 與 `/dorossi running`
+都看不到的作業系統這一側：
+
+```
+/proc usage
+```
+
+**同時跑好幾個平台。** 一個平台一個受監督的行程，各有自己的鎖、記錄檔與
+`state/<平台>/` 底下的狀態；哪個行程握著批次鎖，批次就由它監督：
+
+```
+py -3 start_platforms.py          # 把開著的平台全部起起來
+py -3 start_platforms.py --list   # 哪些會起來、為什麼
+```
+
+**不必顧著的復原。** 批次或自走迴圈斷了網路會停在原地，網路回來就從同一個點接著
+做——沒有次數上限，只有 `/stop`（批次）或 `/dorossi abort`（迴圈）能讓它停。撞到方案
+用量上限而停放的那一輪，會在上限重設後自己重跑，不必記得回來再問一次。
 
 ---
 

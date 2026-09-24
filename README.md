@@ -36,6 +36,7 @@ identity per platform.
 - [Commands](#commands)
 - [Batch behaviour](#batch-behaviour)
 - [Supervision and restart](#supervision-and-restart)
+- [Worked examples](#worked-examples)
 - [Where the deeper docs are](#where-the-deeper-docs-are)
 - [Development](#development)
 
@@ -485,6 +486,70 @@ moment a process disappears — there is no stale-flag state to clean up:
 | `.webrunner_supervisor.lock` | A second batch supervisor |
 | `.batch_supervisor.lock` | Decides which bot process supervises the batch |
 | `chrome_slot.lock` | The cross-process browser slot, so a batch and a verification run never open two browser stacks |
+
+---
+
+<!-- section: worked-examples -->
+## Worked examples
+
+Short scenarios showing how the bot is operated day to day. Fuller annotated
+walkthroughs — one file per scenario — are in
+[`Examples/`](Examples/README.md). Commands are shown for a platform with a
+slash menu; on a platform without one the same commands are typed as text (see
+[`docs/platforms.md`](docs/platforms.md)). Every id below is a placeholder.
+
+**Set up and run a batch.** Fill the queues (one entry per line; edits are
+picked up at the next pair), mark where to stop, preview, then start and watch:
+
+```
+/todo prompt add    scenery, wide shot, soft light
+/todo char1 add     example-character
+/todo prompt end          # the stop marker: the batch ends here
+/gen plan                 # preview the pairs that will actually run
+/run                      # start (also /run in 90m, /run at 02:00)
+/gen current              # the pair in flight
+/gen progress             # images done vs. remaining
+/eta                      # estimated finish (stops counting at the marker)
+/gen pause                # and /gen resume — the checkpoint is kept
+```
+
+**Ask the answering backend.** A mention with free text is the question entry
+point; the rest is owner-only session management:
+
+```
+@bot <your question, e.g. summarise the last run and flag anything odd>
+```
+
+`/dorossi session continue all` resumes every interrupted autonomous loop at
+once — **including ones you aborted**; archive a session with
+`/dorossi session delete` to keep it out. `/dorossi ai` switches provider and
+`@bot /model <alias> …` switches model for one session. A turn that hits the
+plan usage limit **parks itself** in the queue with a wall-clock re-run time and
+comes back on its own — `/dorossi queue show` lists parked turns and
+`/dorossi queue remove` (by id) cancels one.
+
+**See what the machine is doing.** While a long batch runs, this shows the
+browser's memory, the batch runtime and how much RAM and disk are left — the OS
+side that `/gen current` and `/dorossi running` do not cover:
+
+```
+/proc usage
+```
+
+**Run several platforms at once.** One supervised process per platform, each
+with its own lock, log and state under `state/<platform>/`; whichever process
+holds the batch lock supervises the batch:
+
+```
+py -3 start_platforms.py          # start every enabled platform
+py -3 start_platforms.py --list   # which will start, and why
+```
+
+**Recovery you do not have to babysit.** A batch or autonomous loop that loses
+network connectivity stops in place and resumes from the same point when
+connectivity returns — no round limit; only `/stop` (batch) or
+`/dorossi abort` (loop) ends it. A turn parked by the plan usage limit re-runs
+itself once the limit resets, so you never have to remember to ask again.
 
 ---
 
