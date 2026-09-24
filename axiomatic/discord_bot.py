@@ -4229,7 +4229,9 @@ async def mcmd_tag_suggest(message: discord.Message, rest: str) -> None:
     from collections import Counter as _Counter
     counter: _Counter[str] = _Counter()
     for p in posts:
-        counter.update((p.get("tag_string_general") or "").split())
+        general = p.get("tag_string_general")
+        if isinstance(general, str):
+            counter.update(general.split())
     # 把角色自己的 tag 拿掉（如果剛好混進 general — 通常不會但保險）。
     char_lower = char_tag.lower()
     for variant in char_lower.split():

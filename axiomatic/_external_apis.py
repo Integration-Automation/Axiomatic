@@ -265,6 +265,17 @@ async def _http_get_json(url: str, *, params=None, headers=None,
         print(f"http_get_json {url}: {error!r}", file=sys.stderr)
         return -1, None
 
+def _dict_entries(data) -> list[dict]:
+    """回應裡真正是物件的那幾筆；回應本身不是 list 就是空的。
+
+    這些站在錯誤、限流或改結構時，會回一個夾著非物件的 list（或帶錯誤物件的 body）。
+    呼叫端一律 `.get(...)`，讓非物件流出去只會在 handler 裡變成一個例外，整個指令
+    只剩一句泛用的失敗。所有讀圖庫 list 的地方都走這一支，規則只寫一次。"""
+    if not isinstance(data, list):
+        return []
+    return [entry for entry in data if isinstance(entry, dict)]
+
+
 async def _danbooru_posts(tags: str, *, limit: int,
                           random_order: bool = True) -> list[dict]:
     """抓一批 Danbooru post。所有 Danbooru post 查詢的**唯一**實作。
@@ -291,7 +302,7 @@ async def _danbooru_posts(tags: str, *, limit: int,
         status, data = await _http_get_json(DANBOORU_API, params=base)
     if status != 200:
         return []
-    return data if isinstance(data, list) else []
+    return _dict_entries(data)
 
 
 def _take_unseen(posts: list[dict], count: int) -> list[dict]:
@@ -369,12 +380,9 @@ async def _query_tags_json(api: _TagsAPI, *, name: str | None = None,
     status, data = await _http_get_json(
         api.url, params=params, headers=api.headers,
     )
-    if status != 200 or not isinstance(data, list):
+    if status != 200:
         return []
-    # 只留真正的 dict entry。這些站的 `/tags.json` 在錯誤 / 限流時會回一個
-    # list of 非 dict（或帶 error 物件）的 body；callers 一律 `.get(...)`，
-    # 讓非 dict 流出去只會在 handler 裡噴 AttributeError。
-    return [t for t in data if isinstance(t, dict)]
+    return _dict_entries(data)
 
 def _is_search_modifier(tok: str) -> bool:
     """Danbooru 搜尋修飾詞（`rating:general`、`score:>=5`、`order:rank` …）
@@ -474,9 +482,9 @@ async def _fetch_danbooru_posts_latest(tags: str, limit: int = 4) -> list[dict]:
     """抓 `tags` 最新 N 張 post（不走 random、依預設順序就是 newest-first）。"""
     params = {"tags": tags, "limit": limit}
     status, data = await _http_get_json(DANBOORU_API, params=params)
-    if status != 200 or not isinstance(data, list):
+    if status != 200:
         return []
-    return data
+    return _dict_entries(data)
 
 async def _fetch_danbooru_post_latest(tags: str) -> dict | None:
     """抓 `tags` 的**最新一張**。沒有 dedup（user 明確指定要 latest 就給最新
@@ -516,9 +524,8 @@ async def _fetch_safebooru_post(tags: str) -> dict | None:
     status, data = await _http_get_json(
         _SAFEBOORU_API, params=params, headers={"User-Agent": _BROWSER_UA},
     )
-    if status != 200 or not isinstance(data, list) or not data:
-        return None
-    return random.choice(data)
+    posts = _dict_entries(data) if status == 200 else []
+    return random.choice(posts) if posts else None
 
 async def _fetch_e621_post(tags: str) -> dict | None:
     """從 e621 抽一張隨機 post。用 `order:random` meta tag。"""
@@ -529,9 +536,7 @@ async def _fetch_e621_post(tags: str) -> dict | None:
     )
     if status != 200 or not isinstance(data, dict):
         return None
-    posts = data.get("posts") or []
     # `posts` 在站方改結構 / 回錯誤物件時可能不是 list（例如 dict）——
     # `random.choice` 對 dict 會丟 KeyError，對其他型別丟 TypeError。
-    if not isinstance(posts, list) or not posts:
-        return None
-    return random.choice(posts)
+    posts = _dict_entries(data.get("posts"))
+    return random.choice(posts) if posts else None

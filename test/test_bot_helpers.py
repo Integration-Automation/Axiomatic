@@ -19257,6 +19257,30 @@ def test_the_dorossi_log_views_survive_junk_lines(monkeypatch, tmp_path):
     assert "queue_full" in sent[-1] and "error" in sent[-1], sent[-1]
 
 
+def test_tag_suggest_skips_posts_whose_general_tags_are_not_text(monkeypatch):
+    """`tag_string_general` 是外部回應的欄位：數字、清單、缺欄都可能出現，不得讓整個指令
+    只剩一句泛用的失敗；其餘的 post 照樣聚合。"""
+    posts = [{"tag_string_general": 5}, {"tag_string_general": ["x"]}, {},
+             {"tag_string_general": "smile solo"}, {"tag_string_general": "smile"}]
+
+    async def _resolve(_api, _raw):
+        return None
+
+    async def _bulk(_tag, limit):
+        return posts
+
+    sent: list = []
+
+    async def _reply(_message, content=None, **_kw):
+        sent.append(content)
+
+    monkeypatch.setattr(b, "_resolve_fuzzy_tags", _resolve)
+    monkeypatch.setattr(b, "_fetch_danbooru_posts_bulk", _bulk)
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    _sr_run(b.mcmd_tag_suggest(types.SimpleNamespace(), "rossi_(arknights)"))
+    assert len(sent) == 1 and "smile, solo" in sent[0] and "5 張" in sent[0], sent
+
+
 class _HealthEnv:
     """`/dorossi health` 的最小環境：狀態、工作目錄、事件檔都換成測試的，事件不寫出去。"""
 

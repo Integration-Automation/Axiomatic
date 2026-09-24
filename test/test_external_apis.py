@@ -2403,6 +2403,40 @@ def test_the_summary_repeats_every_failure_at_the_bottom(monkeypatch,
 # 兩個只抽一張的圖庫：隨機排序的 meta tag 與「從回應裡挑一張」
 # ---------------------------------------------------------------------------
 
+_POST_READERS = {
+    "danbooru_post": (lambda: ex._fetch_danbooru_post("tag"), False, "one"),
+    "danbooru_bulk": (lambda: ex._fetch_danbooru_posts_bulk("tag"), False, "list"),
+    "danbooru_random_n": (lambda: ex._fetch_danbooru_posts_random("tag", 2), False, "list"),
+    "danbooru_latest": (lambda: ex._fetch_danbooru_posts_latest("tag"), False, "list"),
+    "danbooru_latest_one": (lambda: ex._fetch_danbooru_post_latest("tag"), False, "one"),
+    "safebooru_post": (lambda: ex._fetch_safebooru_post("tag"), False, "one"),
+    "e621_post": (lambda: ex._fetch_e621_post("tag"), True, "one"),
+    "danbooru_tags": (lambda: ex._query_tags_json(ex._DANBOORU_TAGS, name="tag"), False, "list"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_POST_READERS))
+def test_every_post_reader_drops_entries_that_are_not_objects(name, fake_http, monkeypatch):
+    """站方出錯或改結構時會回夾著非物件的 list。呼叫端一律 `.get(...)`，所以讀進來的時候
+    就要濾掉——漏一個的話，那個指令只剩一句泛用的失敗。
+
+    抽一張的那幾支用 `random.choice`：固定成「挑第一個」、並把垃圾排在前面，沒濾的版本就
+    **一定**挑到垃圾——不固定的話，它有五分之一的機會剛好挑到真的那筆而照樣通過。"""
+    monkeypatch.setattr(ex.random, "choice", lambda seq: seq[0])
+    fetch, wrapped, shape = _POST_READERS[name]
+    real = {"id": 987_654_321, "tag_string_general": "a b"}
+    body = [None, "junk", 5, ["nested"], real]
+    fake_http.replies = [(200, {"posts": body} if wrapped else body)] * 3
+    got = _run(fetch())
+    assert got == (real if shape == "one" else [real]), got
+
+
+def test_the_post_reader_table_covers_every_list_reading_fetcher():
+    """`_POST_READERS` 少列一個讀 list 的抓取函式，上一支就看不到它。對著 `_FETCHERS` 對帳：
+    只有 e621 的 tag 查詢不在這裡——它與 danbooru_tags 共用 `_query_tags_json`。"""
+    assert set(_FETCHERS) - set(_POST_READERS) == {"e621_tags"}
+
+
 @pytest.mark.parametrize("fetch, meta, wrap", [
     (ex._fetch_safebooru_post, "sort:", lambda posts: posts),
     (ex._fetch_e621_post, "order:", lambda posts: {"posts": posts}),
