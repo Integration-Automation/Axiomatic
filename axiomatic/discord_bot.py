@@ -22693,6 +22693,10 @@ async def _dorossi_model_check_and_announce() -> None:
         return
     channel = client.get_channel(_dorossi_model_announce_channel_id())
     if channel is None:
+        # 每分鐘都會走到這裡，所以只說一次；不說的話，一個設錯的頻道會讓公告永遠停在記憶
+        # 體裡，而 log 裡跟「送出去了」一樣安靜。
+        _warn_once("[dorossi] model announcement waiting: the announce channel "
+                   "cannot be resolved")
         return
     try:
         await channel.send("\n\n".join(_dorossi_model_announce_pending))
@@ -22702,6 +22706,11 @@ async def _dorossi_model_check_and_announce() -> None:
         print(f"[dorossi] model announcement failed, will retry: {error!r}",
               file=sys.stderr)
         return
+    else:
+        # 成功也留一行：送出去與卡住在 log 裡原本分不出來，而「公告有沒有真的出去」是
+        # 這條路唯一要回答的問題（每天至多一次，不會洗版）。
+        print(f"[dorossi] model announcement sent "
+              f"({len(_dorossi_model_announce_pending)} item(s))", file=sys.stderr)
     _dorossi_model_announce_pending.clear()
 
 

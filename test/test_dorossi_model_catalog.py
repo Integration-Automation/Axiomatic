@@ -41,8 +41,11 @@ def _isolate_catalog(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(db, "DOROSSI_MODEL_CATALOG_FILE",
                         tmp_path / "dorossi_models.json")
-    claude = dict(db.DOROSSI_MODEL_CHOICES)
-    codex = dict(db.DOROSSI_CODEX_MODEL_CHOICES)
+    # 從**內建**表複製，不是從現在的表：模組載入時已經把這台主機上的目錄檔併進去了，
+    # 而那份檔是正在跑的 bot 每天改寫的。那次檢查第一次真的找到模型之後，「新發現的
+    # 別名」在這裡全都成了「已經有了」，四支測試跟著紅——程式一行沒動。
+    claude = dict(db._DOROSSI_BUILTIN_MODEL_CHOICES)
+    codex = dict(db._DOROSSI_BUILTIN_CODEX_MODEL_CHOICES)
     monkeypatch.setattr(db, "DOROSSI_MODEL_CHOICES", claude)
     monkeypatch.setattr(db, "DOROSSI_CODEX_MODEL_CHOICES", codex)
     monkeypatch.setattr(db, "DOROSSI_BACKEND_MODEL_CHOICES",
@@ -107,6 +110,27 @@ def test_a_model_id_that_makes_no_sense_is_refused_not_guessed(bad):
 # ---------------------------------------------------------------------------
 # 2. 落地：只新增、不覆寫，而且不可逆的條目不准進來
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("snapshot, literal", [
+    ("_DOROSSI_BUILTIN_MODEL_CHOICES", "DOROSSI_MODEL_CHOICES"),
+    ("_DOROSSI_BUILTIN_CODEX_MODEL_CHOICES", "DOROSSI_CODEX_MODEL_CHOICES"),
+])
+def test_the_built_in_snapshot_is_exactly_what_the_source_says(snapshot, literal):
+    """上面那個夾具的前提：內建表複本就是原始碼裡寫的那張字面表，**不含**載入時從這台
+    主機的目錄檔併進來的東西。複本若在合併之後才取、或只是同一個物件的別名，主機上的
+    目錄檔就又會滲進每一支測試——而這台主機的目錄檔裡可能真的有東西。"""
+    import ast  # noqa: PLC0415
+    source = Path(db.__file__).read_text(encoding="utf-8")
+    table = next(node.value for node in ast.parse(source).body
+                 if isinstance(node, ast.Assign)
+                 and any(isinstance(tg, ast.Name) and tg.id == literal
+                         for tg in node.targets)
+                 and isinstance(node.value, ast.Dict))
+    written = {ast.literal_eval(k): ast.literal_eval(v)
+               for k, v in zip(table.keys, table.values)}
+    assert len(written) >= 2, written   # 正面對照：抽到的是一張表，不是空的
+    assert getattr(db, snapshot) == written
+
+
 def test_a_discovered_model_becomes_a_pinned_alias():
     catalog = {"resolved": {"claude": {"opus": "claude-opus-5-5"}}}
     added = db.dorossi_merge_model_catalog(catalog)
@@ -600,13 +624,28 @@ def test_an_announcement_that_failed_to_send_is_sent_on_the_next_tick(monkeypatc
     assert channel.sent == ["🆕 A"], "送出去之後不該再送一次"
 
 
-def test_an_unreachable_channel_keeps_the_announcement(monkeypatch):
+def test_an_unreachable_channel_keeps_the_announcement(monkeypatch, capsys):
+    """頻道拿不到時留著，而且在 log 裡說**一次**——每分鐘都會走到這裡，一個設錯的頻道
+    原本會讓公告永遠停在記憶體裡、log 裡什麼都沒有。送出去之後也要留一行，否則「送出去
+    了」與「還卡著」在 log 裡分不出來。"""
     channel = _FlakyChannel([])
     _announce_env(monkeypatch, None, ["🆕 A"])
     _run(b._dorossi_model_check_and_announce())
+    _run(b._dorossi_model_check_and_announce())
+    err = capsys.readouterr().err
+    assert err.count("model announcement waiting") == 1, err
     monkeypatch.setattr(b.client, "get_channel", lambda _cid: channel)
     _run(b._dorossi_model_check_and_announce())
     assert channel.sent == ["🆕 A"]
+    assert "model announcement sent (1 item(s))" in capsys.readouterr().err
+
+
+def test_a_failed_send_does_not_claim_it_was_sent(monkeypatch, capsys):
+    channel = _FlakyChannel([RuntimeError("gateway hiccup")])
+    _announce_env(monkeypatch, channel, ["🆕 A"])
+    _run(b._dorossi_model_check_and_announce())
+    err = capsys.readouterr().err
+    assert "will retry" in err and "announcement sent" not in err, err
 
 
 def test_a_forbidden_channel_drops_the_announcement(monkeypatch):

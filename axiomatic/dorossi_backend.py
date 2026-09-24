@@ -358,6 +358,11 @@ def dorossi_merge_model_catalog(catalog: dict) -> list:
 # 一次：少了這一行，一個壞掉的目錄檔會讓聯集永遠是空的，而空的聯集等於 `/model` 的
 # token 路徑一個值都不接受。
 _dorossi_rebuild_all_model_choices()
+# 合併**之前**的內建表複本。合併之後那兩張表的內容取決於這台主機上那份目錄檔——也就是
+# 取決於正在跑的 bot 上一次每日檢查找到了什麼。需要「只有內建值」的地方（測試）從這裡
+# 拿，不要從那兩張會長大的表拿。
+_DOROSSI_BUILTIN_MODEL_CHOICES: dict = dict(DOROSSI_MODEL_CHOICES)
+_DOROSSI_BUILTIN_CODEX_MODEL_CHOICES: dict = dict(DOROSSI_CODEX_MODEL_CHOICES)
 _DOROSSI_MODEL_CATALOG = dorossi_load_model_catalog()
 dorossi_merge_model_catalog(_DOROSSI_MODEL_CATALOG)
 
