@@ -1023,3 +1023,89 @@ def test_a_cancelled_loop_is_marked_interrupted_and_resumable(loop_env, monkeypa
     assert marker["stop"] == "interrupted"
     assert db._dorossi_loop_marker_wants_autoresume(marker)
     assert b._dorossi_loops == {}
+
+# --------------------------------------------------------------------------
+# `_dorossi_loop_one_round` itself (every test above replaces it with a fake, so its own
+# wiring had never run)
+# --------------------------------------------------------------------------
+
+class _RoundLive:
+    def __init__(self):
+        self.log: list = []
+
+    async def finalize(self, content):
+        self.log.append(("finalize", content))
+
+    def reopen(self):
+        self.log.append(("reopen",))
+
+
+def _round_env(monkeypatch, *, fail_first=False, abort=False):
+    calls: list = []
+
+    def _backend(name):
+        async def _invoke(prompt, stored_id, **kwargs):
+            calls.append((name, prompt, stored_id, kwargs))
+            if fail_first and len(calls) == 1:
+                raise b._DorossiResumeError("stale session")
+            return f"answer-{name}", "new-sid", {"cost": 0.1}
+        return _invoke
+
+    monkeypatch.setattr(b, "_dorossi_via_claude_code", _backend("claude_code"))
+    monkeypatch.setattr(b, "_dorossi_via_codex", _backend("codex"))
+    state = types.SimpleNamespace(abort=abort, set_proc=lambda proc: None)
+    return calls, _RoundLive(), state
+
+
+def _one_round(snap, live, state):
+    async def _on_text(_text):
+        return None
+    return asyncio.run(b._dorossi_loop_one_round("do it", snap, live, _on_text, 30.0, state))
+
+
+def test_one_round_wires_the_first_backend_with_its_budget_and_tuning(monkeypatch):
+    """Default backend: resume the stored session and pass effort, model, budget and the
+    previous round's cumulative baseline."""
+    calls, live, state = _round_env(monkeypatch)
+    snap = {"cc_session_id": "s-1", "cc_cwd": "/w", "cc_extra_dir": "/x", "effort": "high",
+            "model": "m1", "cc_usage_mark": {"cost": 1.0}, "codex_session_id": "c-9"}
+    assert _one_round(snap, live, state) == ("answer-claude_code", "new-sid", {"cost": 0.1})
+    [(name, prompt, stored, kwargs)] = calls
+    assert (name, prompt, stored) == ("claude_code", "do it", "s-1")
+    assert kwargs["effort"] == "high" and kwargs["model"] == "m1"
+    assert kwargs["usage_baseline"] == {"cost": 1.0}
+    assert kwargs["max_budget_usd"] == b.DOROSSI_MAX_BUDGET_USD
+    assert (kwargs["workdir"], kwargs["extra_dir"]) == ("/w", "/x")
+    assert kwargs["loop_system_guidance"] == b.DOROSSI_LOOP_SYSTEM_GUIDANCE
+    assert kwargs["abort_check"]() is False
+    assert live.log == []
+
+
+def test_one_round_gives_the_other_backend_only_what_it_understands(monkeypatch):
+    """The other backend takes its own session id and the model; it has no effort or budget
+    flags, and passing them would make it refuse to run."""
+    calls, live, state = _round_env(monkeypatch)
+    snap = {"backend": "codex", "codex_session_id": "c-9", "cc_session_id": "s-1",
+            "effort": "high", "model": "m2"}
+    _one_round(snap, live, state)
+    [(name, _prompt, stored, kwargs)] = calls
+    assert (name, stored, kwargs["model"]) == ("codex", "c-9", "m2")
+    assert "effort" not in kwargs and "max_budget_usd" not in kwargs and "usage_baseline" not in kwargs
+
+
+def test_a_stale_session_is_retried_once_as_a_new_one(monkeypatch):
+    """A stale stored session: tell the user it is refreshing, then rerun once as a new
+    session (id=None)."""
+    calls, live, state = _round_env(monkeypatch, fail_first=True)
+    assert _one_round({"cc_session_id": "s-1"}, live, state)[0] == "answer-claude_code"
+    assert [c[2] for c in calls] == ["s-1", None]
+    assert live.log == [("finalize", "⏳ 重新整理對話中…"), ("reopen",)]
+
+
+def test_an_aborted_round_is_not_retried(monkeypatch):
+    """An abort that kills the process also looks like a stale session. Retrying then would
+    spawn another process racing the abort."""
+    calls, live, state = _round_env(monkeypatch, fail_first=True, abort=True)
+    with pytest.raises(b._DorossiResumeError):
+        _one_round({"cc_session_id": "s-1"}, live, state)
+    assert len(calls) == 1 and live.log == []
