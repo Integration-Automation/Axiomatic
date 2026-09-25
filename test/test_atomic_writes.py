@@ -947,3 +947,190 @@ def test_the_covered_set_drift_comparison_actually_bites():
     assert _covered_set_drift(both, both | {"NEW_FILE"}) == ([], ["NEW_FILE"])
     # 兩個方向同時壞掉時，兩邊都要報，不能只報先算的那一個
     assert _covered_set_drift({"X_FILE"}, {"Y_FILE"}) == (["X_FILE"], ["Y_FILE"])
+
+
+# ---------------------------------------------------------------------------
+# One name, one file: every process spells its cross-process path constants itself
+# ---------------------------------------------------------------------------
+#
+# The bot, the batch, the dashboard and the launchers each write their own line
+# `WEBRUNNER_PAUSE_FILE = PROJECT_ROOT / "webrunner.pause"` -- they may not import each other
+# (the module boundary), so these constants can only be written once per process. Measured
+# 2026-09-25: 25 names are defined in two or more modules, all naming the same file, and
+# **nothing was comparing them**. Change one copy and both sides keep running, they just never
+# meet again: the pause marker, the single-image request and the DOM request the bot writes are
+# never read by the batch, with no error anywhere.
+#
+# What is compared is the **resolved path**, not the spelling: a launcher writes
+# `REPO_ROOT / "webrunner.pid"`, the package writes `PROJECT_ROOT / "webrunner.pid"`, each root
+# computed from its own `__file__`, and both are the same file.
+#
+# The blind spot: two processes giving one file **different** names. This compares same-named
+# constants, so it cannot know about that case.
+
+# Same name, deliberately a different file (or deliberately an opaque shape). Each entry needs
+# its reason; once it resolves to the same file everywhere, it is reported as stale.
+_SAME_NAME_DIFFERENT_FILE = {
+    "LOCK_FILE": "Each supervisor's own single-instance lock (`start_webrunner.py` / "
+                 "`start_discord_bot.py`); the bot's is per platform, so it is also an opaque shape.",
+}
+# 25 shared names measured on 2026-09-25.
+_PATH_PARITY_FLOOR = 20
+
+
+def _evaluate_path(node: ast.AST, env: dict, module_file: Path):
+    """Evaluate a module-level path expression to an absolute path, or None (never a guess).
+
+    Only these shapes are understood: `Path(__file__)`, `.resolve()`, `.parent`,
+    `X / "literal"`, and names this module already resolved above.
+    """
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
+    if isinstance(node, ast.Attribute) and node.attr == "parent":
+        base = _evaluate_path(node.value, env, module_file)
+        return None if base is None else base.parent
+    if isinstance(node, ast.Call) and not node.keywords:
+        func = node.func
+        if (isinstance(func, ast.Name) and func.id == "Path" and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name) and node.args[0].id == "__file__"):
+            return module_file
+        if isinstance(func, ast.Attribute) and func.attr == "resolve" and not node.args:
+            return _evaluate_path(func.value, env, module_file)
+        return None
+    if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
+            and isinstance(node.right, ast.Constant) and isinstance(node.right.value, str)):
+        base = _evaluate_path(node.left, env, module_file)
+        return None if base is None else base / node.right.value
+    return None
+
+
+def _module_path_constants(module_file: Path, source: str) -> tuple[dict, set]:
+    """Module-level ALL-CAPS names -> resolved absolute path; plus the ones that do not resolve."""
+    env: dict = {}
+    opaque: set = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        else:
+            continue
+        if not (isinstance(target, ast.Name) and target.id.isupper()):
+            continue
+        resolved = _evaluate_path(value, env, module_file)
+        if resolved is None:
+            opaque.add(target.id)
+            env.pop(target.id, None)
+        else:
+            env[target.id] = resolved
+            opaque.discard(target.id)
+    return env, opaque
+
+
+def _path_parity(sources: dict, repo_root: Path) -> tuple[dict, dict, set]:
+    """`{module file: source}` -> (same name different file, uncomparable, shared names).
+
+    Same name different file: `{name: {module: relative path}}`. Uncomparable: one module
+    resolves the name, another defines it in a shape that does not resolve -- that copy would
+    silently drop out of the comparison, so it is reported rather than skipped.
+    """
+    def _label(path: Path) -> str:
+        return path.relative_to(repo_root).as_posix()
+
+    resolved_by_name: dict = {}
+    opaque_by_name: dict = {}
+    for module_file, source in sources.items():
+        resolved, opaque = _module_path_constants(module_file, source)
+        for name, value in resolved.items():
+            try:
+                shown = value.relative_to(repo_root).as_posix()
+            except ValueError:
+                shown = str(value)
+            resolved_by_name.setdefault(name, {})[_label(module_file)] = shown
+        for name in opaque:
+            opaque_by_name.setdefault(name, []).append(_label(module_file))
+    shared = {name for name, where in resolved_by_name.items() if len(where) > 1}
+    disagreements = {name: resolved_by_name[name] for name in sorted(shared)
+                     if len(set(resolved_by_name[name].values())) > 1}
+    uncomparable = {name: sorted(opaque_by_name[name])
+                    for name in sorted(set(resolved_by_name) & set(opaque_by_name))}
+    return disagreements, uncomparable, shared
+
+
+def _unexplained_findings(disagreements: dict, uncomparable: dict, exempt) -> tuple[dict, dict]:
+    """Drop the exempt names from both findings -- a deliberately different file can land in either."""
+    return ({name: where for name, where in disagreements.items() if name not in exempt},
+            {name: where for name, where in uncomparable.items() if name not in exempt})
+
+
+def _stale_exemptions(disagreements: dict, uncomparable: dict, exempt) -> list:
+    """An exempt name that now resolves to one file (or is no longer shared) is stale."""
+    return sorted(name for name in exempt if name not in disagreements and name not in uncomparable)
+
+
+def _real_path_parity() -> tuple[dict, dict, set]:
+    return _path_parity({path.resolve(): path.read_text(encoding="utf-8") for path in _SOURCES},
+                        PKG_ROOT.parent.resolve())
+
+
+def test_a_path_constant_names_the_same_file_in_every_process():
+    disagreements, uncomparable, shared = _real_path_parity()
+    # Positive control: finding no shared name at all looks exactly like "all consistent".
+    assert len(shared) >= _PATH_PARITY_FLOOR, (
+        f"only {len(shared)} path constants shared across modules -- the extraction is broken, "
+        "or the scan scope shrank.")
+    assert "WEBRUNNER_PAUSE_FILE" in shared, "the bot and the batch both define the pause marker"
+    unexpected, opaque = _unexplained_findings(disagreements, uncomparable,
+                                               _SAME_NAME_DIFFERENT_FILE)
+    assert not unexpected, (
+        f"one constant names different files in different processes: {unexpected}. Both sides "
+        "keep running and simply never read what the other wrote. If they really are two files, "
+        "rename one, or add it to `_SAME_NAME_DIFFERENT_FILE` with its reason.")
+    assert not opaque, (
+        f"these constants resolve in one module but are written in an uncomparable shape in "
+        f"another: {opaque}. That copy silently drops out of the comparison; write it back as "
+        "`PROJECT_ROOT / \"...\"`.")
+
+
+def test_every_same_name_exemption_still_names_two_different_files():
+    disagreements, uncomparable, _shared = _real_path_parity()
+    assert _SAME_NAME_DIFFERENT_FILE, "the exemption list is empty -- delete this test instead"
+    for name, reason in _SAME_NAME_DIFFERENT_FILE.items():
+        assert reason.strip(), f"the exemption for `{name}` has no reason"
+    stale = _stale_exemptions(disagreements, uncomparable, _SAME_NAME_DIFFERENT_FILE)
+    assert not stale, f"these exemptions now name one file (or are no longer shared); delete them: {stale}"
+
+
+def test_the_path_parity_check_sees_what_it_claims_to():
+    """The real data is consistent, so the comparison needs its own control, or deleting it
+    stays green.
+
+    One case per direction: a real difference is reported; a different spelling of the same
+    file must **not** be (only this input kills a mutant that compares spellings instead of
+    resolved paths); an unresolvable copy is reported as uncomparable. The two exemption helpers
+    are checked here too: the real data has no exempt name on the uncomparable side, so a
+    mutant filtering only one side is killed only by synthetic input.
+    """
+    repo = PKG_ROOT.parent.resolve()
+    pkg_module = repo / "axiomatic" / "a.py"
+    root_module = repo / "b.py"
+    other_pkg_module = repo / "axiomatic" / "c.py"
+    pkg_root = "PROJECT_ROOT = Path(__file__).resolve().parent.parent\n"
+    sources = {
+        pkg_module: pkg_root + (
+            'X_FILE = PROJECT_ROOT / "x.json"\n'
+            'Y_FILE = PROJECT_ROOT / "d" / "y.txt"\n'
+            'Z_FILE = PROJECT_ROOT / "z.txt"\n'),
+        root_module: "REPO_ROOT = Path(__file__).resolve().parent\n" + (
+            'X_FILE = REPO_ROOT / "x2.json"\n'
+            'Y_FILE = REPO_ROOT / "d" / "y.txt"\n'),
+        other_pkg_module: pkg_root + 'Z_FILE = os.path.join(PROJECT_ROOT, "z.txt")\n',
+    }
+    disagreements, uncomparable, shared = _path_parity(sources, repo)
+    assert disagreements == {"X_FILE": {"axiomatic/a.py": "x.json", "b.py": "x2.json"}}
+    assert shared == {"PROJECT_ROOT", "X_FILE", "Y_FILE"}, shared
+    assert uncomparable == {"Z_FILE": ["axiomatic/c.py"]}
+    assert _unexplained_findings(disagreements, uncomparable, {"Z_FILE": "r"}) == (disagreements, {})
+    assert _unexplained_findings(disagreements, uncomparable, {"X_FILE": "r"}) == ({}, uncomparable)
+    assert _stale_exemptions(disagreements, uncomparable,
+                             {"X_FILE": "r", "Y_FILE": "r", "Z_FILE": "r", "GONE": "r"}) == ["GONE", "Y_FILE"]
