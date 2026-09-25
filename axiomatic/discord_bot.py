@@ -25418,8 +25418,12 @@ async def _slash_run(interaction: discord.Interaction, handler, *args,
         # `safe_reply(proxy, …)` 而不是 `proxy.reply(…)` 的理由見上面那條。
         _METRICS_ERRORS += 1
         await safe_reply(proxy, _queue_not_utf8_reply(proxy, error))
-    finally:
-        await proxy.finish()
+    # **Not in a `finally`**: an exception the two branches above do not catch goes
+    # up to `_tree_error`, which replies with the internal-error line. In a `finally`,
+    # `finish()` would first add "done" — the user would see success and then failure.
+    # Only a normal return (or one of the two aborts above, which already replied)
+    # needs the guaranteed reply.
+    await proxy.finish()
 
 
 @tree.command(name="help", description="指令說明（tw / cn / en）",

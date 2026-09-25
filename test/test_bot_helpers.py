@@ -6579,6 +6579,121 @@ def test_every_help_chunk_fits_the_platform_message_limit(lang):
 # 這是 2026-08-19 之後**所有**斜線指令都會經過的唯一一道閘。它同時做四件事：
 # 頻道閘、角色閘、指令計數、稽核紀錄；順序與 `on_message` 的 `!` 派發器一致
 # （拒絕的請求不計數也不稽核）。改壞這裡等於一次改壞 261 個指令的權限。
+class _SlashRunInteraction:
+    """The attributes `_slash_run` touches: deferral, the first followup, then the channel."""
+
+    def __init__(self, uid, *, already_done=False, defer_raises=False):
+        outer = self
+        self.deferred: list = []
+        self.followups: list = []
+        self.channel_sent: list = []
+
+        class _Response:
+            def is_done(self):
+                return already_done or bool(outer.deferred)
+
+            async def defer(self, **kwargs):
+                if defer_raises:
+                    raise RuntimeError("already acknowledged")
+                outer.deferred.append(kwargs)
+
+        async def _followup(content=None, **_kw):
+            outer.followups.append(content)
+
+        async def _channel_send(content=None, **_kw):
+            outer.channel_sent.append(content)
+
+        self.response = _Response()
+        self.followup = types.SimpleNamespace(send=_followup)
+        self.user = types.SimpleNamespace(id=uid)
+        self.channel = types.SimpleNamespace(id=4242, send=_channel_send)
+        self.guild = None
+        self.id = 777
+        self.extras = {}
+
+
+def _run_slash(handler, *args, uid=None, detach_ack=None, **kwargs):
+    interaction = _SlashRunInteraction(b.OWNER_USER_ID + 1 if uid is None else uid, **kwargs)
+    asyncio.run(b._slash_run(interaction, handler, *args, detach_ack=detach_ack))
+    return interaction
+
+
+def test_slash_run_defers_strips_fences_and_replies_once():
+    """Defers once; string arguments lose their surrounding code fence, other types pass
+    through; the handler's first reply goes out as the followup and `finish()` adds nothing."""
+    seen: list = []
+
+    async def _handler(message, text, number):
+        seen.append((text, number))
+        await message.reply("hi")
+
+    interaction = _run_slash(_handler, "```\nhello\n```", 5)
+    assert interaction.deferred == [{"thinking": True}]
+    assert seen == [("hello", 5)]
+    assert interaction.followups == ["hi"] and interaction.channel_sent == []
+
+
+def test_slash_run_answers_a_handler_that_said_nothing():
+    """A handler that returns without replying gets a "done" line, or the spinner never stops."""
+    async def _silent(message):
+        return None
+
+    assert _run_slash(_silent).followups == ["✅ 完成。"]
+
+
+def test_slash_run_does_not_claim_success_before_an_error():
+    """An uncaught exception goes to `_tree_error` for the internal-error reply. No "done"
+    may be sent before it — the user would see success and then failure."""
+    async def _boom(message):
+        raise RuntimeError("boom")
+
+    interaction = _SlashRunInteraction(b.OWNER_USER_ID + 1)
+    with pytest.raises(RuntimeError):
+        asyncio.run(b._slash_run(interaction, _boom))
+    assert interaction.followups == [], interaction.followups
+
+
+def test_slash_run_explains_a_refused_write_and_an_unreadable_queue(monkeypatch):
+    """The two explained aborts each get a clear reply, count one error and get no "done".
+    A non-owner never sees the raw exception."""
+    async def _refused(message):
+        raise b._UndoBackupUnavailable(Path("todo_prompt.md"), OSError("secret path"))
+
+    async def _not_utf8(message):
+        raise b._QueueFileNotUtf8(Path("todo_prompt.md"),
+                                  UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"))
+
+    for handler, phrase in ((_refused, "這次沒有寫入"), (_not_utf8, "不是 UTF-8")):
+        before = b._METRICS_ERRORS
+        interaction = _run_slash(handler)
+        assert len(interaction.followups) == 1 and phrase in interaction.followups[0], (
+            interaction.followups)
+        assert "secret path" not in interaction.followups[0]
+        assert b._METRICS_ERRORS == before + 1
+
+
+def test_slash_run_acks_first_when_asked_to_detach():
+    """A long command spends the followup first; every later reply goes to the channel
+    (the interaction token expires after 15 minutes)."""
+    async def _long(message):
+        await message.reply("later")
+
+    interaction = _run_slash(_long, detach_ack="⏳ started")
+    assert interaction.followups == ["⏳ started"]
+    assert interaction.channel_sent == ["later"]
+
+
+def test_slash_run_still_dispatches_when_defer_fails():
+    """An interaction that was already answered (or whose deferral fails) still dispatches."""
+    ran: list = []
+
+    async def _handler(message):
+        ran.append(True)
+
+    _run_slash(_handler, defer_raises=True)
+    assert ran == [True]
+
+
 class _FakeResponse:
     def __init__(self):
         self.sent = []
