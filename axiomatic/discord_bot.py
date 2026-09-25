@@ -13648,8 +13648,16 @@ async def _reply_uptime(message: discord.Message) -> None:
 
 
 async def _reply_ping(message: discord.Message) -> None:
-    latency_ms = round(client.latency * 1000)
-    await safe_reply(message, f"pong (WebSocket latency: {latency_ms}ms)")
+    """`/ping`: report the heartbeat latency to the platform.
+
+    The library returns NaN before there is a connection and infinity before the first
+    heartbeat is acknowledged (both by design, not errors), and `round()` raises on both —
+    someone who ran `/ping` right after connecting used to get only a generic error."""
+    latency = client.latency
+    if not math.isfinite(latency):
+        await safe_reply(message, "pong (WebSocket latency: not measured yet)")
+        return
+    await safe_reply(message, f"pong (WebSocket latency: {round(latency * 1000)}ms)")
 
 
 async def _reply_roll(message: discord.Message, rest: str) -> None:

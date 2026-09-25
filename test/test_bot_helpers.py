@@ -6579,6 +6579,22 @@ def test_every_help_chunk_fits_the_platform_message_limit(lang):
 # 這是 2026-08-19 之後**所有**斜線指令都會經過的唯一一道閘。它同時做四件事：
 # 頻道閘、角色閘、指令計數、稽核紀錄；順序與 `on_message` 的 `!` 派發器一致
 # （拒絕的請求不計數也不稽核）。改壞這裡等於一次改壞 261 個指令的權限。
+def test_ping_answers_before_the_first_heartbeat(monkeypatch):
+    """Latency is NaN with no connection and infinity before the first heartbeat; both must
+    get a reply, not an exception."""
+    for latency, expected in ((float("nan"), "not measured yet"), (float("inf"), "not measured yet"),
+                              (0.0421, "42ms")):
+        sent: list = []
+
+        async def _reply(_message, content=None, **_kw):
+            sent.append(content)
+
+        monkeypatch.setattr(b, "safe_reply", _reply)
+        monkeypatch.setattr(b, "client", types.SimpleNamespace(latency=latency))
+        _sr_run(b._reply_ping(types.SimpleNamespace()))
+        assert len(sent) == 1 and expected in sent[0], (latency, sent)
+
+
 def _calc(monkeypatch, expr):
     sent: list = []
 
