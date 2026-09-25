@@ -6579,6 +6579,40 @@ def test_every_help_chunk_fits_the_platform_message_limit(lang):
 # 這是 2026-08-19 之後**所有**斜線指令都會經過的唯一一道閘。它同時做四件事：
 # 頻道閘、角色閘、指令計數、稽核紀錄；順序與 `on_message` 的 `!` 派發器一致
 # （拒絕的請求不計數也不稽核）。改壞這裡等於一次改壞 261 個指令的權限。
+def _calc(monkeypatch, expr):
+    sent: list = []
+
+    async def _reply(_message, content=None, **_kw):
+        sent.append(content)
+
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    _sr_run(b.mcmd_calc(types.SimpleNamespace(), expr))
+    return sent[-1]
+
+
+def test_calc_refuses_a_power_that_would_stall_the_bot(monkeypatch):
+    """The sandbox's default power limit only checks operands: `9**3999999` takes 3.3 s, on the
+    event loop, in a public command."""
+    import time as _time
+    started = _time.perf_counter()
+    reply = _calc(monkeypatch, "(9**3999999)*(9**3999999)")
+    assert _time.perf_counter() - started < 3.0
+    assert reply.startswith("calc error"), reply
+    assert b._simpleeval_module.MAX_POWER == b.CALC_MAX_POWER
+    for everyday, expected in (("2**64", "= **18446744073709551616**"), ("10**18", "= **1000000000000000000**")):
+        assert _calc(monkeypatch, everyday) == expected
+
+
+def test_calc_describes_a_result_too_long_to_show(monkeypatch):
+    """An integer over 4300 digits makes even `str()` raise; a too-long result reports its digit
+    count instead of a generic error."""
+    reply = _calc(monkeypatch, "4000**4000")
+    assert "digits" in reply and "14," in reply, reply
+    assert _calc(monkeypatch, "10**1900").startswith("= a number with about 1,901 digits")
+    assert b._calc_result_line(True) == "= **True**"
+    assert b._calc_result_line("x" * 5000).endswith("…**")
+
+
 class _TimerEnv:
     """Minimal `/fun timer` environment: replies and scheduled work are recorded, not awaited."""
 

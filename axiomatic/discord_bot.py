@@ -332,8 +332,20 @@ try:
 except Exception:  # pylint: disable=broad-except
     pyfiglet = None  # type: ignore
 
+# `/fun calc` power limit (base and exponent each). The sandbox's own default is 4,000,000
+# and it checks operand size, not result size: `9**3999999` builds a multi-million-digit
+# integer and costs 3.3 s on the event loop, and the 500-char input fits thirty of them —
+# one public command could stall the whole bot for nearly two minutes. At 4000 the worst
+# 500-char expression measured 0.44 s; everyday sums (`2**64`, `1.05**30`, `10**18`) are
+# unaffected. This is the package's documented module-level setting; the call site still
+# passes only the expression, so the "unreachable" premise for the three simpleeval
+# advisories in `requirements.txt` holds (`test_dependency_floors` guards the call site).
+CALC_MAX_POWER = 4000
+
 try:
+    import simpleeval as _simpleeval_module  # type: ignore
     from simpleeval import simple_eval as _simple_eval  # type: ignore
+    _simpleeval_module.MAX_POWER = CALC_MAX_POWER
 except Exception:  # pylint: disable=broad-except
     _simple_eval = None  # type: ignore
 
@@ -3817,9 +3829,10 @@ async def mcmd_calc(message: discord.Message, rest: str) -> None:
         await safe_reply(message, "usage: `/fun calc <expression>`  e.g. `/fun calc 2+2*3`")
         return
     # Defence-in-depth on this public (cross-channel) surface: cap input length
-    # before eval. simpleeval already guards the usual DoS vectors (** power
-    # limit, string-multiply MAX_STRING_LENGTH, no compound types / imports),
-    # this just bounds parse cost on pathological input.
+    # before eval. simpleeval guards string-multiply (MAX_STRING_LENGTH), compound
+    # types and imports; its own ** limit only bounds the operands, not the result,
+    # which is why `CALC_MAX_POWER` lowers it (see the import block). This cap
+    # bounds parse cost and how many terms one expression can chain.
     if len(rest) > 500:
         await safe_reply(message, "calc error: `expression too long (max 500 chars)`")
         return
@@ -3829,7 +3842,26 @@ async def mcmd_calc(message: discord.Message, rest: str) -> None:
         print(f"calc error: {error!r}", file=sys.stderr)
         await safe_reply(message, f"calc error: `{type(error).__name__}`")
         return
-    await safe_reply(message, f"= **{result}**")
+    await safe_reply(message, _calc_result_line(result))
+
+
+def _calc_result_line(result) -> str:
+    """The `/fun calc` reply. A too-long result is not forced through: an integer over 4300
+    digits makes even `str()` raise (CPython's int-string limit), which used to turn the whole
+    command into a generic error."""
+    try:
+        shown = f"{result}"
+    except ValueError:
+        shown = None
+    if isinstance(result, int) and not isinstance(result, bool) and (
+            shown is None or len(shown) > 1800):
+        digits = int(abs(result).bit_length() * 0.30102999566398) + 1
+        return f"= a number with about {digits:,} digits (too long to show)"
+    if shown is None:
+        return "calc error: `result cannot be shown`"
+    if len(shown) > 1800:
+        return f"= **{shown[:1800]}…**"
+    return f"= **{shown}**"
 
 
 # ---------- @-mention: free APIs -------------------------------------------
