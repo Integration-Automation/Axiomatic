@@ -19397,6 +19397,77 @@ def test_the_email_scrub_stays_linear_on_hostile_input():
         assert time.perf_counter() - started < 1.0, text[:20]
 
 
+def _web_handlers() -> list[str]:
+    """Every `mcmd_*` / `cmd_*` that calls the external JSON exit — derived from the AST,
+    so a new handler is enrolled automatically."""
+    import ast
+    tree = ast.parse(Path(b.__file__).read_text(encoding="utf-8"))
+    names = []
+    for fn in tree.body:
+        if isinstance(fn, ast.AsyncFunctionDef) and fn.name.startswith(("mcmd_", "cmd_")):
+            called = {c.func.id for c in ast.walk(fn)
+                      if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            if called & {"_http_get_json", "_http_post_json"}:
+                names.append(fn.name)
+    return names
+
+
+def _everywhere(value) -> dict:
+    """An object whose common field names all point at `value`, so a handler gets a bad
+    shape however many levels it reads down."""
+    keys = ("data", "Media", "title", "extract", "content_urls", "desktop", "page", "word",
+            "meanings", "definitions", "definition", "partOfSpeech", "num", "img", "alt", "q",
+            "a", "text", "joke", "message", "full_name", "description", "html_url",
+            "stargazers_count", "forks_count", "open_issues_count", "language", "owner",
+            "avatar_url", "coins", "id", "name", "symbol", "usd", "twd", "counts", "posts",
+            "body", "siteUrl", "episodes", "seasonYear", "averageScore", "status")
+    return {key: value for key in keys}
+
+
+_ODD_VALUES = (None, "text", 7, ["x"], {"x": ["y"]}, True)
+_ODD_PAYLOADS = (None, [], ["x"], "text", 5, {}, *(_everywhere(v) for v in _ODD_VALUES),
+                 *([_everywhere(v)] for v in _ODD_VALUES))
+
+
+def test_the_web_handlers_are_derived():
+    """Positive control: the derivation finds the known handlers — an empty list would look
+    exactly like "everything passed"."""
+    names = set(_web_handlers())
+    assert len(names) >= 10 and {"mcmd_wiki", "mcmd_github", "mcmd_anime"} <= names, names
+
+
+@pytest.mark.parametrize("name", _web_handlers())
+def test_every_web_handler_survives_any_response_shape(monkeypatch, name):
+    """A website's response shape is not ours to control: on errors, rate limits or a
+    redesign a field turns into null, a list or a string. Every handler must reply rather than
+    raise — fed malformed shapes one by one, 6 of 12 used to raise."""
+    import inspect
+    payloads = iter(())
+
+    async def _fake(*_a, **_k):
+        return 200, next(payloads)
+
+    sent: list = []
+
+    async def _reply(_message, content=None, **kw):
+        sent.append(content if content is not None else kw.get("embed"))
+
+    monkeypatch.setattr(b, "_http_get_json", _fake)
+    monkeypatch.setattr(b, "_http_post_json", _fake)
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    handler = getattr(b, name)
+    takes_text = len(inspect.signature(handler).parameters) > 1
+    message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.OWNER_USER_ID),
+                                    guild=None, channel=types.SimpleNamespace(id=1))
+    for text in (("", "a/b", "5", "cat ears") if takes_text else (None,)):
+        for payload in _ODD_PAYLOADS:
+            payloads = iter([payload] * 3)
+            sent.clear()
+            args = (message, text) if takes_text else (message,)
+            _sr_run(handler(*args))
+            assert sent, (name, text, payload)
+
+
 _OLD_IQDB_ROW = re.compile(
     r'<a href="(//[^"]+)"[^>]*><img[^>]*></a>.*?(\d+)%\s*similarity', re.DOTALL)
 

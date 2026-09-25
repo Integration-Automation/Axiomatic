@@ -3825,6 +3825,33 @@ def _api_contact_hint(status: int) -> str:
             "這個鍵即可；要放什麼上去是你的決定，程式不會替你挑。）")
 
 
+def _json_dict(value) -> dict:
+    """One level of external JSON: an object comes back as-is; anything else (null, a list,
+    a string, a number) becomes an empty object.
+
+    A website's response shape is not ours to control: on errors, rate limits or a redesign
+    the same field turns into null or another type. The `/web` handlers used to `.get(...)`
+    every level directly, so the first non-object turned the whole command into one generic
+    error (fed malformed shapes one by one, 6 of 12 handlers raised)."""
+    return value if isinstance(value, dict) else {}
+
+
+def _json_list(value) -> list:
+    """Same as `_json_dict`, for lists."""
+    return value if isinstance(value, list) else []
+
+
+def _json_text(value, default: str = "") -> str:
+    """The value if it is a string, otherwise `default`."""
+    return value if isinstance(value, str) else default
+
+
+def _json_count(value) -> int | None:
+    """The value if it is an int (bool excluded), otherwise None. For numbers formatted
+    with `:,` — formatting a string or None that way raises."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 async def mcmd_wiki(message: discord.Message, rest: str) -> None:
     topic = rest.strip()
     if not topic:
@@ -3845,14 +3872,15 @@ async def mcmd_wiki(message: discord.Message, rest: str) -> None:
         await safe_reply(message, _owner_detail(
             message, lambda: generic + _api_contact_hint(status), generic))
         return
-    extract = (data.get("extract") or "").strip()
-    page_url = data.get("content_urls", {}).get("desktop", {}).get("page")
+    data = _json_dict(data)
+    extract = _json_text(data.get("extract")).strip()
+    page_url = _json_text(_json_dict(_json_dict(data.get("content_urls")).get("desktop")).get("page"))
     if not extract:
         await safe_reply(message, "no summary available")
         return
     if len(extract) > 1500:
         extract = extract[:1500] + "…"
-    parts = [f"**{data.get('title', topic)}** — {extract}"]
+    parts = [f"**{_json_text(data.get('title'), topic)}** — {extract}"]
     if page_url:
         parts.append(f"<{page_url}>")
     await safe_reply(message, "\n".join(parts))
@@ -3901,14 +3929,15 @@ async def mcmd_dict(message: discord.Message, rest: str) -> None:
         # 服務有回答、而且回答是空的：這才是「沒有這個字」。
         await safe_reply(message, f"`{word}` not found")
         return
-    entry = data[0]
-    rows = [f"**{entry.get('word', word)}**"]
-    for meaning in entry.get("meanings", [])[:3]:
-        pos = meaning.get("partOfSpeech", "?")
-        defs = meaning.get("definitions", [])
-        if not defs:
+    entry = _json_dict(data[0])
+    rows = [f"**{_json_text(entry.get('word'), word)}**"]
+    for meaning in _json_list(entry.get("meanings"))[:3]:
+        meaning = _json_dict(meaning)
+        pos = _json_text(meaning.get("partOfSpeech"), "?")
+        defs = _json_list(meaning.get("definitions"))
+        d = _json_text(_json_dict(defs[0]).get("definition")) if defs else ""
+        if not d:
             continue
-        d = defs[0].get("definition", "")
         rows.append(f"_{pos}_: {d}")
     if len(rows) == 1:
         await safe_reply(message, "no definitions in response")
@@ -3930,19 +3959,21 @@ async def mcmd_xkcd(message: discord.Message, rest: str) -> None:
         url = f"https://xkcd.com/{num}/info.0.json"
     else:
         status, latest = await _http_get_json("https://xkcd.com/info.0.json")
-        if status != 200 or not latest:
+        newest = _json_count(_json_dict(latest).get("num"))
+        if status != 200 or not newest or newest < 1:
             await safe_reply(message, "could not reach xkcd")
             return
-        num = random.randint(1, latest.get("num", 1))
+        num = random.randint(1, newest)
         url = f"https://xkcd.com/{num}/info.0.json"
     status, data = await _http_get_json(url)
+    data = _json_dict(data)
     if status != 200 or not data:
         await safe_reply(message, f"xkcd #{num} fetch failed")
         return
-    title = data.get("title", "(no title)")
-    img = data.get("img", "")
-    alt = data.get("alt", "")
-    num_actual = data.get("num", num)
+    title = _json_text(data.get("title"), "(no title)")
+    img = _json_text(data.get("img"))
+    alt = _json_text(data.get("alt"))
+    num_actual = _json_count(data.get("num")) or num
     embed = discord.Embed(
         title=f"xkcd #{num_actual}: {title}",
         description=alt,
@@ -3959,8 +3990,9 @@ async def mcmd_quote(message: discord.Message) -> None:
     if status != 200 or not isinstance(data, list) or not data:
         await safe_reply(message, "quote fetch failed")
         return
-    q = data[0].get("q", "")
-    a = data[0].get("a", "Unknown")
+    first = _json_dict(data[0])
+    q = _json_text(first.get("q"))
+    a = _json_text(first.get("a"), "Unknown")
     embed = discord.Embed(description=f"_{q}_", color=0xEEEEEE)
     embed.set_footer(text=f"— {a}")
     await safe_reply(message, embed=embed)
@@ -3970,10 +4002,11 @@ async def mcmd_fact(message: discord.Message) -> None:
     status, data = await _http_get_json(
         "https://uselessfacts.jsph.pl/random.json?language=en"
     )
-    if status != 200 or not data:
+    text = _json_text(_json_dict(data).get("text"))
+    if status != 200 or not text:
         await safe_reply(message, "fact fetch failed")
         return
-    await safe_reply(message, f"💡 {data.get('text', '?')}")
+    await safe_reply(message, f"💡 {text}")
 
 
 async def mcmd_joke(message: discord.Message) -> None:
@@ -3981,10 +4014,11 @@ async def mcmd_joke(message: discord.Message) -> None:
         "https://icanhazdadjoke.com/",
         headers={"Accept": "application/json", "User-Agent": "axiomatic-bot"},
     )
-    if status != 200 or not data:
+    joke = _json_text(_json_dict(data).get("joke"))
+    if status != 200 or not joke:
         await safe_reply(message, "joke fetch failed")
         return
-    await safe_reply(message, f"😂 {data.get('joke', '?')}")
+    await safe_reply(message, f"😂 {joke}")
 
 
 async def mcmd_cat(message: discord.Message) -> None:
@@ -3996,10 +4030,11 @@ async def mcmd_dog(message: discord.Message) -> None:
     status, data = await _http_get_json(
         "https://dog.ceo/api/breeds/image/random"
     )
-    if status != 200 or not data or "message" not in data:
+    image = _json_text(_json_dict(data).get("message"))
+    if status != 200 or not image:
         await safe_reply(message, "dog fetch failed")
         return
-    await safe_reply(message, f"🐶 {data['message']}")
+    await safe_reply(message, f"🐶 {image}")
 
 
 # `/web anime` 那一次 GraphQL POST 的逾時。有名字是為了**對帳**：外部端點的驗證腳本
@@ -4069,25 +4104,26 @@ async def mcmd_github(message: discord.Message, rest: str) -> None:
     status, data = await _http_get_json(
         f"https://api.github.com/repos/{urllib.parse.quote(repo)}"
     )
+    data = _json_dict(data)
     if status != 200 or not data:
         await safe_reply(message, f"github lookup failed (HTTP {status})")
         return
+
+    def _count(key: str) -> str:
+        value = _json_count(data.get(key))
+        return "?" if value is None else f"{value:,}"
+
     embed = discord.Embed(
-        title=data.get("full_name", "?"),
-        description=data.get("description") or "_(no description)_",
-        url=data.get("html_url"),
+        title=_json_text(data.get("full_name"), "?"),
+        description=_json_text(data.get("description")) or "_(no description)_",
+        url=_json_text(data.get("html_url")) or None,
         color=0x24292E,
     )
-    embed.add_field(name="⭐ stars", value=f"{data.get('stargazers_count', 0):,}", inline=True)
-    embed.add_field(name="🍴 forks", value=f"{data.get('forks_count', 0):,}", inline=True)
-    embed.add_field(
-        name="💬 issues",
-        value=f"{data.get('open_issues_count', 0):,}",
-        inline=True,
-    )
-    embed.add_field(name="🧰 language", value=data.get("language") or "?", inline=True)
-    owner = data.get("owner") or {}
-    avatar = owner.get("avatar_url")
+    embed.add_field(name="⭐ stars", value=_count("stargazers_count"), inline=True)
+    embed.add_field(name="🍴 forks", value=_count("forks_count"), inline=True)
+    embed.add_field(name="💬 issues", value=_count("open_issues_count"), inline=True)
+    embed.add_field(name="🧰 language", value=_json_text(data.get("language")) or "?", inline=True)
+    avatar = _json_text(_json_dict(data.get("owner")).get("avatar_url"))
     if avatar:
         embed.set_thumbnail(url=avatar)
     await safe_reply(message, embed=embed)
@@ -4105,24 +4141,30 @@ async def mcmd_crypto(message: discord.Message, rest: str) -> None:
     if status != 200 or not search:
         await safe_reply(message, f"crypto 查詢失敗 (HTTP {status})")
         return
-    coins = search.get("coins") or []
-    if not coins:
+    coins = _json_list(_json_dict(search).get("coins"))
+    coin = _json_dict(coins[0]) if coins else {}
+    coin_id = _json_text(coin.get("id"))
+    if not coin_id:
         await safe_reply(message, f"no coin matching `{sym}`")
         return
-    coin = coins[0]
-    coin_id = coin.get("id")
     status, price = await _http_get_json(
         "https://api.coingecko.com/api/v3/simple/price",
         params={"ids": coin_id, "vs_currencies": "usd,twd"},
     )
-    if status != 200 or not price or coin_id not in price:
+    p = _json_dict(_json_dict(price).get(coin_id))
+    if status != 200 or not p:
         await safe_reply(message, f"price fetch failed for `{coin_id}`")
         return
-    p = price[coin_id]
+
+    def _price(key: str) -> str:
+        value = p.get(key)
+        return (str(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else "?")
+
     await safe_reply(
         message,
-        f"**{coin.get('name')}** ({coin.get('symbol', '').upper()}) — "
-        f"${p.get('usd', '?')} USD / NT${p.get('twd', '?')}"
+        f"**{_json_text(coin.get('name'), coin_id)}** ({_json_text(coin.get('symbol')).upper()}) — "
+        f"${_price('usd')} USD / NT${_price('twd')}"
     )
 
 
@@ -4137,7 +4179,8 @@ async def mcmd_tag_count(message: discord.Message, rest: str) -> None:
     if status != 200 or not data:
         await safe_reply(message, f"tag 查詢失敗 (HTTP {status})")
         return
-    count = data.get("counts", {}).get("posts", "?")
+    count = _json_count(_json_dict(_json_dict(data).get("counts")).get("posts"))
+    count = "?" if count is None else count
     await safe_reply(message, f"`{tag}` → **{count}** 筆貼文")
 
 
@@ -4152,7 +4195,7 @@ async def mcmd_booru_wiki(message: discord.Message, rest: str) -> None:
     if status != 200 or not data:
         await safe_reply(message, f"no wiki for `{tag}` (HTTP {status})")
         return
-    body = (data.get("body") or "").strip()
+    body = _json_text(_json_dict(data).get("body")).strip()
     if not body:
         await safe_reply(message, f"`{tag}` has no wiki body")
         return
