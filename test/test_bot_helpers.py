@@ -6696,6 +6696,57 @@ def test_the_grid_says_so_when_nothing_could_be_downloaded(monkeypatch):
     assert "無法下載" in sent[0][0]
 
 
+def test_every_pause_the_bot_writes_is_one_the_batch_understands(monkeypatch, tmp_path):
+    """The pause marker is a cross-process contract: the bot writes it, the batch reads it. The
+    batch treats a `mode` it does **not** recognise as no pause at all, so once the two sides
+    disagree on a name, `/gen pause` silently does nothing. This feeds the markers the real
+    `cmd_pause` writes to the real `wait_if_paused` (every side effect redirected to tmp)."""
+    marker = tmp_path / "webrunner.pause"
+    monkeypatch.setattr(b, "WEBRUNNER_PAUSE_FILE", marker)
+    monkeypatch.setattr(ws, "WEBRUNNER_PAUSE_FILE", marker)
+    monkeypatch.setattr(ws, "emit_event", lambda *_a, **_k: None)
+    monkeypatch.setattr(b, "_webrunner_alive", lambda: True)
+    sent: list = []
+
+    async def _reply(_message, content=None, **_kw):
+        sent.append(content)
+
+    monkeypatch.setattr(b, "safe_reply", _reply)
+
+    class _Blocked(Exception):
+        pass
+
+    def _sleep(_seconds):
+        raise _Blocked()
+
+    monkeypatch.setattr(ws.time, "sleep", _sleep)
+
+    def _blocks_at(label):
+        try:
+            ws.wait_if_paused(label)
+        except _Blocked:
+            return True
+        return False
+
+    def _pause(text):
+        _sr_run(b.cmd_pause(types.SimpleNamespace(), text))
+        assert sent[-1].startswith("⏸️"), sent[-1]
+
+    _pause("")
+    assert _blocks_at("between images"), "'now' must stop at any boundary"
+
+    _pause("after current")
+    assert not _blocks_at("between images"), "finish the current pair first: no stop between images"
+    assert _blocks_at("alice pair")
+
+    _pause("after 2")
+    assert not _blocks_at("alice pair") and not _blocks_at("bob pair")
+    assert _blocks_at("carol pair"), "must stop after two pairs"
+
+    _sr_run(b.cmd_pause(types.SimpleNamespace(), "after " + "9" * 5000))
+    assert sent[-1].startswith("用法"), "a five-thousand-digit pair count must not make the command raise"
+
+
 def test_ping_answers_before_the_first_heartbeat(monkeypatch):
     """Latency is NaN with no connection and infinity before the first heartbeat; both must
     get a reply, not an exception."""

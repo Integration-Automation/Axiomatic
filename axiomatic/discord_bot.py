@@ -16253,7 +16253,9 @@ async def cmd_pause(message: discord.Message, payload: str = "") -> None:
         marker = {"mode": "after_current", "ts": time.time()}
         reply = "⏸️ 已設定跑完目前 pair 後暫停。"
     else:
-        m = re.match(r"^(?:after\s+)?(\d+)$", text)
+        # At most six digits: an unbounded `\d+` makes `int()` raise past 4300 digits
+        # (CPython's int-string limit); a million pairs is far beyond any batch.
+        m = re.match(r"^(?:after\s+)?([0-9]{1,6})$", text)
         if not m:
             await safe_reply(
                 message,
