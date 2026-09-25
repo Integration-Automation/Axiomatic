@@ -3750,10 +3750,21 @@ async def mcmd_ascii(message: discord.Message, rest: str) -> None:
     await safe_reply(message, f"```\n{safe}\n```")
 
 
-_TIMER_RE = re.compile(r"^(\d+)\s*([smh]?)\s*(.*)$", re.IGNORECASE | re.DOTALL)
+# At most six digits: anything longer is over 24 hours anyway, and an unbounded `\d+`
+# makes `int()` raise past 4300 digits (CPython's int-string limit).
+_TIMER_RE = re.compile(r"^([0-9]{1,6})\s*([smh]?)\s*(.*)$", re.IGNORECASE | re.DOTALL)
+# Per-person cap on pending timers. The command is public (no channel or role gate), and
+# every timer is a task sleeping up to 24 hours that posts when it fires — uncapped, one
+# person could queue tens of thousands and use up the bot's send budget within a day.
+TIMER_MAX_PENDING_PER_USER = 10
+_timers_pending: dict[int, int] = {}
 
 
 async def mcmd_timer(message: discord.Message, rest: str) -> None:
+    """`/fun timer <Ns|Nm|Nh> [message]`: pings the caller in the same channel when it fires.
+
+    Timers live only in this process's memory (a restart drops them); at most
+    `TIMER_MAX_PENDING_PER_USER` per person, released when one fires (or fails to send)."""
     m = _TIMER_RE.match(rest.strip())
     if not m:
         await safe_reply(message, "usage: `/fun timer <Ns|Nm|Nh> <message>`")
@@ -3765,12 +3776,20 @@ async def mcmd_timer(message: discord.Message, rest: str) -> None:
     if seconds < 1 or seconds > 24 * 3600:
         await safe_reply(message, "duration must be between 1s and 24h")
         return
+    author = message.author
+    owner_key = getattr(author, "id", None)
+    if _timers_pending.get(owner_key, 0) >= TIMER_MAX_PENDING_PER_USER:
+        await safe_reply(
+            message,
+            f"you already have {TIMER_MAX_PENDING_PER_USER} timers running — "
+            "wait for one to finish first")
+        return
+    _timers_pending[owner_key] = _timers_pending.get(owner_key, 0) + 1
     await safe_reply(
         message,
         f"⏰ will ping you in {_format_duration(seconds)} — `{msg[:200]}`"
     )
 
-    author = message.author
     channel = message.channel
 
     async def _fire():
@@ -3780,6 +3799,12 @@ async def mcmd_timer(message: discord.Message, rest: str) -> None:
                                allowed_mentions=_mentions_for(author))
         except Exception as error:  # pylint: disable=broad-except
             print(f"timer fire failed: {error!r}", file=sys.stderr)
+        finally:
+            left = _timers_pending.get(owner_key, 1) - 1
+            if left > 0:
+                _timers_pending[owner_key] = left
+            else:
+                _timers_pending.pop(owner_key, None)
 
     _schedule_coro(_fire(), label="timer")
 

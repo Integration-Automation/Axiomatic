@@ -6579,6 +6579,63 @@ def test_every_help_chunk_fits_the_platform_message_limit(lang):
 # 這是 2026-08-19 之後**所有**斜線指令都會經過的唯一一道閘。它同時做四件事：
 # 頻道閘、角色閘、指令計數、稽核紀錄；順序與 `on_message` 的 `!` 派發器一致
 # （拒絕的請求不計數也不稽核）。改壞這裡等於一次改壞 261 個指令的權限。
+class _TimerEnv:
+    """Minimal `/fun timer` environment: replies and scheduled work are recorded, not awaited."""
+
+    def __init__(self, monkeypatch):
+        self.sent: list = []
+        self.scheduled: list = []
+
+        async def _reply(_message, content=None, **_kw):
+            self.sent.append(content)
+
+        def _schedule(coro, *, label=""):
+            self.scheduled.append(coro)
+
+        monkeypatch.setattr(b, "safe_reply", _reply)
+        monkeypatch.setattr(b, "_schedule_coro", _schedule)
+        monkeypatch.setattr(b, "_timers_pending", {})
+
+    def run(self, text, uid=5):
+        async def _send(*_a, **_k):
+            return None
+        message = types.SimpleNamespace(
+            author=types.SimpleNamespace(id=uid, mention=f"<@{uid}>"),
+            channel=types.SimpleNamespace(send=_send))
+        _sr_run(b.mcmd_timer(message, text))
+        return self.sent[-1]
+
+
+def test_a_timer_with_an_absurdly_long_number_gets_the_usage_line(monkeypatch):
+    """With an unbounded `\\d+`, a number over 4300 digits made `int()` raise and the command
+    fell back to a generic error."""
+    env = _TimerEnv(monkeypatch)
+    refusals = ("usage", "duration must be between 1s and 24h")
+    for text in ("9" * 5000 + "s hi", "1234567s", "999999s"):
+        assert env.run(text).startswith(refusals), text[:20]
+    assert env.scheduled == []
+
+
+def test_timers_per_user_are_capped_and_the_slot_comes_back(monkeypatch):
+    """A public command: without a cap one person could queue tens of thousands of timers that
+    fire a day later. The slot must come back once a timer fires."""
+    env = _TimerEnv(monkeypatch)
+    cap = b.TIMER_MAX_PENDING_PER_USER
+    for _ in range(cap):
+        assert env.run("1s ok").startswith("⏰")
+    assert "already have" in env.run("1s one more")
+    assert env.run("1s other person", uid=6).startswith("⏰"), "the cap is per person"
+    assert len(env.scheduled) == cap + 1
+
+    async def _fire_one():
+        await asyncio.wait_for(env.scheduled.pop(0), 5)
+
+    _sr_run(_fire_one())
+    assert env.run("1s after one fired").startswith("⏰")
+    for coro in env.scheduled:
+        coro.close()
+
+
 class _SlashRunInteraction:
     """The attributes `_slash_run` touches: deferral, the first followup, then the channel."""
 
