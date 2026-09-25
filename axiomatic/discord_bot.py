@@ -4428,6 +4428,25 @@ def _grid_open_image(data: bytes):
     return img.convert("RGB")
 
 
+# The grid's image URLs come from the API response (`large_file_url` and friends), not from
+# us. They used to be fetched as given, so a tampered or broken response could send the bot
+# to `http://127.0.0.1:…` or an internal address. Only the image host's own domain, over https.
+GRID_IMAGE_HOST_SUFFIX = "donmai.us"
+
+
+def _grid_image_url_ok(url) -> bool:
+    """Whether this URL may be downloaded as a grid cell: https, on the image host's own domain."""
+    if not isinstance(url, str):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and (
+        host == GRID_IMAGE_HOST_SUFFIX or host.endswith("." + GRID_IMAGE_HOST_SUFFIX))
+
+
 async def _send_danbooru_grid(
     message: discord.Message, tags: str, *, latest: bool = True
 ) -> None:
@@ -4489,6 +4508,10 @@ async def _send_danbooru_grid(
                     or p.get("preview_file_url")
                 )
                 if not url:
+                    continue
+                if not _grid_image_url_ok(url):
+                    print(f"grid image url refused (not the image host over https) "
+                          f"for post {p.get('id')}", file=sys.stderr)
                     continue
                 try:
                     async with session.get(url, headers=headers) as r:

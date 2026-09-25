@@ -6579,6 +6579,123 @@ def test_every_help_chunk_fits_the_platform_message_limit(lang):
 # 這是 2026-08-19 之後**所有**斜線指令都會經過的唯一一道閘。它同時做四件事：
 # 頻道閘、角色閘、指令計數、稽核紀錄；順序與 `on_message` 的 `!` 派發器一致
 # （拒絕的請求不計數也不稽核）。改壞這裡等於一次改壞 261 個指令的權限。
+@pytest.mark.parametrize("url, ok", [
+    ("https://cdn.donmai.us/sample/ab/cd/x.jpg", True),
+    ("https://donmai.us/x.png", True),
+    ("http://cdn.donmai.us/x.jpg", False),
+    ("https://cdn.donmai.us.evil.example/x.jpg", False),
+    ("https://evil-donmai.us/x.jpg", False),
+    ("https://127.0.0.1:8765/x.png", False),
+    ("file:///C:/secret.png", False),
+    (None, False), (5, False), ("https://[::1/x", False),
+])
+def test_a_grid_image_url_must_be_the_image_host_over_https(url, ok):
+    """The URL comes from the API response. A bad response must not make the bot hit a
+    local or internal address."""
+    assert b._grid_image_url_ok(url) is ok
+
+
+def _png_bytes(size=(8, 8)):
+    import io
+    from PIL import Image
+    buffer = io.BytesIO()
+    Image.new("RGB", size, (200, 10, 10)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+class _GridContent:
+    def __init__(self, data):
+        self._data = data
+        self.reads = 0
+
+    async def read(self, n=-1):
+        self.reads += 1
+        chunk, self._data = self._data[:n], self._data[n:]
+        return chunk
+
+
+class _GridResponse:
+    def __init__(self, status, data, declared=None):
+        self.status = status
+        self.content = _GridContent(data)
+        self.content_length = declared
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _grid_env(monkeypatch, posts, responses):
+    """Minimal `_send_danbooru_grid` environment: tag resolution, the post list and the
+    downloads are all fakes; nothing touches the network."""
+    requested: list = []
+    sent: list = []
+
+    class _Session:
+        def __init__(self, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def get(self, url, **_kw):
+            requested.append(url)
+            return responses[url]
+
+    async def _resolve(_api, _raw):
+        return None
+
+    async def _latest(_tag, limit):
+        return posts
+
+    async def _reply(_message, content=None, **kw):
+        sent.append((content, kw.get("file")))
+
+    monkeypatch.setattr(b, "_resolve_fuzzy_tags", _resolve)
+    monkeypatch.setattr(b, "_fetch_danbooru_posts_latest", _latest)
+    monkeypatch.setattr(b.aiohttp, "ClientSession", _Session)
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    return requested, sent
+
+
+def test_the_grid_downloads_only_what_it_can_use(monkeypatch):
+    """Four cells: one fine, one 404, one declaring more than the byte cap, one whose URL is
+    not the image host — that last one must not even be requested. The result is a 1-up grid
+    listing only the post that worked.
+
+    The 404 and over-cap cells both carry a body that IS a valid image: with an undecodable
+    body the decode failure alone skips the cell, and removing the status and declared-size
+    checks stays green (the first version did exactly that; two mutants survived)."""
+    good = "https://cdn.donmai.us/a.png"
+    missing = "https://cdn.donmai.us/b.png"
+    huge = "https://cdn.donmai.us/c.png"
+    posts = [{"id": 1, "large_file_url": good}, {"id": 2, "file_url": missing},
+             {"id": 3, "file_url": huge}, {"id": 4, "file_url": "http://127.0.0.1:8765/x.png"}]
+    responses = {good: _GridResponse(200, _png_bytes()),
+                 missing: _GridResponse(404, _png_bytes()),
+                 huge: _GridResponse(200, _png_bytes(), declared=b.GRID_MAX_IMAGE_BYTES + 1)}
+    requested, sent = _grid_env(monkeypatch, posts, responses)
+    _sr_run(b._send_danbooru_grid(types.SimpleNamespace(), "cat_ears"))
+    assert requested == [good, missing, huge], requested
+    assert len(sent) == 1 and sent[0][1] is not None, sent
+    assert "1-up" in sent[0][0] and "#1" in sent[0][0], sent[0][0]
+    assert "#2" not in sent[0][0] and "#3" not in sent[0][0], sent[0][0]
+    assert responses[huge].content.reads == 0, "a response declaring more than the cap must not be read"
+
+
+def test_the_grid_says_so_when_nothing_could_be_downloaded(monkeypatch):
+    posts = [{"id": 9, "file_url": "https://example.com/x.png"}]
+    requested, sent = _grid_env(monkeypatch, posts, {})
+    _sr_run(b._send_danbooru_grid(types.SimpleNamespace(), "cat_ears"))
+    assert requested == [] and len(sent) == 1 and sent[0][1] is None, sent
+    assert "無法下載" in sent[0][0]
+
+
 def test_ping_answers_before_the_first_heartbeat(monkeypatch):
     """Latency is NaN with no connection and infinity before the first heartbeat; both must
     get a reply, not an exception."""
