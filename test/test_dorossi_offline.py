@@ -101,7 +101,7 @@ def test_a_server_overload_still_wins_over_the_network_words():
 
 def test_the_verdict_docstring_lists_the_new_branch_in_order():
     doc = db._claude_stream_verdict.__doc__
-    assert "CLI 拒絕旗標 → 連不上伺服器 → resume 重試" in doc
+    assert "CLI rejects a flag → cannot reach the server → resume retry" in doc
 
 
 @pytest.mark.parametrize("blob, expected", [

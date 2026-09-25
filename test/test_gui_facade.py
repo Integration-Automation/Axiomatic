@@ -379,13 +379,14 @@ def test_exception_names_matched_by_string_still_exist():
 #
 #     if type(error).__name__ == "AccessibilityNotAvailableError":
 #         if "window title" in str(error):
-#             raise GuiError("找不到符合的視窗。") from error
-#         raise GuiError("UI 元素定位功能無法在此環境使用。") from error
+#             raise GuiError("No matching window was found.") from error
+#         raise GuiError("UI element location is unavailable in this environment.") from error
 #
 # 第一層有守門、第二層沒有——本 repo 同一週已經記過兩次這個形狀（DoD #3 的兩個
 # 半句、§Git Commits 的五份語料）。而這一層的退化**比第一層更糟**：型別改名只是
-# 把話講得比較泛，訊息改字卻會把「找不到符合的視窗」（使用者改得了：標題打錯）
-# 換成「UI 元素定位功能無法在此環境使用」（死路：這台機器不支援）。使用者會去查
+# 把話講得比較泛，訊息改字卻會把「No matching window was found.」（使用者改得了：
+# 標題打錯）換成「UI element location is unavailable in this environment.」（死路：
+# 這台機器不支援）。使用者會去查
 # 一個不存在的環境問題。
 #
 # 它也比型別名字更容易壞：例外**訊息**是任何函式庫裡最隨手會被改的字串，而這個
@@ -504,7 +505,7 @@ def test_every_message_substring_still_discriminates():
     """兩個方向都要成立：至少命中一個，而且不能全部命中。
 
     只檢查「至少命中一個」的話，套件把每一則訊息都寫上那個字也會過，而那時每一種
-    失敗都會被講成「找不到符合的視窗」——判別性沒了，症狀卻是零。
+    失敗都會被講成「No matching window was found.」——判別性沒了，症狀卻是零。
     """
     tree = _parse_gui_control()
     package_root = Path(AC.__file__).resolve().parent

@@ -1,32 +1,41 @@
-"""Dorossi 後端：Claude Code／Anthropic API 叫用、工作階段持久化與純邏輯（P5 重構）。
+"""Dorossi backend: Claude Code / Anthropic API invocation, session persistence and pure logic (P5 refactor).
 
-P5 重構：把 `discord_bot.py` 裡 `@bot Dorossi` 的**後端與純邏輯**抽出來。判準與
-P1/P2/P4 相同——「回傳資料／純邏輯／不綁 discord 物件的後端叫用」搬出，「產生
-Discord 回覆、或與 bot runtime 狀態（鎖、佇列、自走全域旗標、live 串流訊息、
-discord channel）糾纏的 orchestration」留在 bot。
+P5 refactor: extract the **backend and pure logic** of `@bot Dorossi` out of
+`discord_bot.py`. The criterion is the same as P1/P2/P4 -- "returns data / pure
+logic / backend invocation not bound to discord objects" moves out, while
+"orchestration that produces a Discord reply, or is entangled with bot runtime
+state (locks, queues, the autonomous-loop global flag, live streaming messages,
+the discord channel)" stays in the bot.
 
-搬進本模組（無 discord、無 bot 可變全域）：
-  * Dorossi 後端設定常數（由 bot_config 衍生）、系統提示、自走迴圈的提示／哨符
-    語料、意圖片語比對。
-  * 多 session 工作階段儲存（載入／存檔／遷移／存取輔助，純 JSON 邏輯）。
-  * 後端叫用本身：claude_code（`claude -p` 串流＋兩段式看門狗＋自走輸出沉默
-    backstop＋預算閘）、Anthropic API；以及 usage-limit／budget／round-info／
-    壓縮觸發等純判定輔助。
-  * 三個型別化例外（_DorossiResumeError／_DorossiLoopSilence／
-    _DorossiUsageLimitError），由後端叫用 raise、由 bot orchestration 接住。
+Moved into this module (no discord, no mutable bot globals):
+  * Dorossi backend configuration constants (derived from bot_config), the
+    system prompt, the autonomous-loop prompt / sentinel corpus, and intent
+    phrase matching.
+  * Multi-session storage (load / save / migrate / accessor helpers, pure JSON
+    logic).
+  * The backend invocation itself: claude_code (`claude -p` streaming + a
+    two-stage watchdog + an autonomous-output silence backstop + a budget gate)
+    and the Anthropic API; plus pure decision helpers for usage-limit / budget /
+    round-info / compaction triggering.
+  * Three typed exceptions (_DorossiResumeError / _DorossiLoopSilence /
+    _DorossiUsageLimitError), raised by the backend invocation and caught by the
+    bot's orchestration.
 
-留在 `discord_bot.py`（與 discord／runtime 糾纏）：mcmd_dorossi／
-_dorossi_process_turn／_dorossi_run_loop／_dorossi_loop_one_round／mcmd_session／
-mcmd_abort、live 串流（_DorossiLiveMessage）、佇列鎖／waiter／自走全域旗標／中途
-注入緩衝、Discord 回覆組裝（_dorossi_error_hint／_dorossi_usage_limit_reply／
-_dorossi_render_session_list／_dorossi_apply_session_action）、owner 閘
-（_dorossi_loop_gate_open／_dorossi_should_loop）、DOROSSI_USER_ID／OWNER_USER_ID。
+Left in `discord_bot.py` (entangled with discord / runtime): mcmd_dorossi /
+_dorossi_process_turn / _dorossi_run_loop / _dorossi_loop_one_round / mcmd_session /
+mcmd_abort, the live stream (_DorossiLiveMessage), the queue lock / waiter / the
+autonomous-loop global flag / the mid-flight injection buffer, Discord reply
+assembly (_dorossi_error_hint / _dorossi_usage_limit_reply /
+_dorossi_render_session_list / _dorossi_apply_session_action), the owner gate
+(_dorossi_loop_gate_open / _dorossi_should_loop), DOROSSI_USER_ID / OWNER_USER_ID.
 
-模組邊界（CLAUDE.md 硬規則）：被動共用模組，可被 bot import；**不可**
-`import discord_bot`（循環），也**不可** import webrunner 腳本。本模組完全不碰
-discord，也不組任何送往 Discord 的回覆字串——失敗一律 print 到 stderr、回傳資料
-／答案或 raise 型別化例外，由 bot 端組泛用回覆。token 成本守則（B1/B2/B3）與自走
-invariant 都在這裡的後端叫用中維持。
+Module boundary (CLAUDE.md hard rule): a passive shared module, importable by
+the bot; it MUST NOT `import discord_bot` (circular), and MUST NOT import the
+webrunner scripts. This module never touches discord and never assembles any
+reply string bound for Discord -- on failure it always prints to stderr and
+returns data / an answer or raises a typed exception, leaving the bot to
+assemble a generic reply. The token-cost rules (B1/B2/B3) and the autonomous
+invariants are all maintained here in the backend invocations.
 """
 from __future__ import annotations
 
@@ -53,17 +62,22 @@ except Exception:  # pragma: no cover - optional dependency
     AsyncAnthropic = None
 
 from _bot_config import load_bot_config
-# 外部化的 prompt 文字載入器（passive、stdlib-only）。長 prompt 字串搬到版本庫根
-# 目錄下的 bot_prompts/，開機時讀取；缺檔／壞檔回退到下方的 _DEFAULT_* 內建預設值，
-# 故 fresh clone 一定能啟動。檔案內用 {sentinel}/{open_sentinel} 佔位符，載入時由
-# replacements 換回程式內的哨符常數（哨符仍單一來源在程式碼）。
+# Externalised prompt-text loader (passive, stdlib-only). The long prompt strings
+# live under `bot_prompts/` in the repo root, read once at startup; a missing /
+# corrupt file falls back to the built-in `_DEFAULT_*` defaults below, so a fresh
+# clone always starts. The files use {sentinel}/{open_sentinel} placeholders that
+# `replacements` swaps back to the in-code sentinel constants at load time (the
+# sentinels stay single-sourced in code).
 from _bot_prompts import load_prompt
-# 「同一段文字只往 stderr 印一次」（被動共用模組）。後端 CLI 的環境與啟動形狀的警告
-# 每一輪都會再判一次，不去重的話一個放著沒改的環境變數會用同一句話洗掉整份 log。
+# "print the same text to stderr only once" (a passive shared module). The
+# backend CLI's environment- and launch-shape warnings are re-evaluated every
+# round; without dedup an unchanged environment variable would wash out the whole
+# log with the same line.
 from _warn_dedup import warn_once as _warn_once
-# 這個行程的平台身分。工作階段、用量、模型目錄與工作目錄都是**這個行程自己的**
-# 狀態，所以一律落在 `state/<平台>/` 底下——一個平台一個行程，彼此不共用可變狀態，
-# 也就不需要跨行程鎖。
+# This process's platform identity. The sessions, usage log, model catalogue and
+# working directory are all **this process's own** state, so they always land
+# under `state/<platform>/` -- one process per platform, sharing no mutable state
+# with each other, and therefore needing no cross-process lock.
 from _platform_runtime import platform_file as _platform_state
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -73,8 +87,9 @@ BOT_CONFIG = load_bot_config()
 
 
 DOROSSI_BACKEND = BOT_CONFIG["dorossi_backend"]  # "claude_code" | "api"
-# claude_code 後端的工具模式（見 bot_config.json）。"off"（預設）＝純聊天，停用
-# 所有工具；"full" ＝完整 agent（bypassPermissions ＋ 所有工具）。
+# Tool mode for the claude_code backend (see bot_config.json). "off" (the
+# default) = plain chat with every tool disabled; "full" = a complete agent
+# (bypassPermissions + all tools).
 DOROSSI_CC_TOOLS = BOT_CONFIG["dorossi_cc_tools"]  # "off" | "full"
 # Don't cap answer length. The Claude Code backend has no token cap; for the
 # API backend keep a generous non-streaming ceiling (~16K stays under the SDK
@@ -82,49 +97,68 @@ DOROSSI_CC_TOOLS = BOT_CONFIG["dorossi_cc_tools"]  # "off" | "full"
 DOROSSI_MAX_TOKENS = 16000
 DOROSSI_MODEL = "claude-opus-4-8"          # API backend model id
 DOROSSI_CC_MODEL = "opus"                  # Claude Code backend model alias
-# 微調指令（`/effort`、`/model`）的合法值。使用者可在提問「開頭」用這兩個指令設定
-# 思考力度與後端模型；解析後從實際送給後端的提問剝除。**Session 級語意（擁有者
-# 裁決，取代最初的 per-turn 設計）**：指定後寫入該 session 的持久紀錄
-# （dorossi_session.json 的 slot，鍵 tune_effort／tune_model），該輪與之後所有輪
-# （續談、resume 重試、自走每輪、壓縮輪）都沿用，直到被新指令覆蓋；
-# `/effort default`／`/model default` 清除覆寫、回到預設。`/new`／reset 開始的
-# 新脈絡從預設開始（_dorossi_reset_session 會一併清掉 tune_*）；多 session 各自
-# 獨立存自己的值，切換 session 就切換微調。
-# effort 五個值直接對外（皆為通用字彙、不指涉任何後端）。
+# Valid values for the tuning commands (`/effort`, `/model`). The user can set
+# thinking effort and the backend model with these two commands at the **start**
+# of a prompt; they are stripped from the prompt actually sent to the backend
+# after parsing. **Session-level semantics (owner ruling, replacing the original
+# per-turn design)**: once set, the value is written to that session's persistent
+# record (a slot in dorossi_session.json, keys tune_effort / tune_model) and is
+# reused for that round and every later round (follow-up, resume retry, each
+# autonomous round, compaction round) until a new command overrides it;
+# `/effort default` / `/model default` clears the override and returns to the
+# default. A new context started by `/new` / reset begins from the default
+# (_dorossi_reset_session also clears tune_*); each session stores its own value
+# independently, so switching sessions switches the tuning.
+# The five effort values are exposed directly (all generic vocabulary, referring
+# to no backend).
 DOROSSI_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-# `/model` 的合法值（allowlist）。**擁有者裁決（2026-07-02）的窄範圍保密例外**：
-# `/model` 這個功能面（help 合法值清單、錯誤提示、session 列表的模型顯示）可以
-# 直接露出「後端模型別名」，不再用 fast/standard/max 通用階層抽象——僅此一處，
-# 其他保密規則（不露 CLI 佈線、路徑、原始錯誤、其他服務名）全部照舊，不得把這個
-# 例外外推到其他 surface。key＝對外值＝後端模型**別名**；value 為實際帶給 CLI 的
-# 值。**allowlist 驗證不可拿掉**：使用者輸入永不原樣塞進 CLI 參數，只有查表命中的
-# key 會被存／被送。未指定時維持 DOROSSI_CC_MODEL 預設。Session store 存 key；讀取
-# 時查表驗證（_dorossi_session_tuning），store 被手改／表已移除該 key 就自動退回
-# 預設、不會壞。
+# Valid values for `/model` (an allowlist). **A narrow-scope secrecy exception by
+# owner ruling (2026-07-02)**: this `/model` surface (the help list of valid
+# values, error hints, the model display in the session list) may expose the
+# "backend model alias" directly, no longer abstracted behind a fast/standard/max
+# generic tier -- for this one surface only. Every other secrecy rule (never
+# reveal the CLI wiring, paths, raw errors or other service names) stays as-is,
+# and this exception must not be extrapolated to any other surface. key = the
+# externally shown value = the backend model **alias**; value = the value
+# actually passed to the CLI. **The allowlist validation must not be removed**:
+# user input is never dropped verbatim into a CLI argument, only a key that hits
+# the lookup is stored / sent. When unspecified, the DOROSSI_CC_MODEL default
+# holds. The session store keeps the key; on read it is validated against the
+# table (_dorossi_session_tuning), and a hand-edited store / a key removed from
+# the table falls back to the default automatically without breaking.
 #
-# **2026-09-12：key 與 value 從此不再同名恆等**（原本四個 key 全是恆等映射，上面這
-# 段註解當時就寫著「若日後要釘到完整 model id 只改 value」——現在做了）。使用者要能
-# 挑版本，而不是只能拿到「那一族當下最新的那個」。兩種 key 刻意並存：
+# **2026-09-12: key and value are no longer identity-equal** (originally all four
+# keys were identity mappings, and this comment already said back then "to pin to
+# a full model id later, change only the value" -- now done). The user must be
+# able to pick a version, not only get "the current newest one in that family".
+# The two kinds of key deliberately coexist:
 #
-#   * **不帶版本的四個**（`opus`／`sonnet`／`haiku`／`fable`）value 仍是裸別名，語意
-#     是「這一族**當下最新**的那個」——由後端自己解析，所以新模型上線時不必改這張
-#     表就跟得上。想要「永遠最新」的人選這個。
-#   * **帶版本的**釘死成完整 model id，語意是「就是這一版，不會被升級動到」。長期
-#     任務要可重現時選這個。
+#   * **The four without a version** (`opus` / `sonnet` / `haiku` / `fable`) keep
+#     a bare alias as the value, meaning "the **current newest** one in this
+#     family" -- resolved by the backend itself, so a newly released model is
+#     tracked without touching this table. Pick this to always get the latest.
+#   * **The versioned ones** are pinned to a full model id, meaning "exactly this
+#     version, untouched by upgrades". Pick this when a long-running task needs
+#     reproducibility.
 #
-# **value 那一側（完整 model id）永遠不會送進對話平台。** 對外顯示一律走
-# `discord_bot._model_alias_for()`，它做 value → key 的反查；保密裁定（2026-07-02）
-# 放行的是**別名**，不是完整 id，所以 key 必須維持別名形狀，不得直接拿 model id 當
-# key。
+# **The value side (the full model id) is never sent to the chat platform.**
+# External display always goes through `discord_bot._model_alias_for()`, which
+# reverse-maps value -> key; the secrecy ruling (2026-07-02) permits the
+# **alias**, not the full id, so the key must keep its alias shape and a model id
+# must never be used directly as a key.
 #
-# **這張表原本有一個外部上限：斜線指令的靜態選單最多 25 個選項**（對話平台的限制）。
-# 2026-09-23 起 `/dorossi model` 改走 autocomplete（見 `discord_bot`
-# `_dorossi_model_autocomplete`），上限只落在「**單次回應**最多 25 筆」，不再落在這張
-# 表——因為下面那份模型目錄會在執行期把新發現的別名併進來，靜態選單追不上會動的表。
-# 這張表本身可以繼續長。
+# **This table once had an external ceiling: a slash command's static menu holds
+# at most 25 options** (a chat-platform limit). Since 2026-09-23 `/dorossi model`
+# uses autocomplete instead (see `discord_bot` `_dorossi_model_autocomplete`), so
+# the ceiling is only "at most 25 per **single response**" and no longer falls on
+# this table -- because the model catalogue below merges newly discovered aliases
+# in at runtime, and a static menu cannot keep up with a moving table. This table
+# itself may keep growing.
 #
-# 版本字串本身照抄後端 CLI 的模型目錄（`--model` 接受「別名」或「完整名稱」兩種；
-# 不在目錄裡的字串會被 CLI 當場退回 `unrecognized_model`，不是安靜退回預設）。
+# The version strings themselves are copied from the backend CLI's model
+# catalogue (`--model` accepts either an "alias" or a "full name"; a string not
+# in the catalogue is rejected on the spot by the CLI as `unrecognized_model`,
+# not silently dropped to the default).
 DOROSSI_MODEL_CHOICES = {
     "opus": "opus",
     "opus-5": "claude-opus-5",
@@ -141,79 +175,101 @@ DOROSSI_MODEL_CHOICES = {
     "fable-5.1": "claude-fable-5-1",
     "fable-5": "claude-fable-5",
 }
-# 舊版（通用階層抽象時期）可能已存進 session store 的階層 key → 新別名的「讀取時」
-# 對照，讓既有 session 的設定無感遷移（只在讀取端 fallback，不重寫 store；下次下
-# 指令自然覆蓋掉舊 key）。
+# A "read-time" mapping from legacy tier keys (from the generic-tier-abstraction
+# era) possibly already in a session store -> the new aliases, so an existing
+# session's setting migrates transparently (a fallback on the read side only,
+# never rewriting the store; the next command naturally overrides the old key).
 DOROSSI_LEGACY_MODEL_KEYS = {
     "fast": "haiku",
     "standard": "sonnet",
     "max": "opus",
 }
-# 微調指令的「清除」字面值：`/effort default`／`/model default` 把該 session 的
-# 覆寫值清掉、回到預設（effort 沒有「不帶旗標」對應的字面值可打，必須有清除語法）。
+# The tuning commands' "clear" literal: `/effort default` / `/model default`
+# clears that session's override value and returns to the default (effort has no
+# "no-flag" literal to type, so it needs a clear syntax).
 DOROSSI_TUNE_DEFAULT = "default"
 
-# ---- 每個後端一張模型表（2026-09-23） --------------------------------------
-# 上面那張表是 claude 家族的，`claude_code` 與 `api` 兩個後端共用它。**codex 後端
-# 的模型是另一家廠商的名字，一張表服務不了兩邊**——在這之前 `/model` 對 codex 完全
-# 沒有作用（argv 根本不帶 `-m`），而顯示端只會說「後端預設模型」，使用者看不出
-# 自己設的值被丟掉了。
+# ---- One model table per backend (2026-09-23) ------------------------------
+# The table above is the claude family's, shared by the `claude_code` and `api`
+# backends. **The codex backend's models are another vendor's names, and one
+# table cannot serve both** -- before this, `/model` had no effect on codex at
+# all (argv did not even carry `-m`), and the display side only said "the
+# backend's default model", so the user could not tell their chosen value was
+# being dropped.
 #
-# codex 這張表的內容是**量出來的，不是猜的**。2026-09-23 拿本機的 CLI 對這個帳號
-# 實測四個常見的名字（`gpt-5.1-codex`、`gpt-5.1-codex-max`、`gpt-5-codex`、
-# `gpt-5.6-sol-mini`），四個全部被伺服器以 400
-# 「not supported when using Codex with a ChatGPT account」退回；CLI 自己的設定檔
-# 也只列了一個可用模型。**猜名字的代價是使用者選得到、卻要到下一次提問才失敗**，
-# 而他只看得到一句泛用錯誤——那正是這次要修掉的沉默。所以表裡只放證實可用的那一個，
-# 其餘交給每日的模型目錄檢查去發現（見 `dorossi_refresh_model_catalog`）。
+# The contents of this codex table are **measured, not guessed**. On 2026-09-23
+# the local CLI was tested against this account with four common names
+# (`gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5-codex`, `gpt-5.6-sol-mini`), and
+# all four were rejected by the server with a 400 "not supported when using Codex
+# with a ChatGPT account"; the CLI's own config file also listed only one usable
+# model. **The cost of guessing a name is that the user can select it but only
+# fails at the next prompt**, seeing only a generic error -- exactly the silence
+# this change is fixing. So the table holds only the one confirmed-usable model
+# and leaves the rest for the daily model-catalogue check to discover (see
+# `dorossi_refresh_model_catalog`).
 #
-# 命名規則與 claude 那張表同一個形狀、方向相反：codex 的完整 id 是
-# 「廠商-版號-族名」（`gpt-5.6-sol`），所以別名是「族名-版號」（`sol-5.6`）。
-# 別名一律**不含廠商字樣**——保密裁定放行的是別名，不是完整 id，也不是廠商前綴。
+# The naming rule is the same shape as the claude table, in the opposite
+# direction: codex's full id is "vendor-version-family" (`gpt-5.6-sol`), so the
+# alias is "family-version" (`sol-5.6`). Aliases **never contain a vendor word**
+# -- the secrecy ruling permits the alias, not the full id, and not the vendor
+# prefix.
 DOROSSI_CODEX_MODEL_CHOICES = {
     "sol": "sol",
     "sol-5.6": "gpt-5.6-sol",
 }
 
-# 後端 id → 它的模型表。`/model` 只提供、也只接受「目前這個後端吃得下」的值。
+# backend id -> its model table. `/model` offers and accepts only values the
+# current backend can take.
 DOROSSI_BACKEND_MODEL_CHOICES = {
     "claude_code": DOROSSI_MODEL_CHOICES,
     "api": DOROSSI_MODEL_CHOICES,
     "codex": DOROSSI_CODEX_MODEL_CHOICES,
 }
-# 模型目錄的命名空間：兩個後端共用 claude 那張表，所以也共用同一份發現結果。
+# Model-catalogue namespaces: the two backends share the claude table, so they
+# also share the same discovery results.
 DOROSSI_MODEL_NAMESPACES = {
     "claude_code": "claude", "api": "claude", "codex": "codex",
 }
-# **只有這個後端的 CLI 自己認得裸別名**（`--model opus` ＝「這族當下最新的」）。
-# 另外兩個都需要完整 id：api 是把字串原樣當 model 參數送進 SDK，codex 則是原樣送給
-# 伺服器（實測不認得的名字不會退回預設，而是 400）。所以裸別名在那兩個後端要先由
-# 模型目錄換成具體 id——這正是每日檢查存在的第二個理由。
+# **Only this backend's own CLI understands a bare alias** (`--model opus` = "the
+# current newest in this family"). The other two need a full id: api passes the
+# string straight through as the model parameter into the SDK, and codex sends it
+# straight to the server (measured: an unrecognised name is not dropped to the
+# default but returns a 400). So a bare alias must first be turned into a
+# concrete id by the model catalogue for those two backends -- the second reason
+# the daily check exists.
 DOROSSI_BACKENDS_RESOLVING_ALIASES = frozenset({"claude_code"})
 
-# ---- 執行期模型目錄（每日檢查寫、載入時併回內建表） -------------------------
-# 內建表是**地板**：全新 clone 沒有這個檔也照樣有一組可用的別名。每日檢查發現的
-# 東西只會**新增**別名，永遠不覆寫內建的那幾筆。
+# ---- Runtime model catalogue (written by the daily check, merged back into the
+# built-in table at load) ----------------------------------------------------
+# The built-in table is the **floor**: a fresh clone without this file still has
+# a usable set of aliases. What the daily check discovers only **adds** aliases,
+# never overwriting the built-in ones.
 DOROSSI_MODEL_CATALOG_FILE = _platform_state(PROJECT_ROOT / "dorossi_models.json")
 DOROSSI_MODEL_CATALOG_SCHEMA = 1
-# 探測用的族名：裸別名打給 CLI，讀回它**解析成什麼**——那就是「這一族今天最新的
-# 那個」。族名取自內建表裡不帶版號的那幾個 key，不另外手寫一份。
+# The family names used for probing: a bare alias is sent to the CLI and what it
+# **resolves to** is read back -- that is "today's newest in this family". The
+# family names are taken from the version-less keys in the built-in table rather
+# than hand-writing a second copy.
 DOROSSI_MODEL_PROBE_FAMILIES = tuple(
     key for key, value in DOROSSI_MODEL_CHOICES.items() if key == value)
 
-# 完整 model id 的廠商前綴。別名一律把它拿掉。
+# The vendor prefixes on a full model id. An alias always strips it.
 _DOROSSI_MODEL_VENDOR_PREFIXES = ("claude", "gpt")
 _DOROSSI_MODEL_VERSION_RE = re.compile(r"\d+(?:\.\d+)*")
 
 
 def _dorossi_split_model_id(model_id) -> tuple:
-    """完整 model id → `(族名, 版號)`；看不懂就回 `(None, None)`。
+    """Full model id -> `(family, version)`; returns `(None, None)` if unparsable.
 
-    兩家的 id 形狀不同（`claude-opus-5-5` 是「廠商-族-版」，`gpt-5.6-sol` 是
-    「廠商-版-族」），但**位置**不同、**成分**相同：拿掉廠商前綴之後，純數字的片段
-    是版號、其餘是族名。所以這裡不照位置切，照成分分類，兩家共用同一支。
+    The two vendors' id shapes differ (`claude-opus-5-5` is "vendor-family-
+    version", `gpt-5.6-sol` is "vendor-version-family"), but the **positions**
+    differ while the **components** are the same: after stripping the vendor
+    prefix, the purely numeric segment is the version and the rest is the family.
+    So this does not split by position but classifies by component, and both
+    vendors share one implementation.
 
-    純函式、永不 raise（餵進來的是別的行程印出來的字串）。
+    Pure function, never raises (the input is a string printed by another
+    process).
     """
     text = str(model_id or "").strip().lower()
     if not text or not re.fullmatch(r"[a-z0-9.\-]+", text):
@@ -229,9 +285,12 @@ def _dorossi_split_model_id(model_id) -> tuple:
 
 
 def dorossi_model_alias_from_id(model_id) -> str | None:
-    """完整 model id → **別名**（`claude-opus-5-5` → `opus-5.5`）；看不懂回 None。
+    """Full model id -> the **alias** (`claude-opus-5-5` -> `opus-5.5`); None if
+    unparsable.
 
-    這支是顯示與公告的入口：新模型出現時對外只講得出別名，完整 id 一個字都不外送。
+    This is the entry point for display and announcements: when a new model
+    appears, only the alias can be shown externally, and not one character of the
+    full id is ever sent out.
     """
     family, version = _dorossi_split_model_id(model_id)
     if not family:
@@ -240,14 +299,19 @@ def dorossi_model_alias_from_id(model_id) -> str | None:
 
 
 def dorossi_model_id_from_alias(namespace: str, alias: str) -> str | None:
-    """別名 → 完整 model id（兩張表各自的命名規則的**正向**）；不帶版號回 None。
+    """Alias -> full model id (the **forward** direction of each table's naming
+    rule); None if there is no version.
 
-    存在的理由只有一個：合併目錄之前要**驗來回**。只有 `alias → id` 回得到原本那個
-    id 時，新別名才會被併進表裡。少了這一步，一個沒見過的命名形狀（例如把版號排到
-    族名前面）會被併成一個**推導不回去**的條目——allowlist 照樣放行、值照樣存進工作
-    階段，要等下一次提問才由後端退回，而使用者只看得到一句泛用失敗訊息。
-    `test_dorossi_tuning.test_every_value_is_derivable_from_its_own_alias` 釘的就是
-    這條規則，驗來回讓合併進來的條目**依建構**滿足它。
+    There is only one reason it exists: to **verify the round trip** before
+    merging the catalogue. A new alias is merged into the table only when
+    `alias -> id` reproduces the original id. Without this step an unseen naming
+    shape (e.g. the version placed before the family) would be merged as an entry
+    that **cannot be derived back** -- the allowlist would still admit it, the
+    value would still be stored in the session, and it would only be rejected by
+    the backend at the next prompt, while the user sees only a generic failure
+    message. `test_dorossi_tuning.test_every_value_is_derivable_from_its_own_alias`
+    pins exactly this rule, and the round-trip check makes every merged entry
+    satisfy it **by construction**.
     """
     if not isinstance(alias, str) or "-" not in alias:
         return None
@@ -262,7 +326,8 @@ def dorossi_model_id_from_alias(namespace: str, alias: str) -> str | None:
 
 
 def dorossi_load_model_catalog() -> dict:
-    """讀執行期模型目錄。永不 raise——沒有檔／壞掉都只代表「還沒檢查過」。"""
+    """Read the runtime model catalogue. Never raises -- a missing / corrupt file
+    just means "not checked yet"."""
     try:
         text = DOROSSI_MODEL_CATALOG_FILE.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -280,11 +345,14 @@ def dorossi_load_model_catalog() -> dict:
 
 
 def dorossi_save_model_catalog(catalog: dict) -> bool:
-    """原子寫入（同目錄 temp → `os.replace`）。回傳有沒有寫成功，永不 raise。
+    """Atomic write (same-directory temp -> `os.replace`). Returns whether the
+    write succeeded; never raises.
 
-    讀寫都是 bot 自己，列進原子寫入的名單是為了**撐過重啟**：半寫入的檔在下次啟動
-    讀到就是一份安靜退回內建表的目錄，而使用者只會發現「昨天選得到的模型今天不見
-    了」，沒有任何錯誤訊息。
+    Both reader and writer are the bot itself; it is on the atomic-write list to
+    **survive a restart**: a half-written file read at the next startup is a
+    catalogue that silently falls back to the built-in table, and the user only
+    notices that "a model I could pick yesterday is gone today", with no error
+    message at all.
     """
     try:
         tmp = DOROSSI_MODEL_CATALOG_FILE.with_name(
@@ -298,35 +366,47 @@ def dorossi_save_model_catalog(catalog: dict) -> bool:
         return False
 
 
-# 兩張表的聯集。`_dorossi_parse_turn_flags` 是**純函式**、碰不到工作階段，所以它
-# 沒辦法知道這一輪在哪個後端上——它的職責是「使用者輸入永不原樣進 CLI 參數」，用
-# 聯集驗證就夠；「這個值在這個後端上用不用得到」由 `dorossi_model_applies` 在有
-# 工作階段的地方判，並且**講出來**（見 `discord_bot._dorossi_tuning_labels`）。
+# The union of the two tables. `_dorossi_parse_turn_flags` is a **pure function**
+# that cannot touch a session, so it cannot know which backend this round is on
+# -- its job is "user input never enters a CLI argument verbatim", for which
+# validating against the union is enough; "is this value usable on this backend"
+# is decided by `dorossi_model_applies` where a session is available, and is
+# **stated out loud** (see `discord_bot._dorossi_tuning_labels`).
 #
-# ⚠️ **這是一個會被就地更新的 dict，不是快照——而且那個差別是量出來的。** 第一版寫成
-# `{**A, **B}` 且只在 import 時算一次，於是每日檢查在執行期併進表的新別名**不在聯集
-# 裡**：`_model_alias_for` 反查落空 ⇒ 公告把剛發現的別名整筆濾掉（實測第一次真的跑
-# 完，兩個新別名一個都沒公告出來），而 token 路徑 `@bot /model <新別名>` 會被當成非法
-# 值退回——選單裡選得到、打出來卻不認得。所以 `dorossi_merge_model_catalog` 每次合併
-# 完都要重建它，而且要**就地**重建（`clear()` ＋ `update()`）：`discord_bot` 是以名字
-# import 它的，重新指派一個新 dict 只會換掉這裡的名字，bot 那邊仍然抓著舊的那一份。
+# ⚠️ **This is a dict updated in place, not a snapshot -- and that distinction is
+# measured.** The first version wrote `{**A, **B}` computed once at import, so an
+# alias merged into the tables by the daily check at runtime was **not in the
+# union**: `_model_alias_for`'s reverse lookup missed ⇒ the announcement filtered
+# out the just-discovered alias entirely (measured: the first real run announced
+# neither of the two new aliases), and the token path `@bot /model <new alias>`
+# was rejected as an invalid value -- selectable in the menu yet unrecognised
+# when typed. So `dorossi_merge_model_catalog` must rebuild it after every merge,
+# and rebuild it **in place** (`clear()` + `update()`): `discord_bot` imports it
+# by name, so reassigning a new dict only swaps the name here while the bot still
+# holds the old one.
 DOROSSI_ALL_MODEL_CHOICES: dict = {}
 
 
 def _dorossi_rebuild_all_model_choices() -> None:
-    """就地重建聯集（理由見上面那段警告）。claude 那張在前，維持既有的列舉順序。"""
+    """Rebuild the union in place (reason in the warning above). The claude table
+    comes first, keeping the existing enumeration order."""
     DOROSSI_ALL_MODEL_CHOICES.clear()
     DOROSSI_ALL_MODEL_CHOICES.update(DOROSSI_MODEL_CHOICES)
     DOROSSI_ALL_MODEL_CHOICES.update(DOROSSI_CODEX_MODEL_CHOICES)
 
 
 def dorossi_merge_model_catalog(catalog: dict) -> list:
-    """把目錄裡發現的 model id 併進內建表（只新增、不覆寫），回傳**新增的別名**。
+    """Merge the model ids discovered in the catalogue into the built-in tables
+    (add only, never overwrite), returning the **newly added aliases**.
 
-    回傳值是公告的素材，所以只會是別名。合併的三道門：別名推得出來、來回驗得過、
-    表裡還沒有這個別名也還沒有這個值——第三道擋的是「同一個 id 換個別名又進來一次」，
-    那會讓 `_model_alias_for` 的反查在兩個別名之間二選一，另一個從此顯示成別人的
-    名字。副作用只有「那兩張表就地長大」與「聯集跟著重建」，永不 raise。
+    The return value feeds the announcement, so it is only ever aliases. The
+    merge has three gates: the alias must be derivable, it must round-trip, and
+    the table must not already hold this alias or this value -- the third gate
+    blocks "the same id coming in again under a different alias", which would make
+    `_model_alias_for`'s reverse lookup pick one of the two aliases while the
+    other thereafter displays as someone else's name. The only side effects are
+    "those two tables grow in place" and "the union is rebuilt to match"; never
+    raises.
     """
     added: list = []
     resolved = catalog.get("resolved") if isinstance(catalog, dict) else None
@@ -353,14 +433,17 @@ def dorossi_merge_model_catalog(catalog: dict) -> list:
     return added
 
 
-# 載入時就併進表裡（全新 clone 沒有這個檔 ⇒ 內建表原樣，這是地板）。合併那一支自己
-# 會重建聯集，但**壞掉的目錄會在讀到 `resolved` 之前就提早 return**，所以這裡先建
-# 一次：少了這一行，一個壞掉的目錄檔會讓聯集永遠是空的，而空的聯集等於 `/model` 的
-# token 路徑一個值都不接受。
+# Merge into the tables at load (a fresh clone without this file ⇒ the built-in
+# table as-is, the floor). The merge helper rebuilds the union itself, but **a
+# corrupt catalogue returns early before it reads `resolved`**, so build it once
+# here first: without this line a corrupt catalogue file would leave the union
+# permanently empty, and an empty union means the `/model` token path accepts no
+# value at all.
 _dorossi_rebuild_all_model_choices()
-# 合併**之前**的內建表複本。合併之後那兩張表的內容取決於這台主機上那份目錄檔——也就是
-# 取決於正在跑的 bot 上一次每日檢查找到了什麼。需要「只有內建值」的地方（測試）從這裡
-# 拿，不要從那兩張會長大的表拿。
+# A copy of the built-in tables **before** the merge. After the merge those two
+# tables' contents depend on this host's catalogue file -- that is, on what the
+# running bot's last daily check found. Anything needing "built-in values only"
+# (tests) reads from here, not from the two tables that grow.
 _DOROSSI_BUILTIN_MODEL_CHOICES: dict = dict(DOROSSI_MODEL_CHOICES)
 _DOROSSI_BUILTIN_CODEX_MODEL_CHOICES: dict = dict(DOROSSI_CODEX_MODEL_CHOICES)
 _DOROSSI_MODEL_CATALOG = dorossi_load_model_catalog()
@@ -368,17 +451,19 @@ dorossi_merge_model_catalog(_DOROSSI_MODEL_CATALOG)
 
 
 def dorossi_model_choices(backend: str | None) -> dict:
-    """這個後端的模型表；認不得的後端退回 claude 那張（fail-soft，不是預設值）。"""
+    """This backend's model table; an unrecognised backend falls back to the
+    claude table (fail-soft, not a default value)."""
     return DOROSSI_BACKEND_MODEL_CHOICES.get(backend, DOROSSI_MODEL_CHOICES)
 
 
 def dorossi_session_backend(sess: dict) -> str:
-    """這個工作階段實際會用的後端 id——**單一判準**。
+    """The backend id this session will actually use -- the **single criterion**.
 
-    `ai_provider` 是工作階段級的覆寫（`/dorossi ai`），只有 `codex` 這一個值會改變
-    答案；沒設或設成 `claude` 都回模組設定的 `DOROSSI_BACKEND`（那可能是
-    `claude_code` 也可能是 `api`）。`discord_bot` 原本在四個地方各寫一次同樣的
-    三元式，模型解析與顯示都要問同一個問題，所以抽到這裡。
+    `ai_provider` is a session-level override (`/dorossi ai`); only the value
+    `codex` changes the answer. Unset or set to `claude` both return the module's
+    configured `DOROSSI_BACKEND` (which may be `claude_code` or `api`).
+    `discord_bot` used to write the same ternary in four places; model resolution
+    and display both ask the same question, so it is extracted here.
     """
     if isinstance(sess, dict) and sess.get("ai_provider") == "codex":
         return "codex"
@@ -386,9 +471,11 @@ def dorossi_session_backend(sess: dict) -> str:
 
 
 def dorossi_normalise_model_key(key) -> str | None:
-    """存放檔裡的 `tune_model` → 正規化過的別名 key；不是字串／空字串回 None。
+    """The store file's `tune_model` -> a normalised alias key; None if not a
+    string / empty.
 
-    舊版通用階層 key（`fast`／`standard`／`max`）在這裡做讀取時遷移，不重寫 store。
+    Legacy generic-tier keys (`fast` / `standard` / `max`) are migrated here at
+    read time, without rewriting the store.
     """
     if not isinstance(key, str):
         return None
@@ -399,13 +486,15 @@ def dorossi_normalise_model_key(key) -> str | None:
 
 
 def dorossi_model_applies(backend: str | None, key) -> bool:
-    """這個 key 在這個後端上用不用得到（＝在不在它那張表裡）。"""
+    """Whether this key is usable on this backend (= whether it is in its
+    table)."""
     normalised = dorossi_normalise_model_key(key)
     return bool(normalised) and normalised in dorossi_model_choices(backend)
 
 
 def _dorossi_catalog_family_id(backend: str | None, family: str) -> str | None:
-    """執行期目錄裡，這個後端這一族**當下最新**的完整 id；沒有就 None。"""
+    """In the runtime catalogue, the **current newest** full id of this family on
+    this backend; None if absent."""
     namespace = DOROSSI_MODEL_NAMESPACES.get(backend)
     resolved = _DOROSSI_MODEL_CATALOG.get("resolved")
     if not namespace or not isinstance(resolved, dict):
@@ -418,7 +507,8 @@ def _dorossi_catalog_family_id(backend: str | None, family: str) -> str | None:
 
 
 def _dorossi_version_sort_key(alias: str) -> tuple:
-    """`opus-4.8` → `(4, 8)`，供「同一族裡哪個版號最新」排序用。"""
+    """`opus-4.8` -> `(4, 8)`, for sorting "which version is newest in a
+    family"."""
     _family, _, version = alias.rpartition("-")
     try:
         return tuple(int(part) for part in version.split("."))
@@ -427,10 +517,12 @@ def _dorossi_version_sort_key(alias: str) -> tuple:
 
 
 def _dorossi_newest_pinned_in_family(table: dict, family: str) -> str | None:
-    """內建表裡同一族**版號最大**的那個完整 id；這一族沒有帶版號的條目就 None。
+    """The full id with the **largest version** in the same family in the
+    built-in table; None if this family has no versioned entry.
 
-    這是目錄還沒建立（全新 clone、第一次檢查之前、探測失敗）時的地板：裸別名在不會
-    自己解析別名的後端上，至少要換得到一個真的送得出去的 id。
+    This is the floor when the catalogue is not yet built (a fresh clone, before
+    the first check, a failed probe): a bare alias, on a backend that will not
+    resolve aliases itself, must at least map to an id that can actually be sent.
     """
     candidates = [alias for alias in table
                   if alias.startswith(family + "-")
@@ -441,16 +533,22 @@ def _dorossi_newest_pinned_in_family(table: dict, family: str) -> str | None:
 
 
 def dorossi_resolve_model(backend: str | None, key) -> str | None:
-    """這一輪要帶給後端的模型值；沒設定／這個後端吃不下 → None（＝不帶旗標）。
+    """The model value to pass to the backend this round; None (= pass no flag)
+    if unset / not usable on this backend.
 
-    **allowlist 驗證的最後一道**：只有查表命中的 key 才會有值，使用者輸入永遠不會
-    原樣走到 CLI 參數或 SDK 參數上。三條路：
+    **The last stage of allowlist validation**: only a key that hits the lookup
+    yields a value, and user input never reaches a CLI or SDK argument verbatim.
+    Three paths:
 
-      * 帶版號的 key ⇒ value 就是釘死的完整 id，原樣回。
-      * 裸別名 ＋ 後端自己認得別名（只有 `claude_code`）⇒ 原樣回，語意「這族最新的」
-        由 CLI 解析，所以新模型上線時不必改表就跟得上。
-      * 裸別名 ＋ 後端不認得別名（`api`／`codex`）⇒ 先問執行期模型目錄（每日檢查
-        讀回來的「今天最新」），再退回內建表裡同族版號最大的那個。
+      * A versioned key ⇒ the value is the pinned full id, returned as-is.
+      * A bare alias + a backend that resolves aliases itself (only
+        `claude_code`) ⇒ returned as-is; the "newest in this family" meaning is
+        resolved by the CLI, so a newly released model is tracked without editing
+        the table.
+      * A bare alias + a backend that does not resolve aliases (`api` / `codex`)
+        ⇒ ask the runtime model catalogue first ("today's newest", read back by
+        the daily check), then fall back to the largest-version entry of the same
+        family in the built-in table.
     """
     normalised = dorossi_normalise_model_key(key)
     table = dorossi_model_choices(backend)
@@ -473,157 +571,224 @@ def dorossi_resolve_model(backend: str | None, key) -> str | None:
 # moment `/dorossi fullmode` flips the mode at runtime; nothing reads it today.
 # Tier 2 is essential whenever tools are enabled (DOROSSI_CC_TOOLS ==
 # "full" runs `--permission-mode bypassPermissions`): a tool that blocks forever
-# (a pager, a wait-on-stdin command, a hung行程) leaves its tool_use unresolved,
+# (a pager, a wait-on-stdin command, a hung process) leaves its tool_use unresolved,
 # so the idle tier is suppressed indefinitely and the handler would otherwise
 # await forever with no reply. The hard ceiling guarantees a bounded reply
 # (answer or error) and stays in force in pure-chat mode too.
 #
-# 閒置上限（秒）：這麼久完全沒有輸出、沒有工具在跑、CLI 也沒有回報背景工作，才當成
-# 卡住。2026-09-19 前寫死 300s；擁有者反映「等待太短，任務一直被殺掉」之後改成
-# bot_config.json 的 `dorossi_cc_idle_limit_sec`（預設 600s、clamp ≥ 60s）。
-# `_dorossi_via_claude_code` 在**呼叫時**讀這個模組全域，所以測試換得掉它。
+# Idle ceiling (seconds): this long with no output at all, no tool running, and
+# no background job reported by the CLI counts as stuck. Before 2026-09-19 this
+# was hardcoded 300s; after the owner reported "the wait is too short, tasks keep
+# getting killed" it became bot_config.json's `dorossi_cc_idle_limit_sec`
+# (default 600s, clamped >= 60s). `_dorossi_via_claude_code` reads this module
+# global **at call time**, so a test can swap it out.
 DOROSSI_CC_IDLE_LIMIT_SEC = BOT_CONFIG["dorossi_cc_idle_limit_sec"]
-# 硬性整體上限（牆鐘時間）：必須遠大於閒置上限，否則正常的長回答會被誤砍。
-# 現在是 mode-aware ＋ 可由 bot_config.json 覆寫（兩值都在 loader 端 clamp 到
-# 不小於 DOROSSI_CC_HARD_LIMIT_FLOOR_SEC，避免被設成 0／負數把保護關掉）：
-#   off （純聊天）  ── 較緊，預設 900s；答案有界、無工具、卡死機率低。
-#   full（完整 agent）── 放大，預設 10800s（3 小時；2026-09-19 從 3600s 放大）；
-#                       容納擁有者的長 agentic 任務（多 subagent 編排、跑整套
-#                       測試），但仍有限——硬上限不能移除（full 模式
-#                       bypassPermissions 下卡死的工具會讓 idle tier 永遠不觸發），
-#                       且它同時是佇列鎖前進的保證（一輪最久就是握鎖時間）。
+# Hard overall ceiling (wall-clock time): must be far larger than the idle
+# ceiling, or a normal long answer would be killed by mistake. It is now
+# mode-aware and overridable via bot_config.json (both values are clamped on the
+# loader side to no less than DOROSSI_CC_HARD_LIMIT_FLOOR_SEC, so it cannot be set
+# to 0 / negative to disable the protection):
+#   off  (plain chat)   -- tighter, default 900s; the answer is bounded, no
+#                          tools, low chance of a hang.
+#   full (full agent)   -- larger, default 10800s (3 hours; raised from 3600s on
+#                          2026-09-19); to fit the owner's long agentic tasks
+#                          (multi-subagent orchestration, running the whole test
+#                          suite), but still bounded -- the hard ceiling cannot be
+#                          removed (a tool that hangs under full-mode
+#                          bypassPermissions would keep the idle tier from ever
+#                          firing), and it is also the guarantee the queue lock
+#                          makes progress (a round holds the lock at most this
+#                          long).
 DOROSSI_CC_HARD_LIMIT_OFF_SEC = BOT_CONFIG["dorossi_cc_hard_limit_off_sec"]
 DOROSSI_CC_HARD_LIMIT_FULL_SEC = BOT_CONFIG["dorossi_cc_hard_limit_full_sec"]
-# 「自走模式」每一輪的輸出沉默 backstop（秒），見 bot_config.json 同名鍵（預設
-# 1800s；2026-09-19 從 600s 放寬）。自走模式不設回合上限、也不對**有輸出的**回合套用
-# 硬性牆鐘上限，改由這層「在 N 秒內完全沒有新輸出就終止這一輪」保底；它會在「即使
-# 仍有前景工具在執行」時也照樣觸發（與 idle tier 的關鍵差異），所以卡死的工具不會讓
-# 無人值守的迴圈永遠卡住。**唯一的例外是 CLI 回報了背景工作**：那段沉默是在等它，
-# 不砍，但只撐到這一輪開始後 `_dorossi_cc_hard_limit_sec()` 秒（見
-# `_dorossi_via_claude_code` 的讀取迴圈）。loader 端 clamp 到 ≥ 60s，不能關掉。
+# The per-round output-silence backstop for "autonomous mode" (seconds); see the
+# same-named key in bot_config.json (default 1800s; loosened from 600s on
+# 2026-09-19). Autonomous mode sets no round ceiling and applies no hard
+# wall-clock ceiling to rounds that **produce output**, backstopping instead with
+# this "terminate the round if there is no new output at all for N seconds"; it
+# fires even "while a foreground tool is still executing" (the key difference from
+# the idle tier), so a hung tool cannot leave the unattended loop stuck forever.
+# **The only exception is when the CLI reports a background job**: that silence is
+# waiting on it, so it is not killed, but only up to `_dorossi_cc_hard_limit_sec()`
+# seconds after this round started (see `_dorossi_via_claude_code`'s read loop).
+# Clamped on the loader side to >= 60s; cannot be turned off.
 DOROSSI_LOOP_SILENCE_LIMIT_SEC = BOT_CONFIG["dorossi_loop_silence_limit_sec"]
-# 自走模式撞到「方案用量上限」時的等待策略（見 bot_config.json 同名鍵）。
-# 舊行為是直接停掉整個迴圈、留 loop_pending 讓擁有者事後手動 `/dorossi session
-# continue`；由於方案用量是**每 5 小時滾動重設**的，那等於每天要人工接續好幾次，
-# 無人值守的長任務實質上跑不完。現在改成「睡到額度回來再自己續跑」。
-#   fallback ── 拿不到機器可讀的重設時刻時，第一次等待的秒數；之後每連續再撞一次
-#               就加倍（退避探測），直到 max。預設 900s（15 分鐘）。
-#   max      ── 單次等待的上限秒數。就算後端說「三天後才重設」也最多睡這麼久就再
-#               探一次——探測便宜，而「睡過頭」是不可逆的浪費。預設 21600s（6 小時），
-#               略大於 5 小時的滾動視窗，所以一次等待足以覆蓋一個完整視窗。
-#   max_consecutive ── 連續等待幾次都沒有任何一輪成功就放棄整個迴圈。
-#               **0 ＝不設限（預設）**，符合擁有者「不得有回合／花費類上限」的裁決；
-#               設非零值只是給想要保底的人用。
+# The wait strategy when autonomous mode hits a "plan usage limit" (see the
+# same-named key in bot_config.json). The old behaviour was to stop the whole
+# loop and leave a loop_pending for the owner to manually `/dorossi session
+# continue` later; since the plan usage **resets on a rolling 5-hour window**,
+# that meant several manual resumptions a day, and a long unattended task
+# effectively never finished. It now "sleeps until the quota returns and resumes
+# itself".
+#   fallback -- when no machine-readable reset time is available, the seconds to
+#               wait the first time; each further consecutive hit doubles it
+#               (backoff probing), up to max. Default 900s (15 minutes).
+#   max      -- the ceiling for a single wait. Even if the backend says "resets in
+#               three days", it sleeps at most this long and then probes again --
+#               probing is cheap, and "oversleeping" is irreversible waste.
+#               Default 21600s (6 hours), slightly larger than the 5-hour rolling
+#               window, so a single wait suffices to cover a full window.
+#   max_consecutive -- give up the whole loop after this many consecutive waits
+#               with no round succeeding. **0 = unlimited (the default)**, per the
+#               owner's ruling of "no round / cost ceilings"; a non-zero value is
+#               only for someone who wants a backstop.
 DOROSSI_USAGE_WAIT_FALLBACK_SEC = BOT_CONFIG["dorossi_usage_wait_fallback_sec"]
 DOROSSI_USAGE_WAIT_MAX_SEC = BOT_CONFIG["dorossi_usage_wait_max_sec"]
 DOROSSI_USAGE_WAIT_MAX_CONSECUTIVE = BOT_CONFIG["dorossi_usage_wait_max_consecutive"]
-# 伺服器側暫時性故障（529／5xx）的連續放棄門檻。與上面那條分開，因為兩者的成因與
-# 等待策略都不同：用量上限有 reset 時間可以等，過載只能指數退避。
+# The consecutive-give-up threshold for server-side transient faults (529 / 5xx).
+# Separate from the one above, because their cause and wait strategy both differ:
+# a usage limit has a reset time to wait for, while overload can only be
+# exponentially backed off.
 DOROSSI_TRANSIENT_MAX_CONSECUTIVE = BOT_CONFIG["dorossi_transient_max_consecutive"]
-# 非預期錯誤／輸出靜默的重試上限（見 `dorossi_error_is_fatal`）。
+# The retry ceiling for unexpected errors / output silence (see
+# `dorossi_error_is_fatal`).
 DOROSSI_ERROR_RETRY_MAX = BOT_CONFIG["dorossi_error_retry_max"]
 DOROSSI_SILENCE_RETRY_MAX = BOT_CONFIG["dorossi_silence_retry_max"]
-# 等待的下限（不可設定）：純粹的空轉防護。用量上限的判定字樣比對得很寬
-# （"rate limit"、"limit reached"…），萬一某天有別的錯誤被誤判成用量上限，這條
-# 保證每次重試之間至少隔一分鐘，不會變成燒 CPU／燒 quota 的熱迴圈。
+# The wait floor (not configurable): a pure busy-spin guard. The usage-limit
+# detection matches quite loosely ("rate limit", "limit reached", ...), so should
+# some other error be misread one day as a usage limit, this guarantees at least
+# a minute between retries and keeps it from becoming a CPU- / quota-burning hot
+# loop.
 DOROSSI_USAGE_WAIT_MIN_SEC = 60.0
-# 睡到 reset_at 之後再多等的緩衝：後端的時間戳是「視窗開始」，時鐘偏移或伺服器端
-# 取整都可能讓「剛好那一秒」還是被擋。多等一分鐘比多一輪失敗的探測便宜。
+# The buffer to wait beyond reset_at: the backend's timestamp is "the window
+# start", and clock skew or server-side rounding can leave "that exact second"
+# still blocked. Waiting an extra minute is cheaper than one more failed probe.
 DOROSSI_USAGE_WAIT_GRACE_SEC = 60.0
-# 退避的指數上限。`2 ** attempt` 若不封頂，attempt 大到某個程度時
-# `float * 2**5000` 會直接丟 OverflowError（int→float 溢位）——而這個乘法就發生在
-# 用量上限的處理路徑上，也就是「已經出事了才會走到」的那條路。16 已經遠超過 max
-# 的 clamp，封頂不影響行為，只是不讓它有機會溢位。
+# The exponential cap for backoff. If `2 ** attempt` is not capped, at a large
+# enough attempt `float * 2**5000` raises OverflowError outright (int->float
+# overflow) -- and this multiplication happens on the usage-limit handling path,
+# i.e. the one only reached once something has already gone wrong. 16 is already
+# far past the clamp on max, so the cap does not change behaviour, it just removes
+# the chance to overflow.
 DOROSSI_USAGE_WAIT_MAX_SHIFT = 16
-# 自走迴圈「跨 bot 重啟自動接續」的兩個閥（見 bot_config.json 同名鍵）。等到額度
-# 回來再續跑解決了「後端擋住」那一半；另一半是**行程本身沒了**——重啟、主機當機
-# 都會讓迴圈連同它的等待一起消失，只留
-# 一個 loop_pending 等人工接續。這兩個閥讓 bot 起來時自己把它接回去。
-#   max_age  ── 標記的心跳離現在多久以內才自動接續（秒）。0 ＝關閉自動接續（回到
-#               純人工 `/dorossi session continue`）。預設 86400s（24 小時）：足以
-#               涵蓋「一次用量等待（最多 6 小時）＋一段主機停機」，又不會在一週後
-#               突然自己跑起一個擁有者早就忘了的任務。
-#   max_tries ── 連續自動接續幾次都沒有任何一輪跑完就不再自動接。這是**當機迴圈**
-#               的斷路器：若接續本身就會讓 bot 死掉，沒有它就是無限重啟。任何一輪
-#               跑完就歸零，所以健康的長任務永遠累加不到。0 ＝不設限。
+# The two knobs for the autonomous loop's "auto-resume across a bot restart" (see
+# the same-named keys in bot_config.json). Sleeping until the quota returns solved
+# the "backend blocked" half; the other half is **the process itself is gone** --
+# a restart or a host crash makes the loop, and its wait, vanish together, leaving
+# only a loop_pending awaiting a manual resume. These two knobs let the bot pick
+# it back up itself on startup.
+#   max_age  -- how recently the marker's heartbeat must be to auto-resume
+#               (seconds). 0 = disable auto-resume (back to purely manual
+#               `/dorossi session continue`). Default 86400s (24 hours): enough to
+#               cover "one usage wait (up to 6 hours) + a stretch of host
+#               downtime", without suddenly starting a task the owner long forgot
+#               a week later.
+#   max_tries -- stop auto-resuming after this many consecutive auto-resumes with
+#               no round completing. This is the circuit breaker for a **crash
+#               loop**: if the resume itself crashes the bot, without it this is
+#               an infinite restart. Any round completing resets it, so a healthy
+#               long task never accumulates toward it. 0 = unlimited.
 DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC = BOT_CONFIG[
     "dorossi_loop_autoresume_max_age_sec"]
 DOROSSI_LOOP_AUTORESUME_MAX_TRIES = BOT_CONFIG[
     "dorossi_loop_autoresume_max_tries"]
-# claude_code 後端「每一次 `claude -p` invocation」的美元花費上限（見 bot_config.json
-# 同名鍵）。透過 CLI 的 --max-budget-usd 帶入；自走每一輪、單輪問答每次呼叫都會帶上。
-# 是「每次呼叫」的花費閘、非回合數上限。0 ＝停用（完全不帶旗標）。
-# **預設已停用（0.0，擁有者裁決）**：擁有者明確裁決「不應該有除了後端本身用量上限
-# 以外的上限限制」（他實際撞到 error_max_budget_usd、正常單輪被舊的 5.0 預設攔下）。
-# 此鍵保留給未來想自行設限的人在 bot_config.json 手動覆寫；不要再把非零預設加回來。
-# 設了非零值時，超出會由 `claude -p` 以非零 exit ＋ result 事件
-# subtype=="error_max_budget_usd" 回報，_dorossi_via_claude_code graceful 收尾
-# （不重試、不拋例外，回空答案＝該輪當 idle）——這段攔截機制原樣保留。
+# The dollar-cost ceiling for "each `claude -p` invocation" on the claude_code
+# backend (see the same-named key in bot_config.json). Passed via the CLI's
+# --max-budget-usd; carried on every autonomous round and every single-turn call.
+# It is a per-call cost gate, not a round-count ceiling. 0 = disabled (no flag at
+# all). **Disabled by default (0.0, owner ruling)**: the owner explicitly ruled
+# "there should be no ceiling other than the backend's own usage limit" (he
+# actually hit error_max_budget_usd, a normal single turn stopped by the old 5.0
+# default). This key is kept for anyone who later wants their own limit to set in
+# bot_config.json; do not add a non-zero default back. When a non-zero value is
+# set, an overrun is reported by `claude -p` with a non-zero exit + a result event
+# subtype=="error_max_budget_usd", and _dorossi_via_claude_code finishes
+# gracefully (no retry, no exception, returns an empty answer = the round counts
+# as idle) -- this interception mechanism is kept as-is.
 DOROSSI_MAX_BUDGET_USD = BOT_CONFIG["dorossi_max_budget_usd"]
-# 自走模式「週期性壓縮」觸發門檻（見 bot_config.json 同名鍵）。每隔這麼多工作輪、或
-# 「自上次壓縮以來」累積花費達此美元值，就插入一輪 in-place `/compact` 壓掉舊歷史、
-# 讓後續 resume 的前綴變小。壓 context、非回合數上限。各自 0 ＝停用該條。
+# The trigger thresholds for autonomous mode's "periodic compaction" (see the
+# same-named keys in bot_config.json). Every this-many work rounds, or when the
+# cost accumulated "since the last compaction" reaches this dollar value, an
+# in-place `/compact` round is inserted to crush the old history and shrink the
+# prefix of later resumes. It compacts the context, not a round-count ceiling.
+# Each 0 = disable that condition.
 DOROSSI_LOOP_COMPACT_EVERY_ROUNDS = BOT_CONFIG["dorossi_loop_compact_every_rounds"]
 DOROSSI_LOOP_COMPACT_COST_USD = BOT_CONFIG["dorossi_loop_compact_cost_usd"]
-# 「脈絡過大就自動壓縮」的 token 門檻（見 bot_config.json 同名鍵）。單輪問答與自走迴圈
-# 共用同一把：某一輪送進後端的脈絡大小 ≈ fresh input＋cache_read＋cache_creation
-# （即 info 的 in＋cr＋cc），越過此門檻就對該工作階段插入一次 in-place `/compact`。這是
-# 擁有者裁定用來降 token 的唯一手段（不動 effort／模型／工具設定）。0 ＝停用此條。
+# The token threshold for "auto-compact when the context grows too large" (see the
+# same-named key in bot_config.json). Single-turn Q&A and the autonomous loop
+# share the same one: the context size sent to the backend in a round ≈ fresh
+# input + cache_read + cache_creation (i.e. info's in + cr + cc), and crossing
+# this threshold inserts one in-place `/compact` for that session. This is the
+# owner-ruled sole means of lowering token use (leaving effort / model / tool
+# settings untouched). 0 = disable this condition.
 DOROSSI_COMPACT_CONTEXT_TOKENS = BOT_CONFIG["dorossi_compact_context_tokens"]
-# 單輪 session 衛生（保守）：active session 超過這麼多天沒用就在下一輪自動清空脈絡。
-# 0 ＝停用。見 bot_config.json 同名鍵。
+# Single-turn session hygiene (conservative): an active session unused for more
+# than this many days auto-clears its context on the next round. 0 = disabled.
+# See the same-named key in bot_config.json.
 DOROSSI_SESSION_MAX_AGE_DAYS = BOT_CONFIG["dorossi_session_max_age_days"]
 DOROSSI_API_HISTORY_MAX_MSGS = BOT_CONFIG["dorossi_api_history_max_msgs"]
-# 自走「後端自判進迴圈」總開關。False 只關自判、保留「明確片語」觸發。見同名 config 鍵。
+# The master switch for autonomous "backend self-judges into the loop". False
+# disables only self-judging and keeps the "explicit phrase" trigger. See the
+# same-named config key.
 DOROSSI_SELF_JUDGE_ENABLED = BOT_CONFIG["dorossi_self_judge_enabled"]
 
 
 def _dorossi_cc_hard_limit_sec() -> float:
-    """目前工具模式對應的硬性牆鐘看門狗上限（秒）。full 模式放大、off 維持較緊；
-    watchdog deadline 應呼叫此函式而非引用寫死的數字。"""
+    """The hard wall-clock watchdog ceiling (seconds) for the current tool mode.
+    full mode is larger, off stays tighter; a watchdog deadline should call this
+    function rather than referencing a hardcoded number."""
     return (DOROSSI_CC_HARD_LIMIT_FULL_SEC if DOROSSI_CC_TOOLS == "full"
             else DOROSSI_CC_HARD_LIMIT_OFF_SEC)
 
 
-# CLI **自己**的背景工作等待上限（2026-09-19）。官方 headless 文件「Background tasks
-# at exit」與 2.1.276 執行檔（`var sl=5000,WS=600000;function Xm(){return
-# a.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS??WS}`）一致：`claude -p` 送出最後的 result
-# 之後會等背景 subagent／workflow 做完，但**連續閒置等待滿 10 分鐘**就把還在跑的東西
-# 砍掉、丟掉它的部分結果（stderr 印 "Background tasks still running after …s;
-# terminating"）；背景 shell 則在最後的 result 之後約 5 秒就被收掉。設成 0 是「無上限」。
+# The CLI's **own** background-job wait ceiling (2026-09-19). Consistent with the
+# official headless doc "Background tasks at exit" and the 2.1.276 binary
+# (`var sl=5000,WS=600000;function Xm(){return
+# a.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS??WS}`): after `claude -p` sends the final
+# result it waits for background subagents / workflows to finish, but **after a
+# full 10 minutes of consecutive idle waiting** it kills whatever is still running
+# and discards its partial results (stderr prints "Background tasks still running
+# after …s; terminating"); a background shell is reaped about 5 seconds after the
+# final result. Setting it to 0 means "no ceiling".
 #
-# 所以只放寬 bot 自己的看門狗不夠：擁有者抱怨的「背景 subagent 一直被殺掉」，內層
-# 那把 10 分鐘的刀還在。這裡把它設成跟 bot 的硬上限**同一個值**：
-#   * 不設 0——bot 的看門狗必須始終是最外層、有限的邊界；
-#   * 不比 bot 緊——CLI 的計時從「第一次閒置」開始（一定晚於這一輪開始），所以
-#     「第一次閒置 ＋ 硬上限」永遠不早於 bot 的「開始 ＋ 硬上限」，內層不會先砍。
-# **覆寫**而不是 setdefault：父行程環境裡剛好帶著一個值（例如 0）時不能讓它贏——
-# 與本專案 `PYTHONIOENCODING` 那條教訓同形。
+# So loosening the bot's own watchdog alone is not enough: for the owner's
+# complaint that "background subagents keep getting killed", that inner 10-minute
+# knife is still there. Here it is set to the **same value** as the bot's hard
+# ceiling:
+#   * not 0 -- the bot's watchdog must always be the outermost, bounded edge;
+#   * not tighter than the bot -- the CLI's timer starts at "the first idle"
+#     (necessarily later than this round's start), so "first idle + hard ceiling"
+#     is never earlier than the bot's "start + hard ceiling", and the inner one
+#     never cuts first.
+# **Overwrite**, not setdefault: when the parent process environment happens to
+# carry a value (e.g. 0) it must not win -- the same shape as this project's
+# `PYTHONIOENCODING` lesson.
 _DOROSSI_CC_BG_WAIT_CEILING_ENV = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"
 
-# `claude -p` 子行程**刻意不繼承**的環境變數（2026-09-19 實測後加）。值是「為什麼」，
-# 會原樣印進那一行警告，所以只寫固定的英文短句，不帶任何值。
+# Environment variables **deliberately not inherited** by the `claude -p` child
+# (added after measuring on 2026-09-19). The value is the "why", printed verbatim
+# into that warning line, so it is a fixed English phrase carrying no value.
 #
-# 這個後端的整個前提是「走主機登入的訂閱方案」：用量由方案自己的上限兜著，而擁有者
-# 的裁定是「除了後端本身的用量上限之外不設任何上限」（`dorossi_max_budget_usd` 維持
-# 0）。可是官方驗證文件寫明「非互動模式（-p）下，只要有 API key 就一定用它」，優先序
-# 是 雲端供應商變數 > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY > apiKeyHelper >
-# CLAUDE_CODE_OAUTH_TOKEN > 訂閱登入。同一天以假金鑰實測：init 事件的 `apiKeySource`
-# 從 "none" 變成 "ANTHROPIC_API_KEY"。而 bot 的**另一個**後端（api）正是靠主機上設
-# 這兩個變數來啟用——所以有人為了那個後端設一次，這個後端就**安靜地**從訂閱換成按
-# token 計費、沒有方案上限，沒有任何錯誤、沒有任何訊息。
+# This backend's whole premise is "running the subscription plan of the host
+# login": usage is bounded by the plan's own limit, and the owner's ruling is "no
+# ceiling other than the backend's own usage limit" (`dorossi_max_budget_usd`
+# stays 0). But the official verification doc states plainly that "in
+# non-interactive mode (-p), an API key is always used if present", with priority
+# cloud-provider variables > ANTHROPIC_AUTH_TOKEN > ANTHROPIC_API_KEY >
+# apiKeyHelper > CLAUDE_CODE_OAUTH_TOKEN > the subscription login. Measured the
+# same day with a fake key: the init event's `apiKeySource` changed from "none" to
+# "ANTHROPIC_API_KEY". And the bot's **other** backend (api) is enabled precisely
+# by setting these two variables on the host -- so someone setting it once for
+# that backend **silently** switches this backend from the subscription to
+# per-token billing with no plan limit, with no error and no message.
 #
-# `CLAUDE_CODE_SIMPLE=1` 則等同 `--bare`（官方環境變數文件；同日實測兩者的串流逐位元組
-# 同形）：不讀登入、不讀指示檔，每一輪都以「Not logged in」失敗。
+# `CLAUDE_CODE_SIMPLE=1` is equivalent to `--bare` (the official env-var doc;
+# measured the same day, the two are byte-for-byte identical in streaming): it
+# reads no login and no instruction files, and fails every round with "Not logged
+# in".
 #
-# **刻意留著的：** `CLAUDE_CODE_OAUTH_TOKEN`——它就是訂閱憑證（`claude setup-token` 發的
-# 長效 token），拿掉反而會讓只靠它登入的主機變成未登入；同日以假 token 實測，
-# `apiKeySource` 仍是 "none"。`CLAUDE_CODE_USE_BEDROCK`／`CLAUDE_CODE_USE_VERTEX`／
-# `CLAUDE_CODE_USE_FOUNDRY` 也不動：那是「改走雲端供應商」的明確選擇，不是順手繼承來的
-# 副作用；設了它的人要的就是那個計費方式。
+# **Deliberately kept:** `CLAUDE_CODE_OAUTH_TOKEN` -- it is the subscription
+# credential itself (the long-lived token issued by `claude setup-token`), and
+# dropping it would instead make a host that logs in only via it become not logged
+# in; measured the same day with a fake token, `apiKeySource` was still "none".
+# `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` / `CLAUDE_CODE_USE_FOUNDRY`
+# are also untouched: that is a deliberate "switch to a cloud provider" choice,
+# not a side effect inherited by accident; whoever set it wants that billing
+# method.
 #
-# 只從**子行程**的環境拿掉；本行程的 `os.environ` 不動，api 後端（SDK 在本行程裡讀）
-# 照舊讀得到。
+# Dropped only from the **child** process's environment; this process's
+# `os.environ` is untouched, and the api backend (the SDK reads it in this
+# process) can still read it.
 _DOROSSI_CC_DROPPED_ENV = {
     "ANTHROPIC_API_KEY": (
         "the CLI would authenticate with it instead of the subscription login (billed "
@@ -638,18 +803,23 @@ _DOROSSI_CC_DROPPED_ENV = {
 
 
 def _dorossi_cc_child_env(hard_limit_sec: float, base_env=None) -> dict:
-    """`claude -p` 子行程的環境：繼承目前環境（或 `base_env`），拿掉
-    `_DOROSSI_CC_DROPPED_ENV` 列的變數，並把 CLI 的背景工作等待上限對齊到 bot 這一輪的
-    硬上限（毫秒、正整數，永不為 0）。
+    """The `claude -p` child's environment: inherit the current environment (or
+    `base_env`), drop the variables listed in `_DOROSSI_CC_DROPPED_ENV`, and align
+    the CLI's background-job wait ceiling to the bot's hard ceiling for this round
+    (milliseconds, a positive integer, never 0).
 
-    回傳值只由參數決定；唯一的副作用是**每個被拿掉的變數名**在這個行程裡第一次被拿掉時
-    往 stderr 印一行（`_warn_once`，只印名字、絕不印值）。
+    The return value depends only on the arguments; the only side effect is that
+    **each dropped variable name** prints one stderr line the first time it is
+    dropped in this process (`_warn_once`, printing the name only, never the
+    value).
 
-    `base_env=None` → 在**呼叫時**讀 `os.environ`。不要寫成 `base_env=os.environ`：預設
-    引數在 `def` 當下就綁定，測試換掉 `os.environ` 時預設那條路看不到。
+    `base_env=None` -> read `os.environ` **at call time**. Do not write
+    `base_env=os.environ`: a default argument is bound at the `def`, so that path
+    would not see a test swapping out `os.environ`.
 
-    比對名字時轉大寫：Windows 的環境變數名不分大小寫，`base_env` 若是一般 dict、裡面放
-    著小寫的鍵，CLI 照樣讀得到它。
+    Names are upper-cased for comparison: Windows environment variable names are
+    case-insensitive, so if `base_env` is a plain dict holding a lower-case key,
+    the CLI can still read it.
     """
     env = dict(os.environ if base_env is None else base_env)
     for key in [k for k in env if str(k).upper() in _DOROSSI_CC_DROPPED_ENV]:
@@ -665,15 +835,20 @@ def _dorossi_cc_child_env(hard_limit_sec: float, base_env=None) -> dict:
 # mode's hard limit at import time. The watchdog itself calls
 # _dorossi_cc_hard_limit_sec() so a future runtime mode flip stays correct.
 DOROSSI_CC_HARD_LIMIT_SEC = _dorossi_cc_hard_limit_sec()
-# 工具模式由 bot_config.json 的 dorossi_cc_tools 決定（見 DOROSSI_CC_TOOLS）：
-#   "off"（預設）＝純聊天：傳 `--tools ""`（工具白名單為空）＋ --disallowedTools
-#     （列舉黑名單，第二層）、不加 bypassPermissions，Dorossi 只能對話、無法在主機
-#     執行 shell 或讀寫檔案。理由與實測見 `_dorossi_via_claude_code` 的純聊天分支。
-#   "full" ＝完整 agent：開啟所有工具且移除核准關卡
-#     （--permission-mode bypassPermissions），由擁有者明確授權；此時 Dorossi
-#     訊息（僅擁有者 UID）可在主機無確認執行任意 shell ＋讀寫檔案。
-# 兩種模式都在自己的持久工作目錄內啟動（不納入版本庫）；full 模式下 Bash
-# 仍可 cd 到他處。要改回最安全狀態請維持／改回 dorossi_cc_tools = "off"。
+# The tool mode is decided by bot_config.json's dorossi_cc_tools (see
+# DOROSSI_CC_TOOLS):
+#   "off" (the default) = plain chat: pass `--tools ""` (an empty tool allowlist)
+#     + --disallowedTools (an enumerated blocklist, the second layer), with no
+#     bypassPermissions; Dorossi can only converse and cannot run a shell or read
+#     / write files on the host. Reasoning and measurements are in
+#     `_dorossi_via_claude_code`'s plain-chat branch.
+#   "full" = a full agent: enable all tools and remove the approval gate
+#     (--permission-mode bypassPermissions), explicitly authorised by the owner;
+#     now a Dorossi message (owner UID only) can run any shell + read / write
+#     files on the host with no confirmation.
+# Both modes launch inside their own persistent working directory (not tracked in
+# the repo); in full mode Bash can still cd elsewhere. To return to the safest
+# state, keep / change dorossi_cc_tools back to "off".
 DOROSSI_CC_WORKDIR = _platform_state(PROJECT_ROOT / "dorossi_workspace")
 
 
@@ -692,27 +867,36 @@ def dorossi_session_workdir(uid: str, sid: str) -> str:
 
 
 def _dorossi_cwd_is_managed(cwd: Path | str) -> bool:
-    r"""這個 cwd 是否落在我們自己管的 `DOROSSI_CC_WORKDIR` 子樹裡（含它本身）？
+    r"""Does this cwd fall inside the `DOROSSI_CC_WORKDIR` subtree we manage
+    ourselves (including the root itself)?
 
-    只有答 True 的 cwd 才可以被**自動 mkdir** 出來。使用者用 `/new <路徑>` 指定的
-    外部目錄一律不自動建立——呼叫端 (`_dorossi_validate_dir`) 已經確認它存在。
+    Only a cwd that answers True may be **auto-mkdir**'d. An external directory the
+    user gave via `/new <path>` is never auto-created -- the caller
+    (`_dorossi_validate_dir`) has already confirmed it exists.
 
-    **`.resolve()` 是這道閘的一部分，不是順手整理。** `.parents` 做的是**字面上**
-    的父目錄列舉，所以 `…\dorossi_workspace\..\..\..\evil` 的 parents 裡真的
-    含 `DOROSSI_CC_WORKDIR`，不 resolve 的版本會放行，然後在受管子樹**外面** mkdir
-    出一個目錄。實測：三個這種 `..` 逃脫輸入在不 resolve 時**全部**誤判放行，
-    resolve 之後 0 個，而三個正當輸入照樣通過。
+    **`.resolve()` is part of this gate, not incidental tidying.** `.parents`
+    enumerates parent directories **literally**, so
+    `…\dorossi_workspace\..\..\..\evil`'s parents really do contain
+    `DOROSSI_CC_WORKDIR`, and the un-resolved version would admit it and then mkdir
+    a directory **outside** the managed subtree. Measured: three such `..` escape
+    inputs are **all** wrongly admitted without resolve, 0 after resolve, while
+    three legitimate inputs still pass.
 
-    今天三個 workdir 來源剛好都是安全的——使用者那條在 `_dorossi_validate_dir` 已經
-    resolve 過且要求目錄已存在，per-session 子目錄是用數字 uid ＋ `s<N>` 拼出來的，
-    預設那條就是常數本身。**但那個前提寫在別的函式裡，這道閘看不到，也沒有任何東西
-    把兩邊連起來。** 所以 resolve 留在這裡，讓閘自己站得住，而不是靠上游的好意。
+    All three of today's workdir sources happen to be safe -- the user one is
+    already resolved and required to exist by `_dorossi_validate_dir`, the
+    per-session subdirectory is built from a numeric uid + `s<N>`, and the default
+    one is the constant itself. **But that premise lives in another function, this
+    gate cannot see it, and nothing ties the two together.** So resolve stays here
+    to make the gate stand on its own rather than on upstream goodwill.
 
-    這也是為什麼它是**一支函式而不是兩段 inline 判斷**：原本同一段比對抄在兩個
-    spawn 路徑裡，於是同一個缺陷也就存在兩份。
+    That is also why it is **one function rather than two inline checks**: the same
+    comparison used to be copied into both spawn paths, so the same flaw then
+    existed in two places.
 
-    判不出來（`resolve()` 丟例外）時回 **False**——fail-closed。這個方向的代價只是
-    「不自動建目錄」，子行程起不來會自己報錯；反方向的代價是在受管範圍外面建目錄。
+    When it cannot decide (`resolve()` raises), it returns **False** --
+    fail-closed. The cost in this direction is only "no auto-created directory",
+    and the child process will report its own error if it cannot start; the cost
+    the other way is creating a directory outside the managed range.
     """
     try:
         target = Path(cwd).resolve()
@@ -722,34 +906,48 @@ def _dorossi_cwd_is_managed(cwd: Path | str) -> bool:
 
 
 def _dorossi_require_workdir(cwd) -> None:
-    """spawn 前的最後一道：`cwd` 必須是**此刻**存在的目錄，否則丟 `_DorossiWorkdirError`。
+    """The last gate before spawn: `cwd` must be a directory that exists **right
+    now**, otherwise raise `_DorossiWorkdirError`.
 
-    工作階段存著的目錄（`cc_cwd`／`cc_workdir`）是在**寫入**時驗過的；bot 讀回來那一側
-    （`_dorossi_resolve_cc_workdir`）刻意原值回傳、不再驗，理由寫在那支的 docstring。
-    所以「存的時候在、現在不在」（外接磁碟拔掉、專案搬走或刪掉、store 被手改）只有這裡
-    抓得到。兩個叫用函式都在受管 mkdir **之後**呼叫它——順序反過來，每個全新工作階段
-    的第一輪都會被拒。
+    The directory stored in the session (`cc_cwd` / `cc_workdir`) was validated at
+    **write** time; the bot's read-back side (`_dorossi_resolve_cc_workdir`)
+    deliberately returns it verbatim and does not re-validate, for the reason in
+    that function's docstring. So "it existed when stored, it does not now" (an
+    external drive unplugged, the project moved or deleted, a hand-edited store) is
+    caught only here. Both callers invoke it **after** the managed mkdir --
+    reverse the order and the first round of every brand-new session would be
+    rejected.
 
-    不抓的後果是**診斷說謊**，不是安全問題：`create_subprocess_exec(cwd=<不存在>)` 丟
-    `NotADirectoryError`（WinError 267，實測），`dorossi_error_is_fatal` 判它致命，
-    `_dorossi_error_hint` 就往 stderr 印「CLI backend unavailable or not
-    authenticated」、對外說「請稍後再試」——原因指錯，還把永久的狀況說成暫時的。
+    Not catching it makes **the diagnosis lie**, not a security issue:
+    `create_subprocess_exec(cwd=<missing>)` raises `NotADirectoryError` (WinError
+    267, measured), `dorossi_error_is_fatal` judges it fatal, and
+    `_dorossi_error_hint` prints "CLI backend unavailable or not authenticated" to
+    stderr and tells the user "please try again later" -- pointing at the wrong
+    cause and calling a permanent condition temporary.
 
-    三個刻意的選擇：
+    Three deliberate choices:
 
-    * **沿用寫入端那一支**（`_dorossi_validate_dir`），不另寫判準。它在 `is_dir()`
-      之前只做去空白、剝成對引號、展開 `~`，都是往寬的方向：寬放過去的值 spawn 照樣
-      失敗（等同修正前），而不會多拒絕一個 spawn 其實接受的值。
-    * **只檢查、不改寫。** 驗證函式回的 resolve 形式在這裡丟掉，呼叫端照舊把原字串交給
-      子行程——後端的 `--resume` store 以工作目錄字串為鍵，換一串等於弄丟那段對話。
-    * **不比對「存的值等不等於它的 resolve 形式」、也不擋 `..`。** 那擋得住手改與事後
-      換成 junction 的目錄，但擋不住真正的威脅類別：能改 store 的人有本機寫入權限，直接
-      寫一個絕對路徑就好，而擁有者本來就能用 `/new <路徑>` 指向任何存在的目錄。它唯一
-      買到的是誤拒（專案搬家後留 junction 的正常用法）。
+    * **Reuse the write-side helper** (`_dorossi_validate_dir`), not a second set
+      of criteria. Before `is_dir()` it only strips whitespace, peels a matched
+      pair of quotes and expands `~`, all in the loosening direction: a value it
+      lets through will still fail at spawn (the same as before the fix), and it
+      will never reject one more value that spawn would actually accept.
+    * **Check only, never rewrite.** The resolved form the validation function
+      returns is discarded here, and the caller still hands the original string to
+      the child -- the backend's `--resume` store is keyed by the working-directory
+      string, and changing the string loses that conversation.
+    * **Do not compare "the stored value against its resolved form", and do not
+      block `..`.** That would stop a hand-edited directory or one later swapped for
+      a junction, but not the real threat class: whoever can edit the store has
+      local write access and can just write an absolute path, and the owner can
+      already point at any existing directory with `/new <path>`. All it buys is a
+      false rejection (the normal case of a junction left after moving the
+      project).
 
-    非字串（手改的 store 放了一個數字）走同一條例外，而不是在 `_dorossi_validate_dir`
-    的 `.strip()` 上丟 `AttributeError`。stderr 那一行**不印路徑**：它會進 log，而 log
-    有對外的出口。
+    A non-string (a hand-edited store holding a number) takes the same exception
+    rather than raising `AttributeError` on `_dorossi_validate_dir`'s `.strip()`.
+    That stderr line **prints no path**: it goes into the log, and the log has an
+    external outlet.
     """
     if not isinstance(cwd, str) or _dorossi_validate_dir(cwd) is None:
         print("[dorossi] working directory is not a usable directory; "
@@ -811,32 +1009,40 @@ _DEFAULT_DOROSSI_SYSTEM_PROMPT = (
     "使用者用哪種語言就用該語言回覆，"
     "其中所有中文一律使用繁體中文（台灣用詞）。"
 )
-# 由外部檔載入（缺檔／壞檔回退到上方完整的內建預設值）。**安全硬需求**：回退值必須
-# 是完整的人設＋憑證界線文字，缺檔時 Dorossi 仍須帶著那條憑證界線，不可退化成不安全
-# 狀態。這是刻意的「文字重複」，擁有者已同意用「缺檔回退到內建預設」；
-# `test_bot_prompts` 會逐字元比對檔案與這裡的預設值，改一邊就要改另一邊。
+# Loaded from an external file (a missing / corrupt file falls back to the
+# complete built-in default above). **Security hard requirement**: the fallback
+# value must be the full persona + credential-boundary text, so that even with the
+# file missing Dorossi still carries that credential boundary and does not degrade
+# into an insecure state. This is deliberate "text duplication", and the owner has
+# agreed to "a missing file falling back to the built-in default";
+# `test_bot_prompts` compares the file against this default character by
+# character, so changing one side means changing the other.
 DOROSSI_SYSTEM_PROMPT = load_prompt(
     "dorossi_system.md", _DEFAULT_DOROSSI_SYSTEM_PROMPT)
 
 
-# ---- 「這個工作階段跑的是不是磁碟上那份系統提示」 --------------------------
+# ---- "is this session running the system prompt that is on disk?" ------------
 #
-# 2026-09-03 補。基底系統提示**只在工作階段的第一輪**送出（見 `_cc_args` 裡的
-# `if not session_id: append_parts.append(DOROSSI_SYSTEM_PROMPT)`）——`--resume`
-# 會沿用後端原本記住的那一份。所以編輯 `bot_prompts/dorossi_system.md` 對**既有
-# 的每一個工作階段完全沒有作用**，而且沒有任何地方會講。
+# Added 2026-09-03. The base system prompt is sent **only on a session's first
+# round** (see `if not session_id: append_parts.append(DOROSSI_SYSTEM_PROMPT)` in
+# `_cc_args`) -- `--resume` keeps the copy the backend originally remembered. So
+# editing `bot_prompts/dorossi_system.md` has **no effect at all on any existing
+# session**, and nothing anywhere says so.
 #
-# 代價是實際發生過的：擁有者 2026-08-27 12:16 改寫這份提示（Layer 3 全面放寬），
-# 但當時存在的 7 個工作階段全部建立於那之前（s6 是 08-25，其餘是 08-27 07:0x），
-# 於是那個放寬**一個工作階段都沒有生效**，而且過了一週才被發現。症狀是「改了設定
-# 卻沒有反應」——跟「跑著的程式碼比磁碟舊」是同一類失效，只是換成提示詞。
+# The cost really happened: the owner rewrote this prompt at 2026-08-27 12:16
+# (Layer 3 fully loosened), but all 7 sessions that existed then were created
+# before that (s6 on 08-25, the rest at 08-27 07:0x), so the loosening **took
+# effect in not a single session**, and it took a week to notice. The symptom is
+# "changed the setting but nothing happened" -- the same class of failure as "the
+# running code is older than the disk", only with a prompt instead.
 #
-# 指紋只取前 16 個十六進位字元：夠分辨改動，又短到可以直接寫進狀態檔給人看。
+# The fingerprint keeps only the first 16 hex characters: enough to tell edits
+# apart, and short enough to write straight into a status file for a human to read.
 SYSTEM_PROMPT_FINGERPRINT_LEN = 16
 
 
 def system_prompt_fingerprint(text: str | None = None) -> str:
-    """目前這份基底系統提示的短指紋。永不 raise。"""
+    """Short fingerprint of the current base system prompt. Never raises."""
     raw = DOROSSI_SYSTEM_PROMPT if text is None else text
     if not isinstance(raw, str):
         raw = str(raw)
@@ -845,11 +1051,12 @@ def system_prompt_fingerprint(text: str | None = None) -> str:
 
 
 def session_prompt_state(sess: dict) -> str:
-    """`"current"` / `"stale"` / `"unknown"`——這個工作階段帶的是哪一份系統提示。
+    """`"current"` / `"stale"` / `"unknown"` -- which system prompt this session carries.
 
-    `"unknown"` 是**舊資料**：指紋是 2026-09-03 才開始記的，在那之前建立的工作
-    階段沒有這個欄位。不要把 unknown 當成 stale——那會讓每一個舊工作階段都亮紅燈，
-    而會亂叫的守門最後會被人關掉（`test_language` 記過同一個教訓）。
+    `"unknown"` is **legacy data**: the fingerprint has only been recorded since
+    2026-09-03, and sessions created before that have no such field. Do not treat
+    unknown as stale -- that would light every old session up red, and a guard that
+    cries wolf ends up switched off (`test_language` recorded the same lesson).
     """
     if not isinstance(sess, dict):
         return "unknown"
@@ -882,11 +1089,13 @@ DOROSSI_RESET_KEYWORDS = frozenset(
 # clear the active session in place (keep its slot/id). This split only matters
 # now that a user can hold several sessions at once.
 DOROSSI_NEW_KEYWORDS = frozenset({"/new", "新對話"})
-# `dir=` 只在 **token 邊界**上才算關鍵字（字串開頭，或前面有空白）。
-# 用 `find("dir=")` 找任何位置的話，一個真的含有 `dir=` 的路徑會被從中間剖開：
-# `/new D:\\Work\\dir=test` → cwd `D:\\Work\\`（**存在**，所以驗證會通過）
-# ＋ extra `test`。結果不是「被拒絕」而是「安靜地在上一層目錄幹活」，而在 full
-# 工具模式下那個目錄就是後端可以無確認讀寫、可以跑 shell 的範圍。
+# `dir=` counts as the keyword only on a **token boundary** (start of the string,
+# or preceded by whitespace). Searching anywhere with `find("dir=")` would split a
+# path that really contains `dir=` down the middle:
+# `/new D:\\Work\\dir=test` -> cwd `D:\\Work\\` (**exists**, so validation passes)
+# + extra `test`. The result is not "rejected" but "quietly working one directory
+# up", and in full tool mode that directory is the scope where the backend can
+# read and write without confirmation and run a shell.
 _DOROSSI_DIR_KEYWORD_RE = re.compile(r"(?:^|\s)dir=", re.IGNORECASE)
 
 
@@ -895,48 +1104,55 @@ def _dorossi_parse_reset(
     """Classify a Dorossi prompt as a (possibly scoped) reset.
 
     Syntax (canonical):
-      <reset-keyword>                       → 開新對話，無任何範圍設定
-      <reset-keyword> <絕對路徑>             → 開新對話，並把該目錄設為本次對話往後
-                                               每一輪後端的「工作目錄 (cwd)」（新語法，
-                                               免打 dir=；後端真的在那裡執行、載入該
-                                               目錄自己的設定檔）
-      <reset-keyword> dir=<絕對路徑>         → 開新對話，並把該目錄設為本次對話的額外
-                                               「可存取」範圍（沿用 --add-dir 舊語意，
-                                               cwd 仍是預設 workspace）
-      <reset-keyword> <cwd> dir=<extra>     → 兩者並用：cwd 換成 <cwd>，並額外開放
-                                               <extra> 給後端存取
+      <reset-keyword>                       → start a new conversation, with no scope setting
+      <reset-keyword> <absolute-path>       → start a new conversation, and make that
+                                               directory the backend's "working directory
+                                               (cwd)" for every later round of this
+                                               conversation (new syntax, no dir= needed;
+                                               the backend really runs there and loads
+                                               that directory's own config files)
+      <reset-keyword> dir=<absolute-path>   → start a new conversation, and make that
+                                               directory an extra "accessible" scope for
+                                               this conversation (keeps the old --add-dir
+                                               meaning; cwd is still the default workspace)
+      <reset-keyword> <cwd> dir=<extra>     → both at once: cwd becomes <cwd>, and
+                                               <extra> is additionally opened to the backend
 
-    乾淨切法：先用 `dir=`（case-insensitive，且**只在 token 邊界**——字串開頭或
-    前面有空白）切出 `extra_part`，再把前半段
-    `split(None, 1)` 成「關鍵字 ＋ cwd_part」。**只有關鍵字才 lower() 做比對；
-    cwd_part / extra_part 兩段路徑一律維持原樣（可含空格、`:`、`\\`），永不
-    lowercased。**
+    Clean split: first cut `extra_part` off with `dir=` (case-insensitive, and
+    **only on a token boundary** -- start of the string or preceded by whitespace),
+    then `split(None, 1)` the front half into "keyword + cwd_part". **Only the
+    keyword is lower()-ed for comparison; both paths, cwd_part / extra_part, are
+    always kept verbatim (they may contain spaces, `:`, `\\`) and never
+    lowercased.**
 
     Returns (is_reset, is_new, cwd_part, extra_part). `is_reset` is False for any
     normal Q&A (so a real question that merely contains "dir=" still falls
     through to the backend). `is_new` is True when the keyword OPENS A NEW
     session (`/new` / `新對話`) and False when it clears the active session in
     place (`/reset` / `/clear` / `重置` / `清除對話`). When it is a reset,
-    `cwd_part` is the raw cwd path (新語法) or None, and `extra_part` is the raw
-    --add-dir path (dir= 舊語意) or None. Both paths are returned verbatim and
+    `cwd_part` is the raw cwd path (new syntax) or None, and `extra_part` is the raw
+    --add-dir path (old dir= meaning) or None. Both paths are returned verbatim and
     UNVALIDATED — the caller validates that each is an existing directory before
     applying it.
     """
     stripped = prompt.strip()
-    # 1) 先用 `dir=`（case-insensitive、**只在 token 邊界**）切出額外可存取目錄
-    #    （--add-dir 舊語意）。邊界那一條的理由見 `_DOROSSI_DIR_KEYWORD_RE`。
+    # 1) First cut off the extra accessible directory with `dir=` (case-insensitive,
+    #    **only on a token boundary**; the old --add-dir meaning). For why the
+    #    boundary matters, see `_DOROSSI_DIR_KEYWORD_RE`.
     match = _DOROSSI_DIR_KEYWORD_RE.search(stripped)
     if match is None:
         before_dir, extra_part = stripped, ""
     else:
         before_dir = stripped[:match.end() - len("dir=")]
         extra_part = stripped[match.end():].strip()
-    # 2) 前半段切出「關鍵字 ＋ cwd_part」。split(None, 1) 吃掉關鍵字後整段空白，
-    #    剩餘即為 cwd（直接語法、免打 dir=）。空字串 → 純重置。
+    # 2) Cut the front half into "keyword + cwd_part". split(None, 1) swallows all
+    #    the whitespace after the keyword, and the rest is the cwd (direct syntax,
+    #    no dir= needed). Empty string -> a plain reset.
     parts = before_dir.split(None, 1)
     keyword = parts[0] if parts else ""
     cwd_part = parts[1].strip() if len(parts) > 1 else ""
-    # 只有第一個 token（關鍵字）才 lower() 比對；兩段路徑都維持原樣。
+    # Only the first token (the keyword) is lower()-ed for comparison; both paths
+    # stay verbatim.
     kw_lower = keyword.lower()
     if kw_lower in DOROSSI_RESET_KEYWORDS:
         is_new = kw_lower in DOROSSI_NEW_KEYWORDS
@@ -945,22 +1161,28 @@ def _dorossi_parse_reset(
 
 
 def _dorossi_unquote_dir(raw: str | None) -> str:
-    """把使用者貼進來的目錄字串正規化：去前後空白，再脫掉**成對**的引號一層。
+    """Normalise a directory string the user pasted in: strip surrounding
+    whitespace, then remove one layer of **matching** quotes.
 
-    存在的理由是一個真實的操作習慣：檔案總管的「複製路徑」（Shift ＋右鍵）產生的
-    字串**自帶雙引號**，貼進來就是 `"D:\\Work\\Foo"`。那不是任何一個存在的目錄，
-    於是被判成「無法使用」——而 `/dorossi` 對外的訊息是刻意泛用的，使用者只會看到
-    「指定的目錄無法使用」，看不出差別只在頭尾兩個字元。
+    It exists because of a real working habit: File Explorer's "Copy as path"
+    (Shift + right-click) produces a string that **carries its own double quotes**,
+    so what gets pasted is `"D:\\Work\\Foo"`. That is not any existing directory,
+    so it was judged "unusable" -- and the outward-facing `/dorossi` message is
+    deliberately generic, so the user only sees "the given directory cannot be
+    used" and cannot tell that the only difference is the first and last character.
 
-    只脫**成對**的一層，不用 repo 其他地方那種 `.strip('"').strip("'")`：後者會把
-    頭尾所有引號字元一路刮掉，遇到真的叫 `'foo'` 的目錄（POSIX 合法）就把它改成了
-    另一個目錄——驗證函式回傳的值會直接變成後端的工作目錄，安靜地指錯地方比乾脆
-    被拒還糟。Windows 的檔名本來就不能含 `"`，所以那一側沒有取捨。
+    Only **one matching** layer is removed, not the `.strip('"').strip("'")` used
+    elsewhere in the repo: that scrapes every quote character off both ends, and a
+    directory really named `'foo'` (legal on POSIX) would be turned into a
+    different directory -- the value the validator returns becomes the backend's
+    working directory directly, and quietly pointing at the wrong place is worse
+    than being rejected outright. Windows file names cannot contain `"` anyway, so
+    there is no trade-off on that side.
 
-    與 `_gui_control.unquote_path` 是同一條判準的兩份實作（兩邊都是門面模組、
-    互不 import）。**改其中一份時另一份要一起改**；
-    `test_dorossi_dirs.test_both_unquote_implementations_answer_identically`
-    會在兩者答案分岔時變紅。"""
+    This and `_gui_control.unquote_path` are two implementations of the same rule
+    (both are facade modules that do not import each other). **Change one, change
+    the other**; `test_dorossi_dirs.test_both_unquote_implementations_answer_identically`
+    turns red when their answers diverge."""
     text = (raw or "").strip()
     for quote in ('"', "'"):
         if len(text) >= 2 and text[0] == quote and text[-1] == quote:
@@ -969,14 +1191,17 @@ def _dorossi_unquote_dir(raw: str | None) -> str:
 
 
 def _dorossi_validate_dir(raw: str | None) -> str | None:
-    """把使用者提供的目錄字串驗證為「已存在的目錄」並回傳解析後的絕對路徑；
-    無效（不存在 / 不是目錄 / 解析出錯）則回 None。永遠不會 raise，也永遠不會把
-    路徑回傳到 Discord（呼叫端只用回傳值決定是否套用，對外仍維持泛用訊息）。
+    """Validate a user-supplied directory string as "an existing directory" and
+    return the resolved absolute path; invalid (missing / not a directory /
+    resolution error) returns None. Never raises, and never sends the path back to
+    Discord (the caller only uses the return value to decide whether to apply it,
+    and keeps the outward message generic).
 
-    正規化（`_dorossi_unquote_dir`）刻意放在**這裡**而不是各呼叫端：三個入口
-    （`/dorossi allowdir add`、`/dorossi session new … cwd=`、`@bot /new <路徑>`
-    與 `dir=`）全部經過本函式，但先前只有第一個在自己那邊剝引號，於是同一串貼上的
-    路徑在一個指令能用、另外兩個安靜失敗。"""
+    The normalisation (`_dorossi_unquote_dir`) deliberately lives **here** rather
+    than at each caller: all three entry points (`/dorossi allowdir add`,
+    `/dorossi session new … cwd=`, `@bot /new <path>` and `dir=`) go through this
+    function, but previously only the first stripped quotes on its own side, so the
+    same pasted path worked in one command and silently failed in the other two."""
     cand_raw = _dorossi_unquote_dir(raw)
     if not cand_raw:
         return None
@@ -990,17 +1215,22 @@ def _dorossi_validate_dir(raw: str | None) -> str | None:
 
 
 def _dorossi_looks_like_path(text: str | None) -> bool:
-    """粗略判斷一段文字「看起來像不像路徑」，用來決定 cwd 解析失敗時要不要提示。
+    """Roughly judge whether a piece of text "looks like a path", used to decide
+    whether to hint when cwd resolution fails.
 
-    只有看起來像路徑卻無法使用時才提醒使用者；像 `/new 隨便幾個字` 這種一般文字
-    不是路徑，視為純重置、不顯示「目錄無法使用」雜訊（需求 #5）。判準刻意寬鬆：
-    含路徑分隔符（`/`、`\\`）、Windows 磁碟機字首（如 `C:`）、或家目錄符號 `~`
-    其一即視為「像路徑」。"""
+    The user is reminded only when something looks like a path yet cannot be used;
+    ordinary text like `/new a few random words` is not a path, is treated as a
+    plain reset, and shows no "directory cannot be used" noise (requirement #5).
+    The criterion is deliberately loose: any one of a path separator (`/`, `\\`), a
+    Windows drive prefix (such as `C:`), or the home-directory symbol `~` counts as
+    "looks like a path"."""
     if not text:
         return False
-    # 與 `_dorossi_validate_dir` 走同一套正規化，否則兩者會對同一串輸入給出矛盾的
-    # 答案：`"C:"` 帶引號時驗證會通過（剝掉引號後是磁碟根目錄），這裡卻因為第一個
-    # 字元是 `"` 而說「不像路徑」——路徑被拒時就不會提示，靜默失敗。
+    # Go through the same normalisation as `_dorossi_validate_dir`, otherwise the
+    # two give contradictory answers for the same input: a quoted `"C:"` passes
+    # validation (with the quotes stripped it is a drive root), yet here the first
+    # character being `"` would say "not a path" -- so a rejected path would get no
+    # hint and fail silently.
     t = _dorossi_unquote_dir(text)
     if not t:
         return False
@@ -1008,46 +1238,58 @@ def _dorossi_looks_like_path(text: str | None) -> bool:
         return True
     if t.startswith("~"):
         return True
-    # Windows 磁碟機字首，如 `C:`、`D:\...`。
+    # A Windows drive prefix, such as `C:`, `D:\...`.
     if len(t) >= 2 and t[0].isalpha() and t[1] == ":":
         return True
     return False
 
 
 def _dorossi_parse_turn_flags(prompt: str) -> tuple:
-    """解析提問「開頭」的指令 token `/effort <level>`、`/model <tier>`、
-    `/session <id>`（純函式，永不 raise）。三者皆選填、順序不拘、大小寫不拘；
-    只認提示最前面連續出現的指令 token——一旦遇到第一個非指令 token 就停止，所以
-    出現在句中的 `/effort`（例如「請解釋 /effort 的意思」）不會被誤判、原文原樣保留。
+    """Parse the command tokens `/effort <level>`, `/model <tier>`, `/session <id>`
+    at the **start** of a question (pure function, never raises). All three are
+    optional, in any order, case-insensitive; only command tokens appearing
+    consecutively at the very front of the prompt count -- parsing stops at the
+    first non-command token, so an `/effort` in mid-sentence (e.g. "please explain
+    what /effort means") is not misread and the original text is kept verbatim.
 
-    語意：
-      * `/effort <v>`（session 級，擁有者裁決）：v ∈ DOROSSI_EFFORT_LEVELS 或
-        DOROSSI_TUNE_DEFAULT（"default" ＝清除該 session 的覆寫、回到預設）；
-        重複出現後者覆蓋前者。
-      * `/model <m>`（session 級）：m 必須是 DOROSSI_ALL_MODEL_CHOICES 的 allowlist
-        key（後端模型別名——擁有者裁決的窄範圍例外，這個功能面可露出別名）或
-        "default"；回傳驗證過的 key。**allowlist 驗證是硬需求**：使用者輸入永不
-        原樣進 CLI 參數，送後端時由 _dorossi_session_tuning 再查一次表取 value。
-        這裡用的是**兩個後端的聯集**：純函式碰不到工作階段，不知道這一輪在哪個後端
-        上。「這個後端吃不吃得下」由 dorossi_model_applies 在有工作階段的地方判，而且
-        會講出來（`discord_bot._dorossi_tuning_labels`），不是安靜忽略。
-      * `/session <id>`（**本輪級，不是 session 級**，擁有者需求 2026-08-27）：
-        把這一輪送到指定的 session slot，**不改動 active 指標**。用途是同時對多
-        個專案發問而不用來回 switch——引擎本來就支援多 session 並行（per-session
-        鎖 ＋ `_dorossi_loops` registry），卡住的只是「ask 永遠打到 active」。
-        值必須通過 `_dorossi_is_session_id`（`s` ＋數字）；這裡只驗**格式**，
-        「該 session 存不存在」由呼叫端在狀態鎖內驗（純函式碰不到 state）。
-      * 無效／缺值的指令記進 errors（(kind, raw_value)，
-        kind ∈ {"effort","model","session"}），該 token 照樣被消耗、繼續往後解析
-        ——呼叫端見 errors 非空就整筆拒絕並回泛用錯誤（原始值只進 stderr）。
+    Semantics:
+      * `/effort <v>` (session level, owner's ruling): v ∈ DOROSSI_EFFORT_LEVELS or
+        DOROSSI_TUNE_DEFAULT ("default" = clear that session's override and return
+        to the default); when repeated, the later one wins.
+      * `/model <m>` (session level): m must be an allowlist key of
+        DOROSSI_ALL_MODEL_CHOICES (a backend model alias -- the narrow exception
+        the owner ruled on, so this feature surface may expose aliases) or
+        "default"; the validated key is returned. **Allowlist validation is a hard
+        requirement**: user input never goes into CLI arguments verbatim, and
+        _dorossi_session_tuning looks the table up again for the value when
+        sending to the backend. This uses the **union of both backends**: a pure
+        function cannot see the session and does not know which backend this round
+        is on. "Can this backend take it" is judged by dorossi_model_applies where
+        there is a session, and it is said out loud
+        (`discord_bot._dorossi_tuning_labels`), not silently ignored.
+      * `/session <id>` (**round level, not session level**, owner's request
+        2026-08-27): send this round to the given session slot **without moving
+        the active pointer**. The use is asking about several projects at once
+        without switching back and forth -- the engine already supports multiple
+        sessions in parallel (per-session lock + the `_dorossi_loops` registry);
+        the only blocker was "ask always hits the active one". The value must pass
+        `_dorossi_is_session_id` (`s` + digits); only the **format** is checked
+        here, and "does that session exist" is checked by the caller under the
+        state lock (a pure function cannot see state).
+      * An invalid / missing-value command is recorded in errors ((kind, raw_value),
+        kind ∈ {"effort","model","session"}); the token is still consumed and
+        parsing continues -- a caller that sees non-empty errors rejects the whole
+        thing and replies with a generic error (the raw value goes only to stderr).
 
-    Returns (effort, model_key, session_id, cleaned_prompt, errors)：前三者為
-    None 表示本輪未指定（effort／model 沿用 session 已存值，否則預設；session
-    None ＝走 active）。cleaned_prompt 是剝掉指令後、實際要送給後端的提問（可能為
-    空字串——呼叫端把「只打指令」當純設定更新處理）。呼叫端用
-    _dorossi_apply_turn_tuning 把非 None 的 effort／model 寫進 session slot
-    （"default" ＝清除鍵），之後每輪由 _dorossi_session_tuning 讀出生效值；
-    session_id **不寫進任何 store**，它只活這一輪。"""
+    Returns (effort, model_key, session_id, cleaned_prompt, errors): None for any
+    of the first three means this round did not specify it (effort / model keep the
+    session's stored value, otherwise the default; session None = use active).
+    cleaned_prompt is the question actually sent to the backend with the commands
+    stripped (it may be an empty string -- the caller treats "only commands typed"
+    as a pure settings update). The caller uses _dorossi_apply_turn_tuning to write
+    non-None effort / model into the session slot ("default" = clear the key), and
+    each later round reads the effective value via _dorossi_session_tuning;
+    session_id is **written to no store** and lives only for this round."""
     effort = None
     model_tier = None
     session_id = None
@@ -1081,19 +1323,22 @@ def _dorossi_parse_turn_flags(prompt: str) -> tuple:
             else:
                 errors.append((kind, raw_value))
         if not vparts:
-            rest = ""  # 指令在句尾且沒帶值（已記 error）→ token 已消耗、沒東西可再解析
+            rest = ""  # command at the end with no value (error recorded) -> token consumed, nothing left
             break
         rest = vparts[1].strip() if len(vparts) > 1 else ""
     return effort, model_tier, session_id, rest, errors
 
 
 def _dorossi_apply_turn_tuning(sess: dict, effort, model_tier) -> bool:
-    """把本輪解析出的微調指令套用到 session slot（in place；session 級持久化）。
-    None ＝本輪沒打該指令、不動既存值；DOROSSI_TUNE_DEFAULT ＝清除該覆寫（回到
-    預設）；其餘為已驗證的合法值（effort 力度字／model 為 DOROSSI_MODEL_CHOICES
-    的 allowlist key，存 key、送後端時再查表取 value——理由見表的註解）。回傳
-    「是否有任何變動企圖」（有打指令就 True，供呼叫端決定要不要在確認訊息提一
-    句），純函式、永不 raise。"""
+    """Apply the tuning commands parsed from this round to the session slot (in
+    place; session-level persistence). None = the command was not typed this round,
+    leave the stored value alone; DOROSSI_TUNE_DEFAULT = clear that override (back
+    to the default); anything else is an already-validated legal value (effort is
+    the effort word / model is an allowlist key of DOROSSI_MODEL_CHOICES; the key
+    is stored and looked up for the value when sending to the backend -- the reason
+    is in the table's comment). Returns "was any change attempted" (True whenever a
+    command was typed, so the caller can decide whether to mention it in the
+    confirmation message); pure function, never raises."""
     changed = False
     if effort:
         if effort == DOROSSI_TUNE_DEFAULT:
@@ -1111,18 +1356,22 @@ def _dorossi_apply_turn_tuning(sess: dict, effort, model_tier) -> bool:
 
 
 def _dorossi_session_tuning(sess: dict, backend: str | None = None) -> tuple:
-    """讀出 session slot 目前生效的微調：回傳 (effort, model)——直接可往後端帶
-    的值。effort 存的就是力度字；model 存的是 allowlist key，這裡經
-    `dorossi_resolve_model` 換成實際帶給後端的值（allowlist 驗證的最後一道：只有
-    查表命中才會有值）。舊版通用階層 key（fast/standard/max）讀取時無感遷移
-    （不重寫 store）。未設定、或 store 裡的值已不合法（手改過／表已移除該 key）→
-    該項回 None（＝維持預設、不帶旗標），永不 raise。
+    """Read the tuning currently in effect for the session slot: returns (effort,
+    model) -- values that can go straight to the backend. effort is stored as the
+    effort word itself; model is stored as an allowlist key, which
+    `dorossi_resolve_model` turns here into the value actually passed to the
+    backend (the last line of allowlist validation: there is a value only when the
+    lookup hits). Legacy generic tier keys (fast/standard/max) are migrated
+    transparently on read (the store is not rewritten). Unset, or a stored value
+    that is no longer legal (hand-edited / the key was removed from the table) ->
+    that item returns None (= keep the default, pass no flag); never raises.
 
-    **`backend` 省略時由 `dorossi_session_backend(sess)` 判**（工作階段的
-    `ai_provider` 覆寫 > 模組設定）。2026-09-23 之前這支是後端盲的：它只查 claude
-    那張表，所以 `/model` 設的值對 codex 完全沒作用，而且沒有任何人講出來。現在
-    「這個後端吃不下這個值」回的是 None（維持後端預設），顯示端則由
-    `dorossi_model_applies` 判出來並**明講**。
+    **When `backend` is omitted it is decided by `dorossi_session_backend(sess)`**
+    (the session's `ai_provider` override > the module setting). Before 2026-09-23
+    this was backend-blind: it only looked up the claude table, so a value set with
+    `/model` had no effect at all on codex, and nobody said so. Now "this backend
+    cannot take this value" returns None (keep the backend default), and the display
+    side works it out through `dorossi_model_applies` and **says so explicitly**.
     """
     effort = sess.get("tune_effort")
     if effort not in DOROSSI_EFFORT_LEVELS:
@@ -1132,20 +1381,29 @@ def _dorossi_session_tuning(sess: dict, backend: str | None = None) -> tuple:
     return effort, dorossi_resolve_model(backend, sess.get("tune_model"))
 
 
-# --- Dorossi 自走模式（autonomous self-loop） ------------------------------------
-# 擁有者授權、無人值守的多輪 agentic 工作：偵測到「自主完成、不要問我」這類意圖
-# 時，Dorossi 後端會在同一個工作階段裡一輪一輪自己往前推進，直到自報完成。整個迴圈
-# 期間持有 Dorossi 佇列鎖（接受的取捨，僅擁有者），`@bot abort` 可隨時中止。
+# --- Dorossi autonomous self-loop ------------------------------------------------
+# Owner-authorised, unattended multi-round agentic work: when an intent like
+# "finish it on your own, don't ask me" is detected, the Dorossi backend pushes
+# forward round after round in the same session until it reports completion. The
+# Dorossi queue lock is held for the whole loop (an accepted trade-off, owner
+# only), and `@bot abort` can stop it at any time.
 #
-# 完成協定：每一輪的「使用者提示詞」裡注入一個哨符指令（resume 會保留原始 system
-# prompt，所以協定必須放在每輪的 user prompt）。後端完成整個任務時，在回覆最後獨立
-# 一行輸出這個哨符；迴圈偵測到哨符即結束，並把哨符從對外回覆中剝掉。哨符字串屬於
-# 「迴圈內部細節」，永不外洩到 Discord（串流預覽與最終回覆都會剝除）。
+# Completion protocol: a sentinel instruction is injected into each round's "user
+# prompt" (resume keeps the original system prompt, so the protocol must live in
+# each round's user prompt). When the backend finishes the whole task it prints
+# this sentinel on its own line at the end of the reply; the loop ends when it
+# sees the sentinel and strips it from the outward reply. The sentinel string is
+# an "internal loop detail" and never leaks to Discord (both the streaming preview
+# and the final reply strip it).
 DOROSSI_LOOP_SENTINEL = "<<<DOROSSI-LOOP-DONE>>>"
-# 共用的「實證驗證」引導：附加到下列三段每輪提示尾端（用常數串接，保持 DRY，避免
-# 三段各自複製維護）。之所以要附加到「每一輪」而不是只放第一輪，是因為 resume 會保
-# 留原始 system prompt，但每輪的協定／引導只活在當輪的 user prompt 裡——只放第一輪
-# 的話，後面幾輪就讀不到這段守則，會退回老毛病（憑空推託、不實際驗瀏覽器改動）。
+# Shared "verify with evidence" guidance: appended to the end of the three
+# per-round prompts below (joined as constants to stay DRY instead of each of the
+# three keeping its own copy). It is appended to "every round" rather than only
+# the first because resume keeps the original system prompt, but each round's
+# protocol / guidance lives only in that round's user prompt -- if it were only in
+# the first round, later rounds could not read these rules and would slip back
+# into old habits (making excuses out of thin air, not actually verifying browser
+# changes).
 _DEFAULT_DOROSSI_LOOP_VERIFY_GUIDANCE = (
     '\n\n[驗證守則] 一、若你要做的改動牽涉瀏覽器、driver 或 Selenium 啟動路徑'
     '，不要因為「沒有瀏覽器、無法驗證」就跳過，或只憑空推論而不實際動手驗證。這個專案有一支獨立的'
@@ -1172,11 +1430,14 @@ _DEFAULT_DOROSSI_LOOP_VERIFY_GUIDANCE = (
 )
 DOROSSI_LOOP_VERIFY_GUIDANCE = load_prompt(
     "dorossi_loop_verify_guidance.md", _DEFAULT_DOROSSI_LOOP_VERIFY_GUIDANCE)
-# 共用的「工具自足」引導：與 VERIFY_GUIDANCE 一樣，附加到下列三段每輪提示尾端（理
-# 由相同——resume 只保留原始 system prompt，協定／引導必須每輪重注入；只放第一輪後
-# 面幾輪就讀不到）。語意：把整台機器的工具鏈當成自己的，缺工具就自己取得、不要推
-# 託。這是內部後端 prompt、非 Discord 對外字串，可以明講 pip／套件管理器／下載這類
-# 具體手段。
+# Shared "be self-sufficient with tools" guidance: like VERIFY_GUIDANCE, appended
+# to the end of the three per-round prompts below (same reason -- resume keeps
+# only the original system prompt, so protocol / guidance must be re-injected
+# every round; if only in the first round, later rounds cannot read it). Meaning:
+# treat the whole machine's toolchain as your own, and when a tool is missing, get
+# it yourself instead of making excuses. This is an internal backend prompt, not
+# an outward Discord string, so it may name concrete means such as pip / a package
+# manager / downloading.
 _DEFAULT_DOROSSI_LOOP_TOOLING_GUIDANCE = (
     "\n\n[工具自足] 你在這台機器上有完整的 shell 與工具鏈，請把它當成你的工作環境"
     "盡量用好用滿。若任務需要某個工具、函式庫或執行檔，而機器上目前沒有，就**自己"
@@ -1188,14 +1449,20 @@ _DEFAULT_DOROSSI_LOOP_TOOLING_GUIDANCE = (
 )
 DOROSSI_LOOP_TOOLING_GUIDANCE = load_prompt(
     "dorossi_loop_tooling_guidance.md", _DEFAULT_DOROSSI_LOOP_TOOLING_GUIDANCE)
-# B3 #5：把上面兩段「耐久守則」從『每輪 user prompt』搬到『附加系統提示』通道。實測
-# --append-system-prompt 在 --resume 上「該輪生效、且不會被 baked 進 session」（故每次
-# 叫用都要重帶）——放系統提示＝每輪都實際到達後端、卻不會像 user prompt 那樣累積進對話
-# 歷史被後續每輪重送（避免 ~O(N²) 複利）。自走迴圈每輪（含 resume／壓縮輪）都經
-# loop_system_guidance 帶上這個常數；下方 user prompt（FIRST_SUFFIX／CONTINUE／PUSHBACK）
-# 只留精簡 body。守則不可直接刪——只是換成「會被保留／快取的系統提示」通道送達，後端每
-# 輪仍受其約束（迴圈每輪都帶＝即使 resume 的是先前單輪建立、沒 baked 守則的 session，也
-# 一樣每輪補上，故無「resume 非迴圈 session 讀不到守則」的舊 trap）。
+# B3 #5: move the two "durable rules" above from the "per-round user prompt" to the
+# "appended system prompt" channel. Measured: --append-system-prompt on --resume
+# "takes effect for that round and is not baked into the session" (so it must be
+# passed again on every call) -- in the system prompt it really reaches the
+# backend every round, yet does not accumulate into the conversation history and
+# get resent by every later round the way a user prompt does (avoiding ~O(N²)
+# compounding). Every self-loop round (including resume / compaction rounds)
+# carries this constant through loop_system_guidance; the user prompts below
+# (FIRST_SUFFIX / CONTINUE / PUSHBACK) keep only a lean body. The rules must not
+# simply be deleted -- they just arrive through the "kept / cached system prompt"
+# channel instead, and the backend is still bound by them every round (carried
+# every round = even when resuming a session created earlier by a single turn,
+# without the rules baked in, they are still added every round, so the old trap
+# of "resuming a non-loop session cannot read the rules" is gone).
 DOROSSI_LOOP_SYSTEM_GUIDANCE = (
     DOROSSI_LOOP_VERIFY_GUIDANCE + DOROSSI_LOOP_TOOLING_GUIDANCE
 )
@@ -1209,8 +1476,9 @@ _DEFAULT_DOROSSI_LOOP_FIRST_SUFFIX = (
     "做的事』時，才在回覆的最後『獨立一行』輸出 " + DOROSSI_LOOP_SENTINEL + " 當作完成"
     "訊號；只完成幾項並不算窮盡，只要還有任何事情可以做，就絕對不要輸出這個字串，"
     "繼續推進就好。"
-)  # 耐久守則改走系統提示（DOROSSI_LOOP_SYSTEM_GUIDANCE），不再附在 user prompt
-# 檔案裡哨符處寫 {sentinel}，載入時換回 DOROSSI_LOOP_SENTINEL（哨符單一來源在程式碼）。
+)  # durable rules go through the system prompt (DOROSSI_LOOP_SYSTEM_GUIDANCE), no longer in the user prompt
+# The file writes {sentinel} where the sentinel goes, swapped back to
+# DOROSSI_LOOP_SENTINEL at load time (the sentinel stays single-sourced in code).
 DOROSSI_LOOP_FIRST_SUFFIX = load_prompt(
     "dorossi_loop_first_suffix.md", _DEFAULT_DOROSSI_LOOP_FIRST_SUFFIX,
     replacements={"sentinel": DOROSSI_LOOP_SENTINEL})
@@ -1221,7 +1489,7 @@ _DEFAULT_DOROSSI_LOOP_CONTINUE_PROMPT = (
     "一個可以改進的地方繼續實作。只有在你主動再找過一輪（含上網搜尋）、確認真的徹底"
     "沒有任何值得做的事時，才在回覆的最後『獨立一行』輸出 " + DOROSSI_LOOP_SENTINEL +
     "；只完成幾項不算窮盡，只要還有事情可以做就不要輸出，繼續做下去。"
-)  # 耐久守則改走系統提示（DOROSSI_LOOP_SYSTEM_GUIDANCE），不再附在 user prompt
+)  # durable rules go through the system prompt (DOROSSI_LOOP_SYSTEM_GUIDANCE), no longer in the user prompt
 DOROSSI_LOOP_CONTINUE_PROMPT = load_prompt(
     "dorossi_loop_continue.md", _DEFAULT_DOROSSI_LOOP_CONTINUE_PROMPT,
     replacements={"sentinel": DOROSSI_LOOP_SENTINEL})
@@ -1231,15 +1499,20 @@ _DEFAULT_DOROSSI_LOOP_PUSHBACK_PROMPT = (
     "抉擇就用合理的預設值自行決定，不要回頭問我。只有在你真的徹底找過、確認再也沒有"
     "任何值得做的事時，才在回覆的最後『獨立一行』輸出 " + DOROSSI_LOOP_SENTINEL +
     "；只要還有任何事情可以做，就不要輸出，繼續推進。"
-)  # 耐久守則改走系統提示（DOROSSI_LOOP_SYSTEM_GUIDANCE），不再附在 user prompt
+)  # durable rules go through the system prompt (DOROSSI_LOOP_SYSTEM_GUIDANCE), no longer in the user prompt
 DOROSSI_LOOP_PUSHBACK_PROMPT = load_prompt(
     "dorossi_loop_pushback.md", _DEFAULT_DOROSSI_LOOP_PUSHBACK_PROMPT,
     replacements={"sentinel": DOROSSI_LOOP_SENTINEL})
-# 「週期性壓縮」維護輪送出的提示：用後端自身的 `/compact` slash command（已實測 headless
-# `claude -p` 經 STDIN 可靠生效、保留 session id），並以 focus 參數明確要求保留任務續跑
-# 所需的脈絡（壓縮有損——實測會摘要掉細節，故必須點名要保住任務／待辦／決策）。這一輪
-# 只做壓縮、不產出任務進度（result 多半為空），由迴圈當「維護輪」處理：不計入 idle、不貼
-# 輸出、壓完重置計數後續跑。此為內部後端提示、永不對外送出。
+# The prompt sent by the "periodic compaction" maintenance round: it uses the
+# backend's own `/compact` slash command (measured: headless `claude -p` via STDIN
+# applies it reliably and keeps the session id), with a focus argument that
+# explicitly asks to keep the context needed to carry on the task (compaction is
+# lossy -- measured to summarise details away, so the task / to-dos / decisions
+# must be named to be kept). This round only compacts and makes no task progress
+# (the result is usually empty), and the loop treats it as a "maintenance round":
+# it does not count toward idle, posts no output, and resets the counter and
+# carries on after compacting. This is an internal backend prompt, never sent
+# outward.
 _DEFAULT_DOROSSI_LOOP_COMPACT_PROMPT = (
     "/compact 請保留以下脈絡以便無縫接續這個持續任務：整體任務目標與限制、所有尚未"
     "完成的待辦與接下來的步驟、已完成的重點、關鍵決策與踩過的雷、目前正在進行的工作"
@@ -1247,21 +1520,33 @@ _DEFAULT_DOROSSI_LOOP_COMPACT_PROMPT = (
 )
 DOROSSI_LOOP_COMPACT_PROMPT = load_prompt(
     "dorossi_loop_compact.md", _DEFAULT_DOROSSI_LOOP_COMPACT_PROMPT)
-# 連續這麼多輪「沒有進展」（後端自報完成，或該輪根本沒產出）才停止整個自走迴圈。
-# 用來提高過早收工的門檻：後端做幾項就吐哨符時，會先被推回再找一輪，連續多輪都沒
-# 進展才真正放手。純模組常數即可（不塞進 bot_config，以免缺鍵破壞載入器）。
+# Only after this many consecutive rounds with "no progress" (the backend reported
+# completion, or the round produced nothing at all) does the whole self-loop stop.
+# This raises the bar against quitting too early: when the backend emits the
+# sentinel after doing a few items, it is first pushed back to look for another
+# round, and only several rounds in a row without progress really let go. A plain
+# module constant is enough (not put into bot_config, so a missing key cannot
+# break the loader).
 DOROSSI_LOOP_EXHAUSTION_ROUNDS = 3
 
-# 後端自判（混合觸發第二條路徑）：閘門開（擁有者＋claude_code＋full）但提問沒命中自走
-# 片語時，在 turn-1 的提示尾端注入「自我評估」指示，讓後端自己判斷這是不是需要連續多輪
-# 無人值守推進到完成的較大任務；若是，就在 turn-1 回覆最後『獨立一行』輸出「開場哨符」。
-# bot 偵測到開場哨符就把 turn-1 當第一輪、轉進自走迴圈從第二輪續跑。開場哨符與完成哨符
-# DOROSSI_LOOP_SENTINEL 是「不同字串、職責不同」：開場＝要不要進迴圈；完成＝迴圈要不要
-# 停。兩者皆屬迴圈內部訊號，永不外洩到 Discord（串流預覽與最終回覆都會剝除）。
+# Backend self-judgement (the second path of the hybrid trigger): when the gate is
+# open (owner + claude_code + full) but the question does not hit a self-loop
+# phrase, a "self-assessment" instruction is injected at the end of the turn-1
+# prompt so the backend judges for itself whether this is a larger task that needs
+# several unattended rounds to finish; if so, it prints the "open sentinel" on its
+# own line at the end of the turn-1 reply. When the bot sees the open sentinel it
+# treats turn 1 as the first round and switches into the self-loop from round two.
+# The open sentinel and the completion sentinel DOROSSI_LOOP_SENTINEL are
+# "different strings with different jobs": open = whether to enter the loop;
+# completion = whether the loop should stop. Both are internal loop signals and
+# never leak to Discord (both the streaming preview and the final reply strip
+# them).
 DOROSSI_LOOP_OPEN_SENTINEL = "<<<DOROSSI-LOOP-OPEN>>>"
-# 自判指示措辭刻意保守：只有「單則答不完、需要連續多輪無人值守推進到完成」的較大任務才
-# 吐開場哨符；一般問答／查詢／單則可答完的請求一律不要吐，拿不準時也不要吐——避免一般
-# 問題被後端誤判成自走。
+# The self-judgement wording is deliberately conservative: only a larger task that
+# "cannot be answered in one reply and needs several unattended rounds to finish"
+# emits the open sentinel; ordinary Q&A / lookups / requests answerable in one
+# reply never do, and neither does anything uncertain -- so that ordinary
+# questions are not misjudged by the backend as self-loop work.
 _DEFAULT_DOROSSI_LOOP_SELFJUDGE_SUFFIX = (
     "\n\n[自我評估] 先照常完整回答、或著手處理上面的請求。處理完之後，請你自己評估："
     "這個請求是不是一個『單則回覆答不完、需要連續多輪、無人值守地自主推進直到完成』的"
@@ -1270,74 +1555,105 @@ _DEFAULT_DOROSSI_LOOP_SELFJUDGE_SUFFIX = (
     "一般問答、查詢、或單則就能回覆完的請求，就『絕對不要』輸出這個字串，正常回覆即可。"
     "拿不準時一律不要輸出。這個字串純屬內部訊號，不要對它多做任何說明或解釋。"
 )
-# 檔案裡開場哨符處寫 {open_sentinel}，載入時換回 DOROSSI_LOOP_OPEN_SENTINEL。
+# The file writes {open_sentinel} where the open sentinel goes, swapped back to
+# DOROSSI_LOOP_OPEN_SENTINEL at load time.
 DOROSSI_LOOP_SELFJUDGE_SUFFIX = load_prompt(
     "dorossi_loop_selfjudge_suffix.md", _DEFAULT_DOROSSI_LOOP_SELFJUDGE_SUFFIX,
     replacements={"open_sentinel": DOROSSI_LOOP_OPEN_SENTINEL})
-# 後端自判要續跑時、轉進自走迴圈的 ack。措辭刻意與「明確下令進自走」的 ack 不同，讓擁
-# 有者一眼看出是後端自己判斷這個任務較大、需要持續推進（而非自己明確下了自走指令）。
+# The ack for switching into the self-loop when the backend judges it should carry
+# on. The wording is deliberately different from the ack for "an explicit order to
+# enter the self-loop", so the owner can see at a glance that the backend itself
+# judged this task to be larger and in need of continued work (rather than the
+# owner having explicitly ordered the self-loop).
 DOROSSI_SELF_JUDGE_ACK = (
-    "🔁 這個任務較大，我會持續推進直到完成或你喊停（`@bot abort`）。"
+    "🔁 This is a bigger task; I'll keep going until it's done or you tell me to stop (`@bot abort`)."
 )
 
-# 觸發自走模式的「意圖片語」。比對策略刻意精準：只有同時通過（擁有者 ＋ full 工具
-# 模式 ＋ 命中下列其一）才會進入自走模式，避免一般問題誤觸。CJK 直接子字串比對，
-# 英文走 lower-case 比對。
-# 清單也涵蓋「本專案自己對這個模式的稱呼」：擁有者很自然會用專案術語下令，而不是只
-# 用「不要問我／做到完成」這類泛用講法。其中「自走」是本專案對此模式的專名，擁有者
-# 講「自走」幾乎必然就是要這個模式，誤觸風險低，直接當裸子字串收。「循環」相關則一律
-# 只收複合片語（循環模式／一直循環／自走循環／循環下去…），刻意不收裸詞「循環」——
-# 否則 full 模式下問「這個 for 迴圈有 bug」「這段循環怎麼寫」之類會誤觸。
-# 「循環模式／迴圈模式」是擁有者實際用來指稱本模式的講法（與「自走模式」同義），必須
-# 在清單內；「模式」兩字把它與泛指程式迴圈的裸詞區隔開，誤觸風險等同「自走」。反過來，
-# 「進入循環／開始循環／自動循環」這類**可以在描述程式行為時出現**的講法刻意不收
-# （「程式進入循環後就卡住」會誤觸，誤觸＝白跑好幾輪、燒 token），要下令請用「循環
-# 模式」或既有片語。
+# The "intent phrases" that trigger self-loop mode. The matching strategy is
+# deliberately precise: only a question that passes all of (owner + full tool mode
+# + hits one of the entries below) enters self-loop mode, so ordinary questions do
+# not trip it. CJK is matched as a plain substring, English is matched lower-case.
+# The list also covers "this project's own names for the mode": the owner will
+# naturally give the order in project terms, not only with generic phrasing like
+# 「不要問我」 (don't ask me) / 「做到完成」 (do it until done). Of these, 「自走」 is
+# this project's proper name for the mode; when the owner says 「自走」 they almost
+# certainly mean this mode, the false-trigger risk is low, and it is taken as a
+# bare substring. Anything with 「循環」 (cycle / loop) is taken only as a compound
+# phrase (循環模式 / 一直循環 / 自走循環 / 循環下去 …), and the bare word 「循環」 is
+# deliberately not taken -- otherwise asking in full mode something like "this for
+# loop has a bug" or "how do I write this loop" would trip it.
+# 「循環模式／迴圈模式」 (loop mode) is how the owner actually refers to this mode
+# (a synonym of 「自走模式」), so it must be in the list; the word 「模式」 (mode)
+# separates it from the bare word for a program loop, and its false-trigger risk
+# matches 「自走」. Conversely, phrasing that **can appear when describing program
+# behaviour**, such as 「進入循環／開始循環／自動循環」 (enter a loop / start
+# looping / loop automatically), is deliberately not taken ("the program gets stuck
+# after entering the loop" would trip it, and a false trigger = several wasted
+# rounds burning tokens); to give the order, use 「循環模式」 or an existing phrase.
 _DOROSSI_LOOP_INTENT_SUBSTRINGS = (
     "不要問我", "不用問我", "別問我", "不要再問我", "別再問我",
     "不要回頭問", "不要問問題", "別問問題",
     "做到完成", "做到完為止", "做完為止", "做到好為止",
-    # 刻意不收「自動完成」：那是編輯器 autocomplete 的標準譯名，「VS Code 的自動完成怎麼
-    # 關掉」會直接起一個無人值守的迴圈（2026-09-22 拿掉）。
+    # 「自動完成」 is deliberately not taken: it is the standard translation of an
+    # editor's autocomplete, and "how do I turn off VS Code's autocomplete" would
+    # start an unattended loop outright (removed 2026-09-22).
     "自己做完", "自己完成", "自行完成", "自主完成",
     "持續做", "持續推進", "不要停下來", "無人值守",
-    # 本專案自有術語：「自走」是專名（裸詞即收）；「循環」一律收複合片語。
+    # This project's own terms: 「自走」 is a proper name (taken as a bare word);
+    # 「循環」 is always taken as a compound phrase.
     "自走",
     "循環模式", "迴圈模式",
-    # 「一直循環」留著：那是擁有者實際下令用的講法（2026-07-26 回報「明確說要一直循環」
-    # 卻沒進迴圈），代價是「程式一直循環停不下來」這種問句也會命中。「不斷循環」「反覆循環」
-    # 「一直迴圈」沒有這個理由，又正是描述程式卡住的講法（在台灣「迴圈」就是程式的 loop），
-    # 2026-09-22 拿掉，與「進入循環」不收同一條規則。
+    # 「一直循環」 (keep looping) stays: it is the phrasing the owner actually used
+    # as an order (2026-07-26 report: "said explicitly to keep looping" yet no loop
+    # started), at the cost that a question like "the program keeps looping and
+    # won't stop" also hits. 「不斷循環」「反覆循環」「一直迴圈」 (loop endlessly /
+    # loop repeatedly / keep on looping) have no such reason and are exactly how one
+    # describes a stuck program (in Taiwan 「迴圈」 is the programming loop), so they
+    # were removed 2026-09-22, by the same rule that leaves out 「進入循環」.
     "一直循環", "自走循環", "持續循環", "循環下去",
     "持續迴圈", "迴圈下去",
-    # 英文刻意不收描述程式行為的講法（2026-09-22 拿掉 `loop until` / `loop forever` /
-    # `keep looping` / 裸的 `without asking`）：「how do I loop until the list is
-    # empty」「why does it keep looping」「install without asking for confirmation」
-    # 都是一般的程式問題，跟中文不收「進入循環」同一條理由。
+    # English deliberately leaves out phrasing that describes program behaviour
+    # (removed 2026-09-22: `loop until` / `loop forever` / `keep looping` / a bare
+    # `without asking`): "how do I loop until the list is empty", "why does it keep
+    # looping" and "install without asking for confirmation" are all ordinary
+    # programming questions, for the same reason the Chinese list leaves out
+    # 「進入循環」.
     "don't ask me", "do not ask me", "without asking me",
     "keep going until", "until it is done", "until it's done", "until done",
     "do it autonomously", "work autonomously", "autonomously until",
     "loop mode", "autonomous mode",
 )
-# 含觸發詞、意思卻完全無關的複合詞：比對前先整個遮掉。「自走砲」是遊戲與軍事用語（擁有者
-# 玩的正是這類遊戲）、「自走式」是機具的形容詞、「持續整合」是 CI、「持續時間」「持續性」
-# 是一般名詞。遮掉的是那個詞本身，同一句裡另外寫的「自走模式」照樣命中。
+# Compound words that contain a trigger word but mean something completely
+# unrelated: masked out entirely before matching. 「自走砲」 (self-propelled gun) is
+# a gaming and military term (exactly the kind of game the owner plays), 「自走式」
+# (self-propelled) is an adjective for machinery, 「持續整合」 is CI, and
+# 「持續時間」「持續性」 (duration / persistence) are ordinary nouns. Only the word
+# itself is masked, so a separate 「自走模式」 in the same sentence still hits.
 _DOROSSI_LOOP_INTENT_MASKS = (
     "自走砲", "自走炮", "自走式",
     "持續整合", "持續時間", "持續性",
 )
-# 跨字的「一直做到…完成」類片語：(開頭, 結尾, 中間必須含其一)。每一筆都套同一組規則
-# （`_dorossi_loop_pair_hit`），新增的配對自動適用，不要另寫一次性的 if：
-#   1. 有順序——開頭在結尾前面；
-#   2. 中間不超過 `_DOROSSI_LOOP_PAIR_MAX_GAP` 個字、不跨句；
-#   3. 中間不含 `_DOROSSI_LOOP_PAIR_ENDPOINTS`——「先做到這裡為止就好」「做到今天為止」
-#      講的是停在哪裡，跟「做到完成為止」剛好相反；「才」是敘述語氣（「一直做到半夜
-#      才完成」「持續多久才完成」）；
-#   4. 第三欄非空時，中間必須含其中之一——「持續…完成」要有「到」（直到完成／修到完成），
-#      否則「持續整合的設定完成了嗎」這種問句也算。
-# 2026-09-22 以前是「兩個字串出現在任何位置、任何順序」就算，實測「你目前為止做到哪裡了？」
-# 「先做到這裡為止就好」都會起一個無人值守的迴圈；而整個測試套件裡這條分支一次都沒有
-# 回過 True（有配對的測試句都先被單一片語命中），所以沒有人發現。
+# Phrases that span words, of the 「一直做到…完成」 (keep doing it … until done)
+# kind: (head, tail, the gap must contain one of). Every entry goes through the
+# same set of rules (`_dorossi_loop_pair_hit`), so a newly added pair gets them
+# automatically -- do not write a one-off if:
+#   1. Ordered -- the head comes before the tail;
+#   2. The gap is at most `_DOROSSI_LOOP_PAIR_MAX_GAP` characters and does not
+#      cross a sentence;
+#   3. The gap contains none of `_DOROSSI_LOOP_PAIR_ENDPOINTS` -- 「先做到這裡為止就好」
+#      (just do it up to here for now) and 「做到今天為止」 (do it until today) are
+#      about where to stop, the exact opposite of 「做到完成為止」 (do it until
+#      done); 「才」 is narrative (「一直做到半夜才完成」 "kept at it until midnight
+#      before it was done", 「持續多久才完成」 "how long did it take to finish");
+#   4. When the third field is non-empty, the gap must contain one of them --
+#      「持續…完成」 needs 「到」 (直到完成 / 修到完成, "until done" / "fix until
+#      done"), otherwise a question like 「持續整合的設定完成了嗎」 ("is the CI
+#      setup done?") would count too.
+# Before 2026-09-22 it counted whenever "the two strings appear anywhere, in any
+# order"; measured, 「你目前為止做到哪裡了？」 ("how far have you got so far?") and
+# 「先做到這裡為止就好」 both started an unattended loop; and across the whole test
+# suite this branch had never once returned True (every test sentence with a pair
+# was hit first by a single phrase), so nobody noticed.
 _DOROSSI_LOOP_INTENT_PAIRS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("一直做到", "完成", ()),
     ("做到", "為止", ()),
@@ -1350,11 +1666,17 @@ _DOROSSI_LOOP_PAIR_ENDPOINTS = (
 )
 _DOROSSI_LOOP_PAIR_SENTENCE_BREAKS = frozenset("。！？!?；;\n")
 
-# 本模式的**名字**出現在問句裡，多半是在問這個功能，不是在下令（2026-09-22）。實例：
-# 「現在是否已經支援 Discord 上的平行多個執行 /dorossi ask 或自走模式」起了一個自走迴圈——
-# 名字「自走」是裸子字串，而那一句是問句。所以名字要算數，得是「不是問句」，或是問句但名字
-# 前面緊接著一個啟動動詞、而且不是在問怎麼做（「可以進入自走模式幫我補完嗎」算、「要怎麼進入
-# 自走模式？」不算）。一般的下令片語（不要問我、做到完成…）不受這條影響。
+# When this mode's **name** appears in a question, it is usually asking about the
+# feature, not giving an order (2026-09-22). The real case:
+# 「現在是否已經支援 Discord 上的平行多個執行 /dorossi ask 或自走模式」 ("is running
+# several /dorossi ask or self-loop mode in parallel on Discord supported now?")
+# started a self-loop -- the name 「自走」 is a bare substring, and that sentence is
+# a question. So for the name to count, the sentence must "not be a question", or
+# be a question whose name is immediately preceded by an invoking verb and which
+# is not asking how to do it (「可以進入自走模式幫我補完嗎」 "can you enter self-loop
+# mode and finish it for me?" counts; 「要怎麼進入自走模式？」 "how do I enter
+# self-loop mode?" does not). The ordinary order phrases (不要問我, 做到完成 …) are
+# not affected by this.
 _DOROSSI_LOOP_MODE_NAMES = (
     "自走", "自走循環", "循環模式", "迴圈模式", "loop mode", "autonomous mode",
 )
@@ -1375,11 +1697,14 @@ _DOROSSI_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;\n])")
 
 
 def _dorossi_loop_mode_name_counts(text: str, name: str) -> bool:
-    """模式名字 `name` 在 `text`（已小寫）裡算不算下令。見
-    `_DOROSSI_LOOP_MODE_NAMES` 上面的說明。
+    """Whether the mode name `name` in `text` (already lower-cased) counts as an
+    order. See the note above `_DOROSSI_LOOP_MODE_NAMES`.
 
-    **逐句判斷**：問號與「為什麼」只管它自己那一句——「我不知道為什麼測試會紅？進入自走
-    模式把它修好」的下令在第二句，整段一起看的話會被第一句的問號與「為什麼」吃掉。"""
+    **Judged sentence by sentence**: a question mark and 「為什麼」 (why) govern only
+    their own sentence -- in 「我不知道為什麼測試會紅？進入自走模式把它修好」 ("I don't
+    know why the tests are red? Enter self-loop mode and fix it") the order is in the
+    second sentence, and looking at the whole text at once would let the first
+    sentence's question mark and 「為什麼」 swallow it."""
     for sentence in _DOROSSI_SENTENCE_SPLIT_RE.split(text):
         if name not in sentence:
             continue
@@ -1398,9 +1723,10 @@ def _dorossi_loop_mode_name_counts(text: str, name: str) -> bool:
 
 def _dorossi_loop_pair_hit(text: str, head: str, tail: str,
                            gap_needs: tuple[str, ...] = ()) -> bool:
-    """`text` 裡有沒有一段「`head` …（中間）… `tail`」符合配對規則（見
-    `_DOROSSI_LOOP_INTENT_PAIRS` 上面的四條）。每一個 `head` 出現的位置都試，
-    所以前面一段不算數的，不會擋掉後面真正的那一段。"""
+    """Whether `text` holds a "`head` … (gap) … `tail`" stretch that satisfies the
+    pair rules (the four listed above `_DOROSSI_LOOP_INTENT_PAIRS`). Every position
+    where `head` occurs is tried, so an earlier stretch that does not count cannot
+    block a real one later on."""
     start = text.find(head)
     while start != -1:
         gap_from = start + len(head)
@@ -1418,12 +1744,16 @@ def _dorossi_loop_pair_hit(text: str, head: str, tail: str,
 
 
 def _dorossi_matches_loop_intent(prompt: str) -> bool:
-    """提問是否帶有「自主完成、不要問我」的自走意圖。比對刻意保守：誤觸的代價是一個
-    無人值守的迴圈，漏掉的代價是擁有者得換個明確的說法。
+    """Whether the question carries the self-loop intent of "finish it on your own,
+    don't ask me". The matching is deliberately conservative: the cost of a false
+    trigger is an unattended loop, while the cost of a miss is the owner having to
+    rephrase more explicitly.
 
-    ⚠️ 不要假設「漏掉了還有後端自判會再問一次」：那條路徑由 `dorossi_self_judge_enabled`
-    控制，本機 `bot_config.json` 把它關掉了（2026-09-22 查到），所以在這台主機上這支函式
-    是進入自走的**唯一**入口——收緊它的時候，真正的下令講法一句都不能漏。"""
+    ⚠️ Do not assume "a miss still gets a second chance from backend
+    self-judgement": that path is controlled by `dorossi_self_judge_enabled`, and
+    this machine's `bot_config.json` turns it off (found 2026-09-22), so on this
+    host this function is the **only** way into the self-loop -- when tightening
+    it, not a single real order phrasing may be dropped."""
     if not prompt:
         return False
     for mask in _DOROSSI_LOOP_INTENT_MASKS:
@@ -1440,16 +1770,20 @@ def _dorossi_matches_loop_intent(prompt: str) -> bool:
 
 
 def _dorossi_remove_all_sentinels(text: str, markers: tuple[str, ...]) -> str:
-    """把 `markers` 從 `text` 裡移除到**一個都不剩**，而不是只掃一遍。
+    """Remove `markers` from `text` until **not one is left**, rather than in a
+    single pass.
 
-    `str.replace` 掃一遍就結束，但「移除」本身會把左右兩邊接起來，所以夾心寫法
-    （`<<<DOROSSI-LOOP-` ＋ 一個完整哨符 ＋ `DONE>>>`）在移掉內層之後會**重新拼出**
-    一個完整的哨符，單次 replace 的結果因此可能仍然含有哨符。剝除這幾支的整個存在
-    理由就是「送出去之前一個都不能剩」，所以掃到不再變動為止。
+    `str.replace` stops after one pass, but the removal itself joins the left and
+    right sides together, so a sandwich (`<<<DOROSSI-LOOP-` + one complete sentinel
+    + `DONE>>>`) **reassembles** a complete sentinel once the inner one is removed,
+    and a single replace can therefore still leave a sentinel behind. The entire
+    reason these strippers exist is "not one may be left before sending", so this
+    scans until nothing changes.
 
-    兩個哨符共用 `<<<DOROSSI-LOOP-` 這段長前綴，移掉其中一個也可能拼出另一個，
-    所以是「每一輪把所有 marker 都掃一次，整輪沒變動才收手」，不是逐個 marker 各
-    自收斂。每一次有效的替換都讓字串變短，所以一定會停。
+    The two sentinels share the long prefix `<<<DOROSSI-LOOP-`, and removing one
+    can also assemble the other, so it is "scan every marker once per pass, and
+    stop only after a whole pass with no change", not each marker converging on its
+    own. Every effective replacement makes the string shorter, so it always stops.
     """
     while True:
         before = text
@@ -1460,9 +1794,11 @@ def _dorossi_remove_all_sentinels(text: str, markers: tuple[str, ...]) -> str:
 
 
 def _dorossi_strip_loop_sentinel(answer: str) -> tuple[str, bool]:
-    """回傳 (cleaned, done)。done 為 True 表示這一輪輸出含完成哨符；cleaned 已把所有
-    哨符出現處移除並修整前後空白。用於「最終的每輪答案」以判定是否結束迴圈，並確保
-    哨符不會出現在對外回覆。"""
+    """Return (cleaned, done). done is True when this round's output contains the
+    completion sentinel; cleaned has every occurrence of the sentinel removed and
+    surrounding whitespace trimmed. Used on "the final per-round answer" to decide
+    whether to end the loop, and to make sure the sentinel never appears in the
+    outward reply."""
     if not answer or DOROSSI_LOOP_SENTINEL not in answer:
         return answer, False
     return _dorossi_remove_all_sentinels(
@@ -1470,25 +1806,31 @@ def _dorossi_strip_loop_sentinel(answer: str) -> tuple[str, bool]:
 
 
 def _dorossi_strip_open_sentinel(answer: str) -> tuple[str, bool]:
-    """回傳 (cleaned, opened)。opened 為 True 表示 turn-1 輸出含「開場哨符」（後端自判
-    這是需要多輪自主完成的較大任務）；cleaned 已把所有哨符出現處移除並修整前後空白。
-    用於後端自判路徑的 turn-1 答案，確保開場哨符絕不出現在對外回覆。"""
+    """Return (cleaned, opened). opened is True when the turn-1 output contains the
+    "open sentinel" (the backend judged this to be a larger task needing several
+    autonomous rounds); cleaned has every occurrence of the sentinel removed and
+    surrounding whitespace trimmed. Used on the turn-1 answer of the backend
+    self-judgement path, to make sure the open sentinel never appears in the
+    outward reply."""
     if not answer or DOROSSI_LOOP_OPEN_SENTINEL not in answer:
         return answer, False
     return _dorossi_remove_all_sentinels(
         answer, (DOROSSI_LOOP_OPEN_SENTINEL,)).strip(), True
 
 
-# 串流預覽要剝除的所有內部哨符（完成 ＋ 開場）。兩者皆屬迴圈／自判內部訊號，絕不可
-# 在 live 預覽裡一閃而過。
+# Every internal sentinel the streaming preview must strip (completion + open).
+# Both are internal loop / self-judgement signals and must never flash by in the
+# live preview.
 _DOROSSI_STREAM_SENTINELS = (DOROSSI_LOOP_SENTINEL, DOROSSI_LOOP_OPEN_SENTINEL)
 
 
 def _dorossi_redact_sentinel_stream(text: str) -> str:
-    """串流預覽用：移除已完整出現的哨符（完成／開場皆含），並把「結尾的半截哨符
-    （前綴）」也藏起來，避免半串流出來的哨符在 live 預覽裡一閃而過。只動結尾的前綴，
-    不影響正文。兩個哨符共用長前綴，但結尾只可能是其中一個的前綴；逐一檢查、命中即
-    回，故不會互相干擾。"""
+    """For the streaming preview: remove sentinels that have fully appeared (both
+    completion and open), and also hide "a half sentinel (prefix) at the end", so a
+    half-streamed sentinel never flashes by in the live preview. Only the trailing
+    prefix is touched; the body is unaffected. The two sentinels share a long
+    prefix, but the end can only be a prefix of one of them; each is checked in
+    turn and the first hit returns, so they cannot interfere with each other."""
     if not text:
         return text
     text = _dorossi_remove_all_sentinels(text, _DOROSSI_STREAM_SENTINELS)
@@ -1501,57 +1843,77 @@ def _dorossi_redact_sentinel_stream(text: str) -> str:
 
 _dorossi_client = None  # lazily-constructed AsyncAnthropic singleton
 
-# api 後端的單次請求逾時與 SDK 自帶重試次數。**寫出來是刻意的，不是複製預設值。**
+# The api backend's per-request timeout and the SDK's own retry count. **Spelling
+# them out is deliberate, not a copy of the defaults.**
 #
-# 這條路沒有串流，所以 claude_code 那套兩層 watchdog（閒置層 ＋ 硬性牆鐘）在這裡
-# 一層都用不上：`messages.create()` 就是一次 await，唯一的界限就是 SDK 的逾時。
-# 而 `anthropic` 在 `requirements.txt` 裡沒有釘版本（fresh clone 拿最新是刻意的），
-# 所以「界限」等於「這一版 SDK 的預設值」——那不是本專案做的決定，而且會在升版時
-# 無聲改變。無人值守的自走迴圈最不該有的就是一個會自己漂移的時間上限。
+# This path has no streaming, so neither layer of the claude_code two-layer
+# watchdog (the idle layer + the hard wall clock) applies here:
+# `messages.create()` is a single await, and its only bound is the SDK's timeout.
+# And `anthropic` is not pinned in `requirements.txt` (a fresh clone getting the
+# latest is deliberate), so "the bound" equals "this SDK version's default" --
+# not a decision this project made, and one that changes silently on upgrade. An
+# unattended self-loop should least of all have a time limit that drifts on its
+# own.
 #
-# 這兩個值**與 anthropic 1.3.0／1.4.0 的預設完全相同**（read timeout 600s、重試 2 次），
-# 所以明寫它們不改變行為，只是把它從「繼承來的」變成「選定的」。
+# These two values are **exactly the defaults of anthropic 1.3.0 / 1.4.0** (read
+# timeout 600s, 2 retries), so writing them out does not change behaviour; it only
+# turns them from "inherited" into "chosen".
 #
-# **但「最壞 600 × (1 + 2) ＝ 30 分鐘」這句話，光靠這兩個值是不成立的（2026-09-19）。**
-# 兩次重試**之間**還有 SDK 自己的睡眠，而 anthropic 1.6.0 改了它：
-# `_calculate_retry_timeout` 原本只在 `0 < retry_after <= 60` 時照伺服器的
-# `Retry-After` 睡，否則退回自己的指數退避（最多 8 秒）；1.6.0 起改成
-# `min(retry_after, 4_294_967.0)`，也就是**伺服器說睡多久就睡多久**。本機假伺服器
-# 實測 429 ＋ `retry-after: 3600`：1.4.0 是 0.4／0.8 秒各重試一次、1.3 秒丟
-# `RateLimitError`；1.7.0 是每次重試前睡 3600 秒，一輪卡約 2 小時。fresh clone 今天
-# 拿到的就是 1.7.0。後果有兩層：這一輪握著工作階段鎖卡兩小時；而 bot 自己的用量上限
-# 處理（`reset_at = now + retry_after`）要等 SDK 睡完才拿得到例外，算出來的重設時刻
-# 還**晚了已經睡掉的那段**。
+# **But "worst case 600 × (1 + 2) = 30 minutes" does not hold on these two values
+# alone (2026-09-19).** **Between** two retries there is also the SDK's own sleep,
+# and anthropic 1.6.0 changed it: `_calculate_retry_timeout` used to follow the
+# server's `Retry-After` only when `0 < retry_after <= 60`, otherwise falling back
+# to its own exponential backoff (at most 8 seconds); from 1.6.0 on it is
+# `min(retry_after, 4_294_967.0)`, i.e. **it sleeps however long the server
+# says**. Measured against a local fake server with 429 + `retry-after: 3600`:
+# 1.4.0 retries once each after 0.4 / 0.8 seconds and raises `RateLimitError` at
+# 1.3 seconds; 1.7.0 sleeps 3600 seconds before each retry, stalling a round for
+# about 2 hours. 1.7.0 is what a fresh clone gets today. The consequences come in
+# two layers: this round holds the session lock stuck for two hours; and the bot's
+# own usage-limit handling (`reset_at = now + retry_after`) only gets the exception
+# once the SDK has finished sleeping, so the reset time it computes is also **late
+# by the stretch already slept away**.
 #
-# 所以現在有兩層，都是本專案自己的東西，不隨 SDK 版本漂：
-#   1. `_dorossi_api_clamp_retry_after`（http client 的 response hook）：伺服器要求的
-#      等待超過 `_DOROSSI_API_SDK_SLEEP_CAP_SEC`（60 秒，正是 1.6.0 之前 SDK 自己的
-#      上限）時，在回應上補 `x-should-retry: false`，SDK 就不自己重試、立刻丟例外，
-#      `retry-after` 標頭原樣留在例外上給 `_dorossi_api_retry_after_sec` 讀。短的等待
-#      與沒帶等待的 5xx／529 照舊由 SDK 重試。
-#   2. `_dorossi_api_call_ceiling_sec()`：`_dorossi_via_api` 用 `asyncio.timeout` 把
-#      整次 `messages.create()` 框起來。上面那句 30 分鐘本來就不精確——600 是 read
-#      timeout（位元組之間的間隔），不是一次請求的總長——所以「最壞多久」必須由本專案
-#      自己強制，而不是從 SDK 的參數推論出來。
-# 要不要收緊這些數字是擁有者的調校決定（比 claude_code 純聊天模式的硬上限
-# `dorossi_cc_hard_limit_off_sec`＝900s 寬一倍），寫在這裡是為了讓那個決定看得見。
+# So there are now two layers, both this project's own, which do not drift with
+# the SDK version:
+#   1. `_dorossi_api_clamp_retry_after` (the http client's response hook): when the
+#      wait the server asks for exceeds `_DOROSSI_API_SDK_SLEEP_CAP_SEC` (60
+#      seconds, exactly the SDK's own cap before 1.6.0), it adds
+#      `x-should-retry: false` to the response, so the SDK does not retry on its
+#      own and raises at once, with the `retry-after` header left intact on the
+#      exception for `_dorossi_api_retry_after_sec` to read. Short waits, and
+#      5xx / 529 with no wait, are still retried by the SDK as before.
+#   2. `_dorossi_api_call_ceiling_sec()`: `_dorossi_via_api` wraps the whole
+#      `messages.create()` in `asyncio.timeout`. The 30-minute figure above was
+#      never precise anyway -- 600 is the read timeout (the gap between bytes), not
+#      the total length of one request -- so "how long at worst" must be enforced
+#      by this project itself, not inferred from the SDK's parameters.
+# Whether to tighten these numbers is the owner's tuning decision (twice as wide
+# as the claude_code chat-only hard limit `dorossi_cc_hard_limit_off_sec` = 900s);
+# it is written here to make that decision visible.
 DOROSSI_API_TIMEOUT_SEC = 600.0
 DOROSSI_API_MAX_RETRIES = 2
-# SDK 內建重試**每一次**最多准睡幾秒（見上面第 1 層）。60 不是新挑的數字：它是
-# anthropic 1.6.0 之前 SDK 自己寫死的上限，所以在 1.4.0 上這一層的效果只是「超過
-# 60 秒就不重試」，不會讓任何原本會發生的短等待消失。
+# How many seconds the SDK's built-in retry may sleep **each time** at most (see
+# layer 1 above). 60 is not a newly picked number: it is the cap the SDK
+# hard-coded before anthropic 1.6.0, so on 1.4.0 the only effect of this layer is
+# "no retry beyond 60 seconds", and no short wait that would have happened
+# disappears.
 _DOROSSI_API_SDK_SLEEP_CAP_SEC = 60.0
-# 外框的額外餘裕：連線建立、排程抖動。刻意小——外框的用途是「最壞情況有界」，
-# 不是「剛好容得下最慢的正常回合」。
+# Extra slack for the outer frame: connection setup, scheduling jitter.
+# Deliberately small -- the outer frame is there to "bound the worst case", not to
+# "just fit the slowest normal round".
 _DOROSSI_API_CEILING_SLACK_SEC = 30.0
 
 
 def _dorossi_api_call_ceiling_sec() -> float:
-    """一次 `messages.create()`（含 SDK 內建重試）最多准跑幾秒。
+    """How many seconds one `messages.create()` (including the SDK's built-in
+    retries) may run at most.
 
-    ＝ 每次請求的逾時 × 請求次數 ＋ 每次重試前最多睡 `_DOROSSI_API_SDK_SLEEP_CAP_SEC`
-    ＋ 餘裕。預設 600 × 3 ＋ 60 × 2 ＋ 30 ＝ 1950 秒。**在呼叫時才讀模組常數**，不寫成
-    預設引數（預設引數在 `def` 當下就綁死，之後改常數不會生效）。"""
+    = per-request timeout × number of requests + at most
+    `_DOROSSI_API_SDK_SLEEP_CAP_SEC` of sleep before each retry + slack. By default
+    600 × 3 + 60 × 2 + 30 = 1950 seconds. **The module constants are read at call
+    time**, not written as default arguments (a default argument is bound when the
+    `def` runs, so changing the constant later would have no effect)."""
     retries = max(0, int(DOROSSI_API_MAX_RETRIES))
     return (float(DOROSSI_API_TIMEOUT_SEC) * (1 + retries)
             + retries * _DOROSSI_API_SDK_SLEEP_CAP_SEC
@@ -1559,24 +1921,31 @@ def _dorossi_api_call_ceiling_sec() -> float:
 
 
 def _dorossi_sdk_retry_wait_sec(headers, *, now: float | None = None) -> float | None:
-    """SDK 內建重試遇到這組回應標頭時，**會**打算睡幾秒。回 None ＝ 標頭沒有給等待。
+    """How many seconds the SDK's built-in retry **would** plan to sleep given this
+    set of response headers. None = the headers give no wait.
 
-    **逐步照抄 SDK 自己的 `_parse_retry_after_header`**（1.4.0 與 1.7.0 逐字相同），
-    包括它的優先順序與怪癖，因為這支要回答的問題是「SDK 會怎麼做」，不是「伺服器的
-    意思是什麼」：
-      1. `retry-after-ms`（非標準、毫秒）轉得成 float 就用它——**即使是 nan 或負數**，
-         SDK 也不會再往下看；
-      2. 否則 `retry-after` 轉得成 float 就當秒數（SDK 容許小數）；
-      3. 否則把 `retry-after` 當 HTTP 日期（`email.utils.parsedate_tz` ＋ `mktime_tz`，
-         沒有時區時照本機時間解讀——SDK 就是這樣做的），回「那個時刻減掉現在」，可能
-         是負數。
-    回傳值可能是 nan／inf／負數，**呼叫端自己判斷**（`_dorossi_api_clamp_retry_after`
-    只問「> 60 嗎」，nan 自然不過、inf 自然過，正好對應 SDK 的 `retry_after > 0`）。
+    **Copies the SDK's own `_parse_retry_after_header` step by step** (identical
+    word for word in 1.4.0 and 1.7.0), including its precedence and quirks, because
+    the question this answers is "what will the SDK do", not "what does the server
+    mean":
+      1. if `retry-after-ms` (non-standard, milliseconds) converts to float, use it
+         -- **even if it is nan or negative**, the SDK looks no further;
+      2. otherwise, if `retry-after` converts to float, take it as seconds (the SDK
+         allows fractions);
+      3. otherwise treat `retry-after` as an HTTP date (`email.utils.parsedate_tz` +
+         `mktime_tz`, read as local time when there is no time zone -- that is what
+         the SDK does), returning "that moment minus now", which may be negative.
+    The return value may be nan / inf / negative, and **the caller judges it**
+    (`_dorossi_api_clamp_retry_after` only asks "is it > 60", which nan naturally
+    fails and inf naturally passes, matching the SDK's `retry_after > 0`).
 
-    刻意**不**拿來取代 `_dorossi_api_retry_after_sec`：那一支回答的是「值不值得拿來排
-    等待」，只收有限的正秒數，HTTP 日期一律不收（有測試釘住）。兩支問的是兩個問題。
-    SDK 那份私有實作若哪天改了，`test_dorossi_api_retry` 的對照測試會拿同一份語料去問
-    兩邊。永不 raise——這支跑在 http client 的 hook 裡，炸了會把一個正常的回應換成例外。
+    Deliberately **not** used to replace `_dorossi_api_retry_after_sec`: that one
+    answers "is the value worth scheduling a wait on", accepts only finite positive
+    seconds and never an HTTP date (pinned by a test). The two ask two different
+    questions. If the SDK's private implementation ever changes, the comparison test
+    in `test_dorossi_api_retry` asks both sides with the same corpus. Never raises
+    -- this runs inside the http client's hook, and blowing up there would turn a
+    normal response into an exception.
     """
     try:
         if headers is None:
@@ -1600,22 +1969,27 @@ def _dorossi_sdk_retry_wait_sec(headers, *, now: float | None = None) -> float |
 
 
 async def _dorossi_api_clamp_retry_after(response) -> None:
-    """http client 的 response event hook：伺服器要求的等待超過
-    `_DOROSSI_API_SDK_SLEEP_CAP_SEC` 時，叫 SDK 不要自己重試。
+    """The http client's response event hook: when the wait the server asks for
+    exceeds `_DOROSSI_API_SDK_SLEEP_CAP_SEC`, tell the SDK not to retry on its own.
 
-    做法是在回應上補 `x-should-retry: false`——SDK 的 `_should_retry` 第一件事就是看
-    這個標頭（1.4.0 與 1.7.0 都是），看到 `"false"` 就不重試、直接把錯誤往上丟。
-    `retry-after` 本身**不動**，所以 `_dorossi_via_api` 照樣從例外上讀得到它，
-    `_DorossiUsageLimitError.reset_at` 也就是「現在 ＋ 伺服器要的秒數」，不會再晚上
-    SDK 已經睡掉的那段。
+    It does so by adding `x-should-retry: false` to the response -- the first thing
+    the SDK's `_should_retry` looks at is this header (in both 1.4.0 and 1.7.0), and
+    on `"false"` it does not retry and raises the error straight up. `retry-after`
+    itself is **left untouched**, so `_dorossi_via_api` can still read it from the
+    exception, and `_DorossiUsageLimitError.reset_at` is simply "now + the seconds
+    the server asked for", no longer late by the stretch the SDK has already slept.
 
-    **不限於 429**：1.6.0 起任何會被重試的狀態碼（408／409／429／5xx）都會照
-    `Retry-After` 睡滿，所以判準是「SDK 會不會睡超過 60 秒」，不是狀態碼。沒帶等待
-    （或等待 ≤ 60 秒）的 5xx／529 照舊由 SDK 用自己的退避重試。2xx 不碰。
+    **Not limited to 429**: from 1.6.0 on, every status code that gets retried
+    (408 / 409 / 429 / 5xx) sleeps the full `Retry-After`, so the criterion is
+    "would the SDK sleep more than 60 seconds", not the status code. 5xx / 529 with
+    no wait (or a wait ≤ 60 seconds) is still retried by the SDK with its own
+    backoff. 2xx is left alone.
 
-    必須是 async（`AsyncClient` 會 await 每一個 hook）。**永不 raise**：hook 丟的例外
-    會把一個本來可以正常處理的回應換成一個看不懂的新例外。出事只記型別名到 stderr
-    ——這行會進 `discord_bot.log`，而 `/log tail` 是那個檔的對外出口。"""
+    Must be async (`AsyncClient` awaits every hook). **Never raises**: an exception
+    thrown by a hook would turn a response that could have been handled normally
+    into a new, baffling exception. On trouble only the type name goes to stderr --
+    that line lands in `discord_bot.log`, and `/log tail` is that file's outward
+    exit."""
     try:
         status = getattr(response, "status_code", None)
         if not isinstance(status, int) or status < 400:
@@ -1630,11 +2004,13 @@ async def _dorossi_api_clamp_retry_after(response) -> None:
 
 
 def _dorossi_api_http_client():
-    """帶著 `_dorossi_api_clamp_retry_after` 的 http client；SDK 不提供工廠時回 None。
+    """An http client carrying `_dorossi_api_clamp_retry_after`; None when the SDK
+    offers no factory.
 
-    用 SDK 自己的 `DefaultAsyncHttpxClient`（公開 API），所以連線上限、預設逾時、
-    跟隨轉址與不帶 `http_client` 時完全相同（2026-09-19 在 1.4.0／1.7.0 實測：連線上限
-    都是 1000、逾時 600）——唯一的差別就是那個 hook。"""
+    It uses the SDK's own `DefaultAsyncHttpxClient` (public API), so the connection
+    limits, default timeout and redirect following are exactly the same as without
+    `http_client` (measured 2026-09-19 on 1.4.0 / 1.7.0: connection limit 1000 and
+    timeout 600 on both) -- the only difference is that hook."""
     factory = getattr(anthropic, "DefaultAsyncHttpxClient", None) if anthropic else None
     if factory is None:
         return None
@@ -1646,11 +2022,13 @@ def _get_dorossi_client():
     is missing or no credentials can be resolved (construction is offline, so a
     failure here means an auth/config problem, not a network one).
 
-    逾時與重試次數一律明寫（見 `DOROSSI_API_TIMEOUT_SEC`）：這條路沒有串流，
-    SDK 的逾時就是唯一的時間界限，不能讓它跟著相依套件的預設值漂。
-    http client 帶著 retry-after 夾子（同一段說明的第 1 層）；夾子裝不上時照樣建
-    client、在 stderr 講一句——外框（第 2 層）仍然守著最壞時間，不為了一個準確度
-    的改善把整個後端關掉。"""
+    The timeout and retry count are always spelled out (see
+    `DOROSSI_API_TIMEOUT_SEC`): this path has no streaming, the SDK's timeout is
+    the only time bound, and it must not drift with the dependency's defaults.
+    The http client carries the retry-after clamp (layer 1 of the same note); when
+    the clamp cannot be installed the client is still built and one line goes to
+    stderr -- the outer frame (layer 2) still guards the worst-case time, and an
+    accuracy improvement is no reason to shut the whole backend down."""
     global _dorossi_client
     if _dorossi_client is not None:
         return _dorossi_client
@@ -1682,16 +2060,21 @@ class _DorossiResumeError(RuntimeError):
 
 
 class _DorossiTransientError(RuntimeError):
-    """後端回了一個**伺服器側、通常會自己好**的錯誤（529 Overloaded、502/503/504
-    之類），不是工作階段過舊、也不是方案用量上限。
+    """The backend returned a **server-side error that usually clears by itself**
+    (529 Overloaded, 502/503/504 and the like) -- not a stale session, and not the
+    plan's usage limit.
 
-    2026-09-03 補。在這之前這種錯誤會一路變成 `RuntimeError` 落進自走迴圈的泛用
-    `except`，於是**整個無人值守的迴圈就地停掉**——而錯誤訊息自己寫著「usually
-    temporary — try again in a moment」。實測 21:31 與 21:36 連兩次 529（中間那次
-    「重試」是把工作階段丟掉重開，對伺服器過載完全沒有幫助），第二次就收工了。
+    Added 2026-09-03. Before this, such an error travelled all the way into a
+    `RuntimeError` that fell into the self-loop's generic `except`, so **the whole
+    unattended loop stopped on the spot** -- while the error message itself said
+    "usually temporary — try again in a moment". Measured: two 529s in a row at
+    21:31 and 21:36 (the "retry" in between threw the session away and started a new
+    one, which does nothing at all for a server overload), and the second one ended
+    the run.
 
-    `status` 給程式判斷（重試要等多久），`reason` 是給 log 的短字串——**不要**把它
-    直接送到對話平台，那是未經控制的外部文字（Layer 1）。
+    `status` is for the code to judge (how long to wait before retrying), `reason`
+    is a short string for the log -- **do not** send it straight to the chat
+    platform; it is uncontrolled external text (Layer 1).
     """
 
     def __init__(self, reason: str, *, status: int | None = None,
@@ -1701,11 +2084,13 @@ class _DorossiTransientError(RuntimeError):
         self.session_id = session_id
 
 
-# 會自己好的 HTTP 狀態。429 **不在**這裡：那是用量／速率上限，由
-# `_dorossi_cc_usage_limit` 走它自己的等待路徑（有 reset 時間可以等）。
+# HTTP statuses that clear by themselves. 429 is **not** here: that is a usage /
+# rate limit, which `_dorossi_cc_usage_limit` routes down its own waiting path
+# (there is a reset time to wait for).
 DOROSSI_TRANSIENT_STATUSES = frozenset({500, 502, 503, 504, 529})
 
-# 文字標記。狀態碼有時候不會被帶進 result 事件，只留下英文訊息。
+# Text markers. The status code is sometimes not carried into the result event,
+# leaving only the English message.
 _TRANSIENT_TEXT_MARKERS = (
     "overloaded",            # 529 Overloaded / overloaded_error
     "internal server error",
@@ -1717,20 +2102,28 @@ _TRANSIENT_TEXT_MARKERS = (
 
 
 class _DorossiOfflineError(RuntimeError):
-    """後端**連不上它的伺服器**：DNS 解析失敗、連線被拒／被重設、網路不可達。
+    """The backend **cannot reach its server**: DNS resolution failed, the
+    connection was refused / reset, the network is unreachable.
 
-    2026-09-22 補。那天 17:32–18:37 本機 DNS 整段失效，後端 CLI 回的是
-    `API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)`，
-    而這一類在此之前沒有任何分類：一路落到判定的最後一條，被當成「工作階段過舊」
-    ——**丟掉脈絡、開新工作階段重試**（新的那次當然一樣連不上），然後自走迴圈的
-    泛用重試用完三次就停，六個正在跑的任務全部停在原地。
+    Added 2026-09-22. That day, 17:32–18:37, the local DNS was down the whole time,
+    and the backend CLI returned
+    `API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)`,
+    a class that had no classification before: it fell all the way to the last
+    branch of the verdict and was treated as "stale session" -- **the context was
+    thrown away and a new session retried** (which of course could not connect
+    either), then the self-loop's generic retry gave up after three tries, and all
+    six running tasks stopped where they stood.
 
-    處理方式跟用量上限、暫時性故障同一個原則：**等，而且用同一個工作階段重跑**。
-    差別在「等到什麼時候」：這裡等的是網路回來（呼叫端輪詢連線），不是一段猜的秒數，
-    也**沒有次數上限**——擁有者裁決不得有回合／花費類上限，等網路只能被 abort 結束。
+    It is handled on the same principle as the usage limit and transient failures:
+    **wait, and rerun with the same session**. The difference is "wait until when":
+    here it waits for the network to come back (the caller polls connectivity), not
+    a guessed number of seconds, and **with no attempt limit** -- the owner ruled
+    out any round / spending limits, so waiting for the network can only be ended
+    by abort.
 
-    `backend` 給呼叫端決定要探測哪一個主機；`reason` 是給 log 的短字串——**不要**
-    送到對話平台（Layer 1）。`session_id` 是這次叫用**傳進去**的那一個（續接用）。
+    `backend` lets the caller decide which host to probe; `reason` is a short
+    string for the log -- **do not** send it to the chat platform (Layer 1).
+    `session_id` is the one **passed in** to this invocation (for resuming).
     """
 
     def __init__(self, reason: str, *, backend: str | None = None,
@@ -1740,9 +2133,10 @@ class _DorossiOfflineError(RuntimeError):
         self.session_id = session_id
 
 
-# 「連不上伺服器」的文字標記（小寫比對）。來源分兩種：CLI 的 result 文字（實測
-# 2026-09-22：`API Error: Can't reach the API server — check your internet or DNS
-# (ENOTFOUND)`），以及 CLI／SDK 寫到 stderr 或錯誤事件的底層錯誤碼。
+# Text markers for "cannot reach the server" (matched lower-case). They come from
+# two sources: the CLI's result text (measured 2026-09-22: `API Error: Can't reach
+# the API server — check your internet or DNS (ENOTFOUND)`), and the low-level
+# error codes the CLI / SDK writes to stderr or to error events.
 _OFFLINE_TEXT_MARKERS = (
     "can't reach the api server",
     "cannot reach the api server",
@@ -1760,13 +2154,15 @@ _OFFLINE_TEXT_MARKERS = (
     "dns error",
     "error sending request for url",
 )
-# result 文字那一條的長度上限：CLI 的通知是一行模板，會談到「連線錯誤」的答案是散文。
-# 與用量上限、未登入那兩條同一個理由（一篇剛好討論 ECONNRESET 的長答案不能被判成離線）。
+# The length cap for the result-text branch: the CLI's notice is a one-line
+# template, while an answer that talks about "connection errors" is prose. Same
+# reason as the usage-limit and not-logged-in branches (a long answer that happens
+# to discuss ECONNRESET must not be judged offline).
 _DOROSSI_OFFLINE_NOTICE_MAX_CHARS = 300
 
 
 def _dorossi_offline_marker_in(text) -> bool:
-    """`text` 裡有沒有「連不上伺服器」的字樣。永不 raise。"""
+    """Whether `text` contains "cannot reach the server" wording. Never raises."""
     try:
         low = str(text or "").lower()
     except Exception:  # pylint: disable=broad-except
@@ -1776,10 +2172,12 @@ def _dorossi_offline_marker_in(text) -> bool:
 
 def _dorossi_cc_offline(result_ev, err: str = "", session_id: str | None = None
                         ) -> "_DorossiOfflineError | None":
-    """rc != 0 的這一輪，是不是「連不上伺服器」？是就回填好的例外，否則 None。
+    """Was this rc != 0 round a "cannot reach the server"? If so return a filled-in
+    exception, otherwise None.
 
-    證據兩處：`result` 事件（`is_error` 為真、文字短得像一則通知）與 stderr。成功完成
-    的 result 一律不是（`_claude_result_succeeded`）。純函式、永不 raise。"""
+    Evidence comes from two places: the `result` event (`is_error` true, text short
+    enough to be a notice) and stderr. A successfully completed result never is
+    (`_claude_result_succeeded`). Pure function, never raises."""
     try:
         if _claude_result_succeeded(result_ev):
             return None
@@ -1801,8 +2199,9 @@ def _dorossi_cc_offline(result_ev, err: str = "", session_id: str | None = None
 
 def _dorossi_codex_offline(text, session_id: str | None = None
                            ) -> "_DorossiOfflineError | None":
-    """codex 的 stderr／失敗事件像不像「連不上伺服器」。只從 rc != 0 那條被呼叫，
-    餵進來的文字不含答案（見 `_dorossi_codex_usage_limit` 的說明）。"""
+    """Whether codex's stderr / failure event looks like "cannot reach the server".
+    Called only from the rc != 0 path, and the text fed in contains no answer (see
+    the note on `_dorossi_codex_usage_limit`)."""
     if not _dorossi_offline_marker_in(text):
         return None
     return _DorossiOfflineError(str(text)[:400], backend="codex",
@@ -1810,12 +2209,16 @@ def _dorossi_codex_offline(text, session_id: str | None = None
 
 
 def _dorossi_api_is_offline(exc) -> bool:
-    """SDK 例外是不是連線層的失敗（`APIConnectionError`）。永不 raise。
+    """Whether an SDK exception is a connection-layer failure
+    (`APIConnectionError`). Never raises.
 
-    **逾時（`APITimeoutError`，它是 `APIConnectionError` 的子類）不算**：那是連上了、
-    對方一直沒回，不是網路斷了——等網路回來不會讓它變好，照舊走既有的例外路徑
-    （`test_dorossi_api_retry` 釘著它原樣往上拋）。有狀態碼的（`APIStatusError` 家族）
-    也一律不是——那是伺服器回了話，走用量上限／暫時性故障／其他的既有分類。"""
+    **A timeout (`APITimeoutError`, a subclass of `APIConnectionError`) does not
+    count**: that means the connection was made and the other side never answered,
+    not that the network is down -- waiting for the network will not make it
+    better, so it keeps taking the existing exception path (`test_dorossi_api_retry`
+    pins it being re-raised as is). Anything with a status code (the
+    `APIStatusError` family) never is either -- the server answered, so it goes
+    through the existing usage-limit / transient-failure / other classifications."""
     try:
         timeout_cls = getattr(anthropic, "APITimeoutError", None) if anthropic else None
         if timeout_cls is not None and isinstance(exc, timeout_cls):
@@ -1832,11 +2235,13 @@ def _dorossi_api_is_offline(exc) -> bool:
 def _dorossi_cc_transient_error(result_ev: dict, answer: str = "",
                                 session_id: str | None = None
                                 ) -> "_DorossiTransientError | None":
-    """看 `result` 事件像不像「伺服器暫時性故障」；是就回一個填好的例外，否則 None。
+    """Whether the `result` event looks like "a transient server failure"; if so
+    return a filled-in exception, otherwise None.
 
-    與 `_dorossi_cc_usage_limit` 同一個形狀，**而且必須排在它後面**呼叫：用量上限
-    也可能帶著 5xx 以外的狀態碼，但它有專屬的等待策略（等到額度重設），比這裡的
-    指數退避精準得多。
+    Same shape as `_dorossi_cc_usage_limit`, **and it must be called after it**: a
+    usage limit can also carry a status code other than 5xx, but it has its own
+    waiting strategy (wait until the quota resets), far more precise than the
+    exponential backoff here.
     """
     if not isinstance(result_ev, dict):
         result_ev = {}
@@ -1863,11 +2268,14 @@ def _dorossi_cc_transient_error(result_ev: dict, answer: str = "",
 
 def _dorossi_transient_wait_seconds(attempt: int, *, base: float = 30.0,
                                     cap: float = 900.0) -> float:
-    """第 `attempt` 次（從 1 起算）連續暫時性失敗要等幾秒：指數退避、上限 `cap`。
+    """How many seconds to wait after the `attempt`-th (counting from 1)
+    consecutive transient failure: exponential backoff, capped at `cap`.
 
-    起步 30 秒而不是幾秒：伺服器過載時立刻重打只會加重它，而無人值守的任務並不
-    急著在十秒內恢復。上限 15 分鐘，讓一次長時間的服務中斷不會變成每 15 分鐘之外
-    的空轉，也不會久到錯過恢復。
+    It starts at 30 seconds rather than a few: hitting an overloaded server again
+    right away only makes it worse, and an unattended task is in no hurry to
+    recover within ten seconds. The cap is 15 minutes, so a long service outage
+    does not turn into idling beyond every 15 minutes, nor wait so long that it
+    misses the recovery.
     """
     try:
         n = max(1, int(attempt))
@@ -1883,10 +2291,13 @@ class _DorossiLoopSilence(RuntimeError):
     idle tier, which waits for pending tools) — so a hung tool in an unattended
     loop can't suppress the watchdog forever.
 
-    2026-09-05 起迴圈**會先重生幾次再放棄**（`dorossi_silence_retry_max`，預設 2，
-    退避 20s→40s）：卡住的多半是那個後端行程，換一個新的常常就過了，而在那之前
-    一次卡頓就等於整個無人值守任務停在原地等人接。連續卡到超過上限才停——那時候
-    就不像偶發了。設成 0 會回到「一次靜默就停」的舊行為。"""
+    Since 2026-09-05 the loop **respawns a few times before giving up**
+    (`dorossi_silence_retry_max`, default 2, backoff 20s→40s): what hangs is
+    usually that backend process, and a fresh one often gets through, whereas
+    before that a single stall meant the whole unattended task stood still waiting
+    for someone to pick it up. It stops only after hanging more times in a row than
+    the limit -- by then it no longer looks sporadic. Setting it to 0 restores the
+    old "stop on the first silence" behaviour."""
 
 
 class _DorossiUsageLimitError(RuntimeError):
@@ -1894,20 +2305,26 @@ class _DorossiUsageLimitError(RuntimeError):
     limit was hit (not a transient or stale-session failure, so the fresh-session
     retry must be skipped).
 
-    三個欄位刻意分成「給人看的」與「給程式用的」兩類，不要合併：
+    The three fields are deliberately split into "for people" and "for code"; do
+    not merge them:
 
-    * `reset_hint` — **給人看的**重設時間字串，已經過 `_dorossi_sanitize_reset_hint`
-      收斂成已知安全形狀（它是本模組唯一會被組進 Discord 回覆的後端原始文字）。
-      不可信、不可拿來算數；`None` 代表沒有可展示的提示。
-    * `reset_at` — **給程式用的** epoch 秒數，只有在後端給出明確時間戳
-      （`…|<epoch>` 變體、或 API 後端的 `retry-after` 標頭）時才有值。自走迴圈用它
-      決定要睡多久；拿不到就 `None`，由呼叫端退避探測。**人類可讀的
-      「resets 3:45pm」不會被換算成 `reset_at`**——那種寫法沒有時區、猜錯 5 小時的
-      代價遠大於多探一次的成本，理由寫在 `_dorossi_extract_reset_epoch`。
-    * `session_id` — 撞上上限那一刻後端已經推進到的工作階段 id（可能為 `None`）。
-      **這是「等待後續跑不會丟掉工作」的關鍵**：用量上限通常是「做到一半」才撞上，
-      若不把這個 id 存回 slot，等額度回來之後 resume 的會是上一輪的舊 id，這一輪
-      已經做完的事就全部白做。
+    * `reset_hint` -- the reset-time string **for people**, already narrowed by
+      `_dorossi_sanitize_reset_hint` to a known-safe shape (it is the only raw
+      backend text this module lets into a Discord reply). Untrusted and not to be
+      computed with; `None` means there is no hint to show.
+    * `reset_at` -- epoch seconds **for code**, set only when the backend gives an
+      explicit timestamp (the `…|<epoch>` variant, or the API backend's
+      `retry-after` header). The self-loop uses it to decide how long to sleep;
+      without one it is `None` and the caller probes with backoff. **A
+      human-readable "resets 3:45pm" is not converted into `reset_at`** -- that
+      form has no time zone, and guessing 5 hours wrong costs far more than one
+      extra probe; the reasoning is in `_dorossi_extract_reset_epoch`.
+    * `session_id` -- the session id the backend had advanced to at the moment it
+      hit the limit (may be `None`). **This is the key to "waiting and then carrying
+      on loses no work"**: a usage limit is usually hit "halfway through", and if
+      this id is not saved back to the slot, the resume after the quota returns
+      uses the previous round's old id, and everything this round already did is
+      wasted.
     """
 
     def __init__(self, message: str, reset_hint: str | None = None, *,
@@ -1920,31 +2337,42 @@ class _DorossiUsageLimitError(RuntimeError):
 
 
 class _DorossiWorkdirError(NotADirectoryError):
-    """spawn 前發現工作目錄已經不是可用的目錄（`_dorossi_require_workdir` 丟的）。
+    """Before spawning, the working directory turned out to be no longer a usable
+    directory (raised by `_dorossi_require_workdir`).
 
-    **刻意繼承 `NotADirectoryError`，不像兄弟們繼承 `RuntimeError`。** 修正前這個狀況
-    就是子行程丟的 `NotADirectoryError`，而 `dorossi_error_is_fatal` 已經把那個型別判成
-    致命（自走迴圈立刻停，不白白重試三輪）；任何 `except OSError` 也照舊接得到。這裡只是
-    提早、帶名字地丟出同一件事，讓 `_dorossi_error_hint` 分得出來、講對原因。改成
-    `RuntimeError` 的話，一個永久的狀況會被迴圈重試三輪才停。
+    **It deliberately inherits `NotADirectoryError`, unlike its siblings that
+    inherit `RuntimeError`.** Before the fix this situation was exactly the
+    `NotADirectoryError` the child process raised, and `dorossi_error_is_fatal`
+    already judges that type fatal (the self-loop stops at once instead of
+    retrying three rounds for nothing); any `except OSError` still catches it too.
+    This merely raises the same thing earlier and by name, so `_dorossi_error_hint`
+    can tell it apart and give the right reason. As a `RuntimeError`, a permanent
+    condition would be retried three rounds by the loop before stopping.
 
-    訊息是固定的英文短句、不含路徑；它不會被送到對話平台（對外字串由 bot 組）。
+    The message is a fixed short English sentence with no path; it is never sent to
+    the chat platform (the bot assembles outward strings).
     """
 
 
 class _DorossiCliOptionError(RuntimeError):
-    """後端 CLI **在開始這一輪之前**就拒絕了我們傳給它的某個選項（`unknown option`）。
+    """The backend CLI rejected one of the options we passed it **before starting
+    the round** (`unknown option`).
 
-    幾乎一定是「裝著的 CLI 比這份程式碼舊」：本專案會隨 CLI 的新功能加旗標（例如
-    2026-09-19 純聊天加的 `--tools ""`），而舊版的指令列剖析器看到不認得的選項就以
-    rc=1 結束、stdout 一個字都沒有、stderr 是 `error: unknown option '<旗標>'`（同日用
-    2.1.276 餵一個不存在的選項實測）。
+    This almost certainly means "the installed CLI is older than this code": the
+    project adds flags as the CLI gains features (for example `--tools ""` added for
+    chat-only on 2026-09-19), and an older command-line parser exits with rc=1 on
+    an option it does not recognise, with not a single character on stdout and
+    `error: unknown option '<flag>'` on stderr (measured the same day by feeding
+    2.1.276 a nonexistent option).
 
-    分出一個型別有兩個理由：(1) 不要落到 resume 重試——重開一個工作階段會以完全相同
-    的方式失敗，只是多起一次行程、多印一次看不懂的 log；(2) 重試毫無機會成功，所以
-    列在 `_FATAL_ERROR_TYPES`，無人值守的迴圈不必白試三輪。
-    `option` 是被拒絕的那個旗標名（已由 `_CLI_UNKNOWN_OPTION_RE` 收斂成旗標的形狀）。
-    訊息是固定英文加旗標名、不含路徑；對外字串由 bot 組（一律泛用）。
+    There are two reasons for a separate type: (1) do not fall into the resume
+    retry -- a fresh session fails in exactly the same way, only spawning one more
+    process and printing one more baffling log line; (2) a retry has no chance of
+    succeeding, so it is listed in `_FATAL_ERROR_TYPES` and the unattended loop
+    need not try three rounds for nothing.
+    `option` is the rejected flag name (already narrowed to a flag's shape by
+    `_CLI_UNKNOWN_OPTION_RE`). The message is fixed English plus the flag name, with
+    no path; the bot assembles outward strings (always generic).
     """
 
     def __init__(self, option: str) -> None:
@@ -1953,24 +2381,31 @@ class _DorossiCliOptionError(RuntimeError):
 
 
 class _DorossiAuthError(RuntimeError):
-    """後端 CLI **沒有可用的登入**：沒登入、憑證失效、或被迫進 bare 模式而讀不到登入。
+    """The backend CLI **has no usable sign-in**: not logged in, credentials
+    expired, or forced into bare mode where it cannot read the sign-in.
 
-    2026-09-19 補。實測（CLI 2.1.276）兩種形狀都是 rc=1 ＋ 一則 `is_error` 為真的
-    result，而在這之前它們落到最後兩條：有工作階段 → `_DorossiResumeError` → 呼叫端
-    **丟掉對話**重開一個（以完全相同的方式失敗）→ `RuntimeError`，而那句文字（「Not
-    logged in · Please run /login」「Failed to authenticate. API Error: 401 …」）一個
-    `_FATAL_ERROR_MARKERS` 都不中，所以自走迴圈再重試三輪（20／40／80 秒退避）。401
-    那一種每一次叫用都要先讓 CLI 自己重試十次（實測 190 秒），一輪是 resume ＋ 新開
-    兩次。沒有一次有機會成功：登入不會在重試之間自己回來。
+    Added 2026-09-19. Measured (CLI 2.1.276): both shapes are rc=1 + one result
+    with `is_error` true, and before this they fell into the last two branches:
+    with a session -> `_DorossiResumeError` -> the caller **throws the
+    conversation away** and opens a new one (which fails in exactly the same way)
+    -> `RuntimeError`, and that text ("Not logged in · Please run /login", "Failed
+    to authenticate. API Error: 401 …") hits none of `_FATAL_ERROR_MARKERS`, so the
+    self-loop retried three more rounds (20 / 40 / 80 second backoff). The 401 kind
+    first lets the CLI retry ten times on its own on every call (measured 190
+    seconds), and each round is two calls, resume + fresh. None of them has any
+    chance of succeeding: the sign-in does not come back by itself between retries.
 
-    列在 `_FATAL_ERROR_TYPES`（重試無用），而且判定排在 resume 重試**之前**（丟掉對話
-    也無用）。`evidence` 是判定依據的標籤（`api_error_status=401`、
-    `api_retry=authentication_failed`、`result text`），由判定端用固定詞彙組成、不含
-    CLI 的原始文字；`bare_suspect` ＝ init 事件沒有 `memory_paths`（像 bare 模式）。
+    Listed in `_FATAL_ERROR_TYPES` (retrying is useless), and the verdict comes
+    **before** the resume retry (throwing the conversation away is useless too).
+    `evidence` is a label for what the verdict rested on (`api_error_status=401`,
+    `api_retry=authentication_failed`, `result text`), composed by the verdict from
+    a fixed vocabulary and containing none of the CLI's raw text; `bare_suspect` =
+    the init event has no `memory_paths` (looks like bare mode).
 
-    訊息刻意**不含** `_FATAL_ERROR_MARKERS` 的任何字樣：致命判定必須靠型別成立，不能靠
-    訊息剛好含某個字——否則把它從 `_FATAL_ERROR_TYPES` 拿掉也不會有任何測試變紅。
-    對外字串由 bot 組（一律泛用）。
+    The message deliberately contains **none** of the `_FATAL_ERROR_MARKERS`
+    wording: the fatal verdict must hold by type, not because the message happens
+    to contain some word -- otherwise removing it from `_FATAL_ERROR_TYPES` would
+    turn no test red. The bot assembles outward strings (always generic).
     """
 
     def __init__(self, evidence: str, *, bare_suspect: bool = False) -> None:
@@ -2018,18 +2453,23 @@ def _dorossi_clean_label(raw: str | None) -> str | None:
 
 
 def _dorossi_parse_session_new(tail: str | None) -> tuple[str | None, str | None]:
-    """把 `/dorossi session new` 的參數切成 `(label, cwd)`（純函式，永不 raise）。
+    """Split the arguments of `/dorossi session new` into `(label, cwd)` (pure
+    function, never raises).
 
-    語法：`new [標籤] [cwd=<目錄>]`
-      * 標籤是自由文字，可含空格、`,`、`(`、`:` ——所以工作目錄只認 `cwd=`
-        （大小寫不拘）這個鍵，不能靠位置切。
-      * `cwd=` **之後整段**都是路徑：路徑本身可含空格、`:`、`\\`，一律原樣保留、
-        永不 lower()。因此標籤要寫在 `cwd=` 前面。
-      * 這裡**不驗證**路徑；呼叫端用 `_dorossi_validate_dir` 驗「已存在的目錄」
-        才套用，被拒的原始字串只寫 stderr（對外永遠不回傳路徑）。
+    Syntax: `new [label] [cwd=<directory>]`
+      * The label is free text and may contain spaces, `,`, `(`, `:` -- so the
+        working directory is recognised only by the `cwd=` key (case-insensitive),
+        not by position.
+      * **Everything after** `cwd=` is the path: the path itself may contain
+        spaces, `:`, `\\`, is always kept verbatim and never lower()-ed. So the
+        label must come before `cwd=`.
+      * The path is **not validated** here; the caller applies it only after
+        `_dorossi_validate_dir` confirms "an existing directory", and a rejected raw
+        string is written only to stderr (the path is never echoed outward).
 
-    刻意只認 `cwd=`：`dir=`（`--add-dir` 的額外可存取範圍）在 `_dorossi_parse_reset`
-    是另一個語意，不併進這條文法——額外範圍請用 `/dorossi allowdir add`。
+    Only `cwd=` is recognised, deliberately: `dir=` (the extra accessible scope of
+    `--add-dir`) has a different meaning in `_dorossi_parse_reset` and is not folded
+    into this grammar -- for an extra scope use `/dorossi allowdir add`.
     """
     text = (tail or "").strip()
     if not text:
@@ -2048,11 +2488,12 @@ def _dorossi_empty_user() -> dict:
 
 
 def _dorossi_int_or_none(value):
-    """`value` 是真正的 int 就回它，否則 None。
+    """Return `value` if it is a real int, otherwise None.
 
-    **`bool` 要單獨排掉**：它是 `int` 的子類別，`True` 會一路變成 1，於是
-    `f"s{seq}"` 產出 `"sTrue"`——一個 `_DOROSSI_SESSION_ID_RE` 認不得的 id。
-    `CLAUDE.md` 對兩個設定載入器寫過同一條規則，這裡是第三處。
+    **`bool` must be excluded separately**: it is a subclass of `int`, `True` would
+    become 1 all the way through, and `f"s{seq}"` would then produce `"sTrue"` -- an
+    id `_DOROSSI_SESSION_ID_RE` does not recognise. `CLAUDE.md` states the same rule
+    for the two config loaders; this is the third place.
     """
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -2075,20 +2516,25 @@ def _dorossi_migrate_user(rec) -> dict:
     (no "sessions" key) is wrapped as session "s1" so its conversation survives;
     garbage becomes an empty user. Never raises (caller guards too).
 
-    正規化時也會丟掉 `sessions` 裡**畸形的 slot**——值不是 dict（或 key 不是字串）
-    的條目。`dorossi_session.json` 是本機檔案、擁有者自己編輯得動，而每一個讀取端
-    （工作階段清單、每一輪問答取的快照、匯出）都直接對 slot 呼叫 `.get(...)`，
-    所以一筆手改出來的畸形 slot 會讓那些指令全部炸 AttributeError——而那正是擁有者
-    最需要它們的時候。
+    Normalisation also drops **malformed slots** in `sessions` -- entries whose
+    value is not a dict (or whose key is not a string). `dorossi_session.json` is a
+    local file the owner can edit by hand, and every reader (the session list, the
+    snapshot each Q&A round takes, the export) calls `.get(...)` directly on the
+    slot, so one hand-made malformed slot would make all of those commands blow up
+    with AttributeError -- exactly when the owner needs them most.
 
-    攔在這裡而不是各讀取端各防一次，理由是這裡是整個存放檔的**單一正規化入口**：
-    `_dorossi_load_state` 一定走 `_dorossi_migrate_state`，後者對每個 uid 呼叫本
-    函式。攔一次，所有讀取端一起受惠；分散防守則會漏掉下一個新增的讀取端，而漏掉
-    的那一個不會有任何症狀，直到有人真的手改過那個檔案。
+    It is caught here rather than guarded once per reader because this is the
+    store's **single normalisation entry point**: `_dorossi_load_state` always goes
+    through `_dorossi_migrate_state`, which calls this function for every uid.
+    Catch it once and every reader benefits; scattered guards would miss the next
+    reader added, and the missed one would show no symptom until someone actually
+    hand-edits that file.
 
-    丟棄發生在修補 `active` / `next_seq` **之前**，所以 `active` 不會指到一個剛被
-    丟掉的 id（既有的 `if active not in sessions` 順序對了就自然正確）。正常資料的
-    輸出完全不變：沒有畸形 slot 時連 `sessions` 這個 dict 物件都原樣沿用、不重建。
+    The drop happens **before** `active` / `next_seq` are repaired, so `active`
+    cannot point at an id that was just dropped (the existing
+    `if active not in sessions` is naturally right once the order is right). Output
+    for normal data is completely unchanged: with no malformed slot even the
+    `sessions` dict object itself is reused as is, not rebuilt.
     """
     if not isinstance(rec, dict):
         return _dorossi_empty_user()
@@ -2099,10 +2545,12 @@ def _dorossi_migrate_user(rec) -> dict:
         if bad:
             sessions = {sid: sess for sid, sess in sessions.items()
                         if isinstance(sid, str) and isinstance(sess, dict)}
-            # 只印形狀像工作階段 id 的 key。其餘 key 來自手改過的檔案，可能裝著
-            # 任何東西（主機路徑、提示詞片段），而這行 stderr 會進 discord_bot.log，
-            # 再由 log 查詢指令送進聊天平台——中間只有一個靠樣式比對的 scrubber，
-            # 認不得沒見過的形狀。slot 的內容一律不印。
+            # Print only keys shaped like a session id. Other keys come from a
+            # hand-edited file and may hold anything (host paths, prompt
+            # fragments), and this stderr line lands in discord_bot.log, from where
+            # the log query command sends it into the chat platform -- with only a
+            # pattern-matching scrubber in between, which cannot recognise shapes
+            # it has never seen. Slot contents are never printed.
             shown = sorted(sid for sid in bad
                            if isinstance(sid, str)
                            and _DOROSSI_SESSION_ID_RE.match(sid))
@@ -2218,28 +2666,40 @@ def _dorossi_reset_session(sess: dict) -> None:
 
 def _dorossi_mark_loop_pending(sess: dict, task: str, *,
                                channel_id=None, message_id=None) -> None:
-    """在 session slot 記下「有未完成的自走任務」（in place；自走迴圈啟動時呼叫，
-    乾淨收尾時用 _dorossi_clear_loop_pending 清掉）。任務描述留存供之後「fresh 重跑」
-    與列表顯示；新描述為空時保留舊描述（接續同一任務不清掉原始任務文字）。任何
-    中斷路徑（abort／沉默 backstop／用量上限／例外／bot 重啟）都不會清掉這個標記，
-    所以擁有者事後可用 `@bot session <id> continue` 接續。純函式、永不 raise。
+    """Record "there is an unfinished self-loop task" on the session slot (in
+    place; called when the self-loop starts, and cleared with
+    _dorossi_clear_loop_pending on a clean finish). The task description is kept
+    for a later "fresh rerun" and for the list display; when the new description is
+    empty the old one is kept (resuming the same task does not wipe the original
+    task text). No interruption path (abort / silence backstop / usage limit /
+    exception / bot restart) clears this marker, so the owner can resume afterwards
+    with `@bot session <id> continue`. Pure function, never raises.
 
-    另外記三件給「跨重啟自動接續」用的東西：
+    It also records three things for "automatic resumption across restarts":
 
-    * `live` ── 「此刻有一個行程正在跑這個迴圈」。設為 True 的地方只有這裡；改回
-      False 的地方只有 `_dorossi_mark_loop_stopped`，而那個**只從迴圈的 `finally`
-      呼叫**。`finally` 在自願結束（abort／沉默／例外／放棄）時一定會跑，行程被砍
-      時一定不會跑——所以「重啟後看到 live 還是 True」精確等於「上一個行程是被砍死
-      的，不是自己停的」。這正是自動接續要的判準：擁有者按了 abort 就不該被自動
-      接回去。
-    * `channel_id` / `message_id` ── 接續時要用的錨點。重啟後向平台查回紀錄當
-      `_dorossi_run_loop` 的 `message`，**擁有者閘門是用平台說的發起人重驗的**，不是
-      信任這裡存的 id。⚠️ `message_id` 對斜線指令來說是 **interaction id**，不是訊息 id
-      ——bot 那一側的 `_resolve_trigger_message` 會從 bot 自己那則回覆的
-      `interaction_metadata` 找回發起人（2026-09-19 以前直接抓訊息、必定 404，這個功能
-      因此從來沒成功過）。查不回來就不自動接，標記留著給人工接。
-    * `auto_tries` ── 連續自動接續次數，當機迴圈的斷路器；沿用舊值（接續同一任務
-      不歸零，歸零只在真的跑完一輪時，見 `_dorossi_touch_loop_pending`）。
+    * `live` -- "a process is running this loop right now". The only place that
+      sets it True is here; the only place that sets it back to False is
+      `_dorossi_mark_loop_stopped`, which is **only called from the loop's
+      `finally`**. `finally` always runs on a voluntary end (abort / silence /
+      exception / giving up) and never runs when the process is killed -- so
+      "seeing live still True after a restart" means exactly "the previous process
+      was killed, it did not stop by itself". That is precisely the criterion
+      automatic resumption needs: once the owner has pressed abort, the loop must
+      not be brought back automatically.
+    * `channel_id` / `message_id` -- the anchor used when resuming. After a restart
+      the record is looked up from the platform and used as `_dorossi_run_loop`'s
+      `message`, and **the owner gate is re-verified against the initiator the
+      platform reports**, not by trusting the id stored here. ⚠️ For a slash command
+      `message_id` is an **interaction id**, not a message id -- the bot side's
+      `_resolve_trigger_message` finds the initiator again from the
+      `interaction_metadata` of the bot's own reply (before 2026-09-19 it fetched
+      the message directly, which always 404'd, so this feature had never once
+      worked). If it cannot be looked up, there is no automatic resumption and the
+      marker stays for a manual one.
+    * `auto_tries` -- the count of consecutive automatic resumptions, the circuit
+      breaker for a crash loop; the old value is carried over (resuming the same
+      task does not reset it; it is reset only when a round really completes, see
+      `_dorossi_touch_loop_pending`).
     """
     prev = sess.get("loop_pending")
     prev = prev if isinstance(prev, dict) else {}
@@ -2256,54 +2716,69 @@ def _dorossi_mark_loop_pending(sess: dict, task: str, *,
     sess["loop_pending"] = marker
 
 
-# 自走迴圈停下來的原因（`loop_pending["stop"]`，由迴圈的 `finally` 寫）。只有
-# 「網路斷了」與「被取消」（bot 關機／重連時 task 被取消）算**不是自己要停的**，
-# 會被**自動**接續；abort 與 paused 永遠不會自動接（都是擁有者明確表達過的意圖，
-# 不能被自動化推翻——差別是 paused 仍可用 `/dorossi session continue` 手動接回來）。
-# 舊標記沒有這個鍵：`live` 為假就當成原因不明，自動接續照舊不接。
+# Why the self-loop stopped (`loop_pending["stop"]`, written by the loop's
+# `finally`). Only "the network dropped" and "cancelled" (the task was cancelled
+# on bot shutdown / reconnect) count as **not a stop it chose**, and those are
+# resumed **automatically**; abort and paused are never resumed automatically
+# (both are intents the owner stated explicitly, which automation must not
+# override -- the difference is that paused can still be brought back by hand
+# with `/dorossi session continue`). Old markers have no such key: with `live`
+# false it is treated as an unknown reason, and automatic resumption still does
+# not resume it.
 DOROSSI_LOOP_STOP_REASONS = frozenset({
-    "abort",        # 擁有者 `/dorossi abort`
-    "network",      # 平台連線中斷，迴圈沒辦法再說話
-    "interrupted",  # task 被取消（bot 關機、重連時被收掉）
-    "silence",      # 輸出沉默重試用完
-    "usage",        # 用量等待次數到了設定的保底上限
-    "transient",    # 暫時性故障重試用完
-    "error",        # 其他錯誤（含致命錯誤）
-    "deleted",      # slot 被刪了（標記跟著不在，寫不進去，留著只為完整）
-    "paused",       # 擁有者 `/dorossi yield`：提交後讓出編輯權暫停，等人接手
+    "abort",        # the owner's `/dorossi abort`
+    "network",      # the platform connection dropped; the loop can no longer speak
+    "interrupted",  # the task was cancelled (bot shutdown, reaped on reconnect)
+    "silence",      # output-silence retries ran out
+    "usage",        # usage waits reached the configured safety cap
+    "transient",    # transient-failure retries ran out
+    "error",        # any other error (including fatal ones)
+    "deleted",      # slot deleted (the marker is gone with it, nothing to write; kept for completeness)
+    "paused",       # the owner's `/dorossi yield`: commit, yield editing rights, pause until someone takes over
 })
-# 只有這兩種算「不是自己要停的」，重連／重啟時**自動**接回去。`paused` 刻意不在
-# 內：讓出的整個用意是「另一位編輯者正在改同一批檔案」，重啟時自動把迴圈叫回來
-# 又動同一批檔案正是它要避免的事——所以 paused 一律等擁有者親手 `continue`。
+# Only these two count as "not a stop it chose" and are brought back
+# **automatically** on reconnect / restart. `paused` is deliberately not
+# included: the whole point of yielding is "another editor is changing the same
+# set of files", and automatically calling the loop back on restart to touch that
+# same set of files is exactly what it is meant to avoid -- so paused always waits
+# for the owner's own `continue`.
 _DOROSSI_AUTORESUMABLE_STOPS = frozenset({"network", "interrupted"})
 
 
 def _dorossi_touch_loop_pending(sess: dict, *, reset_tries: bool = False) -> None:
-    """把標記的心跳推到現在（in place）。**絕不建立標記**——沒有標記就什麼都不做，
-    否則「已自然收尾、標記已清掉」的 slot 會被心跳復活成「有未完成任務」。
+    """Move the marker's heartbeat to now (in place). **Never creates a marker** --
+    with no marker it does nothing, otherwise a slot that "finished naturally and
+    had its marker cleared" would be revived by the heartbeat into "has an
+    unfinished task".
 
-    心跳存在的理由：`ts` 若只在迴圈啟動時寫一次，一個跑了三天的任務在重啟後就會
-    因為「標記太舊」被拒絕自動接續——而那正是這個功能最該接的情形。跑完一輪
-    （`reset_tries=True`，同時清掉當機迴圈計數）與進入用量等待前各推一次，所以
-    `ts` 的語意是「這個迴圈最後一次被證實還活著的時刻」。永不 raise。"""
+    Why the heartbeat exists: if `ts` were written only once when the loop starts,
+    a task that had been running for three days would be refused automatic
+    resumption after a restart because "the marker is too old" -- exactly the case
+    this feature should resume most. It is bumped once after each completed round
+    (`reset_tries=True`, which also clears the crash-loop counter) and once before
+    entering a usage wait, so `ts` means "the last moment this loop was proven to
+    be alive". Never raises."""
     marker = sess.get("loop_pending")
     if not isinstance(marker, dict):
         return
     marker["ts"] = time.time()
     marker["live"] = True
-    marker.pop("stop", None)   # 還活著就沒有「停下來的原因」
+    marker.pop("stop", None)   # still alive, so there is no "reason it stopped"
     if reset_tries:
         marker.pop("auto_tries", None)
 
 
 def _dorossi_mark_loop_stopped(sess: dict, reason: str | None = None) -> None:
-    """標記「迴圈是自己停下來的，不是被砍死的」（in place）。**只從自走迴圈的
-    `finally` 呼叫**，理由見 `_dorossi_mark_loop_pending` 的 `live` 說明。
-    絕不建立標記（自然收尾那條路已經把整個標記清掉了，不要復活它）。永不 raise。
+    """Mark "the loop stopped by itself, it was not killed" (in place). **Only
+    called from the self-loop's `finally`**; for why, see the `live` note on
+    `_dorossi_mark_loop_pending`. Never creates a marker (the natural-finish path
+    has already cleared the whole marker; do not revive it). Never raises.
 
-    `reason`（`DOROSSI_LOOP_STOP_REASONS` 之一）記在 `stop`：只看 `live` 分不出「擁有者
-    按了 abort」與「網路斷了」，而後者正是該被接回去的（2026-09-22 的斷網把六個任務都
-    寫成 `live=False`，於是沒有一個被接回去）。認不得的值不寫——沒有原因就等同舊標記。"""
+    `reason` (one of `DOROSSI_LOOP_STOP_REASONS`) is recorded in `stop`: `live`
+    alone cannot tell "the owner pressed abort" from "the network dropped", and the
+    latter is exactly what should be brought back (the 2026-09-22 network outage
+    wrote all six tasks as `live=False`, so not one was brought back). An
+    unrecognised value is not written -- no reason is the same as an old marker."""
     marker = sess.get("loop_pending")
     if isinstance(marker, dict):
         marker["live"] = False
@@ -2315,11 +2790,15 @@ def _dorossi_mark_loop_stopped(sess: dict, reason: str | None = None) -> None:
 
 
 def _dorossi_mark_loop_aborted(sess: dict) -> None:
-    """擁有者對一個**沒在跑、但等著被自動接續**的任務按了 abort（in place）。
+    """The owner pressed abort on a task that is **not running but waiting to be
+    resumed automatically** (in place).
 
-    迴圈在跑的時候，abort 由迴圈自己的 `finally` 寫成 `stop: abort`；這一支給「迴圈
-    已經因斷網停下來、連線回來就會被接回去」的那種——不寫的話，擁有者中止了也沒用，
-    網路一回來它就自己活過來。絕不建立標記。永不 raise。"""
+    While the loop is running, abort is written as `stop: abort` by the loop's own
+    `finally`; this one is for the kind where "the loop already stopped because the
+    network dropped, and will be brought back once the connection returns" --
+    without it the owner's abort would be useless, and the task would come back to
+    life by itself as soon as the network returned. Never creates a marker. Never
+    raises."""
     marker = sess.get("loop_pending")
     if isinstance(marker, dict):
         marker["live"] = False
@@ -2328,14 +2807,16 @@ def _dorossi_mark_loop_aborted(sess: dict) -> None:
 
 
 def _dorossi_clear_loop_pending(sess: dict) -> None:
-    """清掉「未完成自走任務」標記（自走迴圈自然收尾——連續無進展而停止——時呼叫）。"""
+    """Clear the "unfinished self-loop task" marker (called when the self-loop
+    finishes naturally -- stopping after consecutive rounds without progress)."""
     sess.pop("loop_pending", None)
 
 
 def _dorossi_loop_marker_wants_autoresume(marker) -> bool:
-    """標記本身說「這個任務不是自己要停的」：`live` 還是 True（行程被砍），或停下來的
-    原因在 `_DOROSSI_AUTORESUMABLE_STOPS`。abort 與舊標記（沒有原因、`live` 為假）一律
-    否。純函式、永不 raise。"""
+    """The marker itself says "this task did not choose to stop": `live` is still
+    True (the process was killed), or the reason it stopped is in
+    `_DOROSSI_AUTORESUMABLE_STOPS`. Abort and old markers (no reason, `live` false)
+    are always no. Pure function, never raises."""
     if not isinstance(marker, dict):
         return False
     if marker.get("live") is True:
@@ -2344,24 +2825,32 @@ def _dorossi_loop_marker_wants_autoresume(marker) -> bool:
 
 
 def _dorossi_loop_autoresume_plan(sess: dict, *, now=None):
-    """bot 起來時要不要自己把這個 slot 的自走任務接回去？（純函式、永不 raise）
+    """Should the bot, on start-up, bring this slot's self-loop task back by
+    itself? (pure function, never raises)
 
-    回傳 `(channel_id, message_id, tries)` 或 None。四道條件全過才回非 None：
+    Returns `(channel_id, message_id, tries)` or None. Non-None only when all four
+    conditions pass:
 
-    1. 有形狀正確的 `loop_pending`，且 `live` 為 True——亦即上一個行程是被砍死的；
-       **或**迴圈自己停下來、但原因是 `_DOROSSI_AUTORESUMABLE_STOPS`（網路斷了、task
-       被取消）。擁有者自己 abort／沉默 backstop／例外／放棄都不在其中。
-    2. 有 `channel_id` 與 `message_id` 錨點（舊版標記沒有這兩個鍵，於是只能人工
-       接續——這是刻意的向後相容行為，不是漏洞）。
-    3. 心跳在 `DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC` 以內（0 ＝功能關閉）。時鐘倒退
-       導致的「未來心跳」一律視為過期，不給負數年齡矇混過關。
-    4. `auto_tries` 還沒到 `DOROSSI_LOOP_AUTORESUME_MAX_TRIES`（0 ＝不設限）。
+    1. There is a well-formed `loop_pending` with `live` True -- i.e. the previous
+       process was killed; **or** the loop stopped by itself but for a reason in
+       `_DOROSSI_AUTORESUMABLE_STOPS` (the network dropped, the task was
+       cancelled). The owner's own abort / the silence backstop / an exception /
+       giving up are not among them.
+    2. There are `channel_id` and `message_id` anchors (old markers lack these two
+       keys, so they can only be resumed by hand -- deliberate backward-compatible
+       behaviour, not a hole).
+    3. The heartbeat is within `DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC` (0 = feature
+       off). A "future heartbeat" caused by the clock going backwards is always
+       treated as expired; a negative age does not get to sneak through.
+    4. `auto_tries` has not reached `DOROSSI_LOOP_AUTORESUME_MAX_TRIES` (0 = no
+       limit).
 
-    **這裡不做權限判斷。** 擁有者閘門一律由呼叫端拿「真的抓回來的那則訊息」重驗，
-    存在磁碟上的 id 不是授權依據。"""
+    **No permission check happens here.** The owner gate is always re-verified by
+    the caller against "the message actually fetched back"; an id stored on disk is
+    not grounds for authorisation."""
     max_age = DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC
     if not isinstance(max_age, (int, float)) or isinstance(max_age, bool) \
-            or max_age <= 0 or max_age != max_age:  # NaN 也當關閉
+            or max_age <= 0 or max_age != max_age:  # NaN also counts as off
         return None
     marker = sess.get("loop_pending")
     if not _dorossi_loop_marker_wants_autoresume(marker):
@@ -2387,9 +2876,10 @@ def _dorossi_loop_autoresume_plan(sess: dict, *, now=None):
 
 
 def _dorossi_count_autoresume(sess: dict) -> None:
-    """把這個 slot 的「連續自動接續次數」加一（in place）。在**真的起跑之前**呼叫，
-    所以即使接續當場又把 bot 弄死，計數也已經落地了——這正是斷路器要的。
-    絕不建立標記。永不 raise。"""
+    """Add one to this slot's "consecutive automatic resumptions" (in place).
+    Called **before actually starting**, so even if the resumption kills the bot
+    again on the spot, the count has already landed -- exactly what the circuit
+    breaker needs. Never creates a marker. Never raises."""
     marker = sess.get("loop_pending")
     if not isinstance(marker, dict):
         return
@@ -2400,15 +2890,21 @@ def _dorossi_count_autoresume(sess: dict) -> None:
 
 
 def _dorossi_loop_resume_plan(sess: dict):
-    """判斷一個 session slot 有沒有「可接續的自走任務」、以及該怎麼接（純函式）。
+    """Judge whether a session slot has "a resumable self-loop task", and how to
+    resume it (pure function).
 
-    回傳：
-      * None ── 沒有可接續的任務（沒有 loop_pending 標記，或標記形狀不對）。
-      * ("continue", None) ── 後端脈絡還在（有 cc_session_id）：resume 同一工作
-        階段、以 CONTINUE 提示接續，最完整（自走迴圈 already_ran_first=True 路徑）。
-      * ("fresh", task) ── 脈絡已不在（session 被清）但留有任務描述：用原任務文字
-        重新起跑（already_ran_first=False 路徑）。
-    永不 raise；store 被手改成怪形狀一律當「沒有可接續的」。"""
+    Returns:
+      * None -- no resumable task (no loop_pending marker, or the marker is
+        malformed).
+      * ("continue", None) -- the backend context is still there (there is a
+        cc_session_id): resume the same session and carry on with the CONTINUE
+        prompt, the most complete option (the self-loop already_ran_first=True
+        path).
+      * ("fresh", task) -- the context is gone (the session was cleared) but a task
+        description remains: start over with the original task text (the
+        already_ran_first=False path).
+    Never raises; a store hand-edited into an odd shape is always treated as
+    "nothing to resume"."""
     pending = sess.get("loop_pending")
     if not isinstance(pending, dict):
         return None
@@ -2455,16 +2951,20 @@ def _dorossi_load_state() -> dict:
     except FileNotFoundError:
         return {}
     except Exception as exc:  # pylint: disable=broad-except
-        # 暫時性 I/O 問題（鎖住／權限）：什麼都不動，這次當成「還沒有工作階段」。
+        # A transient I/O problem (locked / permissions): touch nothing, and treat
+        # this time as "no sessions yet".
         print(f"[dorossi] session load failed: {exc!r}", file=sys.stderr)
         return {}
     try:
         raw = _json.loads(text)
     except Exception as exc:  # pylint: disable=broad-except
-        # 內容毀損（不是暫時性 I/O 問題）：先把壞檔搬到 .bad 留存再回空狀態。若原樣
-        # 留著，下一次 _dorossi_save_state 會以「空 state」整檔覆寫掉它（存檔是
-        # temp+os.replace 的全檔取代），使用者所有工作階段就此永久消失、連手動救回
-        # 的機會都沒有。搬檔本身同樣 fail-soft，失敗只記 stderr。
+        # Corrupt content (not a transient I/O problem): first move the bad file
+        # aside to .bad to keep it, then return an empty state. Left as is, the
+        # next _dorossi_save_state would overwrite the whole file with an "empty
+        # state" (saving is a whole-file temp+os.replace), and every one of the
+        # user's sessions would be gone for good, without even a chance of a
+        # manual rescue. The move itself is fail-soft too; a failure only goes to
+        # stderr.
         print(f"[dorossi] session file corrupt, quarantining: {exc!r}",
               file=sys.stderr)
         try:
@@ -2511,71 +3011,96 @@ _DOROSSI_USAGE_LIMIT_MARKERS = (
     "out_of_credits",
 )
 
-# 上面那張表**只能用來判「錯誤文字」**，不能拿去判「成功回合的答案」（2026-09-19 修）。
+# The table above **may only be used to judge "error text"**, never "the answer
+# of a successful round" (fixed 2026-09-19).
 #
-# 表比對得很寬（"rate limit"、"limit reached"、"five_hour"），而成功回合的 result 文字
-# 是**模型自己寫的散文**。2026-09-17 22:44 與 2026-09-19 05:42 各有一輪 rc==0、
-# subtype=success 的正常回答，只因為內文**討論到**某個 SDK 的 rate limit（後者 3892
-# 字，命中點在第 2298 字）就被判成用量上限：答案整份丟掉，自走迴圈睡到五小時視窗的
-# 重設時刻，白等一小時四十八分。
+# The table matches very broadly ("rate limit", "limit reached", "five_hour"),
+# while the result text of a successful round is **prose the model wrote
+# itself**. At 2026-09-17 22:44 and 2026-09-19 05:42 there was one rc==0,
+# subtype=success normal answer each that was judged a usage limit merely because
+# the body **discussed** some SDK's rate limit (the latter was 3892 characters,
+# with the hit at character 2298): the whole answer was thrown away, and the
+# self-loop slept until the five-hour window's reset time, waiting an hour and
+# forty-eight minutes for nothing.
 #
-# 真正的上限通知在這台機器的 log（09-03 起）裡出現過 42 次，**全部**是 rc=1、
-# is_error=True、api_error_status=429——結構化欄位就足以判定，文字根本用不到。rc==0 的文字路徑是給
-# 上游舊版 CLI 那種「result 文字本身就是通知」留的防線，所以在**成功的** result 上，
-# 文字證據只在兩個條件都成立時才算數（`_dorossi_cc_limit_text_counts`）：
+# Real limit notices appeared 42 times in this machine's log (since 09-03), and
+# **every one** was rc=1, is_error=True, api_error_status=429 -- the structured
+# fields suffice to judge it and the text is not needed at all. The rc==0 text
+# path is a line of defence kept for older upstream CLIs where "the result text
+# itself is the notice", so on a **successful** result, text evidence counts
+# only when both conditions hold (`_dorossi_cc_limit_text_counts`):
 #
-#   1. 串流的 `rate_limit_event` 沒有說「這次呼叫放行了」。伺服器的配額標頭說
-#      allowed，這一輪就不可能是配額拒絕——這是結構化的否決。
-#   2. 文字**長得像一則通知**：CLI 的通知是一行模板（「You've hit your session limit ·
-#      resets 4:50pm (Asia/Taipei)」，那 42 則裡最長的 65 字），CLI 另外會接上「·
-#      progress saved」「· ask your admin for a higher limit」這類尾巴，所以上限留到
-#      300 字；會討論 rate limit 的答案是幾百、幾千字的散文。
+#   1. The stream's `rate_limit_event` did not say "this call was allowed". If the
+#      server's quota headers say allowed, this round cannot be a quota refusal --
+#      a structured veto.
+#   2. The text **looks like a notice**: the CLI's notice is a one-line template
+#      ("You've hit your session limit · resets 4:50pm (Asia/Taipei)", the
+#      longest of those 42 was 65 characters), and the CLI also appends tails like
+#      "· progress saved" and "· ask your admin for a higher limit", so the cap is
+#      left at 300 characters; an answer that discusses rate limits is prose of
+#      hundreds or thousands of characters.
 #
-# 兩條各擋一種情況，**不要只留一條**：否決只在事件存在時有效（舊版 CLI、API key 登入的
-# 工作階段都沒有這個事件），長度則擋不住「短答案剛好提到 rate limit」。
-# 錯誤的 result（is_error 為真、subtype 不是 success、或根本沒有 result 事件）照舊用整張
-# 表判定：那時的文字是 CLI 的錯誤訊息，不是模型的答案。
+# Each of the two blocks one case, **do not keep just one**: the veto only works
+# when the event exists (older CLIs and API-key sessions have no such event), and
+# the length cannot stop "a short answer that happens to mention rate limit".
+# An error result (is_error true, subtype not success, or no result event at all)
+# is judged by the whole table as before: the text then is the CLI's error
+# message, not the model's answer.
 _DOROSSI_USAGE_NOTICE_MAX_CHARS = 300
-# `rate_limit_event.rate_limit_info.status` 的詞彙。**不是猜的**：取自 CLI 自己的 SDK
-# 事件 schema（2.1.276 執行檔內 `status:q(["allowed","allowed_warning","rejected"])`，
-# 2026-09-19 查），另有 2026-08-31 實跑收到的 "allowed" 為證
-# （`test_dorossi_usage_limit.REAL_RATE_LIMIT_EVENT`）。前兩個代表這次呼叫被放行
-# （allowed_warning ＝快到上限、但還是放行），只有這兩個能否決文字判定。
+# The vocabulary of `rate_limit_event.rate_limit_info.status`. **Not guessed**:
+# taken from the CLI's own SDK event schema (in the 2.1.276 executable,
+# `status:q(["allowed","allowed_warning","rejected"])`, checked 2026-09-19), with
+# the "allowed" received in a real run on 2026-08-31 as evidence
+# (`test_dorossi_usage_limit.REAL_RATE_LIMIT_EVENT`). The first two mean this call
+# was allowed (allowed_warning = close to the limit, but still allowed), and only
+# those two can veto the text verdict.
 _DOROSSI_RATE_STATUSES = frozenset({"allowed", "allowed_warning", "rejected"})
 _DOROSSI_RATE_STATUS_ALLOWED = frozenset({"allowed", "allowed_warning"})
 
 
-# `reset_hint` 是本模組**唯一**會被組進 Discord 回覆的後端原始文字
-# （_dorossi_usage_limit_reply 會貼成「用量預計於 <hint> 重設」），所以它必須被當成
-# 不可信輸入處理。危險點在於 _DOROSSI_USAGE_LIMIT_MARKERS 比對得很寬（"rate limit"、
-# "limit reached"…），一段其實是別的錯誤、只是剛好含 "reset" 的後端文字也會走到這裡，
-# 例如 "rate limit… connection reset by peer while writing D:\\…\\x.log"——原樣回傳就
-# 把主機路徑／服務名／原始例外送進 Discord，違反「不得出現服務名／本機路徑／原始
-# 錯誤」硬需求。因此只接受「reset(s) ＋ 短短時間字樣」這種已知安全形狀，其餘一律丟棄
-# （回 None，呼叫端就只回泛用的用量上限通知，功能不受影響）。
-# 字元集刻意不含 `/`、`\\`、`~`、引號、反引號等路徑／URL 常見字元。
+# `reset_hint` is the **only** raw backend text this module lets into a Discord
+# reply (_dorossi_usage_limit_reply posts it as "usage expected to reset at
+# <hint>"), so it must be treated as untrusted input. The danger is that
+# _DOROSSI_USAGE_LIMIT_MARKERS matches very broadly ("rate limit", "limit
+# reached" …), so backend text that is really a different error and merely happens
+# to contain "reset" also ends up here, e.g. "rate limit… connection reset by peer
+# while writing D:\\…\\x.log" -- returned verbatim it would send a host path /
+# service name / raw exception into Discord, violating the hard requirement of "no
+# service names / local paths / raw errors". So only the known-safe shape "reset(s)
+# + a short time phrase" is accepted, and everything else is dropped (returns
+# None, and the caller replies with just the generic usage-limit notice; the
+# feature is unaffected).
+# The character set deliberately excludes `/`, `\\`, `~`, quotes, backticks and
+# other characters common in paths / URLs.
 _DOROSSI_RESET_HINT_MAX = 40
 _DOROSSI_RESET_HINT_RE = re.compile(r"^resets?\b[A-Za-z0-9 :,.+-]*",
                                     re.IGNORECASE)
 
 
 def _dorossi_sanitize_reset_hint(snippet: str) -> str | None:
-    """把從後端文字擷取出的「重設時間」片段收斂成已知安全形狀，否則回 None。
-    純函式、永不 raise（見上方註解的保密理由）。
+    """Narrow a "reset time" fragment extracted from backend text down to a
+    known-safe shape, otherwise return None. Pure function, never raises (see the
+    comment above for the secrecy reason).
 
-    做法是**取白名單字元的最長前綴**，不是「整段符合才收」。原本的全有全無版本會
-    把上游最常見的那一句整個丟掉——「Your limit will reset at 1pm (Etc/GMT+5)」的
-    括號不在字元集裡，於是擁有者一個時間都看不到。前綴版一樣安全（前綴本身完全落在
-    白名單內，夾不進路徑或網址），只是不會為了一個括號放棄整句。
+    It works by **taking the longest prefix of allow-listed characters**, not by
+    "accept only if the whole thing matches". The original all-or-nothing version
+    threw away upstream's most common sentence entirely -- the parentheses in
+    "Your limit will reset at 1pm (Etc/GMT+5)" are not in the character set, so the
+    owner saw no time at all. The prefix version is just as safe (the prefix lies
+    entirely within the allow-list and cannot smuggle in a path or URL); it just
+    does not give up a whole sentence over one parenthesis.
 
-    截斷之後還有兩道：
+    After truncation there are two more checks:
 
-    * `[A-Za-z]:` ── 字母緊接冒號代表磁碟機字首（`D:`）或 scheme（`http:`）。時間裡
-      的冒號前面一定是數字。這道是 `rate limit… connection reset by peer while
-      writing D:\\…` 那類假 hint 的主要殺手。
-    * **必須含數字** ── 「重設時間」一定帶數字。少了這條，`reset by peer while
-      writing logs` 這種沒有磁碟機字首的散文會原樣被當成時間送出去。截斷版讓這種
-      句子更容易「剛好整段合法」，所以這道是配套的，不是額外的潔癖。
+    * `[A-Za-z]:` -- a letter immediately followed by a colon means a drive prefix
+      (`D:`) or a scheme (`http:`). In a time the colon is always preceded by a
+      digit. This check is the main killer of fake hints like `rate limit…
+      connection reset by peer while writing D:\\…`.
+    * **Must contain a digit** -- a "reset time" always has a digit. Without this,
+      prose with no drive prefix such as `reset by peer while writing logs` would
+      be sent out verbatim as a time. Truncation makes such sentences more likely
+      to be "entirely legal by chance", so this check is its counterpart, not extra
+      fastidiousness.
     """
     s = (snippet or "").strip()
     if not s:
@@ -2586,8 +3111,8 @@ def _dorossi_sanitize_reset_hint(snippet: str) -> str | None:
     s = match.group(0).strip()
     if not s or len(s) > _DOROSSI_RESET_HINT_MAX:
         return None
-    # 時間裡的冒號前面一定是數字（3:45pm）；字母＋冒號代表磁碟機字首（D:）或
-    # scheme（http:），一律拒收。
+    # In a time the colon is always preceded by a digit (3:45pm); letter + colon
+    # means a drive prefix (D:) or a scheme (http:), always rejected.
     if re.search(r"[A-Za-z]:", s):
         return None
     if not any(ch.isdigit() for ch in s):
@@ -2595,26 +3120,34 @@ def _dorossi_sanitize_reset_hint(snippet: str) -> str | None:
     return s
 
 
-# 管線分隔的時間戳變體：`Claude AI usage limit reached|1749924000`。這是實務上
-# 唯一**機器可讀**的重設時刻來源（上游 issue 標題大量出現這個形狀），所以自走迴圈
-# 「睡到額度回來」只信這一條。10 位＝秒、13 位＝毫秒，兩種都收。
+# The pipe-delimited timestamp variant: `Claude AI usage limit reached|1749924000`.
+# In practice this is the only **machine-readable** source of the reset time
+# (upstream issue titles show this shape a lot), so the self-loop's "sleep until
+# the quota returns" trusts only this one. 10 digits = seconds, 13 digits =
+# milliseconds; both are accepted.
 _DOROSSI_RESET_EPOCH_RE = re.compile(r"\|\s*(\d{10,13})\b")
-# epoch 合理區間（秒）：2001-09 ～ 2096-10。超出就當作「那串數字不是時間戳」。
+# The plausible epoch range (seconds): 2001-09 to 2096-10. Anything outside is
+# taken as "that string of digits is not a timestamp".
 _DOROSSI_EPOCH_MIN = 1_000_000_000
 _DOROSSI_EPOCH_MAX = 4_000_000_000
 
 
 def _dorossi_extract_reset_epoch(text: str) -> float | None:
-    """從用量上限通知裡取出**機器可讀**的重設時刻（epoch 秒），取不到回 None。
-    純函式、永不 raise。
+    """Extract the **machine-readable** reset time (epoch seconds) from a
+    usage-limit notice, or None when there is none. Pure function, never raises.
 
-    **只認 `…|<epoch>` 這一種形狀，刻意不換算人類可讀的「resets 3:45pm」。**
-    理由是時區：上游實際印出的字樣是「Your limit will reset at 1pm (Etc/GMT+5)」，
-    那個時區跟本機時區沒有關係，把 `1pm` 當本機時間換算可能整整差好幾個小時。
-    猜錯的兩個方向代價不對稱——猜早了只是多送一次會立刻失敗的探測（便宜），猜晚了
-    是整個自走任務白白多停數小時（昂貴）。所以拿不到時間戳時一律回 None，讓呼叫端
-    走「短等待起跳、指數退避」的探測，而不是相信一個沒有時區的鐘點。
-    `reset_hint`（給人看的那個字串）不受影響，照舊會顯示鐘點寫法。
+    **Only the `…|<epoch>` shape is recognised; a human-readable "resets 3:45pm" is
+    deliberately not converted.** The reason is the time zone: what upstream
+    actually prints is "Your limit will reset at 1pm (Etc/GMT+5)", a time zone that
+    has nothing to do with the local one, so converting `1pm` as local time could
+    be off by several whole hours. The two directions of a wrong guess cost
+    differently -- guessing early only sends one more probe that fails at once
+    (cheap), while guessing late stalls the whole self-loop task for hours for
+    nothing (expensive). So without a timestamp it always returns None and lets
+    the caller probe with "a short initial wait, exponential backoff", rather than
+    trusting a clock time with no time zone.
+    `reset_hint` (the string for people) is unaffected and still shows the clock
+    time as written.
     """
     if not text:
         return None
@@ -2623,7 +3156,8 @@ def _dorossi_extract_reset_epoch(text: str) -> float | None:
         if match is None:
             return None
         raw = int(match.group(1))
-        # 13 位是毫秒（防禦性：目前實測是秒，但兩種都收才不會哪天靜悄悄失準）。
+        # 13 digits is milliseconds (defensive: measured as seconds today, but
+        # accepting both keeps it from quietly going wrong some day).
         secs = raw / 1000.0 if raw >= 1_000_000_000_000 else float(raw)
         if _DOROSSI_EPOCH_MIN <= secs <= _DOROSSI_EPOCH_MAX:
             return secs
@@ -2633,16 +3167,19 @@ def _dorossi_extract_reset_epoch(text: str) -> float | None:
 
 
 def _dorossi_rate_limit_reset(ev: dict) -> float | None:
-    """從 stream-json 的 `rate_limit_event` 取出重設時刻（epoch 秒）。純函式、永不
-    raise。
+    """Extract the reset time (epoch seconds) from stream-json's
+    `rate_limit_event`. Pure function, never raises.
 
-    **這是目前唯一真正可靠的機器可讀來源。** 原本只認通知文字裡的
-    `…|<epoch>`——那個形狀來自上游 issue 標題，而 2026-08-31 實測**目前的 CLI
-    根本不再輸出它**（在整支執行檔裡搜不到 `Claude AI usage limit reached`）。
-    於是那條路等同永遠回 None，每次撞上限都只能走「15 分鐘起跳、每次加倍」的
-    退避探測，最壞情況白等好幾個小時。
+    **This is currently the only truly reliable machine-readable source.** Originally
+    only `…|<epoch>` in the notice text was recognised -- a shape that came from
+    upstream issue titles, and measured on 2026-08-31 **the current CLI no longer
+    prints it at all** (`Claude AI usage limit reached` appears nowhere in the whole
+    executable). So that path effectively always returned None, and every limit hit
+    could only take the "start at 15 minutes, double each time" backoff probe,
+    waiting hours for nothing in the worst case.
 
-    現在的 CLI 改成**每一次呼叫**都在串流裡發一個 `rate_limit_event`：
+    The current CLI instead emits a `rate_limit_event` in the stream on **every
+    call**:
 
         {"type": "rate_limit_event", "rate_limit_info": {
             "status": "allowed", "resetsAt": 1788199200,
@@ -2651,13 +3188,16 @@ def _dorossi_rate_limit_reset(ev: dict) -> float | None:
                                              "resetsAt": 1788199200},
                                "seven_day": {...}}}}
 
-    `resetsAt` 是這個視窗真正的重設時刻（來自伺服器的配額標頭），所以撞上限時可以
-    **睡到那一刻**而不是猜。優先取頂層的 `resetsAt`——CLI 已經依 `rateLimitType`
-    挑好了當下綁住的那個視窗；取不到才退回 `unifiedWindows.five_hour`。
+    `resetsAt` is this window's real reset time (from the server's quota headers),
+    so on a limit hit it can **sleep until that moment** instead of guessing. The
+    top-level `resetsAt` is preferred -- the CLI has already picked, by
+    `rateLimitType`, the window that is binding right now; only when that is
+    missing does it fall back to `unifiedWindows.five_hour`.
 
-    週上限（`rateLimitType == "seven_day"`）的 `resetsAt` 可能在好幾天後，但呼叫端
-    的 `DOROSSI_USAGE_WAIT_MAX_SEC` 會把單次等待截在 6 小時再重探——探測便宜，睡過
-    頭才是不可逆的浪費。這裡不做這個判斷，只忠實回報時刻。
+    A weekly limit's (`rateLimitType == "seven_day"`) `resetsAt` may be days away,
+    but the caller's `DOROSSI_USAGE_WAIT_MAX_SEC` caps a single wait at 6 hours and
+    probes again -- probing is cheap, oversleeping is the irreversible waste. That
+    judgement is not made here; this only reports the time faithfully.
     """
     try:
         info = ev.get("rate_limit_info")
@@ -2676,7 +3216,7 @@ def _dorossi_rate_limit_reset(ev: dict) -> float | None:
             secs = float(raw)
             if secs != secs:  # NaN
                 continue
-            if secs >= 1_000_000_000_000:  # 毫秒（防禦性，實測是秒）
+            if secs >= 1_000_000_000_000:  # milliseconds (defensive; measured as seconds)
                 secs /= 1000.0
             if _DOROSSI_EPOCH_MIN <= secs <= _DOROSSI_EPOCH_MAX:
                 return secs
@@ -2686,12 +3226,14 @@ def _dorossi_rate_limit_reset(ev: dict) -> float | None:
 
 
 def _dorossi_rate_limit_status(ev) -> str | None:
-    """`rate_limit_event` 的 `rate_limit_info.status`；不在已知詞彙裡就回 None。
-    純函式、永不 raise。
+    """The `rate_limit_info.status` of a `rate_limit_event`; None when it is not in
+    the known vocabulary. Pure function, never raises.
 
-    認不得的值（詞彙哪天擴充、欄位形狀改掉）一律回 None，**不是**當成 allowed：
-    這個值唯一的用途是否決文字判定（見 `_dorossi_cc_limit_text_counts`），所以認不得
-    的失敗方向必須是「不否決」——退回原本的文字判定，而不是把一則真的通知放過去。
+    An unrecognised value (the vocabulary grows some day, the field changes shape)
+    always returns None, **not** treated as allowed: the only use of this value is
+    to veto the text verdict (see `_dorossi_cc_limit_text_counts`), so the failure
+    direction for an unrecognised value must be "no veto" -- fall back to the
+    original text verdict rather than let a real notice through.
     """
     try:
         info = ev.get("rate_limit_info")
@@ -2707,17 +3249,22 @@ def _dorossi_rate_limit_status(ev) -> str | None:
 
 def _dorossi_cc_limit_text_counts(result_ev: dict, answer: str,
                                   stream_status: str | None) -> bool:
-    """用量上限比對表的**文字**命中，這一次算不算數。純函式。
+    """Whether a **text** hit against the usage-limit table counts this time. Pure
+    function.
 
-    規則寫在 `_DOROSSI_USAGE_NOTICE_MAX_CHARS` 上方；這裡只做三件事：
+    The rules are written above `_DOROSSI_USAGE_NOTICE_MAX_CHARS`; this does only
+    three things:
 
-    * result 不是成功完成（`_claude_result_succeeded` 為假）→ 算數。那時的文字是 CLI
-      的錯誤訊息，沿用原本整張表的判定，rc != 0 的行為因此一個字都沒變。
-    * 成功完成、而串流說這次呼叫被放行 → 不算數（結構化否決）。
-    * 成功完成、沒有放行訊號 → 文字要短得像一則通知才算數。
+    * The result did not complete successfully (`_claude_result_succeeded` false)
+      -> counts. The text then is the CLI's error message, judged by the whole
+      table as before, so rc != 0 behaviour has not changed by a single word.
+    * Completed successfully, and the stream says this call was allowed -> does
+      not count (structured veto).
+    * Completed successfully, with no allowed signal -> the text counts only when
+      it is short enough to be a notice.
 
-    長度量的是 `result` 與 `answer` 裡**比較長**的那一個：兩者在實務上是同一段字，
-    但只要有一個是長篇散文，這就不是一則通知。
+    The length measured is the **longer** of `result` and `answer`: in practice
+    they are the same text, but if either is long-form prose, this is not a notice.
     """
     if not _claude_result_succeeded(result_ev):
         return True
@@ -2750,7 +3297,8 @@ def _dorossi_extract_reset_hint(text: str) -> str | None:
                 cut = snippet.find(sep)
                 if cut > 0:
                     snippet = snippet[:cut]
-            # 這段是後端原始文字，會被貼進 Discord → 先收斂成已知安全形狀。
+            # This is raw backend text that gets posted into Discord -> narrow it
+            # to a known-safe shape first.
             return _dorossi_sanitize_reset_hint(snippet)
     except Exception:  # pylint: disable=broad-except
         return None
@@ -2769,10 +3317,12 @@ def _dorossi_cc_usage_limit(result_ev: dict, answer: str,
     so it catches BOTH the non-zero-exit failure and the rc==0 run whose answer
     text is itself the limit notice.
 
-    **結構化欄位永遠優先於文字**：429／402 不經過任何文字條件。文字命中則要再過
-    `_dorossi_cc_limit_text_counts`——成功完成的回合裡，文字是模型寫的答案，不是 CLI
-    的通知（2026-09-19 事故，見 `_DOROSSI_USAGE_NOTICE_MAX_CHARS` 上方）。
-    `stream_status` 是這次呼叫最後一則 `rate_limit_event` 的 status。"""
+    **Structured fields always take precedence over text**: 429 / 402 go through
+    no text condition at all. A text hit must additionally pass
+    `_dorossi_cc_limit_text_counts` -- in a successfully completed round the text
+    is the answer the model wrote, not the CLI's notice (the 2026-09-19 incident,
+    see above `_DOROSSI_USAGE_NOTICE_MAX_CHARS`).
+    `stream_status` is the status of this call's last `rate_limit_event`."""
     status = result_ev.get("api_error_status")
     try:
         status_int = int(status) if status not in (None, "") else None
@@ -2790,19 +3340,24 @@ def _dorossi_cc_usage_limit(result_ev: dict, answer: str,
     if status_int in (429, 402) or text_hit:
         reset_text = result_ev.get("result") or answer or ""
         reset = _dorossi_extract_reset_hint(reset_text)
-        # epoch 走**整個 haystack**（含 subtype / terminal_reason），因為
-        # `…|<epoch>` 不保證出現在 `result` 欄位裡；而 `reset_hint` 維持只看
-        # result/answer，那條路徑會被原樣貼進 Discord，掃描範圍越窄越好。
+        # The epoch scans **the whole haystack** (including subtype /
+        # terminal_reason), because `…|<epoch>` is not guaranteed to appear in the
+        # `result` field; while `reset_hint` keeps looking only at result/answer,
+        # since that path gets posted into Discord verbatim and the narrower its
+        # scan the better.
         #
-        # **串流事件優先於文字。** `stream_reset` 來自這一次呼叫的
-        # `rate_limit_event`（伺服器配額標頭），是結構化的；文字裡的 `|<epoch>`
-        # 來自上游 issue 標題那個形狀，2026-08-31 實測目前的 CLI 已經不再輸出它。
-        # 兩者都取不到時才會回 None，讓呼叫端走退避探測。
+        # **The stream event takes precedence over the text.** `stream_reset`
+        # comes from this call's `rate_limit_event` (the server's quota headers)
+        # and is structured; the `|<epoch>` in text comes from that upstream
+        # issue-title shape, which measured on 2026-08-31 the current CLI no longer
+        # prints. Only when neither is available does it return None, leaving the
+        # caller to probe with backoff.
         epoch = stream_reset
         if epoch is None:
             epoch = _dorossi_extract_reset_epoch(haystack)
-        # 沒有人看得懂的鐘點、但有機器可讀的時刻 → 用時刻補一個給人看的字串，
-        # 否則擁有者會收到「會自動續跑」卻不知道大概什麼時候。
+        # No human-readable clock time but a machine-readable moment -> build a
+        # string for people from the moment, otherwise the owner is told "will
+        # resume automatically" with no idea of roughly when.
         if reset is None and epoch is not None:
             reset = time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
         return _DorossiUsageLimitError(
@@ -2812,29 +3367,38 @@ def _dorossi_cc_usage_limit(result_ev: dict, answer: str,
     return None
 
 
-# ---- codex（GPT）那一側的用量上限／暫時性故障 ------------------------------
+# ---- usage limit / transient failure on the codex (GPT) side ----------------
 #
-# 2026-09-05 補。在這之前 **codex 路徑完全沒有這兩種判定**：`_dorossi_via_codex`
-# 的 rc!=0 只會「有 session_id → `_DorossiResumeError`（丟掉工作階段重開一次）→
-# 否則 `RuntimeError`」，於是 GPT 撞到用量上限時，迴圈會先白白重開一個新工作階段
-# （一樣會撞上），然後把整個無人值守任務判死。Claude 那一側 2026-08-31 就已經改成
-# 「等到額度回復再續跑」，codex 這側一直是舊行為。
+# Added 2026-09-05. Before this **the codex path had neither verdict at all**:
+# rc!=0 in `_dorossi_via_codex` would only go "has session_id ->
+# `_DorossiResumeError` (throw the session away and reopen once) -> otherwise
+# `RuntimeError`", so when GPT hit a usage limit the loop first reopened a new
+# session for nothing (which hit it just the same), then declared the whole
+# unattended task dead. The Claude side had changed to "wait for the quota to
+# recover, then carry on" back on 2026-08-31; the codex side kept the old
+# behaviour.
 #
-# 這裡刻意**重用** `_DorossiUsageLimitError` / `_DorossiTransientError`：自走迴圈
-# 早就知道怎麼等這兩種例外，所以只要讓 codex 路徑丟對的例外，等待與續跑的邏輯
-# 一行都不用改。
+# `_DorossiUsageLimitError` / `_DorossiTransientError` are deliberately **reused**
+# here: the self-loop already knows how to wait on these two exceptions, so as
+# long as the codex path raises the right one, not a single line of the waiting
+# and resuming logic needs to change.
 
-# 相對時間的寫法（"try again in 2.363s"、"try again in 4 days 2 hours 46 minutes"）。
-# 抓 `… in ` 之後**同一行**的一小段窗口，讓下面的單位比對自己去挑。
-# 第一版用的是限縮字元集 `[0-9smhd\s.,]*`，看起來很安全，實際上會在 "4 days" 的
-# `a` 就停下來——"4 days 2 hours 46 minutes" 只算到 4 天，2 小時 46 分**無聲地
-# 消失**。窗口版安全性一樣（單位比對要求「數字＋時間單位字」，訊息裡的
-# "Limit 200000, Used 162582" 沒有單位不會被誤抓），但不會漏掉字詞寫法。
+# Relative-time phrasing ("try again in 2.363s", "try again in 4 days 2 hours 46
+# minutes"). Grab a small window on **the same line** after `… in `, and let the
+# unit match below pick from it.
+# The first version used a narrowed character set `[0-9smhd\s.,]*`, which looked
+# safe but in fact stopped at the `a` of "4 days" -- "4 days 2 hours 46 minutes"
+# counted only 4 days, and the 2 hours 46 minutes **silently vanished**. The
+# window version is just as safe (the unit match requires "number + time-unit
+# word", so the message's "Limit 200000, Used 162582" has no unit and is not
+# caught by mistake), but does not miss the spelled-out forms.
 _RETRY_AFTER_RE = re.compile(
     r"(?:try\s+again|retry|resets?)\s+(?:again\s+)?in\s+([^\n]{0,60})",
     re.IGNORECASE)
-# 輸入被上一條樣式截在 60 字以內，所以今天不會慢；但它本身對一長串數字是平方時間
-# （6 萬個數字 291 秒），lookbehind 讓它只從一串數字的開頭起跑，結果不變。
+# The previous pattern cuts the input at 60 characters, so it is not slow today;
+# but on its own it is quadratic in a long run of digits (291 seconds for 60,000
+# digits), and the lookbehind makes it start only at the beginning of a digit
+# run, with the same result.
 _DURATION_UNIT_RE = re.compile(
     r"(?<![0-9])([0-9]+(?:\.[0-9]+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b",
     re.IGNORECASE)
@@ -2842,16 +3406,20 @@ _UNIT_SECONDS = {"d": 86400.0, "h": 3600.0, "m": 60.0, "s": 1.0}
 
 
 def _dorossi_extract_retry_after_seconds(text: str) -> float | None:
-    """從「**相對**」的重試提示裡取出秒數；取不到回 None。純函式、永不 raise。
+    """Extract the seconds from a **relative** retry hint; None when there are
+    none. Pure function, never raises.
 
-    與 `_dorossi_extract_reset_epoch` 的取捨相反，而且理由是同一個：那支拒絕換算
-    「resets 3:45pm」是因為**沒有時區**，猜錯可能整整差好幾小時。相對寫法沒有這個
-    問題——「in 4 days 2 hours」不管在哪個時區都是同一段長度，所以換算是安全的。
-    codex 的上限通知用的正是相對寫法。
+    The opposite trade-off from `_dorossi_extract_reset_epoch`, and for the same
+    reason: that one refuses to convert "resets 3:45pm" because there is **no time
+    zone**, and a wrong guess could be off by several whole hours. The relative
+    form has no such problem -- "in 4 days 2 hours" is the same length in any time
+    zone, so converting it is safe. codex's limit notices use exactly the relative
+    form.
 
-    只認 `try again in …` / `retry in …` / `resets in …` 之後緊接的那一段，不去掃
-    整句裡任何看起來像時間的東西——訊息裡常常還有別的數字（Limit 200000、
-    Used 162582），亂抓會得到荒謬的等待長度。
+    Only the stretch right after `try again in …` / `retry in …` / `resets in …` is
+    recognised, rather than scanning the whole sentence for anything that looks
+    like a time -- the message often carries other numbers (Limit 200000, Used
+    162582), and grabbing them would produce absurd wait lengths.
     """
     if not text:
         return None
@@ -2866,12 +3434,14 @@ def _dorossi_extract_retry_after_seconds(text: str) -> float | None:
             continue
     if total <= 0:
         return None
-    # 上緣夾住：上游偶爾會吐出離譜的長度，而這個值會直接變成 sleep 的秒數。
+    # Clamp the upper end: upstream occasionally spits out an absurd length, and
+    # this value becomes the sleep's seconds directly.
     return min(total, 7 * 86400.0)
 
 
-# 用量／配額（要等到額度回復）。刻意不含 "overloaded"、"server error" ——那些是
-# 下面的暫時性故障，兩者的等待策略不同。
+# Usage / quota (must wait for the quota to recover). Deliberately excludes
+# "overloaded" and "server error" -- those are the transient failures below, and
+# the two have different waiting strategies.
 _CODEX_USAGE_MARKERS = (
     "usage limit",
     "rate limit",
@@ -2885,7 +3455,8 @@ _CODEX_USAGE_MARKERS = (
     "5h limit",
 )
 
-# 伺服器側暫時性故障（退避重試就好，不必等額度）。
+# Server-side transient failures (retrying with backoff is enough; no need to
+# wait for the quota).
 _CODEX_TRANSIENT_MARKERS = (
     "overloaded",
     "internal server error",
@@ -2903,17 +3474,21 @@ _CODEX_TRANSIENT_MARKERS = (
 
 def _dorossi_codex_usage_limit(text: str, session_id: str | None = None
                                ) -> "_DorossiUsageLimitError | None":
-    """codex 的輸出像不像「方案／配額用量上限」；是就回填好的例外，否則 None。
+    """Whether codex's output looks like "a plan / quota usage limit"; if so return
+    a filled-in exception, otherwise None.
 
-    `reset_at` 只在能從**相對**寫法算出來時才給值（見
-    `_dorossi_extract_retry_after_seconds`）；給不出來就留 None，讓迴圈走
-    「短等待起跳、指數退避」的探測——與 Claude 那側同一套策略。
+    `reset_at` is given a value only when it can be computed from a **relative**
+    form (see `_dorossi_extract_retry_after_seconds`); otherwise it stays None and
+    the loop probes with "a short initial wait, exponential backoff" -- the same
+    strategy as the Claude side.
 
-    **Claude 那一側 2026-09-19 的誤判（成功的答案因為討論到 rate limit 被丟掉）在這裡
-    不會發生，理由是結構性的**：這支只從 `_codex_stream_verdict` 的 rc != 0 分支被
-    呼叫（rc == 0 一律直接 "ok"），而餵進來的文字是 stderr ＋ 失敗事件，
-    `agent_message` 的答案文字從來不在裡面（`_CodexStreamState.feed`）。哪天要在
-    rc == 0 也檢查，必須先套上 `_dorossi_cc_limit_text_counts` 那條規則。
+    **The Claude side's 2026-09-19 misjudgement (a successful answer thrown away
+    for discussing rate limits) cannot happen here, for structural reasons**: this
+    is called only from the rc != 0 branch of `_codex_stream_verdict` (rc == 0 is
+    always straight "ok"), and the text fed in is stderr + failure events, never
+    the `agent_message` answer text (`_CodexStreamState.feed`). If it is ever to
+    check on rc == 0 as well, the `_dorossi_cc_limit_text_counts` rule must be
+    applied first.
     """
     if not text:
         return None
@@ -2931,46 +3506,56 @@ def _dorossi_codex_usage_limit(text: str, session_id: str | None = None
 
 def _dorossi_codex_transient(text: str, session_id: str | None = None
                              ) -> "_DorossiTransientError | None":
-    """codex 的輸出像不像「伺服器暫時忙碌」。**必須排在用量上限判定之後**——理由
-    與 Claude 那側相同：用量上限有重設時間可以等，比指數退避精準得多。"""
+    """Whether codex's output looks like "the server is temporarily busy". **Must
+    come after the usage-limit verdict** -- for the same reason as the Claude side:
+    a usage limit has a reset time to wait for, far more precise than exponential
+    backoff."""
     if not text:
         return None
     low = str(text).lower()
     if any(marker in low for marker in _CODEX_USAGE_MARKERS):
-        return None          # 用量上限優先，不在這裡攔
+        return None          # the usage limit takes precedence; not caught here
     if not any(marker in low for marker in _CODEX_TRANSIENT_MARKERS):
         return None
     return _DorossiTransientError(str(text)[:400], session_id=session_id or None)
 
 
-# ---- 「這個錯誤重試有沒有機會成功」 ----------------------------------------
+# ---- "does retrying this error have any chance of succeeding" --------------
 #
-# 2026-09-05 補。自走迴圈原本只有三種會續跑的錯誤（用量上限、暫時性故障、以及
-# 2026-09-03 才加的那條），其餘**任何**例外都是「貼一句錯誤、`return`、整個無人
-# 值守任務結束」。對一個沒人看著的長任務來說，那代表任何一次偶發失敗——後端行程
-# 被系統殺掉、一次網路抖動、一個沒預期到的例外——都會讓它整夜停在那裡。
+# Added 2026-09-05. The self-loop used to have only three kinds of error it would
+# carry on through (usage limit, transient failure, and the one added only on
+# 2026-09-03); **any** other exception meant "post an error line, `return`, the
+# whole unattended task ends". For a long task nobody is watching, that means any
+# single sporadic failure -- the backend process killed by the system, one
+# network blip, one unexpected exception -- leaves it standing there all night.
 #
-# 判準與 `_supervisor.child_exit_is_fatal` 一樣是**「重試會不會有機會成功」**，
-# 不是「錯誤嚴不嚴重」。設定寫錯與憑證過期重試也不會成功，但它們的例外型別跟
-# 偶發失敗分不出來，只能靠重試上限兜著。
+# The criterion is the same as `_supervisor.child_exit_is_fatal`: **"does
+# retrying have any chance of succeeding"**, not "how severe is the error". A
+# wrong setting or expired credentials will not succeed on retry either, but
+# their exception types cannot be told apart from sporadic failures, so only the
+# retry cap catches them.
 _FATAL_ERROR_TYPES = (
-    FileNotFoundError,      # 後端 CLI 不在 PATH 上——重試一百次還是不在
+    FileNotFoundError,      # the backend CLI is not on PATH -- retry a hundred times and it still is not
     NotADirectoryError,
-    PermissionError,        # 權限問題不會自己好
+    PermissionError,        # a permission problem does not fix itself
     ImportError,
-    _DorossiCliOptionError,  # CLI 不認得我們傳的旗標——它不會在重試之間自己變新
-    _DorossiAuthError,       # CLI 沒有可用的登入——要有人在主機上登入，重試不會自己好
+    _DorossiCliOptionError,  # the CLI does not recognise a flag we pass -- it will not update itself between retries
+    _DorossiAuthError,       # the CLI has no usable sign-in -- someone must sign in on the host; retrying won't fix it
 )
 
-# 這些字樣代表「設定／環境本身錯了」，同樣重試無用。
+# These phrases mean "the configuration / environment itself is wrong", so
+# retrying is equally useless.
 #
-# **CLI 沒登入的兩句真實文字刻意不加進來**（「Not logged in · Please run /login」
-# 「Failed to authenticate. API Error: 401 …」，2026-09-19 實測）：那一類改由
-# `_dorossi_cc_auth_failure` 從結構化欄位判、文字只當退路而且有長度上限，丟的是型別化
-# 的 `_DorossiAuthError`（上面那張型別表）。在這裡加字樣等於對**任何**例外訊息做不設
-# 上限的子字串比對——而 `RuntimeError("claude -p exited …: result=<答案>")` 的訊息裡
-# 裝的是 result 文字，一篇剛好談到 /login 的長答案就會把自走迴圈判死。本月用量上限的
-# 判定已經在同一種寫法上摔過兩次（`_DOROSSI_USAGE_NOTICE_MAX_CHARS` 上方）。
+# **The CLI's two real not-logged-in texts are deliberately not added** ("Not
+# logged in · Please run /login", "Failed to authenticate. API Error: 401 …",
+# measured 2026-09-19): that class is instead judged by `_dorossi_cc_auth_failure`
+# from structured fields, with text only as a fallback and length-capped, raising
+# the typed `_DorossiAuthError` (in the type table above). Adding phrases here
+# would mean an uncapped substring match against **any** exception message --
+# and the message of `RuntimeError("claude -p exited …: result=<answer>")` holds
+# the result text, so a long answer that happens to discuss /login would declare
+# the self-loop dead. This month the usage-limit verdict already fell twice on
+# exactly this pattern (above `_DOROSSI_USAGE_NOTICE_MAX_CHARS`).
 _FATAL_ERROR_MARKERS = (
     "not found on path",
     "cli not found",
@@ -2982,10 +3567,12 @@ _FATAL_ERROR_MARKERS = (
 )
 
 
-# ---- 連線探測：網路回來了沒 -------------------------------------------------
+# ---- Connectivity probe: is the network back? --------------------------------
 #
-# 斷網時的等待不是猜一段秒數，而是**問網路**：對該後端（或對話平台）的主機做一次
-# DNS 解析 ＋ TCP 連線，成功就算回來了。主機名只給這支用，永遠不會送進對話平台。
+# Waiting out a network outage does not guess a number of seconds; it **asks the
+# network**: one DNS resolution + TCP connection to that backend's (or the chat
+# platform's) host, and success means it is back. The host names are used only
+# by this and are never sent into the chat platform.
 DOROSSI_NETWORK_PROBE_HOSTS = {
     "claude_code": ("api.anthropic.com", 443),
     "api": ("api.anthropic.com", 443),
@@ -2996,10 +3583,12 @@ DOROSSI_NETWORK_PROBE_TIMEOUT_SEC = 8.0
 
 
 async def dorossi_network_reachable(target: str) -> bool:
-    """`target`（`DOROSSI_NETWORK_PROBE_HOSTS` 的鍵）現在連得上嗎？永不 raise。
+    """Can `target` (a key of `DOROSSI_NETWORK_PROBE_HOSTS`) be reached right now?
+    Never raises.
 
-    只做「解析 ＋ 連上就關」，不送任何資料；整段有上限，卡住的解析器不會把等待
-    本身卡死。認不得的 target 退回平台那一台。"""
+    It only does "resolve + connect then close", sending no data; the whole thing
+    is bounded, so a hung resolver cannot hang the wait itself. An unrecognised
+    target falls back to the platform host."""
     host, port = DOROSSI_NETWORK_PROBE_HOSTS.get(
         target, DOROSSI_NETWORK_PROBE_HOSTS["platform"])
     try:
@@ -3018,10 +3607,13 @@ async def dorossi_network_reachable(target: str) -> bool:
 
 
 def dorossi_error_is_fatal(exc: BaseException) -> bool:
-    """True ＝ 重試沒有意義，該停下來讓人處理。永不 raise。
+    """True = retrying is pointless; stop and let a human deal with it. Never
+    raises.
 
-    保守的方向刻意選「可重試」：判錯成致命 → 無人值守任務白停一整夜；判錯成可
-    重試 → 最多多試幾次然後照樣停下來（重試次數有上限）。兩種錯誤的代價差很多。
+    The conservative direction is deliberately "retryable": misjudged as fatal ->
+    an unattended task stalls all night for nothing; misjudged as retryable -> at
+    most a few more tries, then it stops anyway (the retry count is capped). The
+    two mistakes cost very different amounts.
     """
     try:
         if isinstance(exc, _FATAL_ERROR_TYPES):
@@ -3034,10 +3626,12 @@ def dorossi_error_is_fatal(exc: BaseException) -> bool:
 
 def dorossi_error_retry_wait_seconds(attempt: int, *, base: float = 20.0,
                                      cap: float = 300.0) -> float:
-    """非預期錯誤的第 `attempt` 次（從 1 起算）重試要等幾秒。指數退避、封頂 5 分。
+    """How many seconds to wait before the `attempt`-th (counting from 1) retry of
+    an unexpected error. Exponential backoff, capped at 5 minutes.
 
-    比暫時性故障那條短（那條起步 30 秒、封頂 15 分）：伺服器過載要給對方時間恢復，
-    而這裡多半是本機的偶發失敗，等太久只是浪費無人值守的時間。
+    Shorter than the transient-failure one (which starts at 30 seconds and caps at
+    15 minutes): an overloaded server needs time to recover, while this is mostly a
+    sporadic local failure, and waiting too long only wastes unattended time.
     """
     try:
         n = max(1, int(attempt))
@@ -3047,16 +3641,20 @@ def dorossi_error_retry_wait_seconds(attempt: int, *, base: float = 20.0,
 
 
 def dorossi_abandoned_loops(state: dict, *, now: float | None = None) -> list:
-    """被中斷、而且**不會再被自動接續**的自走任務。回 `[(uid, sid, age_sec), …]`。
+    """Self-loop tasks that were interrupted and **will not be resumed
+    automatically any more**. Returns `[(uid, sid, age_sec), …]`.
 
-    2026-09-05 補。`_dorossi_loop_autoresume_plan` 有四道條件，任何一道不過就回
-    None——標記過舊、重試次數用完、少了頻道錨點、或不是 live。前三種情況下標記
-    仍然停在 `live: True`，但**沒有任何東西會再去接它**，也沒有任何地方會講。
-    對一個無人值守的長任務來說，那等於「它其實早就停了，而你以為還在跑」。
+    Added 2026-09-05. `_dorossi_loop_autoresume_plan` has four conditions and
+    returns None if any one fails -- marker too old, retries used up, channel
+    anchor missing, or not live. In the first three cases the marker still sits at
+    `live: True`, but **nothing will ever pick it up again**, and nothing anywhere
+    says so. For a long unattended task, that amounts to "it actually stopped long
+    ago, and you think it is still running".
 
-    這裡只回報「該被接回去、但接不回來」的那些（`live` 還是真的，或因為網路／被取消
-    而停下來的，見 `_dorossi_loop_marker_wants_autoresume`）；擁有者 abort 或其他自願
-    停下來的任務不算異常，不列入。
+    Only the ones that "should be brought back but cannot be" are reported here
+    (`live` still true, or stopped because of the network / cancellation, see
+    `_dorossi_loop_marker_wants_autoresume`); tasks the owner aborted or that
+    stopped voluntarily in other ways are not anomalies and are not listed.
     """
     out = []
     if not isinstance(state, dict):
@@ -3071,7 +3669,7 @@ def dorossi_abandoned_loops(state: dict, *, now: float | None = None) -> list:
             if not _dorossi_loop_marker_wants_autoresume(marker):
                 continue
             if _dorossi_loop_autoresume_plan(sess, now=now) is not None:
-                continue          # 還接得回來，不算被遺棄
+                continue          # can still be brought back, so not abandoned
             ts = marker.get("ts")
             age = ((now if now is not None else time.time()) - float(ts)
                    if isinstance(ts, (int, float)) and not isinstance(ts, bool)
@@ -3083,68 +3681,85 @@ def dorossi_abandoned_loops(state: dict, *, now: float | None = None) -> list:
 
 def _dorossi_usage_wait_seconds(exc: Exception, attempt: int,
                                 *, now: float | None = None) -> float:
-    """自走迴圈撞上方案用量上限後，這一次該睡多久（秒）再續跑。
+    """After the self-loop hits the plan's usage limit, how long (seconds) to sleep
+    this time before carrying on.
 
-    `attempt` 由 1 起算，是「這一段**連續**等待裡的第幾次」——中間只要有任何一輪
-    成功，呼叫端就會歸零。
+    `attempt` counts from 1 and is "which try within this **consecutive** stretch
+    of waiting" -- the caller resets it as soon as any round in between succeeds.
 
-    兩條路：
+    Two paths:
 
-    1. `exc.reset_at` 有值（後端給了 `…|<epoch>` 或 API 的 `retry-after`）
-       → 睡到那個時刻再加 `DOROSSI_USAGE_WAIT_GRACE_SEC` 緩衝。
-    2. 沒有值 → 從 `DOROSSI_USAGE_WAIT_FALLBACK_SEC` 起跳、每次加倍的**退避探測**。
-       不去猜「resets 3:45pm」那種沒有時區的鐘點（見 `_dorossi_extract_reset_epoch`）。
+    1. `exc.reset_at` has a value (the backend gave `…|<epoch>` or the API's
+       `retry-after`) -> sleep until that moment plus a
+       `DOROSSI_USAGE_WAIT_GRACE_SEC` buffer.
+    2. No value -> a **backoff probe** starting at `DOROSSI_USAGE_WAIT_FALLBACK_SEC`
+       and doubling each time. It does not guess a clock time with no time zone
+       like "resets 3:45pm" (see `_dorossi_extract_reset_epoch`).
 
-    兩條路的結果都 clamp 進 `[DOROSSI_USAGE_WAIT_MIN_SEC,
-    DOROSSI_USAGE_WAIT_MAX_SEC]`：下限擋誤判成用量上限時的熱迴圈，上限確保就算後端
-    報了一個荒謬的未來時刻，也最多睡 max 就再探一次。
+    Both paths' results are clamped into `[DOROSSI_USAGE_WAIT_MIN_SEC,
+    DOROSSI_USAGE_WAIT_MAX_SEC]`: the floor stops a hot loop when something is
+    misjudged as a usage limit, and the ceiling makes sure that even if the backend
+    reports an absurd future moment, it sleeps at most max before probing again.
 
-    純函式（`now` 可注入），永不 raise。
+    Pure function (`now` can be injected), never raises.
     """
     now = time.time() if now is None else now
     reset_at = getattr(exc, "reset_at", None)
     if isinstance(reset_at, (int, float)) and not isinstance(reset_at, bool):
         remain = float(reset_at) - float(now) + DOROSSI_USAGE_WAIT_GRACE_SEC
-        # 時間戳已經過去（時鐘偏移／後端報了舊視窗）→ 不是「不用等」，而是
-        # 「這個時間戳沒有參考價值」，退回退避探測，不要立刻重試。
+        # The timestamp is already past (clock skew / the backend reported an old
+        # window) -> this is not "no need to wait" but "this timestamp is
+        # worthless"; fall back to the backoff probe rather than retrying at once.
         if remain > 0:
             return _dorossi_clamp_usage_wait(remain)
     try:
         shift = min(max(0, int(attempt) - 1), DOROSSI_USAGE_WAIT_MAX_SHIFT)
     except (TypeError, ValueError):
-        # 「永不 raise」是這支的合約，而它整條路徑都在「已經出事了」的處理流程上；
-        # attempt 傳成怪東西時退回第一次的等待長度，不要把用量上限處理本身炸掉。
+        # "Never raises" is this function's contract, and its whole path runs inside
+        # "something already went wrong" handling; when attempt is passed as
+        # something odd, fall back to the first wait length rather than blowing up
+        # the usage-limit handling itself.
         shift = 0
     return _dorossi_clamp_usage_wait(
         DOROSSI_USAGE_WAIT_FALLBACK_SEC * (2 ** shift))
 
 
 def _dorossi_clamp_usage_wait(secs: float) -> float:
-    """把等待秒數收進 `[MIN, MAX]`。上限本身也 clamp 到不小於下限，免得有人在
-    設定檔裡把 max 設成 10 秒，反而把空轉防護關掉。
+    """Clamp the wait seconds into `[MIN, MAX]`. The ceiling itself is also clamped
+    to be no less than the floor, so someone setting max to 10 seconds in the
+    config file cannot end up switching off the idle-spin protection.
 
-    **`nan` 必須用一道明確的閘擋掉，靠 `min`／`max` 是擋不住的。** nan 的所有比較
-    都回 False，而 CPython 的 `max(a, b)` 是「先取 a，再看 `b > a`」——所以結果
-    完全取決於引數順序：`max(MIN, nan)` 回 MIN（nan 被丟掉），`max(nan, MIN)` 回
-    nan（一路傳下去）。這裡本來寫的正是後者，於是 2026-09-08 實測 nan 進、nan
-    出，夾擠形同不存在。同一個形狀已經記在 `_gui_control.parse_duration` 與
-    `_batch_config._is_finite_number`，這是第三次——所以寫成明確的閘而不是靠引數
-    順序：順序的正確性是隱形的，下一個人重排它不會有任何症狀。
+    **`nan` must be stopped by an explicit gate; `min` / `max` cannot stop it.**
+    Every comparison with nan returns False, and CPython's `max(a, b)` means "take
+    a first, then check `b > a`" -- so the result depends entirely on argument
+    order: `max(MIN, nan)` returns MIN (nan is dropped), `max(nan, MIN)` returns nan
+    (passed all the way down). This used to be written exactly the latter way, so
+    measured on 2026-09-08, nan in gave nan out and the clamp effectively did not
+    exist. The same shape is already recorded at `_gui_control.parse_duration` and
+    `_batch_config._is_finite_number`; this is the third time -- so it is written
+    as an explicit gate rather than relying on argument order: the correctness of
+    the order is invisible, and the next person to reorder it would see no symptom.
 
-    刻意**不**寫成 `isfinite`：`inf` 與 `-inf` 現在的行為是對的且有意義——`inf`
-    夾到 ceiling（「就算後端報了一個荒謬的未來時刻，也最多睡 max 就再探一次」正是
-    上限的用途），`-inf` 夾到 MIN。只有 nan 是「沒有任何資訊」，沒有一個有意義的
-    夾擠結果，所以單獨處理。
+    Deliberately **not** written as `isfinite`: the current behaviour for `inf` and
+    `-inf` is right and meaningful -- `inf` clamps to the ceiling ("even if the
+    backend reports an absurd future moment, sleep at most max before probing
+    again" is exactly what the ceiling is for), and `-inf` clamps to MIN. Only nan
+    carries "no information at all", with no meaningful clamp result, so it is
+    handled on its own.
 
-    nan 回 **MIN** 而不是 MAX：這支的下限是「誤判成用量上限時的熱迴圈防護」，回
-    MIN 等於「等最短的那一段再探一次」；回 MAX 會讓一個無意義的數字把無人值守的
-    自走迴圈停掉 6 小時，那是比較貴的錯誤方向。
+    nan returns **MIN**, not MAX: this function's floor is "hot-loop protection
+    when something is misjudged as a usage limit", and returning MIN means "wait
+    the shortest stretch and probe again"; returning MAX would let a meaningless
+    number stop the unattended self-loop for 6 hours, the more expensive wrong
+    direction.
 
-    目前 nan 進不來（上游 `_dorossi_usage_wait_seconds` 的 `if remain > 0` 對 nan
-    是 False，會落到退避那條路）——但那是**巧合的保護**：那個判斷不是為 nan 而寫
-    的，而 `json.loads` 預設就吃 `NaN`，所以來源真的給得出 nan。合約在自己這裡守住。
+    nan cannot get in today (upstream in `_dorossi_usage_wait_seconds`,
+    `if remain > 0` is False for nan and falls to the backoff path) -- but that is
+    **accidental protection**: that check was not written for nan, and
+    `json.loads` accepts `NaN` by default, so the source really can produce nan.
+    The contract is held here, at home.
     """
-    value = float(secs)          # 先轉換再判 nan，保住原本對數值字串／Decimal 的接受度
+    value = float(secs)          # convert before the nan check, keeping numeric strings / Decimal accepted
     if math.isnan(value):
         return DOROSSI_USAGE_WAIT_MIN_SEC
     ceiling = max(float(DOROSSI_USAGE_WAIT_MAX_SEC), DOROSSI_USAGE_WAIT_MIN_SEC)
@@ -3169,12 +3784,15 @@ def _dorossi_cc_budget_exceeded(result_ev: dict) -> bool:
 
 
 def _dorossi_count(value) -> int | None:
-    """一個 token 計數欄位 → 非負整數；不是可用的數字就回 None。永不 raise。
+    """A token-count field -> a non-negative integer; None when it is not a usable
+    number. Never raises.
 
-    `json.loads` 預設收 `NaN`／`Infinity`，而 `int(float("nan"))` 丟 ValueError、
-    `int(float("inf"))` 丟 OverflowError——這三支用量解析都在「答案已經拿到」之後才跑
-    （`_dorossi_via_claude_code` 的 return 那一行），在那裡丟例外等於把一個答完的回合
-    打成失敗。bool 是 int 的子類別，也要排除。負數當成壞值（token 數不會是負的）。"""
+    `json.loads` accepts `NaN` / `Infinity` by default, and `int(float("nan"))`
+    raises ValueError, `int(float("inf"))` raises OverflowError -- these three usage
+    parsers all run after "the answer is already in hand" (the return line of
+    `_dorossi_via_claude_code`), and raising there would turn a finished round into
+    a failure. bool is a subclass of int and must be excluded too. Negative numbers
+    are treated as bad values (a token count is never negative)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     if not math.isfinite(value) or value < 0:
@@ -3197,18 +3815,21 @@ def _dorossi_usage_int(usage: dict, keys) -> int:
 
 
 def _dorossi_model_usage_totals(result_ev: dict) -> dict | None:
-    """把 `result.modelUsage` 的每模型用量加總成 `{"in","cr","cc","out"}`。
+    """Sum the per-model usage in `result.modelUsage` into `{"in","cr","cc","out"}`.
 
-    為什麼需要它：頂層 `usage` **只算主模型**，但 `total_cost_usd` 是**所有**模型
-    的總和。2026-08-30 用真的 CLI 量到一次一般的問答輪——頂層 `usage.input_tokens`
-    是 2，而 `modelUsage` 裡除了主模型之外還有一個小模型吃掉 897 input / 9 output、
-    花掉 $0.000942，`total_cost_usd` 把兩者都算進去了。也就是說只讀頂層 `usage` 的
-    話，token 與金額本來就對不起來，而這份紀錄存在的理由正是拿來比對兩者。
+    Why it is needed: the top-level `usage` **counts only the main model**, while
+    `total_cost_usd` is the total across **all** models. On 2026-08-30 one ordinary
+    Q&A round measured with the real CLI had a top-level `usage.input_tokens` of 2,
+    while `modelUsage` held, besides the main model, a small model that consumed
+    897 input / 9 output and spent $0.000942, and `total_cost_usd` counted both. In
+    other words, reading only the top-level `usage` means the tokens and the money
+    never reconcile, and the whole reason this record exists is to compare the two.
 
-    鍵名是 camelCase（`inputTokens` / `cacheReadInputTokens` /
-    `cacheCreationInputTokens` / `outputTokens`），與頂層 `usage` 的 snake_case
-    不同——所以不能共用 `_dorossi_usage_int`。整塊缺席／不是 dict 就回 None，讓
-    呼叫端退回頂層 `usage`。永不 raise。
+    The key names are camelCase (`inputTokens` / `cacheReadInputTokens` /
+    `cacheCreationInputTokens` / `outputTokens`), unlike the top-level `usage`'s
+    snake_case -- so `_dorossi_usage_int` cannot be shared. If the block is absent
+    or not a dict it returns None, letting the caller fall back to the top-level
+    `usage`. Never raises.
     """
     models = result_ev.get("modelUsage") if isinstance(result_ev, dict) else None
     if not isinstance(models, dict) or not models:
@@ -3233,19 +3854,25 @@ _CONTEXT_KEYS = ("input_tokens", "cache_read_input_tokens",
 
 
 def _dorossi_last_call_context(result_ev) -> int | None:
-    """這次叫用**最後一次** API 呼叫的脈絡大小（in＋cache_read＋cache_creation）。
+    """The context size of this invocation's **last** API call (in + cache_read +
+    cache_creation).
 
-    來源是 `result.usage.iterations` 的最後一筆。2026-09-19 在 CLI 2.1.276 與 2.1.277
-    各量一次（一次叫用裡 4 次 API 呼叫）：頂層 `usage` 是**這次叫用所有呼叫的加總**
-    （cr 22,904≒4×7.8k），`modelUsage` 再把其他模型也加進去，而 `iterations` **只有
-    一筆＝最後一次呼叫**（8＋7,802＋137＝7,947）。壓縮觸發要的是「下一輪 resume 要重送
-    多大的前綴」，那就是最後一次呼叫看到的脈絡；加總會把一輪 20 次工具呼叫的前綴算 20
-    次（帳本量到 250 萬～1 億，永遠過 300k 門檻 → 每一個工作輪後面都跟一個壓縮輪）。
+    The source is the last entry of `result.usage.iterations`. Measured once each on
+    CLI 2.1.276 and 2.1.277 on 2026-09-19 (4 API calls in one invocation): the
+    top-level `usage` is **the sum over every call in this invocation** (cr 22,904 ≈
+    4 × 7.8k), `modelUsage` adds the other models on top, while `iterations` **has
+    exactly one entry = the last call** (8 + 7,802 + 137 = 7,947). The compaction
+    trigger wants "how big a prefix the next round's resume must resend", which is
+    the context the last call saw; the sum would count the prefix of a round with 20
+    tool calls 20 times (the ledger measured 2.5 million to 100 million, always over
+    the 300k threshold -> every working round followed by a compaction round).
 
-    形狀不對（沒有 `iterations`、不是 list、最後一筆不是 dict、那一筆一個可用的數字
-    都沒有）一律回 None，讓呼叫端退回舊的加總估計——那個方向是「壓得太早」，有界而且
-    不會漏壓。`type` 不是 `"message"` 的項目（目前沒見過）跳過、往前找最後一次真的
-    模型呼叫。永不 raise。"""
+    A wrong shape (no `iterations`, not a list, the last entry not a dict, or that
+    entry without a single usable number) always returns None, letting the caller
+    fall back to the old summed estimate -- that direction is "compact too early",
+    which is bounded and never misses a compaction. Entries whose `type` is not
+    `"message"` (none seen so far) are skipped, searching back for the last real
+    model call. Never raises."""
     usage = result_ev.get("usage") if isinstance(result_ev, dict) else None
     iterations = usage.get("iterations") if isinstance(usage, dict) else None
     if not isinstance(iterations, list):
@@ -3266,17 +3893,22 @@ _CLI_COMMAND_RE = re.compile(r"^/([A-Za-z][A-Za-z0-9_-]{0,31})(?:\s|$)")
 
 
 def _dorossi_cli_command_of(prompt) -> str:
-    """這一輪送出去的是 CLI 的斜線指令（`/compact` 之類）而不是給模型的話嗎？
-    是的話回指令名（小寫、不含 `/`），不是的話回空字串。永不 raise。
+    """Is what this round sends a CLI slash command (`/compact` and the like) rather
+    than words for the model? If so return the command name (lower-case, without
+    `/`), otherwise an empty string. Never raises.
 
-    用途是**把維護輪標進帳本**（`dorossi_usage.ndjson` 的 `k` 欄位），讓「這筆花費是
-    在做壓縮維護、不是在做事」看得出來，不必靠時間相關性去推。實測 2026-08-30：那段
-    期間壓縮佔總花費的 9.9%（$39.73／$401.15），而在標記出現之前那些列跟一般工作輪
-    長得一模一樣。
+    Its use is to **mark maintenance rounds in the ledger** (the `k` field of
+    `dorossi_usage.ndjson`), so that "this spend was compaction maintenance, not
+    work" is visible without inferring it from timing correlations. Measured
+    2026-08-30: in that period compaction was 9.9% of total spend ($39.73 /
+    $401.15), and before the marker appeared those rows looked exactly like ordinary
+    working rounds.
 
-    **這不是拿來讓診斷閉嘴的。** 那條「有花費卻讀不到 token」的診斷照樣對維護輪生效
-    ——因為實測顯示維護輪的數字是**讀得到**的（見 `_dorossi_cc_round_info` 的說明），
-    所以讀不到就真的是回歸。
+    **This is not there to silence the diagnostic.** The "spent money but no tokens
+    readable" diagnostic still applies to maintenance rounds -- because measurement
+    shows maintenance rounds' numbers **are** readable (see the note on
+    `_dorossi_cc_round_info`), so not being able to read them really is a
+    regression.
     """
     if not isinstance(prompt, str):
         return ""
@@ -3303,9 +3935,10 @@ def _dorossi_cc_round_info(result_ev: dict, *, stderr_tail: str = "",
     Each read defensively (missing / non-numeric / bool → 0). These numbers are
     diagnostics / owner-only chart DATA — they NEVER reach Discord.
 
-    **來源優先 `modelUsage`，頂層 `usage` 只是退路**（2026-08-30 改）：`usage` 只算
-    主模型，而 `total_cost_usd` 是所有模型的總和，兩者放同一列會對不起來。細節見
-    `_dorossi_model_usage_totals`。
+    **`modelUsage` is the preferred source; the top-level `usage` is only a
+    fallback** (changed 2026-08-30): `usage` counts only the main model, while
+    `total_cost_usd` is the total across all models, so putting the two in one row
+    would not reconcile. Details in `_dorossi_model_usage_totals`.
     """
     cost = 0.0
     fresh = cread = ccreate = out = 0
@@ -3314,8 +3947,9 @@ def _dorossi_cc_round_info(result_ev: dict, *, stderr_tail: str = "",
         raw = result_ev.get("total_cost_usd")
         if (isinstance(raw, (int, float)) and not isinstance(raw, bool)
                 and math.isfinite(raw) and raw >= 0):
-            # 非有限的金額（`json.loads` 收 NaN）會讓 `cost_since_compact` 變成 nan，
-            # 而 nan 的所有比較都回 False——花費觸發就此安靜失效。
+            # A non-finite amount (`json.loads` accepts NaN) would turn
+            # `cost_since_compact` into nan, and every comparison with nan returns
+            # False -- the spend trigger would then quietly stop working.
             cost = float(raw)
         ctx = _dorossi_last_call_context(result_ev)
         totals = _dorossi_model_usage_totals(result_ev)
@@ -3330,24 +3964,32 @@ def _dorossi_cc_round_info(result_ev: dict, *, stderr_tail: str = "",
                 ccreate = _dorossi_usage_int(usage, ("cache_creation_input_tokens",))
                 out = _dorossi_usage_int(usage, ("output_tokens",))
         if cost > 0.0 and not (fresh or cread or ccreate or out):
-            # `stderr_tail` 只在這一條異常路徑用得到，所以是關鍵字參數、預設空字串
-            # ——正常那一輪不需要它，而正常那一輪佔絕大多數。
-            # 有花費卻一個 token 都讀不到＝這個 result 事件的形狀跟我們預期的不一樣。
-            # 靜默記 0 的話，`dorossi_usage.ndjson` 會多一筆「花了錢、沒用 token」的
-            # 資料點，而那份紀錄的用途正是拿 token 對帳金額。
+            # `stderr_tail` is needed only on this one anomaly path, so it is a
+            # keyword argument defaulting to an empty string -- a normal round does
+            # not need it, and normal rounds are the vast majority.
+            # Spend with not a single token readable = this result event's shape is
+            # not what we expect. Silently recording 0 would add a "spent money, used
+            # no tokens" data point to `dorossi_usage.ndjson`, whose purpose is
+            # exactly to reconcile tokens against money.
             #
-            # **舊帳本裡那 19 筆的成因已經查清楚了（2026-08-30，實跑兩次可重現）：**
-            # 那是自走迴圈的 `/compact` 維護輪。`/compact` 那一輪的 result 事件
-            # **有** `usage` 這個鍵，但裡面五個數字**全是 0**；真正的數字只出現在
-            # `modelUsage`（實測 in=2063、out=1661、cache_read=18115，`costUSD` 與
-            # `total_cost_usd` 完全相等）。也就是說先前記為「已排除 /compact——實測
-            # usage 完整」的那個判斷只看了鍵在不在、沒看值。
-            # 而本檔今天改成**優先讀 `modelUsage`** 之後，這一類就讀得到了——實測把
-            # 真實事件餵進 `_dorossi_cc_round_info` 會得到那四個非零數字。舊資料還在
-            # 是因為線上的 bot 是 2026-08-26 起的行程，還沒載到這段程式。
-            # **所以走到這裡就是回歸**：連 `modelUsage` 都讀不到，帳本要對不起來。
-            # 只印鍵名與 subtype，不印值（這裡什麼都可能有），而且只進 stderr／log，
-            # 不會到 Discord。
+            # **The cause of those 19 rows in the old ledger has been pinned down
+            # (2026-08-30, reproducible across two real runs):** they are the
+            # self-loop's `/compact` maintenance rounds. The result event of a
+            # `/compact` round **does** have the `usage` key, but its five numbers
+            # are **all 0**; the real numbers appear only in `modelUsage` (measured
+            # in=2063, out=1661, cache_read=18115, with `costUSD` exactly equal to
+            # `total_cost_usd`). That is, the earlier verdict recorded as "/compact
+            # ruled out -- usage measured complete" only checked whether the key was
+            # there, not its values.
+            # And since this file today switched to **reading `modelUsage` first**,
+            # this class is readable -- feeding the real event into
+            # `_dorossi_cc_round_info` yields those four non-zero numbers. The old
+            # data is still there because the live bot is a process started on
+            # 2026-08-26 that has not loaded this code yet.
+            # **So reaching here is a regression**: not even `modelUsage` is
+            # readable, and the ledger will not reconcile.
+            # Print only key names and subtype, not values (anything could be in
+            # here), and only to stderr / the log, never to Discord.
             tail = (f" stderr tail: {stderr_tail[-300:]!r}"
                     if stderr_tail else "")
             print(f"[dorossi] result event has cost {cost:.4f} but no usage: "
@@ -3357,40 +3999,51 @@ def _dorossi_cc_round_info(result_ev: dict, *, stderr_tail: str = "",
     info = {"cost_usd": cost, "in": fresh, "cr": cread,
             "cc": ccreate, "out": out}
     if ctx is not None:
-        # 最後一次 API 呼叫的脈絡大小（見 `_dorossi_last_call_context`）。只在讀得到時才
-        # 放，缺席＝「退回加總估計」，由 `_dorossi_context_tokens` 處理。
+        # The last API call's context size (see `_dorossi_last_call_context`). Put in
+        # only when readable; absent = "fall back to the summed estimate", handled
+        # by `_dorossi_context_tokens`.
         info["ctx"] = ctx
     if cli_command:
-        # 記進帳本，這樣「有花費、0 token」那些列自己就說得出原因，不必再靠推理。
+        # Recorded in the ledger, so the "spend, 0 tokens" rows explain themselves
+        # without any more inference.
         info["kind"] = cli_command
     return info
 
 
 # ---------------------------------------------------------------------------
-# 每次叫用的金額／token：CLI 在 2.1.277 把 `--resume` 的總額改成工作階段累計
+# Per-invocation money / tokens: in 2.1.277 the CLI made `--resume` totals
+# cumulative per session
 #
-# 2.1.277（2026-09-18）變更記錄：「Fixed a headless resume (`claude -p --resume`, …)
+# 2.1.277 (2026-09-18) changelog: "Fixed a headless resume (`claude -p --resume`, …)
 # starting the session's cost and usage totals at zero; headless sessions now save their
-# totals at exit」。2026-09-19 用隔離的 2.1.277 與本機 2.1.276 各在同一個工作階段連叫
-# 三次實測：2.1.276 的 `total_cost_usd` 0.0141 → 0.0010 → 0.0010（每次叫用）；2.1.277
-# 0.0134 → 0.0144 → 0.0154（**工作階段累計**），`modelUsage` 的 token 同樣累計；頂層
-# `usage` 與 `usage.iterations` 兩版都是**每次叫用**。result 事件裡沒有任何「本次叫用」
-# 的金額欄位，官方 SDK 成本文件卻還寫著「each result reflects only that call」——上游
-# 語意還在變，所以這裡必須兩種都對，而且不能靠文件。
+# totals at exit". Measured 2026-09-19 by calling an isolated 2.1.277 and the local
+# 2.1.276 three times in a row each on the same session: 2.1.276's `total_cost_usd`
+# went 0.0141 -> 0.0010 -> 0.0010 (per invocation); 2.1.277 went 0.0134 -> 0.0144 ->
+# 0.0154 (**cumulative for the session**), with `modelUsage` tokens cumulative too;
+# the top-level `usage` and `usage.iterations` are **per invocation** in both
+# versions. The result event has no "this invocation" money field at all, yet the
+# official SDK cost docs still say "each result reflects only that call" --
+# upstream semantics are still moving, so this must be right for both, and cannot
+# rely on the docs.
 #
-# 為什麼這件事要緊：自走迴圈把每輪的 `cost_usd` 加總成 `cost_since_compact`（花費觸發
-# 預設 $10），帳本逐輪記錄。累計值逐輪相加是 O(N²)：一個跑了一陣子的工作階段每一輪都
-# 會「超過 $10」→ 每一輪後面都插一個壓縮輪。而 bot 每輪重新起 CLI，**CLI 自動更新一到
-# 就中，不必重啟 bot**。
+# Why this matters: the self-loop sums each round's `cost_usd` into
+# `cost_since_compact` (the spend trigger defaults to $10), and the ledger records
+# it round by round. Adding cumulative values round by round is O(N²): a session
+# that has been running for a while would "exceed $10" every round -> a
+# compaction round inserted after every round. And since the bot starts the CLI
+# afresh each round, **it bites as soon as the CLI auto-updates, no bot restart
+# needed**.
 # ---------------------------------------------------------------------------
-# 從這一版起 `--resume` 的 `total_cost_usd`／`modelUsage` 是工作階段累計。
+# From this version on, `--resume`'s `total_cost_usd` / `modelUsage` are cumulative
+# per session.
 _CLAUDE_CUMULATIVE_TOTALS_FROM = (2, 1, 277)
 _CLI_VERSION_RE = re.compile(r"^\s*(\d{1,4})\.(\d{1,4})\.(\d{1,6})(?!\d)")
 _ACCOUNT_TOKEN_KEYS = ("in", "cr", "cc", "out")
 
 
 def _dorossi_cc_version_tuple(version) -> tuple | None:
-    """`"2.1.277"`（init 事件的 `claude_code_version`）→ `(2, 1, 277)`；讀不懂回 None。"""
+    """`"2.1.277"` (the init event's `claude_code_version`) -> `(2, 1, 277)`; None
+    when unreadable."""
     if not isinstance(version, str):
         return None
     match = _CLI_VERSION_RE.match(version)
@@ -3400,8 +4053,9 @@ def _dorossi_cc_version_tuple(version) -> tuple | None:
 
 
 def _dorossi_cc_totals_mode(version) -> str | None:
-    """這個 CLI 版本 `--resume` 回報的總額是 `"cumulative"` 還是 `"per_call"`；
-    版本讀不到回 None（交給 `_dorossi_cc_account_round` 決定怎麼辦）。"""
+    """Whether this CLI version's `--resume` reports totals as `"cumulative"` or
+    `"per_call"`; None when the version is unreadable (left to
+    `_dorossi_cc_account_round` to decide what to do)."""
     parsed = _dorossi_cc_version_tuple(version)
     if parsed is None:
         return None
@@ -3409,10 +4063,13 @@ def _dorossi_cc_totals_mode(version) -> str | None:
 
 
 def _dorossi_usage_mark_of(mark) -> dict | None:
-    """把存在工作階段槽裡的累計基準（`cc_usage_mark`）驗過一次再用。
+    """Validate the cumulative baseline stored in the session slot
+    (`cc_usage_mark`) once before using it.
 
-    這份資料來自磁碟（`dorossi_session.json`，本機可手改），形狀不對一律當成「沒有
-    基準」——那個方向在累計模式下是「這一輪不計金額」，不會膨脹。永不 raise。"""
+    This data comes from disk (`dorossi_session.json`, hand-editable locally), and
+    a wrong shape is always treated as "no baseline" -- in cumulative mode that
+    direction means "this round's money is not counted", which never inflates.
+    Never raises."""
     if not isinstance(mark, dict):
         return None
     sid = mark.get("sid")
@@ -3436,17 +4093,22 @@ def _dorossi_usage_mark_of(mark) -> dict | None:
 
 
 def _dorossi_per_call(current: list, cumulative: bool, base, floor: list):
-    """一個計數器的「本次叫用」值：回傳 (值, 標籤)。
+    """A counter's "this invocation" value: returns (value, label).
 
-    * 不是累計 → 原值（`"call"`）。
-    * 累計但沒有基準 → `floor`（`"base"`）：分不出這次叫用佔多少，**寧可少算也不膨脹**
-      ——把整個工作階段的總額算成一輪，正是要修的那個缺陷。
-    * 差值有負數，或差值總和明顯小於 `floor` 的總和（`floor` 是這次叫用**一定**至少有的
-      量）→ 計數器重新起算過（壓縮、工作階段重建……）或基準不屬於這一段，回原值
-      （`"reset"`）。「明顯」留了一點容差（5%＋64）：兩份數字來自 CLI 兩個不同的加總，
-      差幾個 token 不該把一個正確的差值打成 reset——reset 回的是原值，在累計模式下那是
-      會膨脹的方向。
-    * 其餘 → 差值（`"delta"`）。
+    * Not cumulative -> the raw value (`"call"`).
+    * Cumulative but no baseline -> `floor` (`"base"`): there is no telling how much
+      this invocation accounts for, so **undercount rather than inflate** --
+      counting the whole session's total as one round is exactly the defect being
+      fixed.
+    * A negative delta, or a delta sum clearly smaller than the sum of `floor`
+      (`floor` is the amount this invocation **certainly** has at least) -> the
+      counter restarted (compaction, session rebuild …) or the baseline does not
+      belong to this stretch; return the raw value (`"reset"`). "Clearly" leaves a
+      little tolerance (5% + 64): the two sets of numbers come from two different
+      sums in the CLI, and a few tokens of difference should not knock a correct
+      delta down to reset -- reset returns the raw value, which in cumulative mode
+      is the inflating direction.
+    * Otherwise -> the delta (`"delta"`).
     """
     if not cumulative:
         return list(current), "call"
@@ -3462,31 +4124,43 @@ def _dorossi_per_call(current: list, cumulative: bool, base, floor: list):
 
 def _dorossi_cc_account_round(info: dict, result_ev, *, resumed_id=None, sid=None,
                               cli_version=None, baseline=None) -> dict:
-    """把 `_dorossi_cc_round_info` 的原始數字換成**這次叫用**的數字，並附上下一次要用的
-    累計基準（`usage_mark`）。純函式、永不 raise；回傳新的 dict，不改 `info`。
+    """Convert the raw numbers of `_dorossi_cc_round_info` into **this
+    invocation's** numbers, and attach the cumulative baseline for next time
+    (`usage_mark`). Pure function, never raises; returns a new dict and does not
+    modify `info`.
 
-    規則（兩種 CLI 語意都要對）：
-    * 沒有 `--resume`（新工作階段）→ 回報值就是這次叫用，兩版都一樣。
-    * 版本 < 2.1.277（`per_call`）→ 回報值就是這次叫用。
-    * 版本 ≥ 2.1.277（`cumulative`）→ 這次叫用＝目前累計 − 同一個工作階段上一次存下的
-      累計（`baseline`）。基準只有在「`sid` 等於這次 resume 的 id、而且當時也是累計
-      模式」時才算數：2.1.276 存下的是**每次叫用**的值，拿它當累計基準會把整個工作
-      階段算成一輪（升版當天每個工作階段都會踩到）。
-    * 版本讀不到 → 沿用同一個工作階段上一次的模式（`baseline["mode"]`）；連那個都沒有
-      就當 `per_call`，也就是改動前的行為。
-    * 累計模式沒有可用的基準（升版後第一次 resume、槽裡的基準遺失）→ 金額記 0、token
-      記頂層 `usage`（**兩版都是每次叫用、只算主模型**，是這次叫用一定至少有的量）。
-      這是刻意的取捨：分不出來的時候少算一輪，而不是把整個工作階段算成一輪；存下的
-      基準讓下一輪起就精確。標籤 `"base"` 會進帳本，事後查得到。
-    * 差值是負的（計數器重新起算）或比頂層 `usage` 還小（基準不屬於這一段）→ 視為從
-      零起算，用回報值（標籤 `"reset"`）。
+    Rules (must be right for both CLI semantics):
+    * No `--resume` (a new session) -> the reported value is this invocation, the
+      same in both versions.
+    * Version < 2.1.277 (`per_call`) -> the reported value is this invocation.
+    * Version ≥ 2.1.277 (`cumulative`) -> this invocation = the current cumulative
+      total − the cumulative total last saved for the same session (`baseline`).
+      The baseline counts only when "`sid` equals this resume's id, and it was also
+      cumulative mode at the time": 2.1.276 saved **per-invocation** values, and
+      using one as a cumulative baseline would count the whole session as one round
+      (every session would hit this on upgrade day).
+    * Version unreadable -> keep the same session's previous mode
+      (`baseline["mode"]`); without even that, treat it as `per_call`, i.e. the
+      behaviour before this change.
+    * Cumulative mode with no usable baseline (the first resume after upgrading, or
+      the slot's baseline lost) -> money recorded as 0, tokens as the top-level
+      `usage` (**per invocation and main model only in both versions**, the amount
+      this invocation certainly has at least). This is a deliberate trade-off: when
+      it cannot be told apart, undercount one round rather than count the whole
+      session as one round; the saved baseline makes it exact from the next round
+      on. The label `"base"` goes into the ledger and can be looked up afterwards.
+    * A negative delta (the counter restarted) or one smaller than the top-level
+      `usage` (the baseline does not belong to this stretch) -> treated as starting
+      from zero, using the reported value (label `"reset"`).
 
-    token 與金額是兩個計數器：token 只有在來自 `modelUsage`（累計那一份）時才會累計；
-    `modelUsage` 缺席時退回的頂層 `usage` 本來就是每次叫用。兩者共用同一個基準，所以
-    任何一個判成 reset，另一個也一起 reset。
+    Tokens and money are two counters: tokens accumulate only when they come from
+    `modelUsage` (the cumulative one); the top-level `usage` fallen back on when
+    `modelUsage` is absent is per invocation anyway. The two share one baseline, so
+    if either is judged reset, the other resets with it.
 
-    `usage_mark` 記的一律是**原始回報值**（不是換算後的），因為下一輪要拿它跟原始回報值
-    相減。它只在知道後端的工作階段 id 時才有。
+    `usage_mark` always records the **raw reported values** (not the converted
+    ones), because the next round subtracts it from the raw reported values. It is
+    present only when the backend's session id is known.
     """
     out = dict(info) if isinstance(info, dict) else {}
     raw_cost = out.get("cost_usd")
@@ -3519,8 +4193,10 @@ def _dorossi_cc_account_round(info: dict, result_ev, *, resumed_id=None, sid=Non
                   else [cum_base[k] for k in _ACCOUNT_TOKEN_KEYS])
     token_vals, token_label = _dorossi_per_call(
         raw_tokens, token_cumulative, token_base, floor_tokens)
-    # 兩個計數器共用同一個基準：任何一個判定「基準不屬於這一段」，另一個的差值也不可信
-    # （同一個基準怎麼可能對金額是對的、對 token 是錯的），兩個一起從原值起算。
+    # The two counters share one baseline: if either judges "the baseline does not
+    # belong to this stretch", the other's delta cannot be trusted either (how could
+    # the same baseline be right for money and wrong for tokens), so both start
+    # from the raw value together.
     if "reset" in (cost_label, token_label):
         if cost_label == "delta":
             cost_vals, cost_label = [raw_cost], "reset"
@@ -3559,10 +4235,12 @@ def _dorossi_trim_usage_file() -> None:
         os.replace(tmp, DOROSSI_USAGE_FILE)
     except Exception as exc:  # pylint: disable=broad-except
         print(f"[dorossi] usage trim failed: {exc!r}", file=sys.stderr)
-        # `os.replace` **只有成功時**才把 temp 搬走。這支的合約是絕不往外拋，所以
-        # 不重拋，但也不能把半份資料留在 repo root：留著的話下一次修剪會直接覆寫
-        # 它（無害），可是它會一直躺在那裡看起來像真的資料，而且它是
-        # `test_gitignore_coverage.py` 盯的那種「repo root 執行期產物」。
+        # `os.replace` moves the temp away **only when it succeeds**. This function's
+        # contract is never to raise outward, so it does not re-raise, but it must
+        # not leave half the data in the repo root either: left there, the next trim
+        # would simply overwrite it (harmless), but it would keep lying around
+        # looking like real data, and it is exactly the kind of "repo-root runtime
+        # artefact" `test_gitignore_coverage.py` watches for.
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
@@ -3595,15 +4273,22 @@ def _dorossi_record_usage(info: dict) -> None:
         }
         kind = info.get("kind")
         if isinstance(kind, str) and kind:
-            # 維護輪（CLI 斜線指令）的標記。只在非空時寫，一般工作輪的列維持原樣，
-            # 舊資料與舊讀取端都不受影響。長度已由 `_CLI_COMMAND_RE` 限死在 32 字元。
+            # The marker for a maintenance round (a CLI slash command). Written only
+            # when non-empty, so ordinary working rows stay as they were and old data
+            # and old readers are unaffected. The length is already capped at 32
+            # characters by `_CLI_COMMAND_RE`.
             rec["k"] = kind[:32]
-        # 以下三欄都是 2026-09-19 加的，只在有值時寫，舊列與舊讀取端不受影響：
-        # * `ctx`  最後一次 API 呼叫的脈絡大小（壓縮觸發用的就是它）。有了它，事後才對得出
-        #          「這一輪為什麼（沒）壓縮」，in/cr/cc 是整次叫用的加總、對不出來。
-        # * `acct` 金額／token 是怎麼換算成「這次叫用」的（見 `_dorossi_cc_account_round`）。
-        #          `"call"` 不寫（就是回報值本身，跟舊列同義）。
-        # * `v`    CLI 版本。帳本會橫跨 2.1.277 的語意變更，沒有這欄就分不出哪幾列是換算過的。
+        # The next three fields were all added 2026-09-19 and are written only when
+        # they have a value, so old rows and old readers are unaffected:
+        # * `ctx`  the last API call's context size (exactly what the compaction
+        #          trigger uses). With it, "why this round did (not) compact" can be
+        #          reconciled afterwards; in/cr/cc are sums over the whole
+        #          invocation and cannot be.
+        # * `acct` how money / tokens were converted into "this invocation" (see
+        #          `_dorossi_cc_account_round`). `"call"` is not written (it is the
+        #          reported value itself, the same meaning as old rows).
+        # * `v`    the CLI version. The ledger spans the 2.1.277 semantic change, and
+        #          without this field there is no telling which rows were converted.
         ctx = _dorossi_count(info.get("ctx"))
         if ctx is not None:
             rec["ctx"] = ctx
@@ -3631,19 +4316,26 @@ def _dorossi_round_info_and_record(result_ev: dict, *,
     Used at every `_dorossi_via_claude_code` return so single-turn and every
     autonomous-loop round each contribute one data point.
 
-    回傳的是**這次叫用**的數字（`_dorossi_cc_account_round` 換算過），不是 CLI 的原始
-    回報值：2.1.277 起 `--resume` 回報的是工作階段累計，直接拿去加總（`cost_since_compact`）
-    或記帳都會重複計算。`resumed_id`／`sid`／`cli_version`／`baseline` 就是換算要的四樣
-    東西（這次 resume 的 id、後端回報的 id、init 事件的版本、槽裡存的上一次累計）；全部
-    省略時＝新工作階段，行為與改動前一致。回傳值多帶一個 `usage_mark`，呼叫端要把它
-    存回同一個槽，下一輪才有基準。
+    What is returned is **this invocation's** numbers (converted by
+    `_dorossi_cc_account_round`), not the CLI's raw reported values: from 2.1.277 on,
+    `--resume` reports session-cumulative totals, and summing them directly
+    (`cost_since_compact`) or ledgering them would double count.
+    `resumed_id` / `sid` / `cli_version` / `baseline` are the four things the
+    conversion needs (this resume's id, the id the backend reported, the init
+    event's version, the previous cumulative total stored in the slot); all omitted
+    = a new session, with the same behaviour as before the change. The return value
+    carries an extra `usage_mark`, which the caller must save back into the same
+    slot so the next round has a baseline.
 
-    `stderr_tail` 只是往下傳給「有花費卻讀不到 token」那條診斷；所有失敗路徑早就會印
-    stderr 尾巴，只有成功路徑把它丟掉。那條診斷看的是**原始**回報值。
+    `stderr_tail` is merely passed down to the "spent money but no tokens readable"
+    diagnostic; every failure path already prints the stderr tail, and only the
+    success path dropped it. That diagnostic looks at the **raw** reported values.
 
-    `cli_command` 標出「這一輪送的是 CLI 的斜線指令而不是給模型的話」，寫進帳本的
-    `k` 欄位，讓維護輪的花費跟工作輪分得開（實測那段期間壓縮佔 9.9%）。它**不影響**
-    上面那條診斷——維護輪的數字讀得到，讀不到就是回歸。
+    `cli_command` marks "this round sent a CLI slash command rather than words for
+    the model" and is written into the ledger's `k` field, so maintenance rounds'
+    spend can be told apart from working rounds' (measured: compaction was 9.9% in
+    that period). It does **not affect** the diagnostic above -- maintenance rounds'
+    numbers are readable, and not being able to read them is a regression.
     """
     info = _dorossi_cc_round_info(result_ev, stderr_tail=stderr_tail,
                                   cli_command=cli_command)
@@ -3680,20 +4372,24 @@ def _dorossi_read_usage(limit: int) -> list[dict]:
 
 
 def dorossi_local_usage_totals(now: float, path=DOROSSI_USAGE_FILE) -> dict:
-    """本機 Dorossi 帳本（`DOROSSI_USAGE_FILE`）的用量小計，給 owner-only 的
-    `/dorossi tokens` 拿去組第一段。回傳三格，每格是 `{"tokens": int, "usd": float}`：
+    """Usage subtotals from the local Dorossi ledger (`DOROSSI_USAGE_FILE`), used by
+    the owner-only `/dorossi tokens` to build its first section. Returns three
+    cells, each `{"tokens": int, "usd": float}`:
 
-    * `today`    —— 與 `now` 同一個**本地日曆日**（依主機時區的當天 00:00 起）。
-    * `last7d`   —— 滾動近 7 日（`ts >= now - 7*86400`）。
-    * `lifetime` —— 帳本裡全部有效列的累計。
+    * `today`    -- the same **local calendar day** as `now` (from 00:00 of that day
+      in the host's time zone).
+    * `last7d`   -- a rolling last 7 days (`ts >= now - 7*86400`).
+    * `lifetime` -- the total over every valid row in the ledger.
 
-    `now` 是「現在」的 epoch 秒（外部注入以利測試）。`tokens` 只算 `in`＋`out`
-    （與舊圖表對 `in`／`out` 的定義一致，不含 cache）；`usd` 直接加總每列
-    `cost_usd`（＝後端 CLI 回報的 `total_cost_usd`，不自建價目表）。
+    `now` is "now" in epoch seconds (injected from outside for testing). `tokens`
+    counts only `in` + `out` (consistent with the old chart's definition of `in` /
+    `out`, excluding cache); `usd` simply sums each row's `cost_usd` (= the
+    `total_cost_usd` the backend CLI reports; no home-grown price table).
 
-    **永不 raise、逐行串流**：檔案缺席／讀不到、以及任何壞 JSON／不是 dict／
-    `ts` 缺席或非有限數的列，一律跳過（不算進任何一格），逐行讀不把整份帳本
-    載進記憶體（append-only NDJSON 可能很大）。"""
+    **Never raises, streams line by line**: a missing / unreadable file, and any
+    row that is bad JSON / not a dict / has `ts` missing or non-finite, is skipped
+    (counted into no cell), and reading line by line never loads the whole ledger
+    into memory (append-only NDJSON can get large)."""
     def _blank():
         return {"tokens": 0, "usd": 0.0}
 
@@ -3748,18 +4444,26 @@ def dorossi_local_usage_totals(now: float, path=DOROSSI_USAGE_FILE) -> dict:
 
 
 def _dorossi_context_tokens(info: dict) -> int:
-    """這一輪結束時的脈絡大小（token），給兩個壓縮觸發用。永不 raise，回傳 int ≥ 0。
+    """The context size (tokens) at the end of this round, for the two compaction
+    triggers. Never raises, returns an int ≥ 0.
 
-    優先用 `info["ctx"]`＝**最後一次 API 呼叫**的 in＋cache_read＋cache_creation（見
-    `_dorossi_last_call_context`）：那就是下一輪 resume 要重送的前綴。
+    Prefers `info["ctx"]` = the **last API call's** in + cache_read + cache_creation
+    (see `_dorossi_last_call_context`): that is the prefix the next round's resume
+    will resend.
 
-    **2026-09-19 之前這裡是 `in＋cr＋cc`，而那三個數字是整次叫用所有 API 呼叫的加總**
-    （`modelUsage` 還再加上其他模型）。full 模式一輪動輒幾十次工具呼叫，同一段前綴被
-    算幾十次：帳本量到 250 萬～1 億，永遠過 300k 門檻，**每一個工作輪後面都跟一個壓縮
-    輪**（末 40 筆嚴格交替，每次 $0.3～4.5、約 3 分鐘、每輪丟一次細節）。舊 docstring
-    寫的「高估只是早一點壓縮」不成立——高估的倍數等於工具呼叫次數。
+    **Before 2026-09-19 this was `in + cr + cc`, and those three numbers are sums
+    over every API call in the whole invocation** (with `modelUsage` adding the
+    other models on top). A full-mode round easily makes dozens of tool calls, so
+    the same prefix was counted dozens of times: the ledger measured 2.5 million to
+    100 million, always over the 300k threshold, and **every working round was
+    followed by a compaction round** (the last 40 rows strictly alternating, each
+    $0.3–4.5, about 3 minutes, and losing detail every round). The old docstring's
+    "overestimating only compacts a bit early" did not hold -- the overestimate's
+    multiple equals the number of tool calls.
 
-    `ctx` 缺席（`iterations` 讀不到）才退回那個加總——方向是壓得太早，有界而且不會漏壓。"""
+    Only when `ctx` is absent (`iterations` unreadable) does it fall back to that
+    sum -- the direction is compacting too early, which is bounded and never misses
+    a compaction."""
     if isinstance(info, dict):
         ctx = _dorossi_count(info.get("ctx"))
         if ctx is not None:
@@ -3807,17 +4511,22 @@ def _dorossi_api_is_usage_limit(exc: Exception, rate_err) -> bool:
     a 429 RateLimitError, a 402 billing error, or a status/message that names
     a rate/usage limit. Tolerant of the SDK being absent (rate_err == ()).
     Never raises — undecidable reads as False."""
-    # 整段包起來的理由跟 `_dorossi_api_transient_error` 一樣（`exc` 來自第三方
-    # SDK，`status_code` 可能是會自爆的 property、`__str__` 也可能自爆），但這裡
-    # **更必要**：本函式排在那一支的前面，先炸的話那邊的防護根本執行不到，整個
-    # `except` 區塊會被換成一個看不懂的新例外、原始錯誤連同 traceback 一起消失。
+    # The whole thing is wrapped for the same reason as
+    # `_dorossi_api_transient_error` (`exc` comes from a third-party SDK,
+    # `status_code` may be a property that blows up, and `__str__` may blow up too),
+    # but here it is **even more necessary**: this function runs before that one,
+    # and if it blows up first, that one's guard never runs at all, the whole
+    # `except` block is replaced by a baffling new exception, and the original
+    # error vanishes along with its traceback.
     #
-    # `getattr(exc, "status_code", None)` 的預設值只吃 AttributeError；property
-    # 拋出來的其他任何例外照樣往外丟，所以那一行本身不是防護。
+    # The default of `getattr(exc, "status_code", None)` only swallows
+    # AttributeError; any other exception a property raises still propagates, so
+    # that line on its own is no guard.
     #
-    # 判不出來時回 False 是安全的方向：往下交給暫時性判定，再不行才裸 `raise`，
-    # 也就是完全退回加這層之前的行為。回 True 反而會讓自走迴圈為了一個沒能確認的
-    # 上限睡上好幾個小時。
+    # Returning False when undecidable is the safe direction: it hands over to the
+    # transient verdict, and failing that a bare `raise`, i.e. exactly the behaviour
+    # from before this layer was added. Returning True would instead make the
+    # self-loop sleep for hours over a limit that could not be confirmed.
     try:
         if rate_err and isinstance(exc, rate_err):
             return True
@@ -3835,9 +4544,11 @@ def _dorossi_api_retry_after_sec(exc: Exception) -> float | None:
     """Read the `retry-after` header (seconds) off an Anthropic SDK error.
     Returns None when the header is missing / unusable. Never raises.
 
-    刻意跟 `_dorossi_api_reset_hint` 拆開：這一支的回傳值**會被拿去算等待秒數**
-    （自走迴圈睡到額度回來），那一支只是給人看的字串。合成一支就得在「秒數」與
-    「格式化字串」之間二選一，兩邊都會將就。"""
+    Deliberately split from `_dorossi_api_reset_hint`: this one's return value **is
+    used to compute a wait in seconds** (the self-loop sleeps until the quota
+    returns), while that one is just a string for people. Merged into one, it would
+    have to pick between "seconds" and "a formatted string", and both sides would
+    make do."""
     try:
         resp = getattr(exc, "response", None)
         headers = getattr(resp, "headers", None)
@@ -3847,9 +4558,10 @@ def _dorossi_api_retry_after_sec(exc: Exception) -> float | None:
         if not retry_after:
             return None
         secs = float(retry_after)
-        # NaN／inf 不能靠 `<= 0` 擋掉（`nan <= 0` 是 False，`inf` 更是直接放行），
-        # 而 float("nan") / float("inf") 都是合法的 float() 輸入——標頭是外部
-        # 來的字串，一律當不可信處理。
+        # NaN / inf cannot be stopped by `<= 0` (`nan <= 0` is False, and `inf`
+        # passes straight through), and float("nan") / float("inf") are both legal
+        # float() input -- the header is an external string, always treated as
+        # untrusted.
         if not (secs > 0) or secs != secs or secs == float("inf"):
             return None
         return secs
@@ -3873,27 +4585,34 @@ def _dorossi_api_reset_hint(exc: Exception) -> str | None:
 
 def _dorossi_api_transient_error(exc: Exception
                                 ) -> "_DorossiTransientError | None":
-    """SDK 例外像不像「伺服器暫時性故障」；是就回一個填好的例外，否則 None。
+    """Whether an SDK exception looks like "a transient server failure"; if so
+    return a filled-in exception, otherwise None.
 
-    與 `_dorossi_cc_transient_error` / `_dorossi_codex_transient` 同一個形狀，
-    **而且必須排在用量上限判定的後面**：429 也是「等一下再來」，但它有專屬的等待
-    策略（讀 `retry-after`／等到額度重設），比這裡的指數退避精準得多。
+    Same shape as `_dorossi_cc_transient_error` / `_dorossi_codex_transient`, **and
+    it must come after the usage-limit verdict**: 429 also means "come back
+    later", but it has its own waiting strategy (read `retry-after` / wait for the
+    quota to reset), far more precise than the exponential backoff here.
 
-    2026-09-05 補。在這之前 api 這條路**完全沒有**這個判定：429／402 之外的一切
-    （含 529 Overloaded 與 5xx）都是裸 `raise`，落進自走迴圈的泛用 `except`，用
-    20s→40s→80s 最多三次的短退避處理——合計不到兩分半，而 2026-09-03 那場過載
-    持續了好幾分鐘以上。另外兩條後端早就走專屬的長退避（30s 起、封頂 15 分、
-    最多 20 輪），這裡只是把它們補齊。
+    Added 2026-09-05. Before this the api path had **no such verdict at all**:
+    everything other than 429 / 402 (including 529 Overloaded and 5xx) was a bare
+    `raise` that fell into the self-loop's generic `except`, handled by a short
+    backoff of 20s→40s→80s at most three times -- under two and a half minutes in
+    total, while the 2026-09-03 overload lasted well over several minutes. The
+    other two backends already took their own long backoff (from 30s, capped at 15
+    minutes, at most 20 rounds); this just brings the api path in line.
 
-    判定同時看 `status_code`（SDK 的 `APIStatusError` 家族會帶）與訊息字樣：
-    連線層的失敗（`APIConnectionError`）沒有狀態碼，只留下文字。
+    The verdict looks at both `status_code` (carried by the SDK's `APIStatusError`
+    family) and the message wording: a connection-layer failure
+    (`APIConnectionError`) has no status code and leaves only text.
     """
-    # 整段包起來，因為兩個輸入都不是我們控制的：`exc` 來自第三方 SDK，
-    # `status_code` 可能是 property（讀取本身就會炸），`__str__` 也可能自爆。
-    # 這支是在 `except` 區塊裡被呼叫的——它自己拋例外會把一個「等一下就好」的
-    # 伺服器錯誤換成一個看不懂的新例外，而原本的錯誤連同它的 traceback 一起消失。
-    # 判不出來時回 None（＝不是暫時性）是安全的方向：呼叫端會落回裸 `raise`，
-    # 也就是補這個判定之前的行為。
+    # The whole thing is wrapped because neither input is under our control: `exc`
+    # comes from a third-party SDK, `status_code` may be a property (reading it can
+    # blow up), and `__str__` may blow up too. This is called inside an `except`
+    # block -- raising here would replace a "just wait a bit" server error with a
+    # baffling new exception, and the original error would vanish along with its
+    # traceback. Returning None when undecidable (= not transient) is the safe
+    # direction: the caller falls back to a bare `raise`, i.e. the behaviour from
+    # before this verdict was added.
     try:
         status = getattr(exc, "status_code", None)
         try:
@@ -3913,26 +4632,36 @@ def _dorossi_api_transient_error(exc: Exception
 
 
 def _dorossi_trim_api_history(history, cap: int | None = None) -> list:
-    """把 `api` 後端要重送的歷史修剪成最後 `cap` 則，並切齊到 user 開頭。
+    """Trim the history the `api` backend resends down to the last `cap` messages,
+    aligned to start at a user message.
 
-    這條路徑只有 `api` 後端會走。API 是無狀態的，所以每一輪都要把整份歷史再送一
-    次；不修剪的話輸入 token 隨輪數線性成長（總成本是輪數的平方），而且遲早會超過
-    脈絡窗拿到 400。**400 不是暫時性錯誤**，所以自走迴圈會用同一份過長的歷史重試
-    到放棄，然後每一輪都以完全相同的方式失敗——沒有任何自我修復的路徑，除非有人
-    知道要下 `/new`。滑動視窗會丟掉最早的脈絡，但「記得少一點」遠好過「從此壞掉」。
+    Only the `api` backend takes this path. The API is stateless, so the whole
+    history is sent again every round; untrimmed, input tokens grow linearly with
+    the round count (total cost is quadratic in rounds), and sooner or later it
+    exceeds the context window and gets a 400. **A 400 is not a transient error**,
+    so the self-loop would retry with the same over-long history until it gave up,
+    and every round would then fail in exactly the same way -- with no path to
+    self-repair unless someone knew to issue `/new`. The sliding window drops the
+    earliest context, but "remembering a bit less" is far better than "broken from
+    now on".
 
-    切齊 user 是必要的，不是整潔：Messages API 不接受以 assistant 開頭的
-    `messages`，而從中間切下去有一半的機率正好切在 assistant 那一則。往後多丟一則
-    而不是往前多留一則——多留會超過上限，等於這個界限有時候不成立。
+    Aligning to user is necessary, not tidiness: the Messages API does not accept
+    `messages` starting with assistant, and cutting in the middle lands right on an
+    assistant message half the time. It drops one more message going forward
+    rather than keeping one more going back -- keeping one more would exceed the
+    cap, meaning the bound would sometimes not hold.
 
-    **切齊是無條件的，修剪才有條件。** 一份沒有超過上限、但本身就以 assistant 開頭
-    的歷史（界限上線前存下來的那些就是）照樣會被 API 打回 400，所以不能只在有修剪
-    的時候才切。`cap <= 0` ＝不限制（與 `dorossi_max_budget_usd` 同慣例），但即使
-    不限制也還是要切齊。
+    **Aligning is unconditional; only trimming is conditional.** A history that is
+    within the cap but itself starts with assistant (those saved before the bound
+    went live are exactly that) is still bounced by the API with a 400, so aligning
+    cannot happen only when trimming. `cap <= 0` = no limit (the same convention as
+    `dorossi_max_budget_usd`), but even without a limit it still aligns.
 
-    真的動到東西時寫一行 stderr：這是預期中的行為不是故障，但「答案為什麼忘了前面
-    講過的事」總有一天有人要查，而查的時候沒有任何紀錄就等於查不到。沒動就不出聲
-    ——每一輪都印一行沒事的訊息，下場是沒人再看它。
+    When it actually changes something it writes one stderr line: this is expected
+    behaviour, not a fault, but "why did the answer forget what was said earlier"
+    will be investigated some day, and with no record at that point there is
+    nothing to find. When nothing changes it stays quiet -- a no-news line printed
+    every round ends up read by nobody.
     """
     if cap is None:
         cap = DOROSSI_API_HISTORY_MAX_MSGS
@@ -3957,26 +4686,31 @@ async def _dorossi_via_api(prompt: str, history: list,
     ceiling ends in a 400 that never recovers. Raises on missing client / API
     error (the SDK defers the credential check to request time).
 
-    `model` 是這一輪 `/model` 解析出來的**完整 model id**（`dorossi_resolve_model`
-    的輸出，allowlist 查表命中才會有值）；None ＝這個工作階段沒指定，用
-    `DOROSSI_MODEL`。2026-09-23 之前這裡寫死 `DOROSSI_MODEL`，所以 `/model` 在這個
-    後端上是**安靜失效**的：指令回「已更新」，送出去的卻永遠是同一個模型。這條路沒有
-    CLI 的別名解析，所以裸別名（`opus`）必須在上游就換成具體 id——那是
-    `dorossi_resolve_model` 的第三條路（模型目錄 → 內建表同族最新）。"""
+    `model` is the **full model id** parsed from this round's `/model` (the output
+    of `dorossi_resolve_model`, which has a value only when the allowlist lookup
+    hits); None = this session did not specify one, use `DOROSSI_MODEL`. Before
+    2026-09-23 this was hard-coded to `DOROSSI_MODEL`, so `/model` **silently did
+    nothing** on this backend: the command replied "updated", yet the same model
+    was always sent. This path has no CLI alias resolution, so a bare alias
+    (`opus`) must be turned into a concrete id upstream -- that is the third path
+    of `dorossi_resolve_model` (model catalogue -> newest of the same family in the
+    built-in table)."""
     cli = _get_dorossi_client()
     if cli is None:
         raise RuntimeError("anthropic SDK client unavailable")
-    # 修剪在**送出之前**，所以界限同時管住這一輪的成本與存回去的那一份
-    # （`new_history` 是從 `msgs` 長出來的，最多只會比上限多兩則，下一輪再收回來）。
+    # Trimming happens **before sending**, so the bound governs both this round's
+    # cost and the copy saved back (`new_history` grows from `msgs` and is at most
+    # two messages over the cap, reclaimed the next round).
     msgs = _dorossi_trim_api_history(history) + [
         {"role": "user", "content": prompt}]
     # Map the SDK's 429 (and 402 billing) to the dedicated usage-limit error so
     # the caller can give an actionable plan/quota reply. RateLimitError exposes
     # the `retry-after` header (seconds) as the reset hint when present.
     rate_err = getattr(anthropic, "RateLimitError", ()) if anthropic else ()
-    # 本專案自己的外框（見 `DOROSSI_API_TIMEOUT_SEC` 上方的說明）。用 `asyncio.timeout`
-    # 而不是 `wait_for`，是為了 `expired()`：它分得出「外框到了」與「SDK 裡面自己丟出
-    # 來的某個 TimeoutError」，後者要照舊走下面的分類。
+    # This project's own outer frame (see the note above `DOROSSI_API_TIMEOUT_SEC`).
+    # `asyncio.timeout` rather than `wait_for` is used for `expired()`: it can tell
+    # "the outer frame ran out" from "some TimeoutError raised inside the SDK", and
+    # the latter must still go through the classification below.
     ceiling = _dorossi_api_call_ceiling_sec()
     bound = asyncio.timeout(ceiling)
     try:
@@ -3989,8 +4723,9 @@ async def _dorossi_via_api(prompt: str, history: list,
             )
     except Exception as exc:  # pylint: disable=broad-except
         if isinstance(exc, TimeoutError) and bound.expired():
-            # 走既有的泛用失敗路徑：訊息刻意不含「unavailable」「api_key」之類的字——
-            # `_dorossi_error_hint` 的 api 分支會把那些字讀成「沒有憑證」。
+            # Take the existing generic failure path: the message deliberately
+            # contains no words like "unavailable" or "api_key" -- the api branch of
+            # `_dorossi_error_hint` would read those as "no credentials".
             print(f"[dorossi] api call exceeded this project's {ceiling:.0f}s "
                   f"ceiling (request timeout x attempts + retry sleeps); giving up",
                   file=sys.stderr)
@@ -4002,14 +4737,17 @@ async def _dorossi_via_api(prompt: str, history: list,
                 str(exc)[:300], _dorossi_api_reset_hint(exc),
                 reset_at=(time.time() + retry_after
                           if retry_after is not None else None)) from exc
-        # **順序就是規則**：用量上限先判（它等得比較準），剩下的才問「是不是
-        # 伺服器暫時性故障」。倒過來的話 429 會被當成過載，用瞎猜的指數退避取代
-        # `retry-after` 帶來的精確等待。
+        # **The order is the rule**: the usage limit is judged first (its wait is
+        # more precise), and only what remains is asked "is this a transient server
+        # failure". The other way round, a 429 would be treated as an overload, and
+        # a blindly guessed exponential backoff would replace the precise wait that
+        # `retry-after` brings.
         transient_exc = _dorossi_api_transient_error(exc)
         if transient_exc is not None:
             raise transient_exc from exc
-        # 連線層的失敗（沒有狀態碼）：等網路回來再用同一份歷史重送。排在用量上限與
-        # 暫時性故障之後，理由同 Claude 那側。
+        # A connection-layer failure (no status code): wait for the network to come
+        # back, then resend the same history. It comes after the usage limit and
+        # transient failures, for the same reason as the Claude side.
         if _dorossi_api_is_offline(exc):
             raise _DorossiOfflineError(
                 f"{type(exc).__name__}"[:400], backend="api") from exc
@@ -4022,26 +4760,33 @@ async def _dorossi_via_api(prompt: str, history: list,
     return answer, new_history
 
 
-# ---- 主機休眠：看門狗不要把睡著的時間算進去（2026-09-22） --------------------
+# ---- Host sleep: the watchdogs must not count time spent asleep (2026-09-22) ----
 #
-# 這台機器是 Modern Standby。睡著的時候整個行程停住，醒來之後 `time.monotonic()`
-# 跳了一大段，所有看門狗（閒置、輸出沉默、硬上限）同時到期——一輪做到一半的回合在
-# 醒來那一瞬間被當成「閒置太久」砍掉，而它其實只是跟著主機一起睡了。
+# This machine uses Modern Standby. While asleep the whole process is frozen, and
+# on waking `time.monotonic()` has jumped a long way, so every watchdog (idle,
+# output silence, hard limit) expires at once -- a round halfway through its work
+# is cut as "idle too long" the instant it wakes, when it had merely been asleep
+# along with the host.
 #
-# 做法：看門狗不再一次 `wait_for(readline, 整段)`，而是切成 `_DOROSSI_WATCH_SLICE_SEC`
-# 的小段等；一小段實際經過的時間比該等的多出 `DOROSSI_SUSPEND_GAP_SEC` 以上，就當成
-# 主機睡過，那一段只算它本來該等的長度，多出來的記進 `_DorossiWatchClock.suspended`
-# （硬上限也扣掉它）。兩個時鐘取大的：`time.monotonic()` 在這個平台上睡著時會不會走
-# 不一定，牆鐘一定會走——兩個都看，哪一種平台都量得到。牆鐘被校時往前撥也會被讀成
-# 「睡過」，代價只是那一輪的看門狗寬限了那麼多秒。
+# Approach: the watchdogs no longer `wait_for(readline, whole span)` in one go, but
+# wait in slices of `_DOROSSI_WATCH_SLICE_SEC`; when a slice's actually elapsed time
+# exceeds what it should have waited by `DOROSSI_SUSPEND_GAP_SEC` or more, the host
+# is taken to have slept, that slice counts only the length it was meant to wait,
+# and the excess is recorded in `_DorossiWatchClock.suspended` (the hard limit
+# subtracts it too). The larger of two clocks is taken: whether `time.monotonic()`
+# advances during sleep on this platform is uncertain, while the wall clock always
+# does -- watching both measures it on any platform. A wall clock pushed forward by
+# time sync is also read as "slept", at the cost only of that round's watchdog
+# getting that many seconds of slack.
 DOROSSI_SUSPEND_GAP_SEC = 30.0
 _DOROSSI_WATCH_SLICE_SEC = 5.0
-# 這個行程到目前為止偵測到的休眠總秒數與次數（任何一個看門狗量到都算）。只給診斷用。
+# Total seconds and count of sleep this process has detected so far (measured by
+# any watchdog). For diagnostics only.
 DOROSSI_SUSPEND_SEEN = {"count": 0, "seconds": 0.0}
 
 
 def dorossi_note_suspend(gap: float) -> None:
-    """記一次偵測到的主機休眠（秒）。永不 raise。"""
+    """Record one detected host sleep (seconds). Never raises."""
     try:
         DOROSSI_SUSPEND_SEEN["count"] += 1
         DOROSSI_SUSPEND_SEEN["seconds"] += float(gap)
@@ -4051,10 +4796,12 @@ def dorossi_note_suspend(gap: float) -> None:
 
 def dorossi_elapsed_with_gap(mono_start: float, wall_start: float,
                              expected: float) -> tuple:
-    """一段「應該等 `expected` 秒」的等待，實際經過多久、其中多少是主機睡著的時間。
+    """For a wait that "should take `expected` seconds", how long actually passed and
+    how much of that was the host asleep.
 
-    回 `(elapsed, suspended)`：`suspended` > 0 代表這一段比預期多出
-    `DOROSSI_SUSPEND_GAP_SEC` 以上（視為休眠），此時 `elapsed` 只算 `expected`。"""
+    Returns `(elapsed, suspended)`: `suspended` > 0 means this stretch overran the
+    expectation by `DOROSSI_SUSPEND_GAP_SEC` or more (treated as sleep), in which
+    case `elapsed` counts only `expected`."""
     elapsed = max(time.monotonic() - mono_start, time.time() - wall_start)
     gap = elapsed - expected
     if gap > DOROSSI_SUSPEND_GAP_SEC:
@@ -4063,7 +4810,8 @@ def dorossi_elapsed_with_gap(mono_start: float, wall_start: float,
 
 
 class _DorossiWatchClock:
-    """看門狗的時鐘：`time.monotonic()` 扣掉這一輪量到的休眠。"""
+    """The watchdogs' clock: `time.monotonic()` minus the sleep measured this
+    round."""
 
     __slots__ = ("suspended",)
 
@@ -4076,12 +4824,14 @@ class _DorossiWatchClock:
 
 async def _dorossi_readline_watched(stream, timeout: float,
                                     clock: "_DorossiWatchClock") -> bytes:
-    """`asyncio.wait_for(stream.readline(), timeout)` 的休眠感知版本。
+    """A sleep-aware version of `asyncio.wait_for(stream.readline(), timeout)`.
 
-    同一個 `readline` 在多個小段之間持續等（不重開，資料不會掉）；只有「醒著的時間」
-    累計到 `timeout` 才丟 `asyncio.TimeoutError`。休眠的秒數記進 `clock.suspended`
-    與 `DOROSSI_SUSPEND_SEEN`。逾時或被取消時把還沒完成的 `readline` 收掉——
-    `StreamReader.readline` 被取消不會吃掉緩衝區裡的資料，下一次呼叫照樣讀得到。"""
+    The same `readline` keeps waiting across several slices (not restarted, so no
+    data is lost); only when "time awake" adds up to `timeout` does it raise
+    `asyncio.TimeoutError`. The seconds of sleep are recorded in `clock.suspended`
+    and `DOROSSI_SUSPEND_SEEN`. On timeout or cancellation the unfinished
+    `readline` is reaped -- a cancelled `StreamReader.readline` does not eat the
+    data in the buffer, and the next call still reads it."""
     task = asyncio.ensure_future(stream.readline())
     try:
         waited = 0.0
@@ -4109,9 +4859,10 @@ async def _read_stream_all(stream) -> bytes:
     """Drain an asyncio stream to EOF, swallowing errors (used for stderr so a
     full pipe can't deadlock the child while we read stdout).
 
-    **讀到 EOF 才回來，而 EOF 不在我們手上**——它要等管線的所有寫端 handle 都關掉。
-    所以這個 coroutine 沒有自己的上限，一律要透過 `_dorossi_drain_stderr` 收，
-    不要在任何地方直接 `await` 它。
+    **It returns only at EOF, and EOF is not in our hands** -- it waits until every
+    write-end handle of the pipe is closed. So this coroutine has no bound of its
+    own, must always be reaped through `_dorossi_drain_stderr`, and must never be
+    `await`ed directly anywhere.
     """
     try:
         return await stream.read()
@@ -4119,48 +4870,66 @@ async def _read_stream_all(stream) -> bytes:
         return b""
 
 
-# 收尾用的上限。**這不是「等後端做完事」的上限**（那是看門狗的工作，預設 900/10800 秒），
-# 是「行程照理說已經結束了，把它收乾淨」的上限，所以短。正常路徑上這個時間根本
-# 花不到：stdout EOF 之後 CLI 毫秒級就離開、管線跟著關閉。
+# The bound for clean-up. **This is not the bound for "waiting for the backend to
+# finish its work"** (that is the watchdogs' job, default 900/10800 seconds); it is
+# the bound for "the process should already have ended, reap it cleanly", so it is
+# short. On the normal path this time is never even used: after stdout EOF the CLI
+# exits within milliseconds and the pipes close with it.
 _DOROSSI_REAP_TIMEOUT_SEC = 10.0
-# 回頭看一眼 `proc.returncode` 的間隔。這不是輪詢式的等待——`wait()` 一完成就會立刻
-# 返回（見 `_dorossi_reap_proc` 用的是 `asyncio.wait` 不是 `sleep`），這個值只決定
-# 「管線被握著」那條路上多久發現得了 rc。
+# The interval for glancing back at `proc.returncode`. This is not a polling wait --
+# `wait()` returns the moment it completes (note that `_dorossi_reap_proc` uses
+# `asyncio.wait`, not `sleep`); this value only decides how soon the rc can be
+# noticed on the "pipes held open" path.
 _DOROSSI_REAP_POLL_SEC = 0.05
-# 連 rc 都問不出來時交給判定的哨符。非 0 → 走既有的「非零離開」分類，不必在
-# `_claude_stream_verdict` 裡多開一條分支（它的判定順序本身就是規則，不要動）。
+# The sentinel handed to the verdict when not even the rc can be obtained. Non-zero
+# -> it takes the existing "non-zero exit" classification, with no need for an
+# extra branch in `_claude_stream_verdict` (its verdict order is itself the rule;
+# do not touch it).
 _DOROSSI_UNREAPED_RC = -9
 
 
 async def _dorossi_reap_proc(proc, timeout: float | None = None) -> int | None:
-    """把一個**應該已經結束**的子行程收掉，並在有限時間內回報 rc（拿不到回 None）。
+    """Reap a child process that **should already have ended**, and report its rc
+    within a bounded time (None when it cannot be obtained).
 
-    **為什麼不能只寫 `await proc.wait()`**（2026-09-09 在本機實測，CPython 3.14 /
-    Windows）：`BaseSubprocessTransport._wait()` 把自己掛在 `_exit_waiters` 上，而那批
-    waiter **只有** `_call_connection_lost` 會叫醒，`_try_finish` 又要求
-    `all(p.disconnected)`——也就是 **stdout 與 stderr 都要先 EOF**。只要有一個孫行程
-    繼承著那兩個管線的寫端，`await proc.wait()` 就**永遠不返回**；不是慢，是無限。
-    而孫行程確實留得下來：Windows 的 `proc.kill()` 是 `TerminateProcess`，只帶走直接
-    子行程，而 `dorossi_cc_tools="full"` 正是會在主機上起 shell 的模式。
+    **Why `await proc.wait()` alone will not do** (measured locally 2026-09-09,
+    CPython 3.14 / Windows): `BaseSubprocessTransport._wait()` hangs itself on
+    `_exit_waiters`, and those waiters are woken **only** by
+    `_call_connection_lost`, while `_try_finish` requires `all(p.disconnected)` --
+    that is, **both stdout and stderr must reach EOF first**. As long as one
+    grandchild process inherits the write end of either pipe,
+    `await proc.wait()` **never returns**; not slow, infinite. And grandchildren
+    really do linger: Windows' `proc.kill()` is `TerminateProcess`, which takes
+    only the direct child, and `dorossi_cc_tools="full"` is exactly the mode that
+    starts shells on the host.
 
-    `proc.returncode` 走的是另一條路：`_process_exited` 在作業系統層的離開被觀察到的
-    當下就把它設好，**與管線無關**。實測數字：kill 之後 0.25 秒 returncode 已經是 1，
-    而同一時間一個 pending 的 `wait()` 三秒後仍未完成。（順序也很關鍵——`_wait()`
-    開頭有 `if self._returncode is not None: return`，所以**已經設定之後**再呼叫
-    `wait()` 會立刻回來；卡住的只有「在設定之前就開始等」的那一次。）
+    `proc.returncode` takes a different route: `_process_exited` sets it the moment
+    the OS-level exit is observed, **independent of the pipes**. Measured: 0.25
+    seconds after kill the returncode is already 1, while a `wait()` pending at the
+    same time is still unfinished three seconds later. (The order matters too --
+    `_wait()` starts with `if self._returncode is not None: return`, so calling
+    `wait()` **after it is set** returns immediately; only a wait that "started
+    before it was set" gets stuck.)
 
-    所以這裡**同時**盯兩個訊號，誰先到算誰：`wait()` 完成（管線正常關閉的路徑，
-    零額外延遲）與 `returncode` 出現（管線被握著的路徑）。**不要**寫成「先 `wait_for`
-    整個 timeout、逾時再看 returncode」——那會在管線被握著時白等滿一個 timeout，而
-    實測 0.25 秒就問得到答案了。
+    So this watches **both** signals at once, whichever comes first: `wait()`
+    completing (the path where the pipes close normally, zero extra delay) and
+    `returncode` appearing (the pipes-held-open path). **Do not** write it as "first
+    `wait_for` the whole timeout, then look at returncode on timeout" -- that would
+    wait a full timeout for nothing when the pipes are held open, while measured the
+    answer is available after 0.25 seconds.
 
-    兩個階段：先給它 `timeout` 秒自己好好離開（正常路徑毫秒級就過了），還沒走才 kill，
-    再給 `timeout` 秒收屍。所以最壞是 2×timeout，仍然有限。
+    Two phases: first give it `timeout` seconds to leave properly on its own (the
+    normal path is over within milliseconds), kill only if it has not gone, then
+    give `timeout` more seconds to reap the body. So the worst case is 2×timeout,
+    still bounded.
 
-    離開時 `wait()` 一律 cancel + gather 收掉，否則只是把「永遠卡住」換成「孤兒任務」。
+    On the way out `wait()` is always cancelled + gathered, otherwise "stuck
+    forever" would merely be traded for "an orphaned task".
 
-    `timeout=None` → 在**呼叫時**查模組常數（不要寫成預設引數：預設引數在 `def` 當下
-    就固定住，之後改模組常數不會生效，測試也就換不掉那個值）。
+    `timeout=None` -> the module constant is looked up **at call time** (do not
+    write it as a default argument: a default argument is fixed when the `def`
+    runs, so later changes to the module constant would have no effect and tests
+    could not swap the value).
     """
     if timeout is None:
         timeout = _DOROSSI_REAP_TIMEOUT_SEC
@@ -4172,7 +4941,8 @@ async def _dorossi_reap_proc(proc, timeout: float | None = None) -> int | None:
             deadline = time.monotonic() + timeout
             while True:
                 if proc.returncode is not None:
-                    # 行程已經死了，只是管線還被別人握著 → rc 問得到，不必再等。
+                    # The process is already dead, only the pipes are still held by
+                    # someone else -> the rc is available, no need to wait more.
                     return proc.returncode
                 if wait_task.done():
                     try:
@@ -4181,12 +4951,13 @@ async def _dorossi_reap_proc(proc, timeout: float | None = None) -> int | None:
                         return proc.returncode
                 if time.monotonic() >= deadline:
                     break
-                # `asyncio.wait` 而不是 `sleep`：`wait()` 一完成就馬上回來（正常路徑
-                # 零額外延遲），同時每 poll 秒有機會回頭看一眼 `returncode`。
+                # `asyncio.wait` rather than `sleep`: it returns as soon as `wait()`
+                # completes (zero extra delay on the normal path), while getting a
+                # chance to glance back at `returncode` every poll interval.
                 await asyncio.wait({wait_task}, timeout=_DOROSSI_REAP_POLL_SEC)
             if phase == 0:
-                # 真的還活著。這是「非預期離開路徑」該做的事：不要把一個 `full` 模式的
-                # 後端行程留在主機上跑。
+                # Really still alive. This is what the "unexpected exit path" should
+                # do: never leave a `full`-mode backend process running on the host.
                 try:
                     proc.kill()
                 except ProcessLookupError:
@@ -4200,16 +4971,21 @@ async def _dorossi_reap_proc(proc, timeout: float | None = None) -> int | None:
 
 
 async def _dorossi_drain_stderr(task, timeout: float | None = None) -> str:
-    """收掉 stderr 抽水任務並取回內容；拿不到就**降級成空字串**，不打掉整輪。
+    """Reap the stderr-draining task and retrieve its content; when it cannot be
+    had, **degrade to an empty string** rather than failing the whole round.
 
-    上限的理由同 `_dorossi_reap_proc`：`_read_stream_all` 等的是 EOF，而 EOF 的到來
-    掌握在別人手上。逾時之後一定要 cancel + gather——只加上限不收任務，等於把
-    「永遠卡住」換成「孤兒任務」。
+    The bound exists for the same reason as in `_dorossi_reap_proc`:
+    `_read_stream_all` waits for EOF, and when EOF arrives is in someone else's
+    hands. After a timeout it must be cancelled + gathered -- adding a bound
+    without reaping the task merely trades "stuck forever" for "an orphaned task".
 
-    stderr 只餵診斷（`failure_reason` 的第三順位來源，前面還有 result 事件與 stdout
-    尾巴），所以拿不到就空字串繼續走判定是正確的降級，不是把錯誤吞掉。
+    stderr only feeds diagnostics (the third-ranked source of `failure_reason`,
+    after the result event and the stdout tail), so carrying on to the verdict
+    with an empty string when it cannot be had is the correct degradation, not
+    swallowing an error.
 
-    `timeout=None` 的意義同 `_dorossi_reap_proc`：呼叫時才查模組常數。
+    `timeout=None` means the same as in `_dorossi_reap_proc`: the module constant is
+    looked up at call time.
     """
     if timeout is None:
         timeout = _DOROSSI_REAP_TIMEOUT_SEC
@@ -4235,15 +5011,19 @@ def find_codex_executable() -> str | None:
     installer uses LocalAppData, which is checked after the normal PATH lookup.
     Only existing regular files are returned; no shell wrapper is involved.
 
-    引號的正規化走 `_dorossi_unquote_dir()`，不要在這裡自己再寫一份。
-    2026-09-10 之前這行是 `.strip().strip('"')`，兩個問題：它只脫得掉 `"`，而
-    `CODEX_CLI_PATH` 是**從 shell 設定的環境變數**，`CODEX_CLI_PATH='…/codex.exe'`
-    是完全正常的寫法——單引號留在字串裡，`Path(...).is_file()` 為 False，於是這個
-    被本 docstring 稱為 "the explicit operator override" 的東西**安靜地被忽略**，
-    退回 PATH 搜尋，而操作者看不到任何差別。第二個問題是它用的正是
-    `_dorossi_unquote_dir` 的 docstring 明文警告過的那種「一路刮掉頭尾引號」寫法
-    （真的叫 `'foo'` 的路徑會被改成別的路徑）。同模組內已經有正確的那一份，
-    這裡曾經是這條判準在本專案的**第三份**私有實作。
+    Quote normalisation goes through `_dorossi_unquote_dir()`; do not write another
+    copy here. Before 2026-09-10 this line was `.strip().strip('"')`, with two
+    problems: it could only strip `"`, while `CODEX_CLI_PATH` is **an environment
+    variable set from a shell**, where `CODEX_CLI_PATH='…/codex.exe'` is a perfectly
+    normal spelling -- the single quotes stayed in the string,
+    `Path(...).is_file()` was False, and so the thing this docstring calls "the
+    explicit operator override" was **silently ignored**, falling back to the PATH
+    search with no visible difference for the operator. The second problem is that
+    it used exactly the "scrape every quote off both ends" style that
+    `_dorossi_unquote_dir`'s docstring explicitly warns against (a path really named
+    `'foo'` would be turned into a different path). The module already had the
+    correct version, and this used to be the project's **third** private
+    implementation of that rule.
     """
     override = _dorossi_unquote_dir(os.environ.get("CODEX_CLI_PATH", ""))
     candidates = [override, _shutil.which("codex")]
@@ -4265,36 +5045,44 @@ def find_codex_executable() -> str | None:
 
 
 # ==========================================================================
-# 每日模型目錄檢查（2026-09-23）
+# Daily model-catalogue check (2026-09-23)
 # ==========================================================================
-# 兩個 CLI 都**沒有**「列出模型」的子指令（2026-09-23 查過 `claude --help` 與
-# `codex exec --help`）。所以發現的辦法只有兩條，按便宜程度排：
+# Neither CLI has a "list models" subcommand (`claude --help` and
+# `codex exec --help` checked on 2026-09-23). So there are only two ways to
+# discover, ordered by cheapness:
 #
-#   1. **SDK 的模型清單**（`client.models.list()`）——權威、一次拿到整份目錄，但要
-#      憑證。本機沒有設任何憑證環境變數（同日量過），所以這條在這台機器上不會跑；
-#      留著是因為換一台有憑證的主機就該走它。
-#   2. **探測**——拿**裸別名**叫一次 CLI，讀回它**解析成什麼**。那就是「這一族今天
-#      最新的那個」，正是我們要的答案。
+#   1. **The SDK's model list** (`client.models.list()`) -- authoritative, the whole
+#      catalogue in one go, but it needs credentials. This machine sets no
+#      credential environment variables (measured the same day), so this does not
+#      run here; it is kept because a host with credentials should take it.
+#   2. **Probing** -- call the CLI once with a **bare alias** and read back **what it
+#      resolved to**. That is "the newest of this family today", exactly the
+#      answer we want.
 #
-# **探測的成本是零個 token，不是「很少」。** claude 那側的 `system`/`init` 事件在
-# 任何請求送出**之前**就印出來，裡面帶著解析後的完整 model id；讀到那一行就把行程
-# 砍掉。codex 那側更乾脆：它先把表頭（含 `model:` 那一行）印出來、**再**去讀 stdin
-# 的提示詞，所以只要一個字都不寫進 stdin，讀到表頭就砍，連請求都不會成形。
-# 每天的代價因此是 5 次行程啟動（四個 claude 族 ＋ 一次 codex），各幾秒鐘。
+# **Probing costs zero tokens, not "a few".** On the claude side the
+# `system`/`init` event is printed **before** any request is sent, carrying the
+# resolved full model id; the process is killed as soon as that line is read. The
+# codex side is even simpler: it prints the header (including the `model:` line)
+# first and **then** reads the prompt from stdin, so as long as not a single
+# character is written to stdin, it is killed on reading the header and no request
+# even takes shape. The daily cost is therefore 5 process launches (four claude
+# families + one codex), a few seconds each.
 #
-# 失敗一律只記 stderr、留著昨天的目錄、明天再試——離線、額度用完、CLI 不在，
-# 都不該比「今天沒更新」更嚴重。
+# Failures only ever go to stderr, keep yesterday's catalogue and retry tomorrow --
+# being offline, out of quota or missing the CLI should never be worse than "not
+# updated today".
 DOROSSI_MODEL_PROBE_TIMEOUT_SEC = 90.0
-# codex 表頭裡的模型那一行（`model: gpt-5.6-sol`）。
+# The model line in the codex header (`model: gpt-5.6-sol`).
 _DOROSSI_CODEX_MODEL_LINE_RE = re.compile(r"^\s*model:\s*(\S+)\s*$")
 
 
 def _dorossi_model_probe_dir() -> Path:
-    """探測用的空白工作目錄。
+    """An empty working directory for probing.
 
-    刻意**不是** repo root 也不是工作階段的目錄：CLI 會讀 cwd 底下的指示檔，拿一個
-    空目錄探測才快、也才不會把探測混進任何一段對話的紀錄裡。放在
-    `DOROSSI_CC_WORKDIR` 底下，所以沿用既有的 gitignore 條目。
+    Deliberately **neither** the repo root nor a session's directory: the CLI reads
+    instruction files under the cwd, and probing from an empty directory is fast
+    and keeps the probe out of every conversation's record. It sits under
+    `DOROSSI_CC_WORKDIR`, so the existing gitignore entry covers it.
     """
     path = DOROSSI_CC_WORKDIR / ".model_probe"
     path.mkdir(parents=True, exist_ok=True)
@@ -4302,11 +5090,15 @@ def _dorossi_model_probe_dir() -> Path:
 
 
 def _dorossi_model_from_init_line(raw: bytes) -> str | None:
-    """串流 JSON 的一行 → 那是不是 `system`/`init`，是的話解析後的完整 model id。
+    """One line of streaming JSON -> whether it is `system`/`init`, and if so the
+    resolved full model id.
 
-    抽成純函式是為了測得動：兩支探測的**整個判斷**就在這一行上，而起一個真的 CLI
-    子行程來測它既慢又要網路。回 None 有兩種意思（不是 init／看不懂），呼叫端都是
-    「繼續讀下一行」，所以不必分。永不 raise——餵進來的是別的行程印出來的位元組。
+    Extracted as a pure function so it can be tested: the **entire judgement** of
+    both probes rests on this one line, and starting a real CLI child process to
+    test it is slow and needs the network. None has two meanings (not init /
+    unreadable), and the caller "reads the next line" for both, so there is no need
+    to tell them apart. Never raises -- what is fed in are bytes printed by another
+    process.
     """
     try:
         event = _json.loads(raw.decode("utf-8", errors="replace"))
@@ -4321,34 +5113,42 @@ def _dorossi_model_from_init_line(raw: bytes) -> str | None:
 
 
 def _dorossi_model_from_header_line(raw: bytes) -> str | None:
-    """另一個 CLI 的表頭一行 → `model:` 印的是什麼（不是那一行就 None）。永不 raise。"""
+    """One header line of the other CLI -> what `model:` prints (None if it is not
+    that line). Never raises."""
     match = _DOROSSI_CODEX_MODEL_LINE_RE.match(raw.decode("utf-8", errors="replace"))
     return match.group(1) if match else None
 
 
 def _dorossi_model_probe_argv(exe: str, family: str) -> list:
-    """claude 探測用的 argv。純函式。
+    """The argv for the claude probe. Pure function.
 
-    **刻意不共用 `_dorossi_cc_argv`**，理由有兩條，都是安全性不是潔癖：那一支會在
-    `dorossi_cc_tools == "full"` 時帶上 `--permission-mode bypassPermissions`，而一個
-    只為了讀一行 init 就開全權限的子行程沒有任何理由存在；它也會附上整份系統提示，
-    讓「讀第一行就砍掉」這件事變得不必要地重。這裡只要三件事：串流 JSON（才有 init
-    事件）、裸別名（才看得到解析結果）、零工具零 MCP（才啟動得快）。
+    **Deliberately does not share `_dorossi_cc_argv`**, for two reasons, both about
+    safety rather than tidiness: that one adds
+    `--permission-mode bypassPermissions` when `dorossi_cc_tools == "full"`, and a
+    child process with full permissions just to read one init line has no reason
+    to exist; it also attaches the whole system prompt, making "kill it after the
+    first line" needlessly heavy. Only three things are needed here: streaming JSON
+    (for the init event), a bare alias (to see the resolution), and zero tools,
+    zero MCP (to start fast).
     """
     return [exe, "-p",
             "--output-format", "stream-json", "--verbose",
             "--model", family,
-            # 主機的全域 MCP 設定會讓 `claude -p` 在冷啟動健康檢查上卡好幾分鐘。
+            # The host's global MCP config makes `claude -p` hang for minutes on the
+            # cold-start health check.
             "--strict-mcp-config",
-            # 工具白名單，而且是空的（fail-closed）。探測不需要任何工具。
+            # A tool allowlist, and an empty one (fail-closed). The probe needs no
+            # tools.
             "--tools", ""]
 
 
 async def _dorossi_probe_claude_family(exe: str, family: str, cwd: str,
                                        timeout_sec: float) -> str | None:
-    """叫一次 `claude -p --model <裸別名>`，讀回 init 事件裡解析後的完整 model id。
+    """Call `claude -p --model <bare alias>` once and read back the resolved full
+    model id from the init event.
 
-    讀到就立刻砍掉行程——init 在請求之前，所以這一趟是零 token。任何失敗回 None。
+    The process is killed the moment it is read -- init comes before the request,
+    so this trip costs zero tokens. Any failure returns None.
     """
     args = _dorossi_model_probe_argv(exe, family)
     proc = await asyncio.create_subprocess_exec(
@@ -4358,8 +5158,8 @@ async def _dorossi_probe_claude_family(exe: str, family: str, cwd: str,
         cwd=cwd, env=_dorossi_cc_child_env(timeout_sec),
         limit=1024 * 1024)
     try:
-        # `-p` 一定要有提示詞（空 stdin 會被當成用法錯誤），但我們在它被送出之前
-        # 就收工了。
+        # `-p` must have a prompt (an empty stdin is treated as a usage error), but
+        # we are done before it is ever sent.
         try:
             proc.stdin.write(b"ping\n")
             await proc.stdin.drain()
@@ -4397,19 +5197,27 @@ async def _dorossi_probe_claude_family(exe: str, family: str, cwd: str,
 
 async def _dorossi_probe_codex_default(exe: str, cwd: str,
                                        timeout_sec: float) -> str | None:
-    """叫一次 `codex exec`，讀回表頭那一行 `model:` 印的是什麼。
+    """Call `codex exec` once and read back what the header's `model:` line prints.
 
-    這是 codex 這側唯一的發現管道——它的 `--json` 串流裡沒有任何地方講模型
-    （2026-09-23 實測），而不認得的模型名不會退回預設，是伺服器 400。所以**刻意不加
-    `--json`**：表頭只印在人讀的那個格式裡。
+    This is the only discovery channel on the codex side -- nothing in its `--json`
+    stream mentions the model (measured 2026-09-23), and an unrecognised model name
+    does not fall back to the default, it is a server 400. So `--json` is
+    **deliberately not passed**: the header is printed only in the human-readable
+    format.
 
-    ⚠️ 兩件事都是量出來才知道的，寫在這裡免得下一個人再踩一次：
+    ⚠️ Both of these were learned only by measuring; they are written here so the
+    next person does not trip over them again:
 
-      1. **提示詞一定要先寫進 stdin。** CLI 是先把 stdin 讀完才印表頭的，不寫就一路
-         等到逾時（第一版刻意不寫，想連提示詞都不送，實測 90 秒全部用完）。
-      2. **表頭印在 stderr，不是 stdout。** 在終端機上 `2>&1` 看不出差別，所以第一版
-         盯著 stdout 讀，讀到的只有整輪跑完之後的那一行答案——等於每天白跑一整個回合。
-         改讀 stderr 之後，`model:` 在請求送出之前就到手，砍掉行程即可，零 token。
+      1. **The prompt must be written to stdin first.** The CLI reads stdin to the
+         end before printing the header, and without it waits all the way to the
+         timeout (the first version deliberately wrote nothing, hoping not to send
+         even a prompt; measured, it used up the full 90 seconds).
+      2. **The header is printed on stderr, not stdout.** In a terminal `2>&1` hides
+         the difference, so the first version read stdout and got only the one line
+         of answer after the whole round had run -- in effect running a whole round
+         every day for nothing. Reading stderr instead, `model:` arrives before the
+         request is sent, the process can simply be killed, and it costs zero
+         tokens.
     """
     args = [exe, "exec", "--skip-git-repo-check", "-C", str(cwd),
             "-c", 'sandbox_mode="read-only"', "-"]
@@ -4455,16 +5263,20 @@ async def _dorossi_probe_codex_default(exe: str, cwd: str,
 
 
 def _dorossi_api_credentials_present() -> bool:
-    """主機上有沒有 SDK 用得到的憑證。**只看有沒有，永遠不印值。**"""
+    """Whether the host has credentials the SDK can use. **Only checks presence;
+    never prints the value.**"""
     return any(str(os.environ.get(name) or "").strip()
                for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"))
 
 
 async def _dorossi_probe_api_catalog(timeout_sec: float) -> dict:
-    """有憑證時走 SDK 的模型清單：一次拿到整份目錄，比探測便宜也比探測完整。
+    """With credentials, use the SDK's model list: the whole catalogue in one go,
+    cheaper and more complete than probing.
 
-    回傳 `{族名: 完整 id}`，只留內建表裡有的那幾族、每族取清單裡最新的一筆（SDK 的
-    清單是新的在前）。沒有憑證／SDK 不在／任何失敗都回空字典，由呼叫端退回探測。
+    Returns `{family: full id}`, keeping only the families in the built-in table,
+    each taking the newest entry in the list (the SDK lists newest first). No
+    credentials / no SDK / any failure returns an empty dict, and the caller falls
+    back to probing.
     """
     if not _dorossi_api_credentials_present():
         return {}
@@ -4488,12 +5300,15 @@ async def _dorossi_probe_api_catalog(timeout_sec: float) -> dict:
 
 async def dorossi_probe_model_catalog(
         timeout_sec: float | None = None) -> dict:
-    """跑一次發現（不寫檔、不改表），回傳 `{命名空間: {族名: 完整 id}}`。
+    """Run discovery once (no file writes, no table changes), returning
+    `{namespace: {family: full id}}`.
 
-    抽出來是為了讓「發現」與「落地」分開測：這一支碰外部世界，下面那支只碰檔案與
-    那兩張表。**會 raise**：個別探測讀不到東西時在裡面吞掉，但建探測目錄與起子行程
-    （執行檔在 `which` 之後不見了、權限不足）的 `OSError` 會丟出來，由
-    `dorossi_refresh_model_catalog` 接住。
+    Extracted so "discovery" and "landing" can be tested separately: this one
+    touches the outside world, the one below touches only the file and the two
+    tables. **It does raise**: an individual probe reading nothing is swallowed
+    inside, but the `OSError` from creating the probe directory or starting a child
+    process (the executable vanished after `which`, insufficient permissions)
+    propagates and is caught by `dorossi_refresh_model_catalog`.
     """
     if timeout_sec is None:
         timeout_sec = DOROSSI_MODEL_PROBE_TIMEOUT_SEC
@@ -4521,11 +5336,14 @@ async def dorossi_probe_model_catalog(
 
 def dorossi_model_catalog_due(interval_hours: float,
                               now: float | None = None) -> bool:
-    """距離上次檢查夠久了嗎。上次的時刻存在目錄檔裡，所以**重啟不會重跑**。
+    """Has it been long enough since the last check? The last time is stored in the
+    catalogue file, so **a restart does not rerun it**.
 
-    存放檔裡的時刻比現在還晚（時鐘被調過、檔案從別台機器複製過來）一律視為到期——
-    否則一個未來的時刻會把這個檢查永久關掉，而且沒有任何症狀。`NaN` 同理：
-    `json.loads` 收得下它，而它跟任何數字比都是 False，會讓下面每一道比較都落空。
+    A stored time later than now (the clock was adjusted, the file was copied from
+    another machine) is always treated as due -- otherwise a future time would
+    switch this check off for good, with no symptom at all. Likewise `NaN`:
+    `json.loads` accepts it, and it compares False against any number, so every
+    comparison below would miss.
     """
     now = time.time() if now is None else now
     last = _DOROSSI_MODEL_CATALOG.get("checked_at")
@@ -4537,15 +5355,20 @@ def dorossi_model_catalog_due(interval_hours: float,
 
 async def dorossi_refresh_model_catalog(
         timeout_sec: float | None = None) -> list:
-    """發現 → 落地 → 併回表，回傳**這次新增的別名**（可能是空的）。
+    """Discover -> land -> merge back into the tables, returning **the aliases added
+    this time** (possibly empty).
 
-    回傳值是公告的素材，所以只會是別名，完整 id 一個字都不會被帶出這一層。
-    探測全軍覆沒時**不動**已經存著的目錄（留著昨天的結果、明天再試）；部分成功就只
-    更新成功的那幾族。永不 raise。
+    The return value is material for an announcement, so it is only ever aliases;
+    not a single character of a full id is carried out of this layer. When every
+    probe fails the stored catalogue is **left untouched** (keep yesterday's
+    results, retry tomorrow); on partial success only the families that succeeded
+    are updated. Never raises.
 
-    探測丟例外也照「全軍覆沒」處理，**`checked_at` 照樣蓋上**。原本這條路直接回傳、
-    不落地，而節流看的正是 `checked_at`，於是起不了子行程的那一天變成每分鐘重試一次
-    ——每一次都印一行 stderr，而且都卡住健康迴圈直到失敗為止。
+    A probe raising is also treated as "every probe failed", and **`checked_at` is
+    still stamped**. Originally this path returned straight away without landing
+    anything, and the throttle looks exactly at `checked_at`, so a day when child
+    processes could not start turned into a retry every minute -- each printing a
+    stderr line and each holding up the health loop until it failed.
     """
     global _DOROSSI_MODEL_CATALOG  # pylint: disable=global-statement
     try:
@@ -4573,13 +5396,16 @@ async def dorossi_refresh_model_catalog(
 
 _DOROSSI_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
 
-# 後端產圖工具的輸出根目錄。**模組層常數是刻意的**：`_collect_codex_images` 產出的
-# 路徑會被 bot 記進 `recent_image_msgs.json`，而 bot 重新載入那份檔案時必須判斷
-# 「這個字串落在允許的根目錄底下嗎」——那道包含性檢查用的正是同一個根。兩邊各寫
-# 一次字面值就是「同一條規則兩份實作」，其中一份遲早會漂掉，而漂掉的症狀是**靜默
-# 的**：合法的對應在下次啟動時被默默丟掉，🗑️／⭐ 就此失效，沒有任何錯誤。
-# 這裡刻意**不** `.resolve()`——兩邊的消費者各自 resolve，才能同時吸收 junction /
-# symlink 與大小寫差異。
+# The output root of the backend's image-generation tool. **A module-level
+# constant is deliberate**: the paths `_collect_codex_images` produces are recorded
+# by the bot in `recent_image_msgs.json`, and when the bot reloads that file it must
+# judge "does this string fall under the allowed root" -- and that containment
+# check uses exactly the same root. Writing the literal once on each side is "one
+# rule, two implementations", one of which will drift sooner or later, and the
+# symptom of drifting is **silent**: legitimate mappings are quietly dropped on the
+# next start, and 🗑️ / ⭐ stop working with no error at all.
+# It is deliberately **not** `.resolve()`d here -- each consumer resolves on its own
+# side, so both junction / symlink and case differences are absorbed.
 CODEX_IMAGE_ROOT = Path.home() / ".codex" / "generated_images"
 
 
@@ -4594,7 +5420,8 @@ def _collect_codex_images(thread_id: str | None, since_ns: int, *,
     """
     if not isinstance(thread_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", thread_id):
         return []
-    # `root=` 是測試的注入點，保留；沒注入時走模組層的單一來源常數。
+    # `root=` is the test injection point and stays; without injection it uses the
+    # single-source module-level constant.
     base = (root or CODEX_IMAGE_ROOT).resolve()
     folder = (base / thread_id).resolve()
     if base not in folder.parents or not folder.is_dir():
@@ -4614,53 +5441,69 @@ def _collect_codex_images(thread_id: str | None, since_ns: int, *,
     return [path for _mtime, path in found]
 
 
-# --- 折疊事件時的兩個防禦性取值 -------------------------------------------
+# --- Two defensive accessors for folding events -------------------------------
 #
-# 兩個 `feed` 的 docstring 都承諾「**永遠不 raise**」，而那個承諾是承重的：claude
-# 那側的讀取迴圈**沒有** try/finally，例外會逸出整支函式 → 子行程沒人 kill、stderr
-# 抽水任務變孤兒、那個 session 的鎖永久卡住，無人值守迴圈就地停住且沒有任何訊號。
+# Both `feed` docstrings promise "**never raises**", and that promise is
+# load-bearing: the claude side's read loop has **no** try/finally, so an exception
+# would escape the whole function -> nobody kills the child process, the
+# stderr-draining task is orphaned, that session's lock is stuck for good, and the
+# unattended loop stops on the spot with no signal at all.
 #
-# 2026-09-08 對兩個 feed 的每個事件骨架、每個巢狀位置逐一塞入各種 JSON 進得來的
-# 非預期值（`None` / 數字 / 字串 / `[]` / `[1]` / `true` / `{}` / 小數）掃了一遍，
-# 發現**三種**互相獨立的機制。一次修一個點正是這個 bug 類別會原地復發的原因，所以
-# 這兩個 helper 是拿來一次擋掉整個類別的——新增欄位時請沿用，不要再寫 `X or {}`
-# 或直接把外部值丟進 set。
+# On 2026-09-08, every event skeleton and every nested position of both feeds was
+# swept with every unexpected value JSON can bring in (`None` / numbers / strings
+# / `[]` / `[1]` / `true` / `{}` / decimals), uncovering **three** independent
+# mechanisms. Fixing one spot at a time is exactly why this bug class keeps coming
+# back in place, so these two helpers exist to block the whole class at once --
+# use them when adding fields, and do not write `X or {}` again or drop external
+# values straight into a set.
 #
-#   (A) 對非 dict 呼叫 `.get()`。慣用法 `X or {}` 只擋得掉 **falsy**（`None`/`{}`），
-#       擋不掉 **truthy 的非 dict**（`5`、`"字串"`、`[1]`）→ AttributeError。
-#       → 一律走 `_event_dict()`。
-#   (B) 把不可雜湊的值放進 set。JSON 的 array/object 會變成 `list`/`dict`，
-#       `set.add()` **與 `set.discard()`** 都會丟 TypeError。
-#       → 一律走 `_protocol_key()`。
-#   (C) 輸入本身不是 str。`json.loads(None)` 丟的是 **TypeError**，不是 ValueError。
-#       → 解析的 except 同時收 `(ValueError, TypeError)`（見兩個 feed）。
+#   (A) Calling `.get()` on a non-dict. The idiom `X or {}` only stops **falsy**
+#       values (`None`/`{}`), not **truthy non-dicts** (`5`, `"a string"`, `[1]`)
+#       -> AttributeError.
+#       -> Always go through `_event_dict()`.
+#   (B) Putting an unhashable value in a set. JSON arrays/objects become
+#       `list`/`dict`, and both `set.add()` **and `set.discard()`** raise
+#       TypeError.
+#       -> Always go through `_protocol_key()`.
+#   (C) The input itself is not a str. `json.loads(None)` raises **TypeError**, not
+#       ValueError.
+#       -> The parse's except catches `(ValueError, TypeError)` together (see both
+#       feeds).
 
 
 def _event_dict(obj: dict, key: str) -> dict:
-    """`obj[key]`，**不是 dict 就回 `{}`**。取代 `obj.get(key) or {}`（機制 A）。"""
+    """`obj[key]`, **or `{}` when it is not a dict**. Replaces
+    `obj.get(key) or {}` (mechanism A)."""
     value = obj.get(key)
     return value if isinstance(value, dict) else {}
 
 
 def _protocol_key(value):
-    """可以安全當成 set 元素的協定識別字，認不得就回 `None`（呼叫端丟掉）。
+    """A protocol identifier that is safe to use as a set element, or `None` when
+    unrecognised (the caller drops it).
 
-    只收 `str` 與 `int`——那正是協定本身用的型別（content block 的 `index` 是整數、
-    `tool_use` 的 `id` 是字串）。**丟掉而不是轉字串**，兩個理由：
+    Only `str` and `int` are accepted -- exactly the types the protocol itself uses
+    (a content block's `index` is an integer, a `tool_use`'s `id` is a string).
+    **Dropped rather than stringified**, for two reasons:
 
-    * 轉換會**發明資料**。`str([1])` 產出的 `"[1]"` 是一個永遠不會被**格式正確**的
-      後續事件配對到的幽靈鍵；`pending_tools` 留著配不掉的項目會一直抑制閒置監看
-      （雖然硬上限仍會兜底），而丟掉的失敗方向是「監看可能早一點開火」——有界、而且
-      會帶著診斷訊息大聲失敗。**安靜地抑制守門，比大聲地早一點開火糟得多。**
-    * `add` 與 `discard` 用同一道過濾，所以兩邊一致：認不得的 id 不會進去，也就不需要
-      被移除。
+    * Conversion **invents data**. `str([1])` produces `"[1]"`, a ghost key that no
+      **well-formed** later event will ever match; an unmatchable entry left in
+      `pending_tools` would keep suppressing the idle watchdog (though the hard
+      limit still backstops it), while dropping fails in the direction "the
+      watchdog may fire a bit early" -- bounded, and failing loudly with a
+      diagnostic. **Quietly suppressing a guard is far worse than loudly firing a
+      bit early.**
+    * `add` and `discard` use the same filter, so both sides agree: an unrecognised
+      id never gets in, so it never needs removing.
 
-    **`bool` 被排除**（`isinstance(True, int)` 是 True，所以要明寫）：`index: true`
-    會讓 `True` 進 `text_block_indices`，而 `1 in {True}` 成立——於是 index 為 1 的
-    **工具**區塊的 delta 會被當成已知的文字區塊。那是進度預覽白名單的安全性質被
-    別名繞過，不只是型別潔癖。同理，這道過濾也順手擋掉 `None`（欄位缺漏時
-    `.get()` 的回傳值），否則「缺 index 的文字區塊」與「缺 index 的工具區塊」會互相
-    別名。
+    **`bool` is excluded** (`isinstance(True, int)` is True, so it must be spelled
+    out): `index: true` would put `True` into `text_block_indices`, and
+    `1 in {True}` holds -- so the delta of the **tool** block with index 1 would be
+    treated as a known text block. That is the progress preview allowlist's safety
+    property bypassed by aliasing, not mere type fastidiousness. Likewise this
+    filter also blocks `None` (what `.get()` returns when the field is missing),
+    otherwise "a text block missing its index" and "a tool block missing its index"
+    would alias each other.
     """
     if isinstance(value, bool):
         return None
@@ -4668,29 +5511,34 @@ def _protocol_key(value):
 
 
 class _CodexStreamState:
-    """一次 `codex exec --json` 串流的累積狀態。分開的理由與 `_ClaudeStreamState`
-    相同：讀取那一半綁死在 subprocess ＋ 看門狗上，折疊這一半是純資料轉換。"""
+    """The accumulated state of one `codex exec --json` stream. Split out for the
+    same reason as `_ClaudeStreamState`: the reading half is tied to the subprocess
+    + watchdog, while this folding half is a pure data transformation."""
 
     def __init__(self, session_id: str | None = None) -> None:
         self.thread_id = session_id
         self.answer = ""
         self.usage: dict = {}
-        # 失敗事件的文字，rc!=0 時用來分類（見 `_codex_stream_verdict`）。
+        # Text from failure events, used to classify rc!=0 (see
+        # `_codex_stream_verdict`).
         self.failure_texts: list = []
 
     def feed(self, raw_line: str, on_text=None) -> None:
-        """把一行原始 stdout 折疊進狀態。**永遠不 raise**，也不做任何 I/O。
+        """Fold one raw stdout line into the state. **Never raises**, and does no
+        I/O.
 
-        與 Claude 那側同一個選擇：解不開的行**跳過、繼續讀**，不中止整輪。
+        The same choice as the Claude side: an unparseable line is **skipped and
+        reading continues**, without aborting the round.
         """
         try:
             event = _json.loads(raw_line)
         except (ValueError, TypeError):
-            return  # 非 JSON 雜訊，或 `raw_line` 根本不是 str/bytes（機制 C）
+            return  # non-JSON noise, or `raw_line` is not even str/bytes (mechanism C)
         if not isinstance(event, dict):
-            # 合法 JSON 但不是物件（`null` / 數字 / 陣列）：舊版會在 `event.get(...)`
-            # 丟 AttributeError，讓呼叫端拿到一個非型別化的例外（abort／resume／
-            # 用量上限全都分類不到）。跟雜訊同樣處理。
+            # Legal JSON but not an object (`null` / a number / an array): the old
+            # version raised AttributeError at `event.get(...)`, handing the caller
+            # an untyped exception (abort / resume / usage limit all failed to
+            # classify it). Treated the same as noise.
             return
         etype = event.get("type")
         if etype == "thread.started":
@@ -4703,16 +5551,19 @@ class _CodexStreamState:
                     try:
                         on_text(self.answer)
                     except Exception:  # pylint: disable=broad-except  # nosec B110
-                        pass  # 進度更新失敗絕不影響主串流
+                        pass  # a failed progress update never affects the main stream
         elif etype == "turn.completed":
             self.usage = _event_dict(event, "usage")
         else:
-            # 失敗類事件的文字要留下來。codex 的用量上限／伺服器錯誤訊息不一定
-            # 會出現在 stderr（走 JSON 事件時常常只在事件裡），而 rc!=0 的分類就靠
-            # 這段文字——收不到就會退回舊行為：白白重開一個新工作階段，然後把整個
-            # 無人值守任務判死。事件型別名稱在不同 codex 版本間會變（本機是
-            # 0.145.0），所以這裡**不寫死型別**，只要事件裡帶了 error／message／
-            # text 欄位就收，寧可多收也不要漏。
+            # Keep the text of failure-type events. codex's usage-limit / server
+            # error messages do not necessarily appear on stderr (with JSON events
+            # they are often only in the event), and the rc!=0 classification relies
+            # on this text -- without it, it falls back to the old behaviour:
+            # reopening a new session for nothing, then declaring the whole
+            # unattended task dead. Event type names change between codex versions
+            # (0.145.0 locally), so the type is **not hard-coded** here; any event
+            # carrying an error / message / text field is kept -- better to keep too
+            # much than to miss one.
             for key in ("error", "message", "text", "reason"):
                 val = event.get(key)
                 if isinstance(val, dict):
@@ -4724,16 +5575,20 @@ class _CodexStreamState:
 
 def _codex_stream_verdict(state: "_CodexStreamState", rc: int, err_text: str,
                           session_id: str | None) -> str:
-    """判定一次**已經結束**的 `codex exec` 串流：回傳 `"ok"` 或 raise。
+    """Judge a `codex exec` stream that has **already ended**: return `"ok"` or
+    raise.
 
-    分類順序與 Claude 那一側完全一致，而且**順序就是規則本身**：
-      用量上限 → 暫時性故障 → 連不上伺服器 → （最後才是）丟掉工作階段重開的
-      resume 重試。
-    resume 重試對「額度用完」與「伺服器過載」都毫無幫助，只是再燒一次呼叫、又把可以
-    續接的對話丟掉；2026-09-05 之前 codex 這一側**只有**那條路。
+    The classification order is exactly the same as the Claude side, and **the
+    order is the rule itself**:
+      usage limit → transient failure → cannot reach the server → (only last) the
+      resume retry that throws the session away and reopens it.
+    The resume retry does nothing at all for "quota used up" or "server
+    overloaded"; it only burns another call and throws away a conversation that
+    could have been resumed; before 2026-09-05 the codex side had **only** that
+    path.
 
-    判定文字同時吃 stderr 與 JSON 失敗事件：codex 走事件輸出時，上限訊息常常只出現
-    在事件裡，stderr 是空的。
+    The verdict text takes both stderr and JSON failure events: when codex emits
+    events, the limit message often appears only in the event, with stderr empty.
     """
     if rc == 0:
         return "ok"
@@ -4758,18 +5613,22 @@ def _dorossi_codex_argv(exe: str, *, session_id: str | None = None,
                         extra_dir: str | None = None,
                         model: str | None = None,
                         tools_mode: str | None = None) -> list:
-    """`codex exec` 的 argv（含 `exe`）。純函式：不碰檔案、不起行程、不讀環境。
+    """The argv (including `exe`) for `codex exec`. Pure function: touches no
+    files, starts no process, reads no environment.
 
-    從 `_dorossi_via_codex` 抽出來（2026-09-23，行為不變——除了新增的 `-m`），理由
-    與 `_dorossi_cc_argv` 同一條：argv 是這條路上唯一「使用者輸入有機會變成 CLI 參數」
-    的地方，抽成純函式才測得動每一種組合。
+    Extracted from `_dorossi_via_codex` (2026-09-23, behaviour unchanged -- apart
+    from the newly added `-m`), for the same reason as `_dorossi_cc_argv`: the argv
+    is the only place on this path where "user input could become a CLI argument",
+    and only as a pure function can every combination be tested.
 
-    `model` 是 `dorossi_resolve_model` 查表命中的**完整 model id**；None ＝不帶
-    `-m`、用 CLI 自己的預設。**使用者輸入永不原樣走到這裡**——這個參數的每一個可能
-    值都來自 allowlist 查表的結果。
+    `model` is the **full model id** the `dorossi_resolve_model` lookup hit; None =
+    no `-m`, use the CLI's own default. **User input never reaches here
+    verbatim** -- every possible value of this argument comes from the allowlist
+    lookup's result.
 
-    `tools_mode` 省略時在**呼叫當下**讀模組全域 `DOROSSI_CC_TOOLS`（同
-    `_dorossi_cc_argv`）。判準仍是「剛好等於 `full` 才解鎖」，其餘一律重申唯讀沙箱。
+    When `tools_mode` is omitted the module global `DOROSSI_CC_TOOLS` is read **at
+    call time** (as in `_dorossi_cc_argv`). The criterion is still "unlocks only
+    when exactly `full`"; anything else reasserts the read-only sandbox.
     """
     if tools_mode is None:
         tools_mode = DOROSSI_CC_TOOLS
@@ -4781,8 +5640,9 @@ def _dorossi_codex_argv(exe: str, *, session_id: str | None = None,
         if extra_dir:
             args += ["--add-dir", extra_dir]
     if model:
-        # 每輪 `/model` 覆蓋。`exec` 與 `exec resume` 都收 `-m/--model`（2026-09-23
-        # 在 CLI 0.145.0 實測兩個子指令的 help 都列著它）。不帶就是 CLI 預設。
+        # The per-round `/model` override. Both `exec` and `exec resume` accept
+        # `-m/--model` (on 2026-09-23, both subcommands' help in CLI 0.145.0 listed
+        # it). Without it, the CLI default applies.
         args += ["-m", model]
     if tools_mode == "full":
         args.append("--dangerously-bypass-approvals-and-sandbox")
@@ -4803,25 +5663,29 @@ async def _dorossi_via_codex(
         model: str | None = None) -> tuple:
     """Run one non-interactive Codex turn; return answer, thread id and usage.
 
-    `model` ＝這一輪 `/model` 解析出來的完整 model id（None ＝不帶旗標）。
-    2026-09-23 之前這條路**完全不帶 `-m`**，所以 `/model` 對 codex 是安靜失效的。"""
+    `model` = the full model id parsed from this round's `/model` (None = no
+    flag). Before 2026-09-23 this path **passed no `-m` at all**, so `/model`
+    silently did nothing for codex."""
     exe = find_codex_executable()
     if exe is None:
         raise FileNotFoundError("codex CLI not found on PATH")
     effective_cwd = workdir or str(DOROSSI_CC_WORKDIR)
     try:
         cwd_path = Path(effective_cwd)
-        # 只有落在我們自己管的子樹裡才自動建目錄；判準是單一決策點，不要在
-        # 這裡自己再寫一次 `.parents` 比對。
+        # Create the directory automatically only inside the subtree we manage;
+        # the criterion is a single decision point, so do not write another
+        # `.parents` comparison here.
         if _dorossi_cwd_is_managed(cwd_path):
             cwd_path.mkdir(parents=True, exist_ok=True)
     except Exception:  # pylint: disable=broad-except
         pass
-    # 存著的目錄可能早就不在了：在 spawn 之前講清楚，而不是讓子行程丟一個會被判成
-    # 「CLI 無法使用」的 NotADirectoryError。見 `_dorossi_require_workdir`。
+    # The stored directory may be long gone: say so clearly before spawning,
+    # rather than letting the child raise a NotADirectoryError that would be judged
+    # "CLI unusable". See `_dorossi_require_workdir`.
     _dorossi_require_workdir(effective_cwd)
 
-    # argv 由 `_dorossi_codex_argv` 組（純函式），**不要在這裡再寫一份**。
+    # The argv is built by `_dorossi_codex_argv` (a pure function); **do not write
+    # another copy here**.
     args = _dorossi_codex_argv(
         exe, session_id=session_id, workdir=effective_cwd,
         extra_dir=extra_dir, model=model)
@@ -4836,11 +5700,13 @@ async def _dorossi_via_codex(
         *args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, cwd=effective_cwd,
         limit=16 * 1024 * 1024)
-    # 回呼／stdin 一律包起來（與 _dorossi_via_claude_code 對齊）：這些都是「輔助動作」，
-    # 失敗絕不可把整輪打掉。尤其 abort_check 命中時會先 kill 行程，緊接著的 stdin 寫入
-    # 必然 BrokenPipe——若不吞掉，例外會在下面 try/finally「之外」逸出，stderr_task 變成
-    # 沒人 await 的孤兒任務，且呼叫端拿到的是非型別化的例外（abort 路徑該走的是 kill →
-    # EOF → rc!=0）。
+    # Callbacks / stdin are always wrapped (in line with _dorossi_via_claude_code):
+    # these are all "auxiliary actions", and their failure must never take the whole
+    # round down. In particular, when abort_check hits, the process is killed first
+    # and the stdin write right after is bound to BrokenPipe -- if not swallowed,
+    # the exception would escape "outside" the try/finally below, stderr_task would
+    # become an orphaned task nobody awaits, and the caller would get an untyped
+    # exception (the abort path should go kill -> EOF -> rc!=0).
     if on_proc is not None:
         try:
             on_proc(proc)
@@ -4862,7 +5728,7 @@ async def _dorossi_via_codex(
     except Exception:  # pylint: disable=broad-except
         pass
     state = _CodexStreamState(session_id)
-    clock = _DorossiWatchClock()        # 扣掉主機睡著的時間（見 `_dorossi_readline_watched`）
+    clock = _DorossiWatchClock()        # minus host sleep time (see `_dorossi_readline_watched`)
     deadline = clock.now() + _dorossi_cc_hard_limit_sec()
     try:
         while True:
@@ -4882,26 +5748,32 @@ async def _dorossi_via_codex(
             proc.kill()
         except ProcessLookupError:
             pass
-        # 有上限地收（不要裸的 `await proc.wait()`）：kill 之後管線若仍被孫行程握著，
-        # `wait()` 要等 EOF 才會回來，也就是永遠不會——見 `_dorossi_reap_proc`。
+        # Reap with a bound (no bare `await proc.wait()`): if the pipes are still
+        # held by a grandchild after the kill, `wait()` only returns at EOF, i.e.
+        # never -- see `_dorossi_reap_proc`.
         await _dorossi_reap_proc(proc)
         if silence_limit is not None:
             raise _DorossiLoopSilence("codex loop output silence")
         raise TimeoutError("codex invocation timed out")
     finally:
-        # 先確保子行程真的結束，才能 await stderr_task。`_read_stream_all` 讀到 EOF 才
-        # 回來，而 EOF 只在子行程結束（管線關閉）後才發生——所以只要有任何「非預期」
-        # 離開路徑（回呼丟例外、任務被取消、readline 超出緩衝上限）讓行程還活著就
-        # 直接 await，這裡會**永遠卡住**，而且是在 wait_for 之外、沒有任何看門狗守著，
-        # 等於握著該 session 的鎖永久掛死。正常路徑（rc 已取得或上面已 kill 過）
-        # returncode 已設定，這段是 no-op。
+        # Make sure the child has really ended before awaiting stderr_task.
+        # `_read_stream_all` returns only at EOF, and EOF only happens after the
+        # child ends (pipes closed) -- so on any "unexpected" exit path (a callback
+        # raising, the task cancelled, readline exceeding the buffer limit) that
+        # leaves the process alive, awaiting it directly would **hang forever**,
+        # outside wait_for with no watchdog guarding it, which amounts to holding
+        # that session's lock hung for good. On the normal path (rc obtained, or
+        # killed above) returncode is already set and this is a no-op.
         #
-        # **2026-09-09 更正：光是「先 kill 再 await」還不夠。** 實測（CPython 3.14 /
-        # Windows）`await proc.wait()` 自己就是無限的——它要等**所有管線 EOF**，而
-        # `proc.kill()` 是 `TerminateProcess`、帶不走繼承了管線的孫行程。所以 kill
-        # 之後的等待與 stderr 的抽水**兩個都要有上限**，逾時之後把任務收乾淨。
-        # 同步的 kill 保留在這裡（不要挪進 `_dorossi_reap_proc` 的「先等再殺」順序）：
-        # 非預期離開路徑上我們不保證還有機會跑完任何 await。
+        # **Correction 2026-09-09: "kill first, then await" alone is not enough.**
+        # Measured (CPython 3.14 / Windows): `await proc.wait()` is itself unbounded
+        # -- it waits for **every pipe to reach EOF**, and `proc.kill()` is
+        # `TerminateProcess`, which cannot take along a grandchild that inherited
+        # the pipes. So both the wait after the kill and the stderr draining **need
+        # a bound**, and the tasks are reaped cleanly after a timeout.
+        # The synchronous kill stays here (do not move it into
+        # `_dorossi_reap_proc`'s "wait, then kill" order): on an unexpected exit
+        # path we are not guaranteed a chance to finish any await.
         if proc.returncode is None:
             try:
                 proc.kill()
@@ -4919,17 +5791,22 @@ async def _dorossi_via_codex(
 
 
 class _ClaudeStreamState:
-    """一次 `claude -p --output-format stream-json` 串流的累積狀態。
+    """The accumulated state of one `claude -p --output-format stream-json` stream.
 
-    **為什麼要跟叫用分開**：讀取那一半綁死在 subprocess ＋ 兩段式看門狗 ＋
-    `proc.kill()` 上，要測就得真的起一個後端；折疊這一半純粹是「事件 → 狀態」的
-    資料轉換，抽出來就能用假串流餵。錯誤分類（用量上限／暫時性過載／輸出靜默）
-    要用的資料全部由這裡累積，而那三條路正是 2026-09-05 事故的現場——判定本身在
-    `_claude_stream_verdict`。
+    **Why it is split from the invocation**: the reading half is tied to the
+    subprocess + the two-stage watchdog + `proc.kill()`, and testing it means
+    really starting a backend; this folding half is purely an "events -> state"
+    data transformation, and once extracted it can be fed a fake stream. All the
+    data the error classification needs (usage limit / transient overload /
+    output silence) is accumulated here, and those three paths are exactly the
+    scene of the 2026-09-05 incident -- the verdict itself is in
+    `_claude_stream_verdict`.
 
-    `kill_reason` 由**讀取端**設定（看門狗砍掉行程時），不是折疊端設的：折疊端看
-    不到時間，也不該看得到。None 代表「串流自己走到 EOF」——注意那**不等於**成功，
-    後端被砍掉、管線斷掉同樣是 EOF，區分它們的是 rc（見 `_claude_stream_verdict`）。
+    `kill_reason` is set by the **reading side** (when a watchdog kills the
+    process), not by the folding side: the folding side cannot see time, and should
+    not. None means "the stream reached EOF by itself" -- note that this is **not
+    the same as** success; a killed backend or a broken pipe is EOF too, and what
+    tells them apart is the rc (see `_claude_stream_verdict`).
     """
 
     _STDOUT_TAIL_LINES = 25
@@ -4937,70 +5814,92 @@ class _ClaudeStreamState:
     def __init__(self, session_id: str | None = None) -> None:
         self.sid = session_id
         self.answer = ""
-        # 串流進度（單則訊息 live 預覽）狀態：累積「答案文字」的 text_delta。
-        # 只累積 type=="text" 的 content block；tool_use 的 input_json_delta 不算，
-        # 也不會被送到 Discord——進度只反映已淨化的答案文字。
+        # Streaming-progress (single-message live preview) state: accumulates the
+        # text_delta of the "answer text". Only type=="text" content blocks are
+        # accumulated; a tool_use's input_json_delta does not count and is never
+        # sent to Discord -- progress reflects only the sanitised answer text.
         self.stream_text = ""
-        self.text_block_indices: set = set()   # 已知為 text 型別的 content block index
-        self.pending_tools: set = set()        # 已發出但尚未收到 result 的 tool_use id
-        # CLI 目前回報的背景工作（`system`/`background_tasks_changed` 的 task_id）。
-        # 與 `pending_tools` 一樣是閒置看門狗的抑制條件：模型可以在回合結尾留下一個
-        # 還沒觸發的監看工作，CLI 先送出 `result`、然後**完全靜默**地等它觸發，再重新
-        # 叫模型、送第二則 `result`。背景工作不是 pending 的 tool_use，所以只看
-        # `pending_tools` 會把這段等待當成閒置砍掉（2026-09-19 事故）。
+        self.text_block_indices: set = set()   # content block indices known to be text
+        self.pending_tools: set = set()        # tool_use ids issued but with no result yet
+        # The background tasks the CLI currently reports (task_ids of
+        # `system`/`background_tasks_changed`). Like `pending_tools`, a suppressing
+        # condition for the idle watchdog: the model can leave a not-yet-triggered
+        # watch task at the end of a turn, the CLI sends `result` first, then waits
+        # **in complete silence** for it to trigger, calls the model again and sends
+        # a second `result`. A background task is not a pending tool_use, so
+        # looking only at `pending_tools` would cut that wait as idle (the
+        # 2026-09-19 incident).
         self.background_tasks: set = set()
-        # 在 `--output-format stream-json` 模式下，`claude -p` 失敗時會把錯誤寫進
-        # STDOUT 的 `result` 事件（而非 stderr）。保留最後一個 result 事件物件，
-        # 以及一段有界的 stdout 尾巴，供 rc != 0 時診斷真正原因。
+        # In `--output-format stream-json` mode, a failing `claude -p` writes the
+        # error into a `result` event on STDOUT (not stderr). Keep the last result
+        # event object and a bounded stdout tail, to diagnose the real cause when
+        # rc != 0.
         self.last_result_ev: dict = {}
         self.stdout_tail: list = []
-        # 本次呼叫最後一則 `rate_limit_event` 給的重設時刻（epoch 秒）。撞到用量上限時
-        # 用它決定要睡多久——這是唯一結構化、來自伺服器配額標頭的來源。
+        # The reset time (epoch seconds) given by this call's last
+        # `rate_limit_event`. On a usage-limit hit it decides how long to sleep --
+        # the only structured source, straight from the server's quota headers.
         self.rate_reset: float | None = None
-        # 同一則事件的 status（allowed / allowed_warning / rejected）。用途只有一個：
-        # 否決成功回合裡的文字判定（見 `_dorossi_cc_limit_text_counts`）。
+        # The same event's status (allowed / allowed_warning / rejected). It has
+        # only one use: vetoing the text verdict in a successful round (see
+        # `_dorossi_cc_limit_text_counts`).
         self.rate_status: str | None = None
-        # init 事件的 `claude_code_version`。唯一用途：判斷這次 `--resume` 回報的
-        # `total_cost_usd`／`modelUsage` 是每次叫用還是工作階段累計（2.1.277 起是後者，
-        # 見 `_dorossi_cc_account_round`）。bot 每輪重新起 CLI，CLI 又會自動更新，所以
-        # 版本要**每一次叫用**從串流裡讀，不能在 bot 啟動時問一次就算數。
+        # The init event's `claude_code_version`. Its only use: judging whether this
+        # `--resume`'s reported `total_cost_usd` / `modelUsage` are per invocation or
+        # session-cumulative (the latter from 2.1.277 on, see
+        # `_dorossi_cc_account_round`). The bot starts the CLI afresh every round and
+        # the CLI auto-updates, so the version must be read from the stream on
+        # **every invocation**, not asked once when the bot starts.
         self.cli_version: str | None = None
-        # init 事件有沒有 `memory_paths` 這個鍵（None ＝還沒看到 init）。實測（2.1.276）
-        # 一般模式兩種工具模式都有、`--bare`／`CLAUDE_CODE_SIMPLE=1` 整個鍵不存在——
-        # 那是「CLI 沒讀登入、沒讀指示檔」唯一看得到的結構化訊號（`apiKeySource` 在
-        # bare 與一般模式都是 "none"，分不出來）。用在啟動警告與未登入那一行診斷。
+        # Whether the init event has the `memory_paths` key (None = no init seen
+        # yet). Measured (2.1.276): present in normal mode under both tool modes,
+        # absent entirely with `--bare` / `CLAUDE_CODE_SIMPLE=1` -- the only visible
+        # structured signal that "the CLI read no sign-in and no instruction files"
+        # (`apiKeySource` is "none" in both bare and normal mode and cannot tell
+        # them apart). Used by the start-up warning and the not-logged-in
+        # diagnostic line.
         self.init_memory_paths: bool | None = None
-        # init 事件的 `apiKeySource`（CLI 的來源**標籤**，例如 "none"／"ANTHROPIC_API_KEY"，
-        # 不是金鑰本身）。"none" ＝走登入；其他值 ＝改用 API key 計費。只給啟動警告用，
-        # 印之前還要過 `_DOROSSI_API_KEY_SOURCE_LABEL_RE`。
+        # The init event's `apiKeySource` (the CLI's source **label**, e.g. "none" /
+        # "ANTHROPIC_API_KEY", not the key itself). "none" = using the sign-in; any
+        # other value = billing through an API key instead. Used only by the
+        # start-up warning, and it must pass `_DOROSSI_API_KEY_SOURCE_LABEL_RE`
+        # before being printed.
         self.api_key_source: str | None = None
-        # 最後一則 `system`/`api_retry` 的錯誤類別與狀態碼（CLI 自己分好的類，詞彙見
-        # `_DOROSSI_AUTH_RETRY_ERRORS` 上方）。**每一則都覆寫**：後來一次非驗證類的重試
-        # 要能蓋掉前面那次驗證類的，否則早先一次暫時的 401 會讓整輪被判成未登入。
+        # The error class and status code of the last `system`/`api_retry` (the
+        # CLI's own classification; vocabulary above `_DOROSSI_AUTH_RETRY_ERRORS`).
+        # **Overwritten by every one**: a later non-auth retry must be able to
+        # override an earlier auth one, otherwise one earlier transient 401 would
+        # get the whole round judged not-logged-in.
         self.retry_error: str | None = None
         self.retry_status: int | None = None
         self.kill_reason: str | None = None    # None / "idle" / "hard" / "silence"
 
     @staticmethod
     def _content_blocks(ev: dict) -> list:
-        """`ev["message"]["content"]`，任何不是 list 的形狀一律回 `[]`（機制 A/B）。
+        """`ev["message"]["content"]`; any shape other than a list returns `[]`
+        (mechanisms A/B).
 
-        `ev.get("message", {})` 的預設值**只在鍵不存在時生效**——鍵在而值是 `null`
-        時不會用到它，於是 `.get("content")` 丟 AttributeError；`content` 是數字時
-        `for blk in 5` 丟 TypeError。兩者都違反 `feed` 的「永遠不 raise」承諾。
+        The default of `ev.get("message", {})` **only applies when the key is
+        missing** -- with the key present and the value `null` it is not used, so
+        `.get("content")` raises AttributeError; with `content` a number,
+        `for blk in 5` raises TypeError. Both break `feed`'s "never raises" promise.
         """
         blocks = _event_dict(ev, "message").get("content")
         return blocks if isinstance(blocks, list) else []
 
     @staticmethod
     def _background_task_ids(tasks) -> set:
-        """`background_tasks_changed` 的 `tasks` 快照 → task_id 集合（機制 A/B）。
+        """The `tasks` snapshot of `background_tasks_changed` -> a set of task_ids
+        (mechanisms A/B).
 
-        那個事件帶的是**完整快照**，不是增量，所以呼叫端整個取代舊集合。形狀不對
-        （`tasks` 不是 list、項目不是 dict、`task_id` 不可雜湊或缺漏）一律丟掉，
-        **不是保留舊值**：理由同 `_protocol_key`——認不得的快照若讓舊集合留著，會
-        安靜地一直抑制閒置看門狗；丟掉的失敗方向是「看門狗可能早一點開火」，有界而且
-        大聲（`_claude_stream_verdict` 在已經拿到成功答案時還會把答案留下）。
+        That event carries a **complete snapshot**, not an increment, so the caller
+        replaces the old set entirely. A wrong shape (`tasks` not a list, an item not
+        a dict, `task_id` unhashable or missing) is always dropped, **not kept as the
+        old value**: for the same reason as `_protocol_key` -- an unrecognised
+        snapshot that left the old set in place would quietly keep suppressing the
+        idle watchdog; dropping fails in the direction "the watchdog may fire a bit
+        early", bounded and loud (`_claude_stream_verdict` still keeps the answer
+        when a successful one is already in hand).
         """
         if not isinstance(tasks, list):
             return set()
@@ -5014,47 +5913,59 @@ class _ClaudeStreamState:
         return ids
 
     def _keep_in_tail(self, raw_line) -> None:
-        """把一行記進有界的 stdout 尾巴（`failure_reason` 的第二順位來源）。空行不記。"""
+        """Record a line in the bounded stdout tail (the second-ranked source of
+        `failure_reason`). Empty lines are not recorded."""
         if raw_line:
             self.stdout_tail.append(raw_line)
             if len(self.stdout_tail) > self._STDOUT_TAIL_LINES:
                 del self.stdout_tail[0]
 
     def feed(self, raw_line: str, on_text=None) -> None:
-        """把一行原始 stdout 折疊進狀態。**永遠不 raise**，也不做任何 I/O。
+        """Fold one raw stdout line into the state. **Never raises**, and does no
+        I/O.
 
-        壞行的處置是**跳過、繼續讀**，不是中止整輪：串流裡混進非 JSON 雜訊
-        （CLI 的警告、被截斷的半行）是常態，而為了一行雜訊丟掉整輪已經跑完的工作
-        代價高得多。真正的失敗訊號是 rc 與 `result` 事件，不是某一行解不開。
+        A bad line is **skipped and reading continues**, rather than aborting the
+        round: non-JSON noise mixed into the stream (CLI warnings, truncated half
+        lines) is normal, and throwing away a whole round's finished work over one
+        line of noise costs far more. The real failure signals are the rc and the
+        `result` event, not one line failing to parse.
         """
         try:
             ev = _json.loads(raw_line)
         except (ValueError, TypeError):
-            # ValueError = 非 JSON 雜訊（含空行、被截斷的半行）。
-            # TypeError  = `raw_line` 根本不是 str/bytes（機制 C）：`json.loads(None)`
-            #              丟的是 TypeError，只收 ValueError 會讓它逸出。
+            # ValueError = non-JSON noise (including empty lines and truncated half
+            #              lines).
+            # TypeError  = `raw_line` is not even str/bytes (mechanism C):
+            #              `json.loads(None)` raises TypeError, and catching only
+            #              ValueError would let it escape.
             self._keep_in_tail(raw_line)
             return
-        # 逐 token 的 `stream_event` 不進診斷尾巴。它們一輪有上百行，25 行的尾巴會被
-        # 它們塞滿，把真正說明失敗的那幾行（非 JSON 的錯誤、`system`／`assistant` 事件）
-        # 擠出去；而 `failure_reason` 在沒有 `result` 時印的就是這條尾巴。
+        # Per-token `stream_event`s stay out of the diagnostic tail. There are
+        # hundreds of them per round, and they would fill the 25-line tail, pushing
+        # out the lines that actually explain a failure (non-JSON errors, `system` /
+        # `assistant` events); and without a `result`, this tail is exactly what
+        # `failure_reason` prints.
         if not (isinstance(ev, dict) and ev.get("type") == "stream_event"):
             self._keep_in_tail(raw_line)
         if not isinstance(ev, dict):
-            # 合法 JSON 但不是物件（`null` / 數字 / 陣列）。舊版直接 `ev.get(...)`，
-            # 那會丟 AttributeError，而 claude 這一側的讀取迴圈**沒有** try/finally
-            # ——例外會逸出整支函式，子行程與 stderr 抽水任務都沒人收，等於漏掉一個
-            # 行程還握著那個 session 的鎖。跟雜訊同樣處理。
+            # Legal JSON but not an object (`null` / a number / an array). The old
+            # version called `ev.get(...)` directly, which raises AttributeError, and
+            # the claude side's read loop has **no** try/finally -- the exception
+            # would escape the whole function, nobody would reap the child or the
+            # stderr-draining task, and a leaked process would still hold that
+            # session's lock. Treated the same as noise.
             return
         etype = ev.get("type")
         if etype == "stream_event":
-            # 來自 --include-partial-messages 的逐 token 串流。只取「答案文字」的
-            # text_delta（type=="text" 的 content block）累積給 on_text；
-            # tool_use 的 input_json_delta 不取，確保進度不外洩工具呼叫內容。
+            # Per-token streaming from --include-partial-messages. Only the "answer
+            # text" text_delta (content blocks with type=="text") is accumulated for
+            # on_text; a tool_use's input_json_delta is not, so progress never leaks
+            # tool-call content.
             sev = _event_dict(ev, "event")
             stype = sev.get("type")
-            # 兩個分支都以這個索引當鍵。`None` 代表「認不得的索引」——**兩邊都丟掉**，
-            # 所以登記與比對永遠對稱（見 `_protocol_key` 的別名說明）。
+            # Both branches key on this index. `None` means "an unrecognised index"
+            # -- **dropped on both sides**, so registering and matching are always
+            # symmetric (see the aliasing note on `_protocol_key`).
             index = _protocol_key(sev.get("index"))
             if stype == "content_block_start":
                 blk = _event_dict(sev, "content_block")
@@ -5072,30 +5983,35 @@ class _ClaudeStreamState:
                             try:
                                 on_text(self.stream_text)
                             except Exception:  # pylint: disable=broad-except  # nosec B110
-                                pass  # 進度更新失敗絕不影響主串流
+                                pass  # a failed progress update never affects the main stream
             return
         if etype == "rate_limit_event":
-            # 每一次呼叫都會來一則，帶著這個配額視窗真正的重設時刻。留最後一則：
-            # 撞上限時就能**睡到那一刻**，而不是走「15 分鐘起跳、每次加倍」的猜。
-            # 見 `_dorossi_rate_limit_reset`。
+            # One arrives on every call, carrying this quota window's real reset
+            # time. Keep the last one: on a limit hit it can **sleep until that
+            # moment** instead of the "start at 15 minutes, double each time" guess.
+            # See `_dorossi_rate_limit_reset`.
             got = _dorossi_rate_limit_reset(ev)
             if got is not None:
                 self.rate_reset = got
-            # status **每一則都覆寫**（讀不到就變 None），不像上面那樣保留上一則的值：
-            # 前一則說 allowed、這一則是讀不懂的拒絕時，留著舊的 allowed 會否決掉一則
-            # 真的通知。None 的失敗方向是「不否決」，退回文字判定。
+            # status is **overwritten by every event** (None when unreadable),
+            # unlike the above which keeps the previous value: when the previous one
+            # said allowed and this one is an unreadable refusal, keeping the old
+            # allowed would veto a real notice. None fails in the direction "no
+            # veto", falling back to the text verdict.
             self.rate_status = _dorossi_rate_limit_status(ev)
             return
         if etype == "system":
             if ev.get("session_id"):
                 self.sid = ev["session_id"]
-            # 真實串流的 system 事件都帶 session_id，所以這一條**不能**寫成上面那個
-            # 分支的 elif，否則背景工作快照永遠讀不到。
+            # Real streams' system events all carry session_id, so this **must not**
+            # be an elif of the branch above, or the background-task snapshot would
+            # never be read.
             if ev.get("subtype") == "init":
                 version = ev.get("claude_code_version")
                 if isinstance(version, str) and version.strip():
                     self.cli_version = version.strip()[:64]
-                # 看的是「鍵在不在」，不是值：bare 模式整個鍵不存在（見 __init__）。
+                # It looks at "is the key there", not the value: in bare mode the key
+                # is absent entirely (see __init__).
                 self.init_memory_paths = "memory_paths" in ev
                 source = ev.get("apiKeySource")
                 self.api_key_source = source[:64] if isinstance(source, str) else None
@@ -5114,26 +6030,30 @@ class _ClaudeStreamState:
             for blk in self._content_blocks(ev):
                 if not isinstance(blk, dict) or blk.get("type") != "tool_result":
                     continue
-                # `discard` 跟 `add` 一樣會對不可雜湊的值丟 TypeError，所以移除這一側
-                # 也要過同一道濾網——而且**必須是同一道**，否則登記得進去、卻移除不掉。
+                # `discard`, like `add`, raises TypeError on an unhashable value, so
+                # the removal side must pass the same filter too -- and it **must be
+                # the same one**, or something could be registered yet never removed.
                 tool_id = _protocol_key(blk.get("tool_use_id"))
                 if tool_id:
                     self.pending_tools.discard(tool_id)
         elif etype == "result":
-            self.last_result_ev = ev  # 保留整個事件（含 subtype/is_error/...）供診斷
-            # 只有字串才算答案。非字串（`null`／數字／物件）代表這個事件沒有可用的
-            # 答案文字，而不是「答案是它的 repr」——原始事件整份留在 `last_result_ev`
-            # 裡，分類（用量上限／預算閘）照樣看得到它。
+            self.last_result_ev = ev  # keep the whole event (subtype/is_error/...) for diagnosis
+            # Only a string counts as an answer. A non-string (`null` / a number / an
+            # object) means this event has no usable answer text, not "the answer is
+            # its repr" -- the raw event stays whole in `last_result_ev`, where the
+            # classification (usage limit / budget gate) still sees it.
             raw_answer = ev.get("result")
             self.answer = raw_answer.strip() if isinstance(raw_answer, str) else ""
             if ev.get("session_id"):
                 self.sid = ev["session_id"]
 
     def failure_reason(self, stderr_tail: str = "") -> str:
-        """rc != 0 時組出的診斷字串（只進 stderr，不進對話平台）。
+        """The diagnostic string assembled when rc != 0 (goes only to stderr, never
+        to the chat platform).
 
-        在 stream-json 模式下 `claude -p` 把錯誤寫到 STDOUT 的 result 事件而非
-        stderr，所以來源依序是：result 事件 → stdout 尾巴 → stderr。
+        In stream-json mode `claude -p` writes errors into the result event on
+        STDOUT rather than stderr, so the sources in order are: result event ->
+        stdout tail -> stderr.
         """
         if self.last_result_ev:
             parts = []
@@ -5145,8 +6065,9 @@ class _ClaudeStreamState:
         else:
             reason = ""
         if not reason:
-            # `str(x)`：機制 C 修好之後非 str 的行也進得了 `stdout_tail`，
-            # 而 `join` 對非 str 元素會丟 TypeError——診斷路徑同樣不該炸。
+            # `str(x)`: since mechanism C was fixed, non-str lines can get into
+            # `stdout_tail` too, and `join` raises TypeError on non-str elements --
+            # the diagnostic path must not blow up either.
             reason = "\n".join(str(x) for x in self.stdout_tail)[-4000:]
         if not reason:
             reason = stderr_tail[-400:]
@@ -5155,23 +6076,29 @@ class _ClaudeStreamState:
         return reason
 
 
-# CLI 指令列剖析器拒絕不認得的選項時印的那一句（2026-09-19 用 2.1.276 餵一個不存在的
-# 選項實測：`error: unknown option '--tools-bogus-xyz'`、rc=1、stdout 全空）。捕捉組刻意
-# 收斂成「看起來像一個旗標」的形狀，所以印進 log 的只會是旗標名，不會是任意文字。
+# The line the CLI's command-line parser prints when it rejects an unrecognised
+# option (measured 2026-09-19 by feeding 2.1.276 a nonexistent option:
+# `error: unknown option '--tools-bogus-xyz'`, rc=1, stdout completely empty). The
+# capture group is deliberately narrowed to "looks like a flag", so only a flag
+# name can ever be printed into the log, never arbitrary text.
 _CLI_UNKNOWN_OPTION_RE = re.compile(r"unknown option '(--?[A-Za-z0-9][A-Za-z0-9_-]{0,63})'")
 
 
 def _dorossi_cc_rejected_option(state: "_ClaudeStreamState",
                                 stderr_tail: str) -> str | None:
-    """rc != 0 時：CLI 是不是**在開始這一輪之前**就拒絕了我們傳的某個選項？是就回那個
-    選項名，否則 None。純函式、永不 raise。
+    """When rc != 0: did the CLI reject one of the options we passed **before
+    starting the round**? If so return that option name, otherwise None. Pure
+    function, never raises.
 
-    兩個條件都要成立：串流裡**沒有**任何 `result` 事件（有的話回合已經開始了，失敗是
-    別的原因——那些照舊走後面的分類），而且 stderr 有剖析器那一句。只看 stderr 不夠：
-    一個正常開始的回合，它的 stderr 裡剛好出現那串字，不該被說成「CLI 太舊」。"""
+    Both conditions must hold: the stream has **no** `result` event at all (if it
+    has one, the round already started and the failure has another cause -- those
+    still go through the classifications further on), and stderr has the parser's
+    line. Looking at stderr alone is not enough: a round that started normally,
+    whose stderr happens to contain that string, must not be called "CLI too old"."""
     try:
-        # 「沒有 result」在這個狀態物件上是**空 dict**，不是 None（`__init__` 設的就是
-        # `{}`，`failure_reason` 用的也是真值判斷）——寫成 `is not None` 會讓這支永遠回 None。
+        # "No result" on this state object is an **empty dict**, not None
+        # (`__init__` sets it to `{}`, and `failure_reason` also tests truthiness) --
+        # writing `is not None` would make this always return None.
         if state.last_result_ev:
             return None
         match = _CLI_UNKNOWN_OPTION_RE.search((stderr_tail or "")[-4000:])
@@ -5180,42 +6107,52 @@ def _dorossi_cc_rejected_option(state: "_ClaudeStreamState",
         return None
 
 
-# ---- 後端 CLI 沒有可用的登入（2026-09-19 實測後補） -------------------------
+# ---- The backend CLI has no usable sign-in (added after measuring, 2026-09-19) ----
 #
-# 實測（CLI 2.1.276）三種形狀，前兩種是這一段要認的，第三種是 resume 重試**真正**該管的：
+# Measured (CLI 2.1.276), three shapes; the first two are what this section
+# recognises, the third is what the resume retry is **really** for:
 #
-#   | 情境 | rc | 串流 | result |
+#   | Situation | rc | Stream | result |
 #   |---|---|---|---|
-#   | `--bare`（或 `CLAUDE_CODE_SIMPLE=1`），環境沒有 key | 1（1.1 秒）| init（**沒有** `memory_paths`）、assistant、result | `subtype` 仍是 "success"、`is_error` 真、`api_error_status` null、`terminal_reason` "api_error"、文字「Not logged in · Please run /login」 |
-#   | `--bare` ＋ 無效的 `ANTHROPIC_API_KEY` | 1（**190 秒**）| 十則 `system`/`api_retry`（`error` "authentication_failed"、`error_status` 401），再 assistant、result | `api_error_status` **401**、文字「Failed to authenticate. API Error: 401 API key is invalid.」 |
-#   | `--resume <不存在的 id>` | 1 | result | `subtype` "error_during_execution"、`result` null、`errors` ["No conversation found …"] |
+#   | `--bare` (or `CLAUDE_CODE_SIMPLE=1`), no key in the environment | 1 (1.1 s) | init (**no** `memory_paths`), assistant, result | `subtype` still "success", `is_error` true, `api_error_status` null, `terminal_reason` "api_error", text "Not logged in · Please run /login" |
+#   | `--bare` + an invalid `ANTHROPIC_API_KEY` | 1 (**190 s**) | ten `system`/`api_retry` (`error` "authentication_failed", `error_status` 401), then assistant, result | `api_error_status` **401**, text "Failed to authenticate. API Error: 401 API key is invalid." |
+#   | `--resume <nonexistent id>` | 1 | result | `subtype` "error_during_execution", `result` null, `errors` ["No conversation found …"] |
 #
-# 判準依證據強度排：**結構化欄位優先，文字最後**，文字還要過兩道（與
-# `_dorossi_cc_limit_text_counts` 同一個教訓——比對得很寬的字樣只能用在錯誤訊息上，
-# 不能用在答案上）。
+# The criteria are ranked by strength of evidence: **structured fields first,
+# text last**, and the text must pass two more checks (the same lesson as
+# `_dorossi_cc_limit_text_counts` -- broadly matching phrases may only be used on
+# error messages, never on answers).
 _DOROSSI_AUTH_STATUSES = frozenset({401})
-# `api_retry` 的 `error` 是 CLI 自己分好的類（2.1.276 執行檔內的 SDK schema：
-# authentication_failed、oauth_org_not_allowed、account_on_hold、verification_required、
-# billing_error、rate_limit、overloaded、invalid_request、model_not_found、server_error、
-# unknown、max_output_tokens、cloud_credential_error）。CLI 自己把其中五類標成「卡住、要
-# 人處理」；這裡只收**憑證**那三類——另外兩類（帳號凍結、需要驗證）也不會自己好，但
-# 「在主機上登入」是錯的處方，那兩類照舊走有上限的重試。billing_error 屬用量／付費，
-# 由用量上限那條（402）管。
+# The `error` of `api_retry` is the CLI's own classification (the SDK schema in the
+# 2.1.276 executable: authentication_failed, oauth_org_not_allowed, account_on_hold,
+# verification_required, billing_error, rate_limit, overloaded, invalid_request,
+# model_not_found, server_error, unknown, max_output_tokens, cloud_credential_error).
+# The CLI itself marks five of these as "stuck, needs a human"; only the three
+# **credential** ones are taken here -- the other two (account on hold,
+# verification required) will not fix themselves either, but "sign in on the host"
+# is the wrong prescription, so those two still take the capped retry.
+# billing_error belongs to usage / payment and is handled by the usage-limit
+# branch (402).
 _DOROSSI_AUTH_RETRY_ERRORS = frozenset({
     "authentication_failed", "oauth_org_not_allowed", "cloud_credential_error"})
-# 只有文字、沒有結構化欄位時的退路（bare 模式「Not logged in」就是這樣：狀態碼 null、
-# 沒有 api_retry）。小寫比對。
+# The fallback when there is only text and no structured field (bare mode's "Not
+# logged in" is exactly that: status code null, no api_retry). Matched
+# lower-case.
 _DOROSSI_AUTH_TEXT_MARKERS = ("not logged in", "please run /login", "failed to authenticate")
-# 文字退路的長度上限。CLI 的通知是一行模板（實測兩句 33 與 58 字）；會談到 /login 的
-# 答案是散文。上限與用量上限那條同值、理由同。
+# The length cap for the text fallback. The CLI's notice is a one-line template
+# (the two measured sentences are 33 and 58 characters); an answer that talks about
+# /login is prose. Same cap as the usage-limit branch, for the same reason.
 _DOROSSI_AUTH_NOTICE_MAX_CHARS = 300
 
 
 def _dorossi_api_retry_fields(ev) -> tuple:
-    """`system`/`api_retry` 事件 → (錯誤類別, 狀態碼)。認不得的一律 None。永不 raise。
+    """A `system`/`api_retry` event -> (error class, status code). Anything
+    unrecognised is None. Never raises.
 
-    類別只收字串並截短（只拿來比對成員、印的是比對後的固定詞彙）；狀態碼只收真的整數
-    （`True` 是 int 的子類，要排除）。"""
+    The class is accepted only as a string and truncated (it is only used for
+    membership tests, and what gets printed is the matched fixed vocabulary); the
+    status code is accepted only as a real integer (`True` is a subclass of int
+    and must be excluded)."""
     try:
         error = ev.get("error")
         status = ev.get("error_status")
@@ -5229,26 +6166,35 @@ def _dorossi_api_retry_fields(ev) -> tuple:
 
 def _dorossi_cc_auth_failure(result_ev, *, retry_error: str | None = None,
                              retry_status: int | None = None) -> str | None:
-    """rc != 0 的這一輪，是不是「CLI 沒有可用的登入」？是就回證據標籤，否則 None。
-    純函式、永不 raise。
+    """Was this rc != 0 round "the CLI has no usable sign-in"? If so return an
+    evidence label, otherwise None. Pure function, never raises.
 
-    依序：
+    In order:
 
-    1. **成功完成的 result 一律不是**（`_claude_result_succeeded`）。早先一次 api_retry
-       說 401、後來重試成功、答案也出來了，而行程因為別的原因非零離開——那不是未登入。
-    2. result 的 `api_error_status` 是 401 → 是。**403 不算**：未實測，而且它是
-       permission_error，可能只是這個方案用不到某個模型（`/model` 換一個就好）或中間有
-       代理擋掉，「在主機上登入」會是錯的處方；判準的保守方向是「可重試」（見
-       `dorossi_error_is_fatal`）。
-    3. 最後一則 api_retry 的類別是憑證類 → 是，但 result 的狀態碼必須是空的或 403：
-       result 是**最後**發生的事，它說了別的狀態碼（400、404…）就以它為準，早先的重試
-       事件不能蓋過它。403 在這裡放行，是因為這時 CLI 自己的分類（讀的是錯誤本文，不只
-       是狀態碼）已經說它是憑證問題。
-    4. 前面都沒有結構化證據（狀態碼空的）時才看文字：`is_error` 為真、文字不超過
-       `_DOROSSI_AUTH_NOTICE_MAX_CHARS`、含 `_DOROSSI_AUTH_TEXT_MARKERS` 其中之一。
+    1. **A successfully completed result never is** (`_claude_result_succeeded`).
+       An earlier api_retry said 401, a later retry succeeded and the answer came
+       out, and the process exited non-zero for some other reason -- that is not
+       not-logged-in.
+    2. The result's `api_error_status` is 401 -> yes. **403 does not count**: not
+       measured, and it is a permission_error, which may just mean this plan cannot
+       use some model (switching with `/model` fixes it) or a proxy in between is
+       blocking it, where "sign in on the host" would be the wrong prescription;
+       the conservative direction of the criterion is "retryable" (see
+       `dorossi_error_is_fatal`).
+    3. The last api_retry's class is a credential class -> yes, but the result's
+       status code must be empty or 403: the result is what happened **last**, and
+       if it states another status code (400, 404 …) that wins, and an earlier
+       retry event cannot override it. 403 is let through here because by then the
+       CLI's own classification (which reads the error body, not just the status
+       code) has already said it is a credential problem.
+    4. Only when none of the above gives structured evidence (status code empty)
+       is the text looked at: `is_error` true, the text no longer than
+       `_DOROSSI_AUTH_NOTICE_MAX_CHARS`, and containing one of
+       `_DOROSSI_AUTH_TEXT_MARKERS`.
 
-    回傳的標籤只由固定詞彙組成（狀態碼數字、白名單裡的類別名、"result text"），不含
-    CLI 的原始文字——它會進 stderr，而 stderr 有 `/log tail` 這個出口。
+    The returned label consists only of fixed vocabulary (the status code number, a
+    class name from the allowlist, "result text"), with none of the CLI's raw text
+    -- it goes to stderr, and stderr has the `/log tail` exit.
     """
     try:
         if _claude_result_succeeded(result_ev):
@@ -5278,9 +6224,11 @@ def _dorossi_cc_auth_failure(result_ev, *, retry_error: str | None = None,
     return None
 
 
-# `apiKeySource` 標籤印出來之前要長得像一個標籤（實測／文件裡的值："none"、
-# "ANTHROPIC_API_KEY"、"apiKeyHelper"、"/login managed key"）。形狀不對就整個不印——
-# 那個欄位哪天改成帶值，也漏不出來。與 `verify_dorossi_cli` 共用這一支。
+# Before being printed, an `apiKeySource` label must look like a label (measured /
+# documented values: "none", "ANTHROPIC_API_KEY", "apiKeyHelper", "/login managed
+# key"). With the wrong shape nothing is printed at all -- so even if that field
+# someday starts carrying a value, it cannot leak. Shared with
+# `verify_dorossi_cli`.
 _DOROSSI_API_KEY_SOURCE_LABEL_RE = re.compile(r"[A-Za-z0-9_./ -]{1,40}")
 _DOROSSI_BARE_MODE_WARNING = (
     "[dorossi] claude -p started without instruction-file discovery (its init event has "
@@ -5290,18 +6238,23 @@ _DOROSSI_BARE_MODE_WARNING = (
 
 
 def _dorossi_cc_startup_warnings(state: "_ClaudeStreamState") -> list:
-    """這一次叫用的 init 事件透露出「CLI 沒照這個後端的前提啟動」的話，回要印的句子。
-    純函式（印由呼叫端交給 `_warn_once`，所以每個行程每句只出現一次）。
+    """If this invocation's init event reveals that "the CLI did not start on this
+    backend's assumptions", return the sentences to print. Pure function (the caller
+    hands the printing to `_warn_once`, so each sentence appears only once per
+    process).
 
-    兩件事，都只在**看到了 init** 時才判（沒有 init ＝判斷不出來，不是警報）：
+    Two things, both judged only when **an init was seen** (no init = cannot tell,
+    not an alarm):
 
-    * init 沒有 `memory_paths` → 像 bare 模式。實測一般模式在純聊天與 full 兩種工具模式
-      下都有這個鍵（2026-09-19，本機 2.1.276，用 bot 自己的 argv），所以正常運作時不會
-      亂叫。
-    * `apiKeySource` 不是 "none" → CLI 改用 API key 計費。本行程已經不把 API key 變數交給
-      子行程（`_DOROSSI_CC_DROPPED_ENV`），所以還出現就代表來源在 CLI 自己的設定裡（設定
-      檔的 env 區塊、apiKeyHelper）。實測以訂閱憑證變數 `CLAUDE_CODE_OAUTH_TOKEN` 登入時
-      仍是 "none"，不會亂叫。
+    * init has no `memory_paths` -> looks like bare mode. Measured: normal mode has
+      this key under both chat-only and full tool modes (2026-09-19, local 2.1.276,
+      with the bot's own argv), so it does not cry wolf in normal operation.
+    * `apiKeySource` is not "none" -> the CLI is billing through an API key instead.
+      This process no longer passes API-key variables to the child
+      (`_DOROSSI_CC_DROPPED_ENV`), so if it still appears, the source is in the
+      CLI's own settings (the settings file's env block, apiKeyHelper). Measured:
+      signing in with the subscription credential variable
+      `CLAUDE_CODE_OAUTH_TOKEN` still gives "none", so it does not cry wolf.
     """
     messages = []
     if getattr(state, "init_memory_paths", None) is False:
@@ -5319,8 +6272,10 @@ def _dorossi_cc_startup_warnings(state: "_ClaudeStreamState") -> list:
 
 
 def _claude_result_succeeded(result_ev) -> bool:
-    """這則 `result` 事件是不是一個**成功完成**的回合（`subtype == "success"` 且
-    `is_error` 不為真）。形狀不對一律當成沒有成功——失敗方向是回到舊行為（丟例外）。"""
+    """Whether this `result` event is a **successfully completed** round
+    (`subtype == "success"` and `is_error` not true). A wrong shape is always taken
+    as not successful -- the failure direction is back to the old behaviour
+    (raising)."""
     return (isinstance(result_ev, dict)
             and result_ev.get("subtype") == "success"
             and not result_ev.get("is_error"))
@@ -5331,54 +6286,77 @@ def _claude_stream_verdict(state: "_ClaudeStreamState", rc: int, err: str,
                            silence_limit: float | None = None,
                            idle_limit: float = 0.0,
                            hard_limit: float = 0.0) -> str:
-    """判定一次**已經結束**的 `claude -p` 串流是什麼結果：回傳字串或 raise。
+    """Judge the outcome of a `claude -p` stream that has **already ended**: return
+    a string or raise.
 
-    回傳 `"ok"`（照常回答）或 `"budget"`（每次叫用的預算閘被觸發，graceful 收尾、
-    不重試、不拋例外）——兩者呼叫端走同一條回傳路徑。其餘一律 raise 型別化例外。
+    Returns `"ok"` (answer as normal) or `"budget"` (the per-invocation budget gate
+    fired; wrap up gracefully, no retry, no exception) -- the caller takes the same
+    return path for both. Everything else raises a typed exception.
 
-    **判定順序就是規則本身，不要重排**（2026-09-05 事故：三個具名分支被排到泛用處
-    理後面，整段變死碼而沒有任何訊號）：
+    **The verdict order is the rule itself; do not reorder it** (the 2026-09-05
+    incident: three named branches were placed after the generic handling, and the
+    whole section became dead code with no signal at all):
 
-      輸出靜默 → 硬性上限 → 閒置 → 預算閘 → 用量上限 → 暫時性故障
-      → 沒有可用的登入 → CLI 拒絕旗標 → 連不上伺服器 → resume 重試。
+      output silence → hard limit → idle → budget gate → usage limit →
+      transient failure → no usable sign-in →
+      CLI rejects a flag → cannot reach the server → resume retry.
 
-    最後那條（丟掉工作階段重開）之所以排最後：它對「額度用完」「伺服器過載」「沒登入」
-    與「CLI 不認得我們傳的旗標」都毫無幫助，只是再燒一次呼叫、又把可以續接的對話丟掉。
-    「沒有可用的登入」排在用量上限與暫時性故障之後，讓 429／402／5xx 照舊走各自的等待
-    （兩邊都成立的輸入由測試釘住）。「CLI 拒絕旗標」只在串流裡連一則 `result` 都沒有時
-    成立，所以它與預算閘、用量上限、暫時性故障湊不出同時成立的輸入；與「沒有可用的
-    登入」只在 api_retry 那條證據上湊得出來，而串流裡有 api_retry 就代表 CLI 已經開始
-    打後端、旗標顯然收下了，所以登入排在它前面。
+    The last one (throw the session away and reopen) comes last because it does
+    nothing at all for "quota used up", "server overloaded", "not logged in" or
+    "the CLI does not recognise a flag we pass"; it only burns another call and
+    throws away a conversation that could have been resumed. "No usable sign-in"
+    comes after the usage limit and transient failure, so 429 / 402 / 5xx still
+    take their own waits (inputs where both hold are pinned by tests). "CLI rejects
+    a flag" holds only when the stream has not a single `result`, so no input can
+    satisfy it together with the budget gate, usage limit or transient failure;
+    together with "no usable sign-in" only via the api_retry evidence, and an
+    api_retry in the stream means the CLI has already started calling the backend
+    and evidently accepted the flags, so the sign-in check comes before it.
 
-    **三種看門狗砍法共用一個出口**：被砍掉、但串流裡**已經**收到成功的 `result` 時，
-    那一輪其實已經答完了，只是 CLI 之後還掛著（例如等一個背景工作觸發）。這時不丟
-    例外，直接走 rc==0 那條收尾（含用量上限攔截），**不**
-    落到後面的 rc != 0 分類——被砍掉的行程 rc 一定非零，落下去會被誤判成失敗或觸發
-    resume 重試。2026-09-19 事故：答案早在 300 秒前就出來了，使用者看到的卻是「暫時
-    無法回應」。
-    這個出口起初**只給閒置**；同一天擁有者交辦「任務一直被殺掉」，而上限拉長之後
-    （full 硬上限 3 小時、背景工作會把閒置與自走沉默一路壓到硬上限），一個不觸發的
-    背景工作可以把一輪撐滿 3 小時再**丟掉早就出來的答案**——所以硬上限與自走沉默也
-    收下答案。邊界照舊：**砍的時刻完全不變**（出口只改「砍完之後怎麼判」），沒有成功
-    的 result 時三種照舊丟例外。自走沉默收下答案之後迴圈照常把它當完成的一輪，而不是
-    沉默重試——重試會把已經做完的那一輪整個重跑一次。
+    **The three watchdog kills share one exit**: when killed, but a successful
+    `result` has **already** arrived in the stream, the round was in fact already
+    answered and the CLI was merely lingering afterwards (e.g. waiting for a
+    background task to trigger). Then no exception is raised; it takes the rc==0
+    wrap-up (including the usage-limit intercept) and does **not** fall into the
+    rc != 0 classification below -- a killed process's rc is always non-zero, and
+    falling through would be misjudged as a failure or trigger a resume retry. The
+    2026-09-19 incident: the answer had come out 300 seconds earlier, yet the user
+    saw "temporarily unable to respond".
+    This exit was at first **for idle only**; the same day the owner reported
+    "tasks keep getting killed", and after the limits were lengthened (the full
+    hard limit is 3 hours, and background tasks push both idle and self-loop
+    silence all the way to the hard limit), a background task that never triggers
+    could hold a round for the full 3 hours and then **throw away the answer that
+    came out long before** -- so the hard limit and self-loop silence keep the
+    answer too. The boundary is unchanged: **the moment of the kill does not change
+    at all** (the exit only changes "how it is judged after the kill"), and without
+    a successful result all three still raise. After self-loop silence keeps the
+    answer, the loop treats it as a completed round as usual rather than a silence
+    retry -- a retry would rerun the already-finished round in full.
 
-    **EOF 不等於成功。** 後端被砍、管線斷掉、abort 落地都是 EOF；分辨它們的是 rc。
-    rc != 0 而串流連一則 `result` 事件都沒有時，`failure_reason` 會退到 stdout 尾巴
-    ／stderr，診斷不會變成空字串。
+    **EOF is not success.** A killed backend, a broken pipe and a landed abort are
+    all EOF; the rc tells them apart. When rc != 0 and the stream has not a single
+    `result` event, `failure_reason` falls back to the stdout tail / stderr, so the
+    diagnostic never becomes an empty string.
 
-    `session_id` 是**這次叫用傳進去的**那一個（不是 `state.sid`）：resume 重試該不該
-    觸發，取決於我們是不是在 resume，而不是後端最後回報了哪個 id。
+    `session_id` is the one **passed in to this invocation** (not `state.sid`):
+    whether the resume retry should fire depends on whether we are resuming, not on
+    which id the backend reported last.
     """
-    # 看門狗出口（見 docstring）：三種砍法共用。答案已經在手上、只是 CLI 答完之後還掛著
-    # 時，**不**丟例外，也**跳過**下面的 rc != 0 分類（被砍掉的行程 rc 一定非零，落下去
-    # 會被當成失敗或觸發 resume 重試），直接走 rc==0 那條收尾——用量上限攔截照樣會跑。
+    # The watchdog exit (see the docstring): shared by the three kills. When the
+    # answer is already in hand and the CLI was merely lingering after answering,
+    # **no** exception is raised and the rc != 0 classification below is
+    # **skipped** (a killed process's rc is always non-zero, and falling through
+    # would be treated as a failure or trigger a resume retry); it takes the rc==0
+    # wrap-up directly -- the usage-limit intercept still runs.
     answered = _claude_result_succeeded(state.last_result_ev)
     if state.kill_reason == "silence":
         limit = silence_limit or 0.0
         if not answered:
-            # 背景工作數要印出來：非零代表這一輪的沉默原本是被背景工作壓住的，砍掉它的
-            # 是那段壓制的牆鐘上限（`hard_limit`），不是一般的沉默——兩者要分得出來。
+            # The background-task count must be printed: non-zero means this round's
+            # silence had been held off by background tasks, and what killed it was
+            # that suppression's wall-clock cap (`hard_limit`), not ordinary silence
+            # -- the two must be distinguishable.
             print(f"[dorossi] claude -p loop-silence-killed: no output for "
                   f"{limit:.0f}s (pending tools={len(state.pending_tools)}, background "
                   f"tasks={len(state.background_tasks)}, round ceiling while "
@@ -5414,36 +6392,44 @@ def _claude_stream_verdict(state: "_ClaudeStreamState", rc: int, err: str,
     elif rc != 0:
         reason = state.failure_reason(err)
         print(f"[dorossi] claude -p exited {rc}: {reason}", file=sys.stderr)
-        # 每輪預算閘（--max-budget-usd）被觸發：這不是工作階段過舊、也不是方案用量
-        # 上限，而是我們自己設的「單次 invocation 花費上限」。**必須在 resume 重試／
-        # 用量上限判定之前**先攔截：一律 graceful 收尾——不重試（會再燒一次預算）、
-        # 不拋例外，讓呼叫端回傳目前的（多半為空的）答案＋session id，自走迴圈把這
-        # 一輪當「無進展(idle)」由 consecutive_idle 吸收、下一輪 resume 續跑。預算
-        # 金額／旗標一律不進 Discord，只記 stderr。
+        # The per-round budget gate (--max-budget-usd) fired: this is neither a stale
+        # session nor the plan's usage limit, but our own "per-invocation spend cap".
+        # It **must be intercepted before the resume retry / usage-limit verdict**:
+        # always wrap up gracefully -- no retry (that would burn the budget again),
+        # no exception; let the caller return the current (usually empty) answer +
+        # session id, and the self-loop treats this round as "no progress (idle)",
+        # absorbed by consecutive_idle, resuming next round. The budget amount /
+        # flag never goes to Discord; stderr only.
         if _dorossi_cc_budget_exceeded(state.last_result_ev):
             print("[dorossi] claude -p hit per-invocation budget cap "
                   "(--max-budget-usd); treating round as idle, no retry.",
                   file=sys.stderr)
             return "budget"
-        # 方案／配額用量上限不是「工作階段過舊」的問題，所以必須在觸發 resume
-        # 重試（會再燒掉一次呼叫）之前先攔截。用量上限要回報專屬例外。
+        # A plan / quota usage limit is not a "stale session" problem, so it must be
+        # intercepted before the resume retry fires (which would burn another call).
+        # A usage limit reports its own dedicated exception.
         usage = _dorossi_cc_usage_limit(
             state.last_result_ev, state.answer, state.sid,
             stream_reset=state.rate_reset, stream_status=state.rate_status)
         if usage is not None:
             raise usage
-        # 伺服器側的暫時性故障（529 Overloaded、5xx）。**必須排在 resume 重試之
-        # 前**：那個重試是把工作階段丟掉重開一個，對「伺服器過載」毫無幫助，只是
-        # 再燒一次呼叫、又把可以續接的對話丟掉。這裡改成往上拋專屬例外，讓自走
-        # 迴圈退避等待後**用同一個工作階段**重跑。
+        # A server-side transient failure (529 Overloaded, 5xx). **It must come before
+        # the resume retry**: that retry throws the session away and opens a new
+        # one, which does nothing at all for "server overloaded", only burning
+        # another call and throwing away a conversation that could have been
+        # resumed. Instead a dedicated exception is raised, so the self-loop backs
+        # off and reruns **with the same session**.
         transient = _dorossi_cc_transient_error(
             state.last_result_ev, state.answer, state.sid)
         if transient is not None:
             raise transient
-        # CLI 沒有可用的登入（沒登入、憑證失效、被迫進 bare 模式）。**必須排在 resume 重試
-        # 之前**：重開一個工作階段會以一模一樣的方式失敗，而且把可以續接的對話丟掉；也要排
-        # 在用量上限與暫時性故障**之後**，讓 429／402／5xx 照舊走它們自己的等待路徑。
-        # 對外照舊泛用（`_dorossi_error_hint` 的致命分支）；stderr 這一行要把處方講對。
+        # The CLI has no usable sign-in (not logged in, credentials expired, forced
+        # into bare mode). **It must come before the resume retry**: a new session
+        # would fail in exactly the same way and throw away a conversation that
+        # could have been resumed; and it must come **after** the usage limit and
+        # transient failure, so 429 / 402 / 5xx still take their own waiting paths.
+        # Outwardly still generic (the fatal branch of `_dorossi_error_hint`); this
+        # stderr line must give the right prescription.
         auth = _dorossi_cc_auth_failure(
             state.last_result_ev, retry_error=state.retry_error,
             retry_status=state.retry_status)
@@ -5459,10 +6445,13 @@ def _claude_stream_verdict(state: "_ClaudeStreamState", rc: int, err: str,
                   f"retrying with a fresh session (it would fail the same way).{hint}",
                   file=sys.stderr)
             raise _DorossiAuthError(auth, bare_suspect=bare)
-        # CLI 在開始之前就拒絕了我們傳的旗標（多半是 CLI 比這份程式碼舊）。**必須排在
-        # resume 重試之前**：重開一個工作階段會以一模一樣的方式失敗。stderr 這一行要把
-        # 原因講對——上面那行 `exited 1: error: unknown option …` 讀起來像一個普通的後端
-        # 錯誤，看不出該做的事是更新 CLI。對外照舊泛用（由 bot 的 `_dorossi_error_hint` 組）。
+        # The CLI rejected a flag we passed before starting (most likely the CLI is
+        # older than this code). **It must come before the resume retry**: a new
+        # session would fail in exactly the same way. This stderr line must state
+        # the right cause -- the `exited 1: error: unknown option …` line above reads
+        # like an ordinary backend error and does not show that the thing to do is
+        # update the CLI. Outwardly still generic (assembled by the bot's
+        # `_dorossi_error_hint`).
         rejected = _dorossi_cc_rejected_option(state, err)
         if rejected is not None:
             print(f"[dorossi] claude -p refused to start: the installed CLI does not "
@@ -5470,28 +6459,37 @@ def _claude_stream_verdict(state: "_ClaudeStreamState", rc: int, err: str,
                   f"older than this code expects - update it. Not retrying with a fresh "
                   f"session (it would fail the same way).", file=sys.stderr)
             raise _DorossiCliOptionError(rejected)
-        # 連不上伺服器（DNS、連線被拒／重設）。**必須排在 resume 重試之前**：丟掉工作
-        # 階段重開一個對斷網毫無幫助（新的那次一樣連不上），只會把可以續接的對話丟掉
-        # ——2026-09-22 的斷網就是這樣讓六個自走任務全部丟了脈絡再停掉。排在其他具名
-        # 分支之後：用量上限／暫時性故障／未登入都有自己更準的處理，它們成立時不該被
-        # 讀成斷網。呼叫端會等網路回來、用**同一個**工作階段重跑。
+        # Cannot reach the server (DNS, connection refused / reset). **It must come
+        # before the resume retry**: throwing the session away and opening a new one
+        # does nothing at all for a network outage (the new one cannot connect
+        # either), and only throws away a conversation that could have been resumed
+        # -- exactly how the 2026-09-22 outage made all six self-loop tasks lose
+        # their context and then stop. It comes after the other named branches: the
+        # usage limit / transient failure / not-logged-in each have their own more
+        # precise handling, and when they hold they must not be read as an outage.
+        # The caller waits for the network to come back and reruns with **the same**
+        # session.
         offline = _dorossi_cc_offline(state.last_result_ev, err, session_id)
         if offline is not None:
             print("[dorossi] claude -p cannot reach its server (network); the caller "
                   "will wait for connectivity and resume the same session",
                   file=sys.stderr)
             raise offline
-        # `--resume` 的 run（session_id 有值）失敗時一律觸發一次性的新工作階段
-        # 重試——不再依賴 stderr 是否含 'resume'/'session' 關鍵字，因為真正的
-        # 失敗訊號出現在 stdout 而非 stderr（過大／過舊的工作階段無法 resume）。
+        # A failed `--resume` run (session_id set) always triggers a one-off retry
+        # with a new session -- no longer depending on whether stderr contains the
+        # 'resume'/'session' keywords, because the real failure signal appears on
+        # stdout rather than stderr (an oversized / stale session cannot resume).
         if session_id:
             raise _DorossiResumeError(reason)
         raise RuntimeError(f"claude -p exited {rc}: {reason}")
-    # rc == 0（或上面的看門狗出口）：少數情況下用量上限會以 rc==0 回來，且 result 文字
-    # 本身就是上限通知而非真正的回答——這裡也要攔截，否則會把上限通知當成正常答覆送出。
-    # **但成功的答案本身不是通知**：一篇剛好討論到 rate limit 的長答案曾在這裡被判成
-    # 用量上限、整份丟掉（2026-09-17、09-19）。文字證據要過
-    # `_dorossi_cc_limit_text_counts`（串流說放行 → 否決；否則要短得像一則通知）。
+    # rc == 0 (or the watchdog exit above): in rare cases a usage limit comes back
+    # with rc==0, and the result text itself is the limit notice rather than a real
+    # answer -- it must be intercepted here too, or the limit notice would be sent
+    # out as a normal reply. **But a successful answer is not itself a notice**: a
+    # long answer that happened to discuss rate limits was once judged a usage limit
+    # here and thrown away whole (2026-09-17, 09-19). Text evidence must pass
+    # `_dorossi_cc_limit_text_counts` (the stream says allowed -> veto; otherwise it
+    # must be short enough to be a notice).
     usage = _dorossi_cc_usage_limit(
         state.last_result_ev, state.answer, state.sid,
         stream_reset=state.rate_reset, stream_status=state.rate_status)
@@ -5506,75 +6504,99 @@ def _dorossi_cc_argv(exe: str, *, session_id: str | None = None,
                      loop_system_guidance: str | None = None,
                      extra_dir: str | None = None,
                      tools_mode: str | None = None) -> list:
-    """`claude -p` 的 argv（`exe` 之後全部）。純函式：不碰檔案、不起行程、不讀環境。
+    """The argv for `claude -p` (everything after `exe`). Pure function: touches no
+    files, starts no process, reads no environment.
 
-    從 `_dorossi_via_claude_code` 抽出來（2026-09-19，行為不變——抽之前與抽之後對 480 種
-    參數組合組出的 argv 逐位元組相同），理由只有一個：手動驗證入口
-    `verify_dorossi_cli.py` 要拿**同一份** argv 去打真的 CLI。它自己抄一份的話，驗到的是
-    那份副本，而這裡哪天多一個旗標它不會知道。
+    Extracted from `_dorossi_via_claude_code` (2026-09-19, behaviour unchanged --
+    the argv built before and after extraction was byte-for-byte identical across
+    480 argument combinations), for one reason only: the manual verification entry
+    point `verify_dorossi_cli.py` must hit the real CLI with **the same** argv. If it
+    kept its own copy, it would be verifying that copy, and would never learn when
+    a flag is added here.
 
-    `tools_mode` 省略（None）時在**呼叫當下**讀模組全域 `DOROSSI_CC_TOOLS`，與抽出來之前
-    一樣（測試靠換掉那個全域切模式）。判準仍是「剛好等於 `"full"` 才解鎖」，其餘一律走
-    純聊天的兩層封鎖——fail-closed 的方向不因為多了這個參數而改變。其他參數的語意見
-    `_dorossi_via_claude_code` 的 docstring。
+    When `tools_mode` is omitted (None), the module global `DOROSSI_CC_TOOLS` is
+    read **at call time**, as before the extraction (tests switch modes by swapping
+    that global). The criterion is still "unlocks only when exactly `"full"`";
+    anything else takes the two-layer chat-only lockdown -- the fail-closed
+    direction does not change because of this extra parameter. For the other
+    parameters' semantics, see the docstring of `_dorossi_via_claude_code`.
     """
     if tools_mode is None:
         tools_mode = DOROSSI_CC_TOOLS
     args = [
         exe, "-p",
         "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-        # 每輪 `/model` 覆蓋（已由解析端對照成後端別名並驗證）；未指定維持預設。
+        # The per-round `/model` override (already mapped to a backend alias and
+        # validated by the parser); unspecified keeps the default.
         "--model", (model or DOROSSI_CC_MODEL),
         # Load ZERO MCP servers (none passed via --mcp-config). The host's
         # global MCP config can cold-start health-checks that hang `claude -p`
         # for minutes inside the bot.
         "--strict-mcp-config",
-        # 把系統提示裡「每機動態區段」（cwd／env／git status）移到第一則 user 訊息，
-        # 讓系統提示前綴在跨行程 resume 時保持穩定 → 提示快取前綴更常命中（這些動態
-        # 區段每次叫用可能變動而讓快取前綴失配）。實測與下方 --append-system-prompt
-        # 併用 CLI 接受、exit 0（help 雖寫「with --system-prompt」，但本碼用的是
-        # --append-system-prompt，預設系統提示仍在用，故此旗標適用）。無條件帶上。
+        # Move the system prompt's "per-machine dynamic sections" (cwd / env / git
+        # status) into the first user message, so the system prompt prefix stays
+        # stable across cross-process resumes -> the prompt-cache prefix hits more
+        # often (those dynamic sections can change on every call and break the
+        # cache prefix). Measured: combined with --append-system-prompt below, the
+        # CLI accepts it and exits 0 (the help says "with --system-prompt", but this
+        # code uses --append-system-prompt and the default system prompt is still in
+        # use, so the flag applies). Always passed.
         "--exclude-dynamic-system-prompt-sections",
     ]
     if effort:
-        # 每輪 `/effort` 覆蓋思考力度；未指定就完全不帶旗標（維持 CLI 預設）。
+        # The per-round `/effort` override of thinking effort; unspecified passes no
+        # flag at all (keeping the CLI default).
         args += ["--effort", effort]
     if max_budget_usd is not None and max_budget_usd > 0:
-        # 每一次 invocation 的美元花費上限（只在 --print 路徑有效，本來就是）。
-        # 超出時 `claude -p` 以非零 exit ＋ result 事件 subtype=="error_max_budget_usd"
-        # 回報，由 `_claude_stream_verdict` 的 rc!=0 區塊 graceful 收尾（不重試、不拋例外）。
+        # A dollar spending cap per invocation (only effective on the --print path,
+        # which this is). When exceeded, `claude -p` reports a non-zero exit + a
+        # result event with subtype=="error_max_budget_usd", wrapped up gracefully by
+        # the rc!=0 block of `_claude_stream_verdict` (no retry, no exception).
         args += ["--max-budget-usd", str(max_budget_usd)]
     if tools_mode == "full":
-        # 完整 agent：開啟所有工具並移除核准關卡（擁有者授權）。
+        # Full agent: every tool enabled and the approval gate removed (owner
+        # authorised).
         args += ["--permission-mode", "bypassPermissions"]
     else:
-        # 純聊天（預設）：Dorossi 只能對話，無法執行 shell／讀寫檔案。**兩層，順序不重要、
-        # 缺一層就不是這裡描述的東西：**
-        #   1. `--tools ""`——工具**白名單**，而且是空的。這一層是 fail-closed：CLI 之後
-        #      新增的工具不會自己出現在純聊天裡。2026-09-19 在 CLI 2.1.276 實測：init 事件
-        #      的工具列表是 0 個，聊天照常回答；一個 full 模式建立、歷史裡有 tool_use 的
-        #      工作階段用它 resume 也照常回答（模式互切不必重設工作階段）。
-        #   2. `--disallowedTools …`——舊的**列舉黑名單**，留著當第二層。它單獨存在時是
-        #      fail-open 的：同一天實測只帶它時 init 仍列出 18～22 個工具（隨 cwd 而異），
-        #      其中 ListAgents（列出本機其他互動式工作階段）與 SendMessage 不經核准就執行
-        #      得到。`--restricted` 也不夠（仍留 14 個）。
-        # 空字串必須是 argv 裡**一個真的空元素**：這裡走 exec、不經 shell，Windows 上
-        # `list2cmdline` 把它寫成 `""`，CLI 讀回來就是空的工具清單（同日以正式程式碼實跑
-        # 一次確認，見 `test_dorossi_stream` 那段；`verify_dorossi_cli.py` 的第 1 項檢查
-        # 每次都再量一次 init 的工具列表）。舊版 CLI 若不認得 `--tools`，會在開始前以
-        # 「unknown option」拒絕——`_dorossi_cc_rejected_option` 把它講清楚。
+        # Chat only (the default): Dorossi can only converse and cannot run a shell
+        # or read / write files. **Two layers; their order does not matter, and
+        # without either one this is not what is described here:**
+        #   1. `--tools ""` -- a tool **allowlist**, and an empty one. This layer is
+        #      fail-closed: tools the CLI adds later do not appear in chat-only by
+        #      themselves. Measured on CLI 2.1.276 on 2026-09-19: the init event's
+        #      tool list is 0 entries and chat answers as usual; a session created in
+        #      full mode with tool_use in its history also answers as usual when
+        #      resumed with it (switching modes needs no session reset).
+        #   2. `--disallowedTools …` -- the old **enumerated denylist**, kept as the
+        #      second layer. On its own it is fail-open: measured the same day, with
+        #      only it, init still listed 18-22 tools (varying with the cwd),
+        #      including ListAgents (lists the host's other interactive sessions)
+        #      and SendMessage, which ran without approval. `--restricted` is not
+        #      enough either (14 remain).
+        # The empty string must be **a real empty element** in the argv: this goes
+        # through exec, not a shell, and on Windows `list2cmdline` writes it as `""`,
+        # which the CLI reads back as an empty tool list (confirmed the same day with
+        # one real run of the production code, see that part of
+        # `test_dorossi_stream`; check 1 of `verify_dorossi_cli.py` measures init's
+        # tool list again every time). An older CLI that does not know `--tools`
+        # refuses with "unknown option" before starting --
+        # `_dorossi_cc_rejected_option` spells that out.
         args += [
             "--tools", "",
             "--disallowedTools",
             "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit",
         ]
-    # 系統提示通道（穩定、可快取、不累積進對話歷史）。實測 --append-system-prompt 與
-    # --resume 併用「該輪生效、且不會被 baked 進 session」，所以：
-    #   * 新工作階段（無 session_id）：補上基底系統提示（含保密守則）——append（非取代），
-    #     保留 Claude Code 的 agent／工具 scaffolding。resume 會保留原本的，不再重補。
-    #   * loop_system_guidance（自走耐久守則，僅自走迴圈傳入）：每一輪（含 resume／壓縮輪）
-    #     都附上，確保守則每輪都實際到達後端、卻不像舊版那樣累積進 user-prompt 歷史。
-    # 兩者併成單一 --append-system-prompt 一次帶上。
+    # The system prompt channel (stable, cacheable, not accumulated into the
+    # conversation history). Measured: --append-system-prompt combined with
+    # --resume "takes effect for that round and is not baked into the session", so:
+    #   * A new session (no session_id): add the base system prompt (including the
+    #     secrecy rules) -- appended (not replacing), keeping Claude Code's agent /
+    #     tool scaffolding. Resume keeps the original, so it is not added again.
+    #   * loop_system_guidance (the self-loop's durable rules, passed only by the
+    #     self-loop): attached on every round (including resume / compaction
+    #     rounds), making sure the rules really reach the backend every round
+    #     without accumulating into the user-prompt history as the old version did.
+    # The two are joined into a single --append-system-prompt passed once.
     append_parts: list[str] = []
     if not session_id:
         append_parts.append(DOROSSI_SYSTEM_PROMPT)
@@ -5585,8 +6607,9 @@ def _dorossi_cc_argv(exe: str, *, session_id: str | None = None,
     if append_parts:
         args += ["--append-system-prompt", "\n\n".join(append_parts)]
     if extra_dir:
-        # 本次對話的額外可存取目錄（開新對話時指定，往後每一輪都要重新帶上）。
-        # 屬於 per-invocation 旗標，不會被 --resume 記住。
+        # This conversation's extra accessible directory (specified when the
+        # conversation was opened, and passed again on every later round). A
+        # per-invocation flag that --resume does not remember.
         args += ["--add-dir", extra_dir]
     return args
 
@@ -5737,15 +6760,18 @@ async def _dorossi_via_claude_code(
     exe = _shutil.which("claude")
     if exe is None:
         raise FileNotFoundError("claude CLI not found on PATH")
-    # argv 由 `_dorossi_cc_argv` 組（純函式），**不要在這裡再寫一份**：手動驗證入口
-    # `verify_dorossi_cli.py` 用同一支組 argv 去打真的 CLI，這裡一分岔，它驗的就是一份
-    # 副本（`test_verify_dorossi_cli` 釘住這一行）。
+    # The argv is built by `_dorossi_cc_argv` (a pure function); **do not write another
+    # copy here**: the manual verification entry point `verify_dorossi_cli.py` uses
+    # the same function to build the argv it sends to the real CLI, and if this one
+    # diverged it would be verifying a copy (`test_verify_dorossi_cli` pins this
+    # line).
     args = _dorossi_cc_argv(
         exe, session_id=session_id, model=model, effort=effort,
         max_budget_usd=max_budget_usd, loop_system_guidance=loop_system_guidance,
         extra_dir=extra_dir)
-    # 本次後端的工作目錄：使用者指定就用它（寫入時驗過存在，spawn 前再確認一次），
-    # 否則用預設 workspace。使用者目錄不對它硬 mkdir。
+    # This backend call's working directory: the user's choice if given (checked to
+    # exist when written, confirmed again before spawning), otherwise the default
+    # workspace. A user directory is never force-created.
     if workdir:
         effective_cwd = workdir
     else:
@@ -5756,19 +6782,24 @@ async def _dorossi_via_claude_code(
     # that must already exist (re-checked just below) and must not be auto-made.
     try:
         cwd_path = Path(effective_cwd)
-        # 只有落在我們自己管的子樹裡才自動建目錄；判準是單一決策點，不要在
-        # 這裡自己再寫一次 `.parents` 比對。
+        # Create the directory automatically only inside the subtree we manage;
+        # the criterion is a single decision point, so do not write another
+        # `.parents` comparison here.
         if _dorossi_cwd_is_managed(cwd_path):
             cwd_path.mkdir(parents=True, exist_ok=True)
     except Exception:  # pylint: disable=broad-except
         pass
-    # 寫入時驗過不代表現在還在（見 `_dorossi_require_workdir`）；必須排在 mkdir 後面。
+    # Validated when written does not mean it still exists now (see
+    # `_dorossi_require_workdir`); this must come after the mkdir.
     _dorossi_require_workdir(effective_cwd)
-    # 硬性牆鐘上限：mode-aware（off 較緊 / full 放大）＋ 可由 bot_config.json 覆寫。
-    # 用函式解析目前模式對應的值，不要引用寫死的數字。**在 spawn 之前取一次**：同一個
-    # 值既是下面看門狗的 deadline，也交給 CLI 當它自己的背景工作等待上限（見
-    # `_dorossi_cc_child_env`），兩者必須是同一個數。loop_mode 下它只用來界定「背景
-    # 工作壓住沉默看門狗」能壓多久，有輸出的回合照舊沒有牆鐘上限。
+    # The hard wall-clock ceiling: mode-aware (tighter for off / wider for full) +
+    # overridable in bot_config.json. Resolve the current mode's value through the
+    # function; do not reference a hard-coded number. **Taken once before spawning**:
+    # the same value is both the watchdog deadline below and what the CLI is given
+    # as its own background-task wait cap (see `_dorossi_cc_child_env`), and the two
+    # must be the same number. In loop_mode it only bounds how long "background tasks
+    # holding off the silence watchdog" can last; a round that keeps producing output
+    # still has no wall-clock ceiling.
     hard_limit = _dorossi_cc_hard_limit_sec()
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -5779,14 +6810,16 @@ async def _dorossi_via_claude_code(
         env=_dorossi_cc_child_env(hard_limit),
         limit=16 * 1024 * 1024,  # one `result` NDJSON line can be large
     )
-    # 讓呼叫端記錄這個子行程（自走模式用來讓 `@bot abort` 即時 kill 當前回合）。
+    # Let the caller record this child process (the self-loop uses it so `@bot
+    # abort` can kill the current round immediately).
     if on_proc is not None:
         try:
             on_proc(proc)
         except Exception:  # pylint: disable=broad-except  # nosec B110
             pass
-    # 若在「呼叫端最後一次檢查旗標」與「這裡 spawn」之間 abort 才落地，立刻自我終止，
-    # 不要讓一輪無人值守的工作在使用者已要求停止後還整輪跑完（下面 readline 會 EOF）。
+    # If an abort landed between "the caller's last flag check" and "the spawn
+    # here", terminate at once rather than letting an unattended round run in full
+    # after the user asked it to stop (readline below will hit EOF).
     if abort_check is not None:
         try:
             if abort_check():
@@ -5803,27 +6836,32 @@ async def _dorossi_via_claude_code(
     except Exception:  # pylint: disable=broad-except
         pass
     # Drain stderr concurrently so a full stderr pipe can't deadlock the child.
-    # **只能由下面的 `finally` 透過 `_dorossi_drain_stderr` 收**——它等的是 EOF，
-    # 而 EOF 不在我們手上（見 `_dorossi_reap_proc` 的說明）。
+    # **May only be reaped by the `finally` below, through `_dorossi_drain_stderr`**
+    # -- it waits for EOF, and EOF is not in our hands (see the note on
+    # `_dorossi_reap_proc`).
     err_task = asyncio.ensure_future(_read_stream_all(proc.stderr))
 
-    # 自走模式（silence_limit 有值）：停用一般兩段式看門狗，改用單一「輸出沉默」
-    # backstop。否則維持原本的 idle ＋ 硬性牆鐘上限。
+    # Self-loop mode (silence_limit set): the normal two-tier watchdog is disabled in
+    # favour of a single "output silence" backstop. Otherwise keep the original idle
+    # + hard wall-clock ceiling.
     loop_mode = silence_limit is not None
     idle = DOROSSI_CC_IDLE_LIMIT_SEC
-    # `hard_limit` 在 spawn 之前就取好了（同一個值也交給了 CLI，見上方）。看門狗的時鐘
-    # 扣掉主機睡著的時間（`_DorossiWatchClock`，見 `_dorossi_readline_watched`）。
+    # `hard_limit` was taken before spawning (the same value was also handed to the
+    # CLI, see above). The watchdog clock subtracts host sleep time
+    # (`_DorossiWatchClock`, see `_dorossi_readline_watched`).
     clock = _DorossiWatchClock()
-    deadline = clock.now() + hard_limit  # 硬性牆鐘上限（不含休眠）
+    deadline = clock.now() + hard_limit  # hard wall-clock ceiling (excluding sleep)
     state = _ClaudeStreamState(session_id)
     try:
         while True:
             if loop_mode:
-                # 自走模式：每次 readline 最多等 silence_limit；沒有硬牆鐘上限、不設回合上限。
+                # Self-loop mode: each readline waits at most silence_limit; no hard
+                # wall-clock ceiling and no round cap.
                 wait = silence_limit
             else:
-                # Bound每次 readline 的等待時間，使其不超過離硬上限剩餘的秒數。
-                # 這樣即使 `if state.pending_tools: continue` 也只能 loop 到硬上限為止。
+                # Bound each readline's wait to no more than the seconds left until
+                # the hard limit, so even `if state.pending_tools: continue` can only
+                # loop until the hard limit.
                 remaining = deadline - clock.now()
                 if remaining <= 0:
                     state.kill_reason = "hard"
@@ -5837,25 +6875,31 @@ async def _dorossi_via_claude_code(
                 line = await _dorossi_readline_watched(proc.stdout, wait, clock)
             except asyncio.TimeoutError:
                 if loop_mode:
-                    # 背景工作還在（背景 subagent／shell／監看工作）：這段沉默是在等它，
-                    # 不砍——但只撐到這一輪的牆鐘上限。**等待長度不改**（仍是
-                    # silence_limit），所以砍的時刻只可能等於或晚於舊行為，不會提早；
-                    # 改成 min(silence, 剩餘) 會在上限前夕把一個剛沉默不久的回合提早砍掉。
-                    # 前景工具（pending_tools）刻意**不**算：卡死的前景工具正是這層
-                    # backstop 要擋的東西。
+                    # A background task is still there (a background subagent / shell /
+                    # watch task): this silence is waiting on it, so do not kill --
+                    # but only up to this round's wall-clock ceiling. **The wait length
+                    # is unchanged** (still silence_limit), so the kill can only happen
+                    # at or after the old behaviour's moment, never earlier; changing it
+                    # to min(silence, remaining) would kill a round that had only just
+                    # gone quiet early, on the eve of the ceiling.
+                    # Foreground tools (pending_tools) deliberately do **not** count: a
+                    # hung foreground tool is exactly what this backstop exists to stop.
                     if state.background_tasks and clock.now() < deadline:
                         continue
-                    # 自走模式 backstop：在 silence_limit 內完全沒有新輸出 → 一律終止，
-                    # 即使仍有工具在執行（與一般 idle tier 的關鍵差異：卡死的工具不會
-                    # 永遠壓住看門狗）。視為卡住，由呼叫端的沉默重試接手。
+                    # The self-loop backstop: no new output at all within silence_limit
+                    # -> always terminate, even with a tool still running (the key
+                    # difference from the normal idle tier: a hung tool cannot hold the
+                    # watchdog off forever). Treated as stuck, and the caller's silence
+                    # retry takes over.
                     state.kill_reason = "silence"
                     try:
                         proc.kill()
                     except ProcessLookupError:
                         pass
                     break
-                # 這一段沒有輸出。先檢查是否已碰到硬上限——若是，不論有沒有 pending
-                # 的工具都一律終止行程。
+                # No output in this stretch. First check whether the hard limit has
+                # been reached -- if so, terminate the process whether or not tools
+                # are pending.
                 if clock.now() >= deadline:
                     state.kill_reason = "hard"
                     try:
@@ -5863,10 +6907,12 @@ async def _dorossi_via_claude_code(
                     except ProcessLookupError:
                         pass
                     break
-                # 還沒到硬上限：若仍有工具/shell 在執行就繼續等，只有「真正閒置」
-                # （無輸出且無工具執行）才會被閒置監看砍掉。CLI 回報的背景工作也算
-                # （回合結尾留下的監看工作會讓 CLI 靜默等它觸發，2026-09-19 事故）；
-                # 兩者都只能把等待撐到上面的硬上限為止。
+                # The hard limit is not reached yet: keep waiting if a tool / shell is
+                # still running; only "truly idle" (no output and no tool running) is
+                # cut by the idle watchdog. Background tasks the CLI reports count too
+                # (a watch task left at the end of a turn makes the CLI wait silently
+                # for it to trigger, the 2026-09-19 incident); either can only stretch
+                # the wait up to the hard limit above.
                 if state.pending_tools or state.background_tasks:
                     continue
                 state.kill_reason = "idle"
@@ -5876,18 +6922,24 @@ async def _dorossi_via_claude_code(
                     pass
                 break
             if not line:
-                break  # EOF — 行程自己結束了。**注意這不等於成功**：被砍掉／管線斷掉
-                # 也是 EOF，分辨它們的是下面的 rc（見 `_claude_stream_verdict`）。
-            # 折疊（純資料轉換）搬進 `_ClaudeStreamState.feed`：讀取這一半綁死在
-            # subprocess ＋ 看門狗上、測不動；折疊那一半可以用假串流餵。
+                break  # EOF -- the process ended by itself. **Note this is not
+                # success**: being killed / a broken pipe is EOF too, and the rc below
+                # tells them apart (see `_claude_stream_verdict`).
+            # Folding (a pure data transformation) moved into
+            # `_ClaudeStreamState.feed`: this reading half is tied to the subprocess +
+            # watchdog and cannot be tested; the folding half can be fed a fake
+            # stream.
             state.feed(line.decode("utf-8", "replace").strip(), on_text)
     except BaseException:  # pylint: disable=broad-except
-        # 非預期離開（`readline` 丟的 `ValueError`／`ConnectionResetError`、外面打進來的
-        # `CancelledError`）：**同步**先把行程砍掉，
-        # 不要等下面 `_dorossi_reap_proc` 那個有上限的 wait。理由是取消路徑上我們不保證
-        # 還有機會跑完任何 await——`finally` 裡的等待是盡力而為，`proc.kill()` 不是
-        # coroutine，一定跑得完。正常路徑（`break`）不經過這裡，所以行程仍然有機會
-        # 自己好好離開，不會被提早砍。
+        # An unexpected exit (a `ValueError` / `ConnectionResetError` raised by
+        # `readline`, a `CancelledError` coming in from outside): kill the process
+        # **synchronously** first, rather than waiting for the bounded wait of
+        # `_dorossi_reap_proc` below. The reason is that on the cancellation path we
+        # are not guaranteed a chance to finish any await -- the waits in `finally`
+        # are best-effort, while `proc.kill()` is not a coroutine and always
+        # completes. The normal path (`break`) does not come through here, so the
+        # process still gets the chance to leave properly on its own and is not
+        # killed early.
         try:
             proc.kill()
         except ProcessLookupError:
@@ -5896,37 +6948,48 @@ async def _dorossi_via_claude_code(
             pass
         raise
     finally:
-        # **每一條離開路徑都要走這裡**，不只是正常結束那一條。實際走得到而迴圈自己
-        # 不處理的有兩類：(1) `readline()` 丟出非逾時的例外——單行 NDJSON 超過 16MB
-        # 緩衝上限時 `readuntil` 的 `LimitOverrunError` 會被 `readline` 轉成
-        # `ValueError`，管線斷掉則是 transport 設進 reader 的 `ConnectionResetError`；
-        # 迴圈的 `except asyncio.TimeoutError` 兩個都接不到。(2) abort／關機從外面打
-        # 進來的 `CancelledError`（`BaseException`，任何 `except Exception` 都接不到）。
-        # （`on_text` 回呼丟例外**不在**這個名單裡：`_ClaudeStreamState.feed` 自己把它
-        # 吞掉了，那是它「永遠不 raise」承諾的一部分，`test_dorossi_stream.py` 有釘。）
-        # 舊版這裡沒有
-        # try/finally，那三條路都會留下一個還在跑的後端行程（`full` 模式下它握著
-        # 主機的 shell）＋一個沒人收的 stderr 抽水任務，而呼叫端此時正握著這個
-        # session 的鎖——後續每一輪都只能排隊等一個永遠不會結束的回合。
+        # **Every exit path must come through here**, not just the normal end. Two
+        # kinds actually reachable that the loop does not handle itself: (1)
+        # `readline()` raising a non-timeout exception -- when a single NDJSON line
+        # exceeds the 16MB buffer limit, `readuntil`'s `LimitOverrunError` is turned
+        # into `ValueError` by `readline`, and a broken pipe is the
+        # `ConnectionResetError` the transport sets on the reader; the loop's
+        # `except asyncio.TimeoutError` catches neither. (2) A `CancelledError`
+        # coming in from outside on abort / shutdown (a `BaseException`, which no
+        # `except Exception` catches). (An `on_text` callback raising is **not** on
+        # this list: `_ClaudeStreamState.feed` swallows it itself, as part of its
+        # "never raises" promise, pinned by `test_dorossi_stream.py`.) The old
+        # version had no try/finally here, and all three paths would leave a
+        # still-running backend process (holding the host's shell in `full` mode) +
+        # an unreaped stderr-draining task, while the caller was holding this
+        # session's lock -- every later round could only queue behind a round that
+        # would never end.
         #
-        # 兩個等待都有上限，理由寫在 `_dorossi_reap_proc`：`await proc.wait()`
-        # 與 `await err_task` **各自**都是無限的，先前只有兩段式看門狗守著迴圈裡面，
-        # 迴圈外面這兩行完全沒人守。
+        # Both waits are bounded, for the reasons written in `_dorossi_reap_proc`:
+        # `await proc.wait()` and `await err_task` are **each** unbounded, and
+        # previously only the two-tier watchdog guarded the inside of the loop,
+        # while these two lines outside it were not guarded at all.
         rc = await _dorossi_reap_proc(proc)
         err = await _dorossi_drain_stderr(err_task)
     if rc is None:
-        # 連 rc 都問不出來（kill 過了行程還在）。這是主機層的異常狀態，交給既有的
-        # 「非零離開」分類去處理——診斷會退到 result 事件／stdout 尾巴。
+        # Not even the rc can be obtained (the process is still there after the
+        # kill). This is an abnormal host-level state, handed to the existing
+        # "non-zero exit" classification -- the diagnostic falls back to the result
+        # event / stdout tail.
         rc = _DOROSSI_UNREAPED_RC
         print("[dorossi] claude -p could not be reaped; "
               f"treating as rc={rc}", file=sys.stderr)
-    # 啟動形狀的警報（像 bare 模式、改用 API key 計費）：排在判定**之前**，因為判定可能
-    # raise——而這兩件事最常出現的時候正是那一輪失敗的時候。每句每個行程只印一次。
+    # Start-up-shape alarms (looks like bare mode, billing through an API key): placed
+    # **before** the verdict, because the verdict may raise -- and these two things
+    # show up most often exactly when that round fails. Each sentence is printed
+    # only once per process.
     for warning in _dorossi_cc_startup_warnings(state):
         _warn_once(warning)
-    # 判定（純函式：raise 或回傳）與帳本寫入（副作用）分開。兩種「正常收尾」
-    # ——"ok" 與預算閘 graceful 的 "budget"——走同一條回傳路徑；預算那條之所以
-    # 不能落到下面的 rc==0 用量檢查，是因為 verdict 已經在它自己那一步 return 了。
+    # The verdict (a pure function: raises or returns) is kept apart from the ledger
+    # write (a side effect). The two "normal wrap-ups" -- "ok" and the budget gate's
+    # graceful "budget" -- take the same return path; the budget one cannot fall
+    # into the rc==0 usage check below because the verdict already returned at its
+    # own step.
     _claude_stream_verdict(state, rc, err, session_id,
                            silence_limit=silence_limit,
                            idle_limit=idle, hard_limit=hard_limit)

@@ -754,7 +754,7 @@ def test_the_log_tail_dump_also_reads_the_previous_session(tmp_path,
     assert "the session that died" in err, (
         "上一個工作階段的尾巴沒被印出來——那正是「跑到一半死掉」要看的東西")
     assert "this attempt failed" in err, "這一次的尾巴也要印"
-    assert "chromedriver.prev.log" in err and "chromedriver.log（這一次）" in err, (
+    assert "chromedriver.prev.log" in err and "chromedriver.log (this attempt)" in err, (
         "兩份沒有分別標示，時間戳混在一起會被讀成同一個工作階段。實際輸出：" + err)
 
 

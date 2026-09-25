@@ -1,24 +1,29 @@
-"""共用的純函式層（driver-agnostic）給兩支 webrunner 變體。
+"""Shared pure-function layer (driver-agnostic) for the two webrunner variants.
 
-`webrunner_novelai.py`（Selenium 變體）與 `webrunner_je_only.py`
-（je_web_runner 變體）原本逐函式同構，只差「DOM／driver 怎麼被呼叫」。本模組
-收斂兩變體「**根本不碰 driver**」的純函式／純 I/O（todo 檔讀寫、prompt 文字
-處理、計時、retry、輸出資料夾配置、事件輸出）與其所需常數，讓兩變體
-`from _webrunner_shared import ...` 共用同一份，避免日後失同步。
+`webrunner_novelai.py` (the Selenium variant) and `webrunner_je_only.py`
+(the je_web_runner variant) were originally function-for-function isomorphic,
+differing only in "how the DOM/driver gets called". This module consolidates
+the pure functions / pure I/O of both variants that "**never touch the
+driver**" (todo file read/write, prompt text processing, timing, retry, output
+folder layout, event output) plus the constants they need, so both variants
+`from _webrunner_shared import ...` share one copy and cannot drift apart.
 
-模組邊界（硬規則）：
-- 本模組必須 **driver-agnostic**：不可 import selenium / je_web_runner，也不
-  建立 / 持有任何 driver。所有需要 driver 的東西留在各變體（P6 後續的 C 系列
-  會以 adapter 注入）。
-- 屬於 CLAUDE.md 允許的「被動共用模組」（地位同 `_queue_consume` /
-  `_run_progress`）：兩變體都 import 它，但兩變體仍**不互相** import、也不
-  import `discord_bot`。
-- 只用 stdlib。
+Module boundary (hard rule):
+- This module MUST be **driver-agnostic**: it may not import selenium /
+  je_web_runner, nor create / hold any driver. Everything that needs a driver
+  stays in each variant (the later C series of P6 will inject it via an
+  adapter).
+- It is one of the "passive shared modules" CLAUDE.md permits (same standing as
+  `_queue_consume` / `_run_progress`): both variants import it, but the two
+  variants still do **not** import **each other**, and do not import
+  `discord_bot`.
+- stdlib only.
 
-這是 P6 重構的第一刀（C1）：純函式抽取、零 adapter。Chrome 生命週期家族
-（snapshot / orphan kill / lock 清理）因與 verify 模式的 module 全域
-（`CHROME_PROFILE_SNAPSHOT` / `_SUPPRESS_ORPHAN_SWEEP`）糾纏，刻意留在各變體，
-待後續 commit 連同 verify 接線一起搬。
+This is the first cut of the P6 refactor (C1): pure-function extraction, zero
+adapters. The Chrome lifecycle family (snapshot / orphan kill / lock cleanup)
+stays in each variant on purpose because it is entangled with the verify-mode
+module globals (`CHROME_PROFILE_SNAPSHOT` / `_SUPPRESS_ORPHAN_SWEEP`); a later
+commit will move it together with the verify wiring.
 """
 from __future__ import annotations
 
@@ -39,55 +44,70 @@ from pathlib import Path, PureWindowsPath
 from _batch_config import load_batch_config  # permitted passive shared loader
 import _run_progress  # permitted passive shared module (resume checkpoint)
 import _queue_consume  # permitted passive shared module (dynamic-consume decisions)
-import _code_fingerprint  # permitted passive shared module (啟動時的程式碼指紋)
-# rc 契約與兩支監督者共用一份（`_supervisor` 同為被動共用模組、純 stdlib）。
+import _code_fingerprint  # permitted passive shared module (startup code fingerprint)
+# The rc contract is shared with the two supervisors (`_supervisor` is also a
+# passive shared module, pure stdlib).
 from _supervisor import (  # noqa: E402
     RC_GENERATION_BLOCKED,
     RC_SETUP_INCOMPLETE,
     RC_ZERO_PROGRESS,
     trim_log,
 )
-# `pair_todos` 的單一來源在 _queue_consume（消費語彙的自然家）；這裡 re-export，
-# 讓本模組與兩變體（以及 ws.pair_todos 測試）沿用同一份，避免失同步（P7）。
+# The single source of `pair_todos` is _queue_consume (the natural home for the
+# consumption vocabulary); it is re-exported here so this module and both
+# variants (plus the ws.pair_todos test) all use one copy and cannot drift (P7).
 from _queue_consume import pair_todos  # noqa: F401  (re-exported single source)
-# `CLAUDE.md` 允許的被動共用模組。只用它的 `_pid_alive`——不要再寫第四份
-# （`test_pid_liveness` 對副本數量有對帳），而且要的正是它「判不出來回 True」
-# 的那個方向，見 `claim_liveness_signal`。
+# A passive shared module permitted by `CLAUDE.md`. Only its `_pid_alive` is
+# used -- do not write a fourth copy (`test_pid_liveness` reconciles the copy
+# count), and this is deliberately the copy whose "can't tell -> return True"
+# direction is what we want here, see `claim_liveness_signal`.
 import _chrome_slot  # noqa: E402
 
-# 本檔位於 `<repo>/axiomatic/_webrunner_shared.py`，`.parent.parent` 即 repo
-# 根；與兩變體各自的 PROJECT_ROOT 算法相同、值相等（且都不會被重新賦值）。
+# This file lives at `<repo>/axiomatic/_webrunner_shared.py`, so `.parent.parent`
+# is the repo root; the same computation each variant uses for PROJECT_ROOT, with
+# an equal value (and neither is ever reassigned).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # After this many in-a-row image failures `generate_loop` emits a
 # `consecutive_failures` alert event (does NOT abort — the hard abort is the
 # batch_config `consecutive_fail_abort`). Used only by generate_loop (C5).
 CONSECUTIVE_FAIL_ALERT = 5
-# `wait_for_new_image` 等圖的時候，每隔這麼久回頭問一次「畫面上是不是跳了
-# 購買／方案對話框」。額度用完的時候圖永遠不會來，所以這一題原本要等整個
-# 180 秒 timeout 燒完、回到 `generate_one_image` 才會問——實測 2026-08-24～
-# 08-27 的 log：65 次被擋，每一次都空等 180~182 秒，合計 3 小時 16 分，而且
-# 使用者的通知也跟著慢 3 分鐘。
+# While `wait_for_new_image` is waiting for an image, this is how often it turns
+# back to ask "did a purchase / plan dialog just pop up on screen". When the
+# quota runs out the image never comes, so this question originally had to wait
+# for the entire 180-second timeout to burn down and return to
+# `generate_one_image` before it was asked -- measured on the 2026-08-24 ~
+# 08-27 log: 65 times blocked, each one an empty 180~182-second wait, 3 hours
+# 16 minutes in total, and the user's notification was 3 minutes late too.
 BLOCK_PROBE_INTERVAL_SEC = 2.0
-# ……但**按下 Generate 之後的前這麼久不問**。理由是這個探測會誤殺一種情況：
-# 對話框已經在畫面上、而站方同時還在算一張真的圖。同一份 log 的 410 次成功
-# 生成：p50=5 秒、p90=9 秒，尾巴拉到 80 秒。抓 p90 當寬限期——真的在算的圖
-# 幾乎都會在這之前落地，而落地就會在迴圈裡先被收下（圖片檢查排在探測之前，
-# 「有圖為大」的既有優先順序不變）。誤殺最壞的後果也只是那張圖等額度回補後
-# 重產一次，不會產生壞資料。順帶：一般 5 秒就好的生成根本不會觸發探測，
-# happy path 一次 round-trip 都沒有多花。
+# ...but **do not ask for this long right after pressing Generate**. The reason
+# is that this probe can false-kill one situation: the dialog is already on
+# screen while the site is simultaneously computing a real image. Over the same
+# log's 410 successful generations: p50=5 s, p90=9 s, with a tail out to 80 s.
+# Take p90 as the grace period -- an image that really is being computed almost
+# always lands before then, and once it lands the loop picks it up first (the
+# image check runs before the probe, and the existing "an image wins" priority
+# is unchanged). The worst outcome of a false-kill is only that this one image
+# is regenerated after the quota refills; no bad data is produced. Incidentally:
+# an ordinary 5-second generation never triggers the probe at all, so the happy
+# path spends not one extra round-trip.
 BLOCK_PROBE_GRACE_SEC = 10.0
 EVENTS_FILE = PROJECT_ROOT / "events.ndjson"
-# 「有批次在跑」的長期訊號。三個寫入端：兩支啟動器（父行程），以及沒有父行程
-# 時的 webrunner 自己（`claim_liveness_signal`）。跨行程檔案 → 原子寫入。
+# The long-lived "a batch is running" signal. Three writers: the two launchers
+# (the parent process), and the webrunner itself when there is no parent process
+# (`claim_liveness_signal`). Cross-process file -> atomic write.
 WEBRUNNER_PID_FILE = PROJECT_ROOT / "webrunner.pid"
 OUTPUT_ROOT = PROJECT_ROOT / "output"
-# Bot 寫 DOM-introspection 請求到這個檔，webrunner 在 iteration 邊界 poll。
+# The bot writes a DOM-introspection request to this file; the webrunner polls
+# it at iteration boundaries.
 DOM_REQUEST_FILE = PROJECT_ROOT / "dom_request.json"
-# 單張生成請求檔 + one-shot 輸出根（serve_single_image_request 用，C4 搬入）。
-# one-shot 圖一律存進 output/_oneshot/<request_id>/，不碰 resume checkpoint /
-# 佇列 pop / 編號。**兩支變體不再各自抄一份這個常數**：pass 3 之後「我這個行程
-# 是不是單圖伺服器」由 argv 旗標宣告（見下面那一段），變體的 main() 不必再碰
-# 這個檔，只有這裡與 bot 各持有一份。
+# The single-image request file + the one-shot output root (used by
+# serve_single_image_request, moved in with C4). One-shot images always go into
+# output/_oneshot/<request_id>/, touching neither the resume checkpoint, nor the
+# queue pop, nor numbering. **The two variants no longer each keep their own
+# copy of this constant**: after pass 3, "is this process a single-image server"
+# is declared by an argv flag (see the section below), the variant's main() no
+# longer needs to touch this file, and only this module and the bot each hold a
+# copy.
 SINGLE_IMAGE_REQUEST_FILE = PROJECT_ROOT / "single_image_request.json"
 WEBRUNNER_PAUSE_FILE = PROJECT_ROOT / "webrunner.pause"
 # Queue / fallback files (read_queues + run_batch pop, C6). Newline-only,
@@ -103,37 +123,50 @@ CHARACTER2_FALLBACK_FILE = PROJECT_ROOT / "character2.md"  # char2 fallback
 UNDESIRED_FILE = PROJECT_ROOT / "undesired.md"         # undesired fallback
 SINGLE_IMAGE_OUTPUT_ROOT = OUTPUT_ROOT / "_oneshot"
 
-# ---------- 這一輪是「批次」還是「單圖伺服器」：用宣告的，不用推論的 ----------
-# **2026-06-27 的正式事故**，證據在 `webrunner.log` 第 1–125 行：一次 `/run` 帶著
-# 57 組佇列配對進來（第 2 行 `todo quadruples: 57`，後面逐筆列出 57 個角色），而第
-# 78 行印出來的卻是 `startup single-image request detected; serving one-shot`——磁碟
-# 上剛好留著一個單圖請求檔，於是 `run_batch` 把整輪批次換成了單圖伺服器：服務兩張
-# 一次性圖（第 122 行的輸出檔名 `oneshot_20260627_082159.png` 就是那個日期），第
-# 124 行閒置收工、`return 0`。整段窗裡**一行批次生成都沒有**，也沒有發 `todo_done`。
-# 而 rc=0 在兩支監督者眼裡就是「乾淨跑完」，所以沒有人重生，那 57 組配對整批沒跑。
+# ---------- Is this run a "batch" or a "single-image server": declared, not inferred ----------
+# **The 2026-06-27 production incident**, evidence in `webrunner.log` lines
+# 1-125: a `/run` came in with 57 queue pairs (line 2 `todo quadruples: 57`,
+# then all 57 characters listed), yet line 78 printed
+# `startup single-image request detected; serving one-shot` -- a single-image
+# request file happened to be sitting on disk, so `run_batch` swapped the whole
+# batch run for a single-image server: it served two one-shot images (line 122's
+# output filename `oneshot_20260627_082159.png` carries that date), then line
+# 124 went idle and `return 0`. In the entire window **not a single batch image
+# was generated**, and no `todo_done` was sent. And to the two supervisors rc=0
+# means "ran clean", so nobody respawned, and all 57 pairs went unrun.
 #
-# 病灶是**模式靠推論**：`SINGLE_IMAGE_REQUEST_FILE.exists()` 回答的是「磁碟上有沒有
-# 人排了一張單圖」，卻被拿去回答另一個完全不同的問題「我這個行程是不是一個單圖
-# 伺服器」。兩個問題的答案只有在 bot 剛好趁 idle spawn 我們的時候才一致；只要一個
-# 請求檔跟一輪 `/run` 在時間上重疊，答案就相反，而且失敗方向是最壞的那個（安靜地
-# 跳過整條佇列，外加一個假的成功 rc）。
+# The disease is that **the mode is inferred**: `SINGLE_IMAGE_REQUEST_FILE.exists()`
+# answers "did someone queue a single image on disk", but it was used to answer
+# a completely different question, "is this process a single-image server". The
+# two questions' answers agree only when the bot happens to spawn us during idle;
+# the moment a request file overlaps in time with a `/run`, they are opposite,
+# and the failure direction is the worst one (silently skipping the entire
+# queue, plus a fake success rc).
 #
-# 修法是把模式**宣告**出來。閘門（pass 3，2026-09-12）現在就是這條規則：
-#     **旗標決定模式；檔案決定「已經在跑的批次下一個要服務什麼」。**
-# 也就是 `SINGLE_IMAGE_REQUEST_FILE` 保留它原本的 in-band 角色（批次在配對邊界與
-# 圖與圖之間 poll 它、順手服務掉），但它**不再**決定這個行程的身分。
+# The fix is to **declare** the mode. The gate (pass 3, 2026-09-12) is now this
+# rule:
+#     **The flag decides the mode; the file decides "what an already-running
+#     batch serves next".**
+# That is, `SINGLE_IMAGE_REQUEST_FILE` keeps its original in-band role (a batch
+# polls it at pair boundaries and between images, and serves it in passing), but
+# it **no longer** decides this process's identity.
 #
-# **為什麼是 argv 而不是環境變數。** `discord_bot._spawn_webrunner` 沒有傳 `env=`，
-# 子行程直接繼承父行程的環境。所以一個為了單圖而設、之後沒有清掉的環境變數，會把
-# 後面**每一輪**批次都轉成伺服器——同一類缺陷原封不動，只是從磁碟搬到行程狀態，而且
-# 更難查：請求檔看得到也刪得掉，環境變數在 log 與工作管理員裡都看不到。argv 反過來
-# 是每一次 spawn 都得自己重講一次，講錯了也會原樣印在啟動那一行裡。
+# **Why argv and not an environment variable.** `discord_bot._spawn_webrunner`
+# passes no `env=`, so the child process inherits the parent's environment
+# directly. So an environment variable set for a single image and not cleared
+# afterwards would turn **every** later batch into a server -- the exact same
+# defect, just moved from disk to process state, and harder to trace: a request
+# file can be seen and deleted, but an environment variable is invisible in the
+# log and in Task Manager. argv, by contrast, has to be respelled on every
+# spawn, and if it is spelled wrong it prints verbatim on the startup line.
 RUN_MODE_BATCH = "batch"
 RUN_MODE_SINGLE_IMAGE_SERVER = "single-image-server"
-# 兩支變體的 `main()` 用 `parse_run_mode(sys.argv)` 認這個旗標；把它接上 argv 的
-# 是 bot 的 `_spawn_webrunner(..., single_image_server=True)`。字面值只有這一份，
-# bot 是 import 過去的——抄第二份的話改名之後 spawn 照樣成功，只是那個行程不再
-# 知道自己是誰（就是上面那次事故的形狀）。
+# The two variants' `main()` recognises this flag via `parse_run_mode(sys.argv)`;
+# what wires it onto argv is the bot's
+# `_spawn_webrunner(..., single_image_server=True)`. There is only one copy of
+# the literal, which the bot imports -- copy a second one and after a rename the
+# spawn still succeeds, only that process no longer knows what it is (exactly the
+# shape of the incident above).
 SINGLE_IMAGE_SERVER_FLAG = "--single-image-server"
 
 # Chrome's renderer-crash interstitial title markers (URL `chrome-error://` is
@@ -143,85 +176,106 @@ _CHROME_CRASH_TITLE_MARKERS = (
     "aw, snap", "aw,snap", "he's dead", "he's just resting", "out of memory",
 )
 
-# ---------- dead browsing context（chrome 中途被截斷）------------------------
-# 「視窗／分頁／session 已經沒了」的指紋，與 hot-path reader 已經用 None /
-# False 吸收掉的**暫時性** chromedriver 卡頓分開。兩者需要相反的反應：卡頓值得
-# continue poll（Chrome 只是忙），但 session 沒了之後**每一次**後續呼叫都會丟出
-# 一模一樣的錯，poll 只是把整個重試預算燒光（實測：一次視窗被關掉要空轉到
-# `consecutive_fail_abort` 觸發，約 30 分鐘）而瀏覽器始終是死的。
-# 訊息 marker 以小寫子字串比對 `str(error)`；類別名比對整條 MRO，所以 selenium
-# 的子類別也算。刻意用純字串而非 import selenium——本模組必須 driver-agnostic。
+# ---------- dead browsing context (chrome cut off mid-run) ------------------------
+# The fingerprint of "the window / tab / session is gone", kept separate from
+# the **transient** chromedriver stall that the hot-path reader already absorbs
+# with None / False. The two need opposite reactions: a stall is worth a
+# continue poll (Chrome is just busy), but once the session is gone **every**
+# subsequent call throws the exact same error, and polling only burns the whole
+# retry budget (measured: one closed window spins until `consecutive_fail_abort`
+# fires, about 30 minutes) while the browser stays dead the whole time.
+# Message markers are matched as lowercase substrings of `str(error)`; class
+# names are matched against the entire MRO, so selenium subclasses count too.
+# Plain strings are used on purpose rather than importing selenium -- this module
+# must be driver-agnostic.
 _SESSION_GONE_MESSAGE_MARKERS = (
-    "no such window",                        # 視窗／分頁在執行中被關掉
-    "target window already closed",          # 使用者實際回報的那一行
-    "web view not found",                    # 它的 `from unknown error:` 第二行
-    "invalid session id",                    # chromedriver 把 session 丟掉了
+    "no such window",                        # window/tab closed mid-run
+    "target window already closed",          # the exact line users reported
+    "web view not found",                    # its `from unknown error:` 2nd line
+    "invalid session id",                    # chromedriver dropped the session
     "session deleted because of page crash",
-    "not connected to devtools",             # devtools socket 斷了
-    "chrome not reachable",                  # 瀏覽器行程整個不見
+    "not connected to devtools",             # the devtools socket dropped
+    "chrome not reachable",                  # the browser process is entirely gone
     "unable to connect to renderer",
     "tab crashed",
 )
 #
-# **這份名單只有在對應的類別真的被 `port.TRANSPORT_ERRORS` 抓得到時才有作用。**
-# 2026-09-09 之前 `MaxRetryError` / `NewConnectionError` 就是反例：它們寫在這裡，
-# 但兩個變體的 tuple 只有 `(WebDriverException, ReadTimeoutError, OSError)`，而這
-# 兩個類別的 MRO **不經過 `OSError`**，所以 hot path 的 `except` 收不到 →
-# `_note_transport_error` 不會被呼叫 → 這份表永遠沒機會發言。正式環境的樣子是
-# 09-07 那三次 `critical_error`：message 是生的 `MaxRetryError`，沒有
-# `browser session gone during …` 前綴。
-# `test_variant_parity.test_every_session_gone_name_is_actually_catchable` 現在
-# 把「表」與「捕捉子」對拉起來——往這裡加名字，就要確認那個類別進得了 tuple。
+# **This list only has any effect when the matching class is actually caught by
+# `port.TRANSPORT_ERRORS`.** Before 2026-09-09 `MaxRetryError` /
+# `NewConnectionError` were the counterexample: they were written here, but both
+# variants' tuple was only `(WebDriverException, ReadTimeoutError, OSError)`, and
+# those two classes' MRO **does not pass through `OSError`**, so the hot path's
+# `except` did not catch them -> `_note_transport_error` was never called ->
+# this table never got a chance to speak. In production it looked like the three
+# 09-07 `critical_error`s: the message was a raw `MaxRetryError`, with no
+# `browser session gone during …` prefix.
+# `test_variant_parity.test_every_session_gone_name_is_actually_catchable` now
+# ties "the table" and "the catcher" together -- adding a name here means
+# confirming that class can reach the tuple.
 _SESSION_GONE_EXC_NAMES = frozenset({
-    "NoSuchWindowException",       # selenium：視窗／target 已關閉
-    "InvalidSessionIdException",   # selenium：session 已刪除
-    "NoSuchDriverException",       # selenium 4.x：driver 不見了
-    # 以下是 urllib3 那一側。判準是**連線有沒有建立起來**：連不上／被拒／中途被
-    # 斷掉，對一個 loopback 監聽器而言就是「那個埠上沒有東西在聽」＝
-    # chromedriver.exe 已經結束。相對地 `ReadTimeoutError`（連上了、請求送出了、
-    # 120 秒沒回話）代表 chromedriver 還活著，所以**刻意不列**——它是「卡頓」的
-    # 正典，列進來會讓一次忙碌變成一次重生。
-    "MaxRetryError",               # urllib3：連 chromedriver 的 socket 被拒
+    "NoSuchWindowException",       # selenium: window/target already closed
+    "InvalidSessionIdException",   # selenium: session already deleted
+    "NoSuchDriverException",       # selenium 4.x: the driver is gone
+    # The following are on the urllib3 side. The criterion is **whether the
+    # connection was established**: could not connect / refused / dropped
+    # mid-way, which for a loopback listener means "nothing is listening on that
+    # port" = chromedriver.exe has already exited. By contrast `ReadTimeoutError`
+    # (connected, request sent, 120 s with no reply) means chromedriver is still
+    # alive, so it is **deliberately omitted** -- it is the canonical "stall",
+    # and listing it here would turn one busy moment into one respawn.
+    "MaxRetryError",               # urllib3: the socket to chromedriver was refused
     "NewConnectionError",
-    "ConnectTimeoutError",         # 連線階段逾時（NewConnectionError 的基底）
-    "ProtocolError",               # 連線中途被對方斷掉（RemoteDisconnected）
-    "ConnectionRefusedError",      # chromedriver 行程已死
+    "ConnectTimeoutError",         # connect-phase timeout (base of NewConnectionError)
+    "ProtocolError",               # connection dropped mid-way by the peer (RemoteDisconnected)
+    "ConnectionRefusedError",      # the chromedriver process is dead
 })
-# JS 探針：回傳這個字面值才算「一次完整的 driver round-trip 成功了」。
-# 用**回傳值**（而不是「沒有丟例外」）當存活判準是刻意的——je 變體的 wrapper 把
-# 每一個 driver 例外吞掉、一律回 None，在那條路徑上「沒丟例外」完全不代表瀏覽器
-# 還活著。
+# JS probe: only returning this literal counts as "one full driver round-trip
+# succeeded". Using the **return value** (rather than "no exception thrown") as
+# the liveness criterion is deliberate -- the je variant's wrapper swallows every
+# driver exception and always returns None, and on that path "no exception
+# thrown" says nothing at all about whether the browser is still alive.
 _ALIVE_PROBE_TOKEN = "je-alive"
 _ALIVE_PROBE_JS = f"return '{_ALIVE_PROBE_TOKEN}';"
 
-# 共用的可見性判準。**不要再用 `offsetParent === null` 判對話框／吐司**。
+# Shared visibility criteria. **Do not use `offsetParent === null` to judge
+# dialogs/toasts any more.**
 #
-# `offsetParent` 對 `position: fixed` 的元素**一律回 null**（規範如此），而 modal
-# 遮罩與吐司幾乎都是 fixed——於是「畫面正中央那個擋住一切的對話框」在掃描裡讀作
-# 「不存在」。失敗形態是**安靜的**：偵測回 None、關閉一個都沒點、診斷清單空白，
-# 三層一起瞎掉，log 上只看得到「生成逾時」。
+# `offsetParent` **always returns null** for `position: fixed` elements (per the
+# spec), and modal overlays and toasts are almost always fixed -- so "the dialog
+# in the dead centre of the screen blocking everything" reads as "does not
+# exist" in the scan. The failure mode is **silent**: detection returns None, no
+# close is clicked, the diagnostic list is blank, all three layers blind at once,
+# and the log shows only "generation timeout".
 #
-# 實證（2026-08-29，`verify_quota_dialog.py` 真 DOM）：把 `role="dialog"` 加上
-# `position:fixed` 之後，Tier 1／Tier 2／dismiss／控制項清單**全部**回空，而同一
-# 份 DOM 只要拿掉 fixed 就全部正常。
+# Empirical proof (2026-08-29, real DOM in `verify_quota_dialog.py`): adding
+# `position:fixed` to `role="dialog"` made Tier 1 / Tier 2 / dismiss / the
+# control list **all** come back empty, while the same DOM was entirely normal
+# once fixed was removed.
 #
-# 換成 `getClientRects()`：`display:none`（含祖先）回空陣列，fixed 的可見元素回
-# 得到矩形。再補一次 computed style，順手把舊判準漏掉的 `visibility: hidden` 也
-# 擋下來——那一種 `offsetParent` 是**非** null 的，等於以前會誤判成「有對話框」。
+# Switched to `getClientRects()`: `display:none` (including ancestors) returns an
+# empty array, and a visible fixed element returns rectangles. Add one computed
+# style check to also block `visibility: hidden`, which the old criterion missed
+# -- for that one `offsetParent` is **non**-null, i.e. it used to be misjudged as
+# "there is a dialog".
 #
-# 只套用在對話框／吐司這幾段。頁面上一般的按鈕、輸入框沿用 `offsetParent`：那些
-# 元素不會是 fixed，而 `offsetParent` 便宜得多（本檔另有約五十處）。
+# Applied only to the dialog/toast sections. Ordinary page buttons and inputs
+# keep using `offsetParent`: those elements will not be fixed, and `offsetParent`
+# is much cheaper (about fifty other uses in this file).
 #
-# **兩個判準，用在不同層，因為兩種誤判的代價相反：**
-# - `onScreen`（容器：對話框、吐司）另外要求「矩形與視窗有交集」。誤判成「有對話
-#   框擋著」的代價是白等一小時，所以這一層寧可嚴。站方頁面裡常留著 opacity:0 或
-#   移到畫面外的 fixed modal 殼，光看 `getClientRects()` 會全部算成可見。
-# - `visible`（對話框**裡面**的控制項）只要求「有佈局且沒被藏起來」。這一層漏掉
-#   一個真的 Cancel 才是更大的害處——長對話框裡捲到視窗外的按鈕仍然點得到。
+# **Two criteria, used at different layers, because the two misjudgements cost
+# the opposite:**
+# - `onScreen` (containers: dialogs, toasts) additionally requires "the rectangle
+#   intersects the viewport". Misjudging "a dialog is blocking" costs an hour of
+#   empty waiting, so this layer would rather be strict. The site's pages often
+#   keep opacity:0 or off-screen fixed modal shells, which `getClientRects()`
+#   alone would all count as visible.
+# - `visible` (controls **inside** the dialog) only requires "has layout and is
+#   not hidden". Missing a real Cancel is the bigger harm here -- a button
+#   scrolled off-screen in a long dialog is still clickable.
 _JS_VISIBLE = r"""
 function visible(el) {
   if (!el) return false;
-  if (el.getClientRects().length === 0) return false;   // display:none / 未佈局
+  if (el.getClientRects().length === 0) return false;   // display:none / not laid out
   const st = getComputedStyle(el);
   if (st.visibility === 'hidden' || st.display === 'none') return false;
   return parseFloat(st.opacity) !== 0;
@@ -237,61 +291,84 @@ function onScreen(el) {
 }
 """
 
-# ---------- 站方擋住生成（購買／方案資訊）------------------------------------
-# 額度用完時站方會跳出購買／訂閱資訊，生成從此不會成功。這**不是**可重試的失敗：
-# 監督者重生一次瀏覽器只會看到同一個對話框，於是變成無限重生（每輪還重跑一次
-# 登入 ＋ setup）。偵測到就要走「乾淨停止、通知使用者、不重生」這條路。
+# ---------- The site blocks generation (purchase / plan information) ------------------------
+# When the quota runs out the site pops up purchase / subscription information,
+# and generation will never succeed again. This is **not** a retryable failure:
+# the supervisor respawning the browser only sees the same dialog, so it becomes
+# an infinite respawn (each round also reruns login + setup). Once detected, it
+# must take the "stop cleanly, notify the user, do not respawn" path.
 #
-# 兩層偵測，刻意分開：
-#   Tier 1（`_GENERATION_BLOCK_JS`）：對話框／吐司文字命中購買語意 → 立刻停。
-#   Tier 2（`has_blocking_dialog`）：**不依賴任何字面**——連續失敗到 abort 門檻
-#     時，若畫面上仍有可見的 modal 對話框擋著，就當成「需要人處理」而不是崩潰。
-#     這層是給「站方改寫字面 / 換語言 / 換成沒讀過的擋法」的保險。
+# Two detection layers, deliberately separate:
+#   Tier 1 (`_GENERATION_BLOCK_JS`): dialog/toast text matches purchase semantics
+#     -> stop immediately.
+#   Tier 2 (`has_blocking_dialog`): **depends on no wording** -- when consecutive
+#     failures reach the abort threshold, if a visible modal dialog is still
+#     blocking the screen, treat it as "needs a human" rather than a crash. This
+#     layer is the insurance for "the site rewrites the wording / changes
+#     language / switches to a block we have not read".
 #
-# 字面清單是**猜測起點**，不是真理：每次停止都會把對話框全文寫進 log（stderr，
-# 不外流），照那份實際文字回來收斂這裡的 pattern。加 pattern 時一律用**片語**、
-# 不要用單字——「subscription」「purchase」單獨出現在導覽列／頁尾很常見，單字比
-# 對會把正常頁面誤判成擋住。
+# The wording list is a **starting guess**, not the truth: every stop writes the
+# dialog's full text to the log (stderr, not leaked), and the patterns here are
+# refined from that actual text. When adding a pattern always use a **phrase**,
+# never a single word -- "subscription" and "purchase" appear alone in nav bars /
+# footers all the time, and single-word matching would misjudge a normal page as
+# blocked.
 #
-# ---- 文案基準（2026-09-09 對 `WEBRunner.log` 全檔量到的）--------------------
-# **這份清單裡只有一條是照實際文字寫的，其餘十條都還是猜的。** log 涵蓋 08-24
-# → 09-09、259 次被擋，`[blocked] dialog text:` 的**相異內容只有一種**：
+# ---- Wording baseline (measured over the whole `WEBRunner.log` on 2026-09-09) ------------
+# **Only one entry in this list is written from actual text; the other ten are
+# still guesses.** The log covers 08-24 -> 09-09, 259 blocks, and
+# `[blocked] dialog text:` had **only one distinct content**:
 #
-#   「The paint's run dry. You need a subscription or to purchase Anlas to
-#     continue. Compare and pick the right plan for you.」（撇號是 U+2019）
+#   "The paint's run dry. You need a subscription or to purchase Anlas to
+#     continue. Compare and pick the right plan for you." (the apostrophe is U+2019)
 #
-# 而這份清單開頭那條 `/not enough anlas/i` 所描述的舊文案
+# Whereas the old wording that this list's opening `/not enough anlas/i` describes
 #
-#   「Not enough Anlas. Purchasing more Anlas lets you keep generating at this
-#     resolution.」
+#   "Not enough Anlas. Purchasing more Anlas lets you keep generating at this
+#     resolution."
 #
-# 在同一份 log 裡出現 **0 次**。也就是說它從來沒有在這個站台上命中過——它跟其他
-# 九條一樣是當初憑想像寫的句型。**留著是對的**（站方換回類似措辭時仍然接得住，
-# 而且它零誤判），但不要把它當成「驗證過的」。
+# appears **0 times** in the same log. That is, it has never once matched on this
+# site -- like the other nine it is a sentence shape written from imagination
+# originally. **Keeping it is right** (it still catches if the site reverts to
+# similar wording, and it has zero false positives), but do not treat it as
+# "verified".
 #
-# 實際文字命中的只有 `/(purchase|buy) (more )?(anlas|credits)/i` **一條**，餘裕
-# 是零：把那句「or to purchase Anlas」換掉，整份清單就從 1/11 掉到 0/11。實測三
-# 種合理改寫（「requires a subscription」語序相反／「need an active plan」／貨幣
-# 詞換成 tokens）在補這兩條之前**全部 0 命中**。
+# The only entry that matched actual text is `/(purchase|buy) (more )?(anlas|credits)/i`
+# **alone**, with zero margin: replace that "or to purchase Anlas" and the whole
+# list drops from 1/11 to 0/11. Three reasonable rewrites measured
+# ("requires a subscription" with the word order reversed / "need an active plan"
+# / the currency word swapped to tokens) all had **0 matches** before these two
+# were added.
 #
-# 漏掉的代價是**中等、不是嚴重**：Tier 2（`has_blocking_dialog`）不依賴任何字面，
-# 連續失敗到 abort 門檻時只要畫面上還有 modal 就會接住，所以最壞是多燒幾次重試。
+# The cost of a miss is **moderate, not severe**: Tier 2 (`has_blocking_dialog`)
+# depends on no wording, and when consecutive failures reach the abort threshold
+# it catches as long as a modal is still on screen, so the worst is a few extra
+# wasted retries.
 #
-# **反方向（誤判）比漏掉貴，所以這裡寧可保守。** Tier 1 命中在批次路徑上不是
-# 「乾淨停止」——它走的是 `wait_for_quota_recovery`，而 `quota_wait_max_sec` 預設
-# 0 ＝ 無上限，所以一次誤判就是**每小時醒來一次、永不結束的等待迴圈**，而且從
-# 事件串流上看起來跟真的額度用完一模一樣（照樣發 `quota_blocked` /`quota_wait`）。
-# 加 pattern 之前一定要對「正常頁面文字」量一次誤判，不要只量正面命中。
+# **The opposite direction (a false positive) costs more than a miss, so here we
+# would rather be conservative.** A Tier 1 hit on the batch path is not a
+# "clean stop" -- it takes `wait_for_quota_recovery`, and `quota_wait_max_sec`
+# defaults to 0 = no limit, so a single false positive is a **wake-once-an-hour,
+# never-ending wait loop**, and on the event stream it looks exactly like a real
+# quota exhaustion (it still sends `quota_blocked` / `quota_wait`). Before adding
+# a pattern, always measure false positives against "normal page text", not just
+# positive hits.
 #
-# 照這個判準**否決掉的**兩個候選，理由記在這裡免得下次有人再提一次：
-#   - `/pick the right plan/i`：邊際貢獻是零（實測每一份會命中它的文案，上面那
-#     兩條新的都已經命中），而它是唯一會咬到反面語料的候選——真正的方案比較頁就
-#     寫著這句話。零收益 ＋ 有誤判風險。
-#   - `/subscription or to (purchase|buy)/i`：貼著這一版的措辭寫，站方把 or 改成
-#     and 就沒了；「需要訂閱」那條已經涵蓋它能接的每一個情境。
-# Tier 1 的容器長度上限，Python 這側的鏡像（JS 裡是字面量——那段是 raw 字串，塞不
-# 進 f-string 的插值）。只拿來把 log 裡的「餘裕」算出來；兩邊不一致由
-# `test_only_tier1_gates_the_dialog_text_on_length` 直接從 JS 原始碼抽出來對照。
+# Two candidates **rejected** by this criterion, with the reasons noted here so
+# nobody proposes them again next time:
+#   - `/pick the right plan/i`: marginal contribution is zero (measured: every
+#     wording that would hit it, the two new entries above already hit), and it
+#     is the only candidate that bites the negative corpus -- a real plan
+#     comparison page literally says this. Zero gain + false-positive risk.
+#   - `/subscription or to (purchase|buy)/i`: written against this exact version's
+#     wording, and gone the moment the site changes "or" to "and"; the "needs a
+#     subscription" entry already covers every situation it could catch.
+# Tier 1's container length cap, mirrored on the Python side (in the JS it is a
+# literal -- that section is a raw string and cannot take an f-string
+# interpolation). Used only to compute the "margin" from the log; a mismatch
+# between the two sides is caught by
+# `test_only_tier1_gates_the_dialog_text_on_length`, which extracts it directly
+# from the JS source.
 _TIER1_TEXT_CAP = 1200
 
 _GENERATION_BLOCK_JS = _JS_VISIBLE + r"""
@@ -309,16 +386,21 @@ const PATTERNS = [
   /no (anlas|credits) (left|remaining)/i,
   /(purchase|buy) (more )?(anlas|credits)/i,
   /(subscribe|subscription) (is )?(required|needed|to continue)/i,
-  // ↓ 2026-09-09 照 log 裡的**實際文字**收斂進來的兩條，見下面「文案基準」。
-  // 這一條補的是上一條的語序缺陷：上一條要求 subscription **後面緊接**
-  // required/needed/to continue，而站方寫的是「You need a subscription **or**
-  // to…」，於是接不到；「Generating **requires a** subscription」這種反向語序
-  // 也一樣接不到。判準改成「需要 ←→ 訂閱」的語意配對，兩種語序都涵蓋。
+  // ↓ Two entries refined from the **actual text** in the log on 2026-09-09,
+  // see "Wording baseline" below. This one fixes a word-order gap in the
+  // previous entry: the previous one required required/needed/to continue
+  // **immediately after** subscription, but the site wrote "You need a
+  // subscription **or** to…", which it could not catch; and the reverse order
+  // "Generating **requires a** subscription" it could not catch either. The
+  // criterion is now a "need <-> subscription" semantic pairing, covering both
+  // orders.
   /(need|needs|requires?|required) (a |an )?(subscription|paid plan)/i,
-  // 站方這一版付費牆的標題句。**這一條是站方專用的便宜保險，不是語意判準**——
-  // 站方一改標題它就失效，那是預期內的，不要為了「讓它更耐改」而放寬成
-  // /run dry/ 之類的單一片語。`.{0,3}` 是為了同時吃彎引號（U+2019，log 裡就是
-  // 這個）、直引號與沒有引號三種寫法。
+  // The title sentence of this version of the site's paywall. **This entry is a
+  // cheap site-specific insurance, not a semantic criterion** -- it stops
+  // working the moment the site changes the title, which is expected; do not
+  // loosen it to a single phrase like /run dry/ to "make it more change-proof".
+  // The `.{0,3}` is to accept the curly apostrophe (U+2019, which is what is in
+  // the log), the straight apostrophe, and no apostrophe, all three.
   /paint.{0,3}s run dry/i,
   /(subscription|plan) (has )?(expired|ended|lapsed|inactive)/i,
   /upgrade your (plan|subscription|account)/i,
@@ -330,17 +412,22 @@ for (const node of document.querySelectorAll(SELECTOR)) {
   if (!onScreen(node)) continue;
   const text = (node.innerText || node.textContent || '')
     .replace(/\s+/g, ' ').trim();
-  // 太長的一定是包住半個頁面的 wrapper，不是對話框本體。**這道上限是 Tier 1
-  // 專用的**：這裡的 SELECTOR 很寬（吐司、`class*=modal`、`aria-live`），需要它
-  // 擋掉誤判，而 Tier 1 誤判＝無上限的等待迴圈。Tier 2 的 selector 已經收斂過，
-  // 不要把這一行抄過去——理由寫在 `_BLOCKING_DIALOG_JS` 上面。
-  // 數字要跟 Python 那側的 `_TIER1_TEXT_CAP` 一致（有守門測試對照）。
+  // Anything too long is a wrapper enclosing half the page, not the dialog
+  // body itself. **This cap is Tier 1-specific**: the SELECTOR here is very wide
+  // (toasts, `class*=modal`, `aria-live`), so it needs this to block false
+  // positives, and a Tier 1 false positive = an unbounded wait loop. Tier 2's
+  // selector is already narrow, so do not copy this line over -- the reason is
+  // written above `_BLOCKING_DIALOG_JS`.
+  // The number must match the Python side's `_TIER1_TEXT_CAP` (a guard test
+  // reconciles it).
   if (!text || text.length > 1200) continue;
   for (const re of PATTERNS) {
     if (re.test(text)) {
-      // `length` 是**全文**長度（`text` 已經被截成 400）。它存在的唯一理由是讓
-      // 「離上面那道 1200 還有多少餘裕」變成量到的數字——站方多加一列方案就可能
-      // 跨過去，而跨過去是靜默的（整段就當作沒有對話框）。
+      // `length` is the **full** text length (`text` has already been sliced to
+      // 400). Its sole reason to exist is to turn "how much margin is left below
+      // that 1200" into a measured number -- the site adding one more plan row
+      // could cross it, and crossing it is silent (the whole thing then counts
+      // as no dialog).
       return {text: text.slice(0, 400), pattern: String(re),
               length: text.length};
     }
@@ -349,106 +436,144 @@ for (const node of document.querySelectorAll(SELECTOR)) {
 return null;
 """
 
-# 關掉擋路的對話框。**這段的第一要務是「絕對不要點到會花錢的按鈕」**——
-# 額度用完的對話框上，「購買」按鈕通常比「取消」更顯眼、更可能被寬鬆的選擇器
-# 命中。所以規則是白名單制而非黑名單制：
-#   1. 只挑**文字完全等於**已知關閉字樣的按鈕（`DISMISS`，完整比對、不是包含）。
-#   2. 或 `aria-label` 含 close/dismiss **且**不含任何付款語意的按鈕。
-#   3. 或「右上角的無字圖示鈕」——幾何 ＋ 語意空白，見下面 `byCorner` 的說明。
-#   4. 都沒有 → 回 'escape'，由呼叫端送 Escape 鍵，一個元素都不交出去。
-# 挑中就回 `{action, el}`，**這一段自己不按**——按的動作由 `_click_dismiss_target`
-# 用 driver 送出（理由見下面第 2 段）。所以安全性質的判定點是**回傳值**：
-# 「不會回傳會花錢的控制項」。
-# `FORBIDDEN` 涵蓋的不只是 purchase/buy——`ok` / `yes` / `confirm` / `continue`
-# 這種模稜兩可的字也一律禁點：在購買對話框上它們就是「確認扣款」。
+# Dismiss the blocking dialog. **This section's first duty is "never click a
+# button that spends money"** -- on a quota-exhausted dialog the "purchase"
+# button is usually more prominent than "cancel" and more likely to be hit by a
+# loose selector. So the rule is a whitelist, not a blacklist:
+#   1. Only pick a button whose **text exactly equals** a known dismiss word
+#      (`DISMISS`, exact match, not contains).
+#   2. Or a button whose `aria-label` contains close/dismiss **and** contains no
+#      payment semantics.
+#   3. Or "the wordless icon button in the top-right corner" -- geometry +
+#      semantic emptiness, see `byCorner`'s description below.
+#   4. None of the above -> return 'escape', and the caller sends the Escape key,
+#      handing over no element at all.
+# Once picked it returns `{action, el}`, and **this section does not click
+# itself** -- the click is sent by `_click_dismiss_target` via the driver (reason
+# in section 2 below). So the safety property's decision point is the **return
+# value**: "it will not return a control that spends money".
+# `FORBIDDEN` covers more than purchase/buy -- ambiguous words like `ok` / `yes` /
+# `confirm` / `continue` are also all forbidden: on a purchase dialog they mean
+# "confirm the charge".
 #
-# **第二層對話框上有一顆會造成真實損害的按鈕：`Unsubscribe`。** 這一層比第一層更
-# 危險：第一層最壞是花錢，這一層最壞是**把訂閱退掉**，整條產線會停擺。
+# **The second-layer dialog has a button that causes real damage: `Unsubscribe`.**
+# This layer is more dangerous than the first: the first's worst case is spending
+# money, this layer's worst case is **cancelling the subscription**, which stalls
+# the entire production line.
 #
-# **`get started` / `gift key` / `anlas` 是 2026-09-07 補進 `FORBIDDEN` 的縱深
-# 防禦，不是因為它們現在擋不住。** 把兩層對話框上的每一顆拿去對 `FORBIDDEN` 掃過
-# 一遍會發現保護厚薄非常不平均：
+# **`get started` / `gift key` / `anlas` were added to `FORBIDDEN` on 2026-09-07
+# as defence in depth, not because they cannot be blocked now.** Scanning every
+# button on both dialog layers against `FORBIDDEN` shows the protection is very
+# unevenly thick:
 #
-#   Unsubscribe / Update Payment Details / Subscribe / Pay As You Go  → 命中
-#   Get Started / Anlas / Activate a Gift Key                         → **沒有命中**
+#   Unsubscribe / Update Payment Details / Subscribe / Pay As You Go  -> hit
+#   Get Started / Anlas / Activate a Gift Key                         -> **not hit**
 #
-# 後面那三顆原本**完全只靠「文字必須為空」那一條**擋住，連 `Unsubscribe` 那種
-# 「剛好含 subscribe」的第二層都沒有。而那一條同時是規則 3 的功能條件，所以放寬它
-# 的人不會意識到自己在動安全性質。補進來之後兩者才真的分開。
+# The latter three were originally blocked **solely by the "text must be empty"
+# rule**, without even the "happens to contain subscribe" second layer that
+# `Unsubscribe` has. And that rule is also rule 3's functional condition, so
+# whoever loosens it will not realise they are touching a safety property. Only
+# after adding these did the two truly separate.
 #
-# **加這三個字不會影響關閉鈕的辨識**：關閉鈕要嘛文字為空（規則 3），要嘛是
-# `close`／`cancel`／`×` 這類（規則 1 的 `DISMISS` 白名單）——沒有任何合理的關閉鈕
-# 會叫 `Get Started` 或 `Anlas`。`anlas` 是站方的貨幣名，之後任何提到它的按鈕都值
-# 得擋。寫成 `get[- ]?started` 是因為 `identityOf` 讀到的常是連字號形式
-# （`data-testid="get-started"`）。
+# **Adding these three words does not affect close-button recognition**: a close
+# button either has empty text (rule 3), or is a `close` / `cancel` / `×` sort of
+# thing (rule 1's `DISMISS` whitelist) -- no reasonable close button is named
+# `Get Started` or `Anlas`. `anlas` is the site's currency name, so any future
+# button mentioning it is worth blocking. It is written as `get[- ]?started`
+# because what `identityOf` reads is often the hyphenated form
+# (`data-testid="get-started"`).
 #
-# **這一段只負責「挑」，不負責「按」。挑好的元素回給 Python，由 driver 送出真的
-# 點選（`_click_dismiss_target`）。** 這件事直接搬動了本專案最貴的那條安全性質的
-# 判定點：以前是「JS 不會 `click()` 到會花錢的按鈕」，現在是「JS 不會**回傳**會花
-# 錢的按鈕」。所有反例測試都必須釘在回傳值上——釘在「有沒有 click 事件」上等於什麼
-# 都沒驗（新版裡它必然是空的）。
+# **This section only "picks", it does not "click". The picked element is
+# returned to Python, and the driver sends the real click
+# (`_click_dismiss_target`).** This directly moved the decision point of this
+# project's most expensive safety property: it used to be "the JS will not
+# `click()` a button that spends money", now it is "the JS will not **return** a
+# button that spends money". Every counterexample test must be pinned to the
+# return value -- pinning to "was there a click event" verifies nothing (in the
+# new version it is necessarily empty).
 #
-# 為什麼要改成 driver 點選——經過一次來回才確定的，兩段都記著，因為兩段各自都是
-# 對的、只是不完整：
+# Why switch to driver click -- settled only after a round trip; both parts are
+# recorded because each is right on its own, just incomplete:
 #
-# 1. **迴圈是需要的。** 規則 3 上線後連續五個額度週期都印
-#    `could not dismiss blocking dialog via 'clicked-corner:button@805,21 32x32'`，
-#    看起來像「找對了卻按不動」。推翻它的是 `describe_dialog_controls` 印出來的
-#    **對話框尺寸**——它在規則 3 上線的那一刻換了：
+# 1. **The loop is needed.** After rule 3 shipped, five consecutive quota cycles
+#    all printed
+#    `could not dismiss blocking dialog via 'clicked-corner:button@805,21 32x32'`,
+#    which looked like "found the right one but could not press it". What refuted
+#    that was the **dialog size** that `describe_dialog_controls` printed -- it
+#    changed at the exact moment rule 3 shipped:
 #
-#      11:44 之前：856x917、11 個候選（Subscribe / Pay As You Go / Get Started）
-#      11:44 之後：420x322、5 個候選（Unsubscribe / Update Payment Details）
+#      before 11:44: 856x917, 11 candidates (Subscribe / Pay As You Go / Get Started)
+#      after 11:44:  420x322, 5 candidates (Unsubscribe / Update Payment Details)
 #
-#    而那份清單是**關閉動作跑完之後**才抓的。所以合成點選確實把付費牆關掉了，
-#    露出後面**第二層**對話框，`has_blocking_dialog` 看到還有 modal 就回報失敗。
+#    And that list is captured **after the dismiss action ran**. So the synthetic
+#    click did close the paywall, exposing a **second-layer** dialog behind it,
+#    and `has_blocking_dialog` saw a modal still there and reported failure.
 #
-# 2. **但迴圈解不掉第二層，合成點選對它無效。** 迴圈上線後的四個額度週期，log 的
-#    形狀變成：第 1 層 @(805,21) 按下去畫面真的換了、第 2 層 @(369,21) 按下去
-#    **一個字都沒變**，早停判準當場收手，仍然落到整頁 reload。
+# 2. **But the loop cannot solve the second layer; the synthetic click has no
+#    effect on it.** Over the four quota cycles after the loop shipped, the log
+#    shape became: layer 1 @(805,21) pressed and the screen really changed;
+#    layer 2 @(369,21) pressed and **not one thing changed**, the early-stop
+#    criterion gave up on the spot, and it still fell to a full-page reload.
 #
-#    兩層那顆關閉鈕的 class 完全一樣
-#    （`sc-2f2fb315-2 sc-29539429-20 sc-1336beac-0 eTBYIC jjGTfR fJg`），同一個元件、
-#    同樣的視覺，卻一個吃合成點選、一個不吃。這反而支持「差別在**元素之上**」而不是
-#    「元件本身不同」：`el.click()` 是**直接對那顆元素派送**，只會往上冒泡；真點選
-#    的 `e.target` 是「那個座標上最上層的元素」。另外 `el.click()` 只派送 `click`
-#    一種事件，真點選會走完整串 pointerdown / mousedown / mouseup / click——把關閉
-#    行為掛在 `onPointerDown` / `onMouseDown` 是 modal 元件常見的寫法（避免點選
-#    穿透），那一類同樣只有真點選收得到。
+#    The close button's class is identical on both layers
+#    (`sc-2f2fb315-2 sc-29539429-20 sc-1336beac-0 eTBYIC jjGTfR fJg`), the same
+#    component, the same visuals, yet one accepts the synthetic click and one
+#    does not. This actually supports "the difference is **above the element**"
+#    rather than "the component itself differs": `el.click()` **dispatches
+#    directly to that element** and only bubbles upward; a real click's `e.target`
+#    is "the topmost element at that coordinate". Also `el.click()` dispatches
+#    only the `click` event, while a real click runs the full chain pointerdown /
+#    mousedown / mouseup / click -- hanging the close behaviour on `onPointerDown`
+#    / `onMouseDown` is a common pattern for modal components (to avoid
+#    click-through), and that kind is likewise received only by a real click.
 #
-# 3. **第二層不是「需要使用者處理」的帳號異常**，這一點查清楚了才動手：
-#    `chromedriver.log` 裡 `has_blocking_dialog` 的回傳原文是
-#    「You are subscribed to the Opus tier! Your subscription renews around
-#    2026/09/18」——就只是藏在付費牆後面的帳號管理面板。行為面也對得上：那之後每
-#    小時照常回補、照常產圖（8.0 張/小時，與歷史基準 7.85 一致）。所以正確處置是
-#    「關掉它」，不是「停下來叫人」。
+# 3. **The second layer is not a "needs the user" account anomaly** -- this was
+#    checked out before acting: the return text of `has_blocking_dialog` in
+#    `chromedriver.log` was
+#    "You are subscribed to the Opus tier! Your subscription renews around
+#    2026/09/18" -- just the account management panel hidden behind the paywall.
+#    The behaviour matches too: after that it refilled and generated hourly as
+#    usual (8.0 images/hour, consistent with the historical baseline of 7.85). So
+#    the correct handling is "close it", not "stop and call a human".
 #
-# 兩段教訓一起記：**單一 log 訊息（「關不掉」）說的是結果，不是機制**，換機制之前
-# 先找一個獨立的量交叉驗證（第 1 段用對話框尺寸救回一次）；但**交叉驗證證明的只是
-# 它證明的那一件事**——尺寸變了只證明第一層被關掉，不證明第二層也會被關掉。
+# Two lessons recorded together: **a single log message ("cannot dismiss") tells
+# you the result, not the mechanism**, so before switching mechanisms find an
+# independent measurement to cross-check (section 1 was rescued once by dialog
+# size); but **a cross-check proves only the one thing it proves** -- the size
+# changing only proves the first layer was closed, it does not prove the second
+# layer will be closed too.
 _DISMISS_DIALOG_JS = _JS_VISIBLE + r"""
 const FORBIDDEN = /(purchase|buy|subscribe|subscription|upgrade|pay|payment|checkout|order|confirm|continue|proceed|accept|agree|ok|okay|yes|renew|top ?up|add funds|get more|get[- ]?started|gift[- ]?key|anlas)/i;
 const DISMISS = /^(cancel|close|not now|later|maybe later|dismiss|no thanks|no,? thanks|back|×|✕|✖|x)$/i;
-// 規則 3 的兩個門檻。**兩個都不能拿掉，它們擋的是不同的東西**，看起來像其中一個
-// 是多餘的正是最容易犯的錯：
-//   CORNER_MAX_PX  擋「在角落、但很大」——整片遮罩、對話框自己的 header 容器。
-//                  它們的右上角座標與關閉鈕**完全一樣**，只有尺寸分得開。
-//   CORNER_FRAC    擋「很小、但不在角落」——對話框中央／底部的無字圖示鈕。
-//                  它們的尺寸與關閉鈕**完全一樣**，只有位置分得開。
-// 實測依據（2026-09-03～09-07 的 `describe_dialog_controls` 清單，856x917 的購買
-// 對話框、11 個候選）：唯二 text 為空的就是右上角那組 32x32 @(805,21)；會花錢的
-// 那幾顆（Pay As You Go / Subscribe / Get Started / Anlas）**每一顆都有文字**，
-// 其中 Anlas 只有 37x24——尺寸條件單獨擋不住它，擋住它的是「語意空白」。
+// Rule 3's two thresholds. **Neither can be removed, they block different
+// things**, and the easiest mistake is that one looks redundant:
+//   CORNER_MAX_PX  blocks "in the corner, but large" -- the full overlay, the
+//                  dialog's own header container. Their top-right coordinate is
+//                  **exactly the same** as the close button, only the size
+//                  separates them.
+//   CORNER_FRAC    blocks "small, but not in the corner" -- the wordless icon
+//                  buttons in the dialog's centre/bottom. Their size is
+//                  **exactly the same** as the close button, only the position
+//                  separates them.
+// Empirical basis (the `describe_dialog_controls` list from 2026-09-03 ~ 09-07,
+// the 856x917 purchase dialog, 11 candidates): the only two with empty text are
+// the top-right pair, 32x32 @(805,21); the ones that spend money (Pay As You Go
+// / Subscribe / Get Started / Anlas) **all have text**, and Anlas is only 37x24
+// -- the size condition alone cannot block it, what blocks it is "semantic
+// emptiness".
 const CORNER_MAX_PX = 48;
 const CORNER_FRAC = 0.2;
-// 候選控制項。`button` 以外還收 `[aria-label]` / `[title]` / `[tabindex]` /
-// `[onclick]`：站方的關閉鈕常常是一個包著 svg 的 div，不是 <button>。
-// **放寬的只有元素形狀，字面白名單一個字都沒動**，所以「絕不點
-// 到會花錢的按鈕」這條性質不變。
+// Candidate controls. Beyond `button` it also takes `[aria-label]` / `[title]` /
+// `[tabindex]` / `[onclick]`: the site's close button is often a div wrapping an
+// svg, not a <button>. **Only the element shape was loosened; not one word of
+// the wording whitelist was changed**, so the "never click a button that spends
+// money" property is unchanged.
 const SELECTOR = 'button,[role="button"],a[href="#"],[aria-label],[title],'
                + '[tabindex],[onclick]';
-// 三條規則都取「最內層」的命中。放寬選擇器之後，一個包著
-// <button>Cancel</button> 的 wrapper 也會命中（innerText 一樣是 Cancel），而
-// `el.click()` 的 target 就是那個 wrapper、不會傳給子節點，等於沒點。
+// All three rules take the "innermost" hit. After loosening the selector, a
+// wrapper enclosing <button>Cancel</button> also matches (its innerText is
+// likewise Cancel), and `el.click()`'s target is that wrapper, which is not
+// passed to the child node, i.e. nothing is clicked.
 function innermost(list) {
   for (const el of list) {
     if (!list.some(other => other !== el && el.contains(other))) return el;
@@ -461,10 +586,11 @@ function labelOf(el) {
 function attrOf(el, name) {
   return (el.getAttribute(name) || '').replace(/\s+/g, ' ').trim();
 }
-// 使用者**讀得到**的字。空 = 這是一顆純圖示鈕，也就是規則 3 的安全性質本身。
-// 收的比 labelOf 廣，因為「innerText 是空的」不等於「沒有字」：
-//   <input type="button" value="Purchase">  innerText 空、value 有字
-//   <button><img alt="Buy"></button>        innerText 空、子節點 alt 有字
+// The text the user **can read**. Empty = this is a pure icon button, which is
+// rule 3's safety property itself. It collects more widely than labelOf, because
+// "innerText is empty" does not mean "no text":
+//   <input type="button" value="Purchase">  innerText empty, value has text
+//   <button><img alt="Buy"></button>        innerText empty, child alt has text
 function readableOf(el) {
   const parts = [labelOf(el), attrOf(el, 'aria-label'), attrOf(el, 'title'),
                  attrOf(el, 'value'), attrOf(el, 'alt')];
@@ -474,9 +600,11 @@ function readableOf(el) {
   }
   return parts.filter(Boolean).join(' ').trim();
 }
-// 開發者取的識別字，給 FORBIDDEN 當縱深防禦用。**obfuscated class name 刻意
-// 不收**：站方的 class 是 `sc-2f2fb315-2 eTBYIC jjGTfR` 這種隨機雜湊，撞出
-// `ok` / `pay` 這種兩三個字母的機率不低，而誤判的代價是規則 3 整個安靜失效。
+// The developer-chosen identifier, used by FORBIDDEN as defence in depth.
+// **The obfuscated class name is deliberately not collected**: the site's class
+// is a random hash like `sc-2f2fb315-2 eTBYIC jjGTfR`, and the odds of it
+// colliding with a two-or-three-letter word like `ok` / `pay` are not low, and
+// the cost of a false positive is rule 3 silently failing entirely.
 function identityOf(el) {
   return [attrOf(el, 'id'), attrOf(el, 'name'), attrOf(el, 'data-testid'),
           attrOf(el, 'data-test'), attrOf(el, 'data-action')]
@@ -506,35 +634,48 @@ for (const node of document.querySelectorAll(
                                        || hitAria.getAttribute('title') || ''),
             el: hitAria};
   }
-  // 規則 3：右上角的無字圖示鈕。站方的關閉鈕語意上完全是空的（沒有文字、沒有
-  // aria-label、沒有 title、連 svg 都沒有——X 是 CSS 畫的），所以規則 1 / 2 對它
-  // 一律失效；實測 **218/218 次**全部落到 'escape'，而 Escape 對這個 modal 同樣
-  // 無效——也就是每個額度週期都要付一次整頁 reload ＋ 重填欄位。
-  // （log 裡另有 153 筆「dismissed」是舊版在驗證前就無條件印的假訊息，別拿它們
-  //   算成功率；真正的判準是「每天的 reload 次數 == 當天的嘗試次數」。）
+  // Rule 3: the wordless icon button in the top-right corner. The site's close
+  // button is semantically completely empty (no text, no aria-label, no title,
+  // not even an svg -- the X is drawn in CSS), so rules 1 / 2 all fail on it;
+  // measured **218/218 times** all fell to 'escape', and Escape is likewise
+  // ineffective on this modal -- meaning every quota cycle pays for one full-page
+  // reload + refilling the fields.
+  // (There are also 153 "dismissed" entries in the log that the old version
+  //   printed unconditionally before verifying -- fake messages; do not count
+  //   them as a success rate. The real criterion is "the day's reload count ==
+  //   that day's attempt count".)
   const box = node.getBoundingClientRect();
   const byCorner = controls.filter(el => {
-    // (a) 語意空白。這是規則 3 的**功能**條件：關閉鈕是純圖示鈕。
+    // (a) Semantic emptiness. This is rule 3's **functional** condition: the
+    // close button is a pure icon button.
     if (readableOf(el)) return false;
-    // (d) 縱深防禦。掃兩個來源，而且**刻意跟 (a) 重疊**：
-    //   - `identityOf`（id / name / data-testid）——(a) 過了之後只可能由這個觸發，
-    //     例如 id="purchase-more"。
-    //   - `readableOf`——在 (a) 還在的時候這裡**必然是空字串**，看起來像死碼。它
-    //     買的是「有人放寬 (a) 的時候仍然不會去點購買鈕」。理由：站方那兩層對話框
-    //     上有三顆按鈕（`Get Started`／`Anlas`／`Activate a Gift Key`）**完全只靠
-    //     (a) 擋住**，而 (a) 同時是「規則 3 能不能找到關閉鈕」的功能條件——同一個
-    //     判斷兼任功能與安全兩個角色，改它的人不會意識到自己在動安全性質。分開
-    //     之後，放寬 (a) 只會讓規則 3 失效（找不到關閉鈕 → 退回 reload，安全），
-    //     而不會讓它去點購買鈕。
-    //     守門：`test_forbidden_alone_still_blocks_every_paying_button`（把 (a)
-    //     關掉之後 FORBIDDEN 仍須擋下兩層對話框上的每一顆）。
+    // (d) Defence in depth. Scan two sources, and **deliberately overlap with
+    // (a)**:
+    //   - `identityOf` (id / name / data-testid) -- once (a) passes, only this
+    //     could trigger, e.g. id="purchase-more".
+    //   - `readableOf` -- while (a) is still in place this is **necessarily an
+    //     empty string**, and it looks like dead code. What it buys is "even if
+    //     someone loosens (a), it still will not click the purchase button".
+    //     Reason: the site's two dialog layers have three buttons (`Get Started`
+    //     / `Anlas` / `Activate a Gift Key`) **blocked solely by (a)**, and (a)
+    //     is simultaneously the functional condition for "can rule 3 find the
+    //     close button" -- one check doing double duty as functional and safety,
+    //     and whoever changes it will not realise they are touching a safety
+    //     property. After splitting them, loosening (a) only makes rule 3 fail
+    //     (cannot find the close button -> fall back to reload, safe), rather
+    //     than making it click the purchase button.
+    //     Guard: `test_forbidden_alone_still_blocks_every_paying_button` (with
+    //     (a) turned off, FORBIDDEN must still block every button on both dialog
+    //     layers).
     if (FORBIDDEN.test(readableOf(el))
         || FORBIDDEN.test(identityOf(el))) return false;
     const r = el.getBoundingClientRect();
-    if (r.width < 8 || r.height < 8) return false;      // 0 尺寸的殼
-    // (b) 小。擋整片遮罩／header 容器——它們的角落座標跟關閉鈕一模一樣。
+    if (r.width < 8 || r.height < 8) return false;      // a 0-size shell
+    // (b) Small. Blocks the full overlay / header container -- their corner
+    // coordinate is identical to the close button's.
     if (r.width > CORNER_MAX_PX || r.height > CORNER_MAX_PX) return false;
-    // (c) 在右上角。擋對話框別處的無字圖示鈕——它們的尺寸跟關閉鈕一模一樣。
+    // (c) In the top-right corner. Blocks wordless icon buttons elsewhere in the
+    // dialog -- their size is identical to the close button's.
     if (r.right < box.right - box.width * CORNER_FRAC) return false;
     if (r.top > box.top + box.height * CORNER_FRAC) return false;
     return true;
@@ -553,15 +694,18 @@ for (const node of document.querySelectorAll(
 return null;
 """
 
-# Escape 退路：對話框上沒有任何可以安全點下去的東西時用。對 React 的舊式事件
-# 系統要補 `keyCode`/`which`（同 `_dismiss_autocomplete` 的理由）。
+# The Escape fallback: used when there is nothing safe to click on the dialog.
+# React's old event system needs `keyCode`/`which` supplied (same reason as
+# `_dismiss_autocomplete`).
 #
-# **派給三個目標，不是只派給 `document`。** 事件從 `document` 只會往上冒泡到
-# `window`，**不會往下傳**；把 keydown 掛在 modal 容器或焦點元素上的元件
-# （focus-trap 類的函式庫很常這樣做）因此永遠收不到。實測依據：本專案 86 次額度
-# 對話框，Escape 一次都沒關掉過，100% 落到「關不掉 → 重新整理」。
-# 這一段送的仍是**合成**事件（`isTrusted === false`）；driver 層的真按鍵走
-# `port.press_escape()`，由 `dismiss_blocking_dialog` 先試。
+# **Dispatch to three targets, not just `document`.** An event from `document`
+# only bubbles up to `window`, it **does not travel down**; a component that
+# hangs keydown on the modal container or the focused element (focus-trap
+# libraries very often do this) therefore never receives it. Empirical basis:
+# over this project's 86 quota dialogs, Escape never once dismissed one, 100%
+# fell to "cannot dismiss -> reload". This section still sends a **synthetic**
+# event (`isTrusted === false`); the driver-layer real keypress goes through
+# `port.press_escape()`, which `dismiss_blocking_dialog` tries first.
 _SEND_ESCAPE_JS = _JS_VISIBLE + r"""
 const targets = new Set([document]);
 if (document.activeElement) targets.add(document.activeElement);
@@ -580,16 +724,22 @@ for (const target of targets) {
 return targets.size;
 """
 
-# 關不掉的時候，把對話框上**有哪些控制項**列出來。純唯讀，一個元素都不點。
+# When it cannot be dismissed, list **which controls** are on the dialog. Purely
+# read-only, clicks not a single element.
 #
-# 為什麼需要它：`dismiss_blocking_dialog` 關失敗時只留下一句「關不掉」，看 log
-# 的人無從知道是「站方根本沒放關閉鈕」還是「放了但選擇器認不出來」——而這兩者的
-# 處置完全相反。沒有這份清單，這個問題就只能靠猜，而在**購買對話框**上靠猜著去
-# 放寬點選規則正是最不該做的事。
+# Why it is needed: when `dismiss_blocking_dialog` fails to close, it leaves only
+# "cannot dismiss", and whoever reads the log has no way to know whether "the
+# site simply provided no close button" or "it did, but the selector could not
+# recognise it" -- and the handling for those two is completely opposite. Without
+# this list the question can only be guessed at, and guessing your way into
+# loosening the click rules on a **purchase dialog** is precisely the thing you
+# should least do.
 #
-# 排序刻意用「離對話框右上角的距離」：關閉鈕幾乎都在那個角落，於是最可疑的那個
-# 會排在最前面，不會被卡在 30 筆上限外。輸出有界（最多 30 筆、每個欄位截斷），
-# 因為它會寫進 WEBRunner.log。
+# The sort deliberately uses "distance from the dialog's top-right corner": the
+# close button is almost always in that corner, so the most suspicious one sorts
+# to the front and is not stranded beyond the 30-entry cap. The output is bounded
+# (at most 30 entries, each field truncated), because it is written into
+# WEBRunner.log.
 _DIALOG_CONTROLS_DIAG_JS = _JS_VISIBLE + r"""
 for (const node of document.querySelectorAll(
        '[role="dialog"],[role="alertdialog"],[aria-modal="true"]')) {
@@ -631,44 +781,58 @@ for (const node of document.querySelectorAll(
 return null;
 """
 
-# Tier 2 用：畫面上有沒有「可見、有內容的 modal 對話框」。不看任何字面。
-# 只認真正的 modal 語意（`role="dialog"` / `aria-modal`），不含吐司與
-# `class*=modal` —— 那些太寬，正常頁面也常帶著隱藏的 modal 容器。
+# For Tier 2: is there a "visible modal dialog with content" on screen. Looks at
+# no wording. Recognises only genuine modal semantics (`role="dialog"` /
+# `aria-modal`), excluding toasts and `class*=modal` -- those are too wide, and
+# normal pages often carry a hidden modal container.
 #
-# **這裡刻意沒有長度上限；Tier 1 那道 `text.length > 1200` 不要抄過來。**
-# 2026-09-09 修掉的缺陷就是「兩層共用同一行 cap」——**兩層守門共用同一個前置
-# 條件，就不是兩層。** 一個 innerText 超過上限的 modal 會同時讓 Tier 1 跳過它
-# **而且** Tier 2 回 None，兩層一起瞎掉。判斷「這是不是第二層」的方式不是看它有
-# 沒有獨立的 selector／pattern，而是看**它會不會被同一個輸入關掉**。
+# **There is deliberately no length cap here; do not copy Tier 1's
+# `text.length > 1200` over.** The defect fixed on 2026-09-09 was exactly "both
+# layers share the same cap line" -- **two guards sharing one precondition are
+# not two layers.** A modal whose innerText exceeds the cap makes Tier 1 skip it
+# **and** Tier 2 return None, both layers blind at once. The way to tell "is this
+# the second layer" is not whether it has its own selector/pattern, but whether
+# **it gets closed by the same input**.
 #
-# 拿掉的兩個理由，方向不同但結論一致：
+# Two reasons for removing it, different directions but the same conclusion:
 #
-# 1. **收斂已經由 selector 做完了。** Tier 1 的 SELECTOR 很寬（含
-#    `[class*="modal"]`、吐司、`aria-live`），所以需要「太長的一定是包住半個頁面
-#    的 wrapper」來擋掉誤判；Tier 2 只認 `role=dialog` / `alertdialog` /
-#    `aria-modal` ＋ `onScreen()`，能通過的本來就只有真正的 modal。長度在這裡不做
-#    任何收斂工作，純粹是從 Tier 1 抄過來的殘留。
-# 2. **成本不對稱的方向是反的，所以 Tier 2 應該寬鬆。** Tier 1 誤判很貴——它走
-#    `wait_for_quota_recovery`，而 `quota_wait_max_sec` 預設 0 ＝ 無上限，一次誤判
-#    就是永不結束的等待迴圈——所以 Tier 1 寧可保守。Tier 2 誤判很便宜：它只在
-#    `consecutive_fail_abort` 門檻（那時整個角色已經死了）與「關對話框迴圈的進度
-#    判準」被問，而在後者，永遠不回 None 只會讓 `stop_reason` 落在 `same`/`still`
-#    → `return False` → 呼叫端整頁 reload（安全）。**Tier 2 的漏判才貴**：
-#    `dismiss_blocking_dialog` 把 None 讀成「關乾淨了」（`stop_reason = "closed"`
-#    → `return True`），於是它會對著一個它根本沒碰到的對話框回報成功。那是靜默的
-#    錯誤結果，不只是漏偵測。
+# 1. **The narrowing is already done by the selector.** Tier 1's SELECTOR is very
+#    wide (including `[class*="modal"]`, toasts, `aria-live`), so it needs
+#    "anything too long is a wrapper enclosing half the page" to block false
+#    positives; Tier 2 recognises only `role=dialog` / `alertdialog` /
+#    `aria-modal` + `onScreen()`, so only a genuine modal could pass in the first
+#    place. Length does no narrowing work here, it is purely a leftover copied
+#    from Tier 1.
+# 2. **The cost asymmetry runs the other way, so Tier 2 should be lenient.** A
+#    Tier 1 false positive is expensive -- it takes `wait_for_quota_recovery`, and
+#    `quota_wait_max_sec` defaults to 0 = no limit, so one false positive is a
+#    never-ending wait loop -- so Tier 1 would rather be conservative. A Tier 2
+#    false positive is cheap: it is only asked at the `consecutive_fail_abort`
+#    threshold (by which point the whole character is already dead) and by the
+#    "dismiss-dialog loop's progress criterion", and in the latter, never
+#    returning None only makes `stop_reason` land on `same`/`still` ->
+#    `return False` -> the caller does a full-page reload (safe). **A Tier 2 miss
+#    is the expensive one**: `dismiss_blocking_dialog` reads None as "closed
+#    cleanly" (`stop_reason = "closed"` -> `return True`), and so it reports
+#    success against a dialog it never even touched. That is a silent wrong
+#    result, not just a missed detection.
 #
-# 而站方的付費牆正好是最容易超過上限的形狀：**整張定價表**（方案卡 ＋ 功能比較
-# 表）。`WEBRunner.log` 08-24 → 09-09 的 260 筆 `[blocked] dialog text:` 相異內容
-# 只有一種，尾巴斷在比較表的第一列——那是 `slice(0, 400)` 的截斷，全文長度從來沒
-# 有人量過。餘裕現在會印出來，見 `_TIER1_TEXT_CAP`。
+# And the site's paywall happens to be the shape most likely to exceed the cap:
+# **the entire pricing table** (plan cards + a feature comparison table). The 260
+# `[blocked] dialog text:` entries in `WEBRunner.log` over 08-24 -> 09-09 had
+# only one distinct content, with the tail cut off at the comparison table's
+# first row -- that is the `slice(0, 400)` truncation, and the full-text length
+# was never measured by anyone. The margin is printed now, see `_TIER1_TEXT_CAP`.
 #
-# **回傳值刻意留在 `str | None`**（見 `has_blocking_dialog`），所以全文長度用
-# in-band 的方式帶出來：截斷時在尾巴附一段標記。呼叫端只拿它做**相等比較**（關
-# 對話框迴圈的進度判準）與 log，兩者都不受影響；順帶還讓「前 400 字一樣、總長
-# 不同」的兩層對話框分得出來。`EXCERPT` 用具名常數而不是字面量，是為了讓「有沒有
-# 長度上限」這件事在原始碼層面仍然一眼看得出來（守門測試抽的是
-# `text.length > <數字>` 這個形狀）。
+# **The return value is deliberately kept as `str | None`** (see
+# `has_blocking_dialog`), so the full-text length is carried out in-band: on
+# truncation a marker is appended to the tail. The caller uses it only for an
+# **equality comparison** (the dismiss-dialog loop's progress criterion) and for
+# the log, neither of which is affected; incidentally it also lets the two dialog
+# layers "same first 400 chars, different total length" be told apart. `EXCERPT`
+# uses a named constant rather than a literal so that "whether there is a length
+# cap" remains visible at a glance at the source level (the guard test extracts
+# the `text.length > <number>` shape).
 _BLOCKING_DIALOG_JS = _JS_VISIBLE + r"""
 const EXCERPT = 400;
 for (const node of document.querySelectorAll(
@@ -715,41 +879,54 @@ return Array.from(document.querySelectorAll(
 """
 
 
-# ---------- 「我現在跑的是哪一版程式碼」（見 `_code_fingerprint`）-------------
+# ---------- "Which version of the code am I running right now" (see `_code_fingerprint`) -------------
 
 def log_code_fingerprint() -> str:
-    """啟動橫幅：把**此刻**載入的程式碼指紋凍住，並印出一行摘要。回傳那一行。
+    """Startup banner: freeze the code fingerprint loaded **right now** and print
+    a one-line summary. Returns that line.
 
-    兩個變體都在 `main()` 的最前面呼叫一次（import 全部跑完之後）。放在共用模組
-    而不是各自複製兩行，理由與 `log_driver_versions` 完全相同：兩支變體必須同步是
-    本專案的硬規則，而「只有一邊有 log」的下場就是出事那次剛好跑的是沒有 log 的
-    那一支。
+    Both variants call it once at the very front of `main()` (after all imports
+    have run). It lives in the shared module rather than each duplicating two
+    lines, for exactly the same reason as `log_driver_versions`: that the two
+    variants must stay in sync is a hard rule of this project, and "only one side
+    has the log" means that the one time it matters, the variant running happens
+    to be the one without the log.
 
-    **為什麼一定要在啟動當下取樣**：`_code_fingerprint.snapshot()` 之後才有東西可
-    以拿來跟磁碟比。等到要查的時候才算，量到的是磁碟現況——也就是比較的另一邊——
-    於是永遠回報「沒有漂移」，而且測起來全綠。這是那個模組唯一真正的失效方式。
+    **Why it must sample at startup**: only after `_code_fingerprint.snapshot()`
+    is there anything to compare against disk. Compute it only when you go to
+    investigate, and what you measure is the current disk state -- i.e. the other
+    side of the comparison -- so it always reports "no drift" and tests all
+    green. That is that module's one real way to fail.
 
-    **不必擔心之後的延遲 import。** `_project_source_files()` 走 `sys.modules`，所以
-    這之後才被 import 進來的本專案模組會出現在 `added` 裡——但 `added` **不算漂移**
-    （見 `_code_fingerprint.drift_report`：那個模組是剛從磁碟載入的，它是最新的，
-    正是「沒有落後」）。所以這裡沒有「呼叫端必須保證後面不再 import」那種約束，
-    要在函式裡延遲 import 什麼都可以。
+    **No need to worry about later lazy imports.** `_project_source_files()` walks
+    `sys.modules`, so a project module imported only after this point shows up in
+    `added` -- but `added` **does not count as drift** (see
+    `_code_fingerprint.drift_report`: that module was just loaded from disk, it is
+    the newest, precisely "not behind"). So there is no "the caller must guarantee
+    no further imports" constraint here; lazy-import whatever you like inside a
+    function.
 
-    **這一行值多少**：本專案的行程一次跑好幾天（webrunner 連續跑過 78.7 小時），
-    而 repo 在它們跑的同時被持續編輯。事後讀 log 有兩個問題只有它答得出來——
-    traceback 印出來的原始碼文字可不可信（`linecache` 是列印當下才讀磁碟的，行號
-    來自載入時的 code object，檔案改過就對不起來），以及「那個修正到底有沒有在這
-    個行程裡生效」（webrunner 換角色重啟的是瀏覽器、不是行程；`/version` 報的是
-    git HEAD，而工作區可以帶著好幾天未提交的修改）。
+    **What this one line is worth**: this project's processes run for days at a
+    time (the webrunner has run 78.7 hours straight), while the repo is
+    continuously edited as they run. Reading the log afterwards, two questions
+    only it can answer -- whether the source text a traceback prints can be
+    trusted (`linecache` reads disk at print time, while the line numbers come
+    from the code object loaded at load time, so once the file has changed they
+    do not line up), and "did that fix actually take effect in this process"
+    (the webrunner restarts the browser when it switches characters, not the
+    process; `/version` reports git HEAD, but the working tree can carry days of
+    uncommitted changes).
 
-    永不 raise：這是一行診斷紀錄，不得有任何機會把一次正常的啟動變成失敗。
+    Never raises: this is a one-line diagnostic record, and must have no chance of
+    turning a normal startup into a failure.
     """
     try:
         _code_fingerprint.snapshot()
         line = _code_fingerprint.describe()
     except Exception as error:  # pylint: disable=broad-except
-        # `!r` 刻意保留：`try` 裡只有 `_code_fingerprint`（純檔案雜湊），碰不到
-        # driver；而 `str(OSError)` 會把被雜湊的原始碼路徑印出來。
+        # `!r` is kept on purpose: the `try` only touches `_code_fingerprint` (a
+        # pure file hash), which cannot reach the driver; whereas `str(OSError)`
+        # would print the hashed source paths.
         line = f"code fingerprint unavailable: {error!r}"
         print(f"code fingerprint failed: {error!r}", file=sys.stderr)
     print(f"  [fingerprint] {line}")
@@ -757,100 +934,126 @@ def log_code_fingerprint() -> str:
 
 
 def report_code_drift() -> str:
-    """週期性檢查點（角色邊界）：磁碟上的程式碼有沒有跟我啟動時載入的分岔。
+    """Periodic checkpoint (character boundary): whether the code on disk has
+    diverged from what I loaded at startup.
 
-    **`drifted is False` 時一個字都不印。** 這不是風格偏好，是這個函式最重要的
-    性質：漂移是本專案的**常態**（repo 一直在被編輯），角色邊界每個角色都會經過
-    一次，而 `discord_bot.log` 已經有 11,250/11,746 行都是同一句 `rpc apply ->`
-    的前例——會被關掉的 log 等於沒有 log。所以只有真的有話要說時才出聲。
+    **When `drifted is False`, print not one word.** This is not a style
+    preference, it is this function's most important property: drift is this
+    project's **normal state** (the repo is edited constantly), every character
+    passes a character boundary once, and `discord_bot.log` already has the
+    precedent of 11,250/11,746 lines all being the same `rpc apply ->` line -- a
+    log that gets turned off is as good as no log. So speak only when there is
+    genuinely something to say.
 
-    `None`（判斷不出來）也要出聲，但措辭必須跟「有漂移」分得開：本專案在
-    `_find_all_chrome_processes` / `_load_pid` / `dashboard_server` 上各踩過一次
-    「失敗的掃描長得跟乾淨的掃描一模一樣」，這裡不重蹈。
+    `None` (cannot tell) must also speak, but its wording must be distinct from
+    "there is drift": this project has hit "a failed scan looks exactly like a
+    clean scan" once each on `_find_all_chrome_processes` / `_load_pid` /
+    `dashboard_server`, and does not repeat it here.
 
-    **偵測到漂移不改變任何行為**——不重啟、不中止、不拒絕產圖。漂移是常態，把它
-    接進控制流程只會製造誤殺。純診斷，回傳印出去的那一行（沒印就回空字串）。
+    **Detecting drift changes no behaviour** -- no restart, no abort, no refusal
+    to generate. Drift is the normal state, and wiring it into control flow only
+    manufactures false kills. Purely diagnostic; returns the line it printed
+    (empty string if it printed nothing).
 
-    永不 raise，理由同 `log_code_fingerprint`。
+    Never raises, same reason as `log_code_fingerprint`.
     """
     try:
         report = _code_fingerprint.drift_report()
     except Exception as error:  # pylint: disable=broad-except
-        # `!r` 刻意保留：同上，`_code_fingerprint` 是純模組，碰不到 driver。
+        # `!r` is kept on purpose: same as above, `_code_fingerprint` is a pure
+        # module and cannot reach the driver.
         print(f"code drift check failed: {error!r}", file=sys.stderr)
         return ""
     if report["drifted"] is False:
-        return ""  # 常態，安靜通過——不要製造下一個 `rpc apply ->`。
+        return ""  # normal, pass silently -- do not manufacture the next `rpc apply ->`.
     if report["drifted"] is None:
-        line = f"  [fingerprint] 無法判斷程式碼有沒有變動：{report['why']}"
+        line = f"  [fingerprint] cannot tell whether the code changed: {report['why']}"
         print(line)
         return line
-    # 只列真正代表「我落後了」的那兩類。`added` **不算漂移**（見
-    # `_code_fingerprint.drift_report`：那是 `snapshot()` 之後才延遲 import 進來
-    # 的模組，剛從磁碟載入、正是最新的），所以把它混進這一行只會指著一個沒有問題
-    # 的檔名，讓讀 log 的人往錯的方向查。`describe()` 也是同樣的取捨。
+    # List only the two kinds that really mean "I am behind". `added` **does not
+    # count as drift** (see `_code_fingerprint.drift_report`: it is a module
+    # lazy-imported only after `snapshot()`, just loaded from disk and thus the
+    # newest), so mixing it into this line would only point at a filename with no
+    # problem, sending the log reader in the wrong direction. `describe()` makes
+    # the same trade-off.
     names = report["changed"] + report["removed"]
-    line = (f"  [fingerprint] 磁碟上的程式碼已經和本行程啟動時載入的不一樣了"
-            f"（{report['at_start']} → {report['now']}）；"
-            f"**本行程跑的仍是舊版**，要等重新啟動才會換。"
-            f"變動：{', '.join(names)}")
+    line = (f"  [fingerprint] the code on disk is now different from what this "
+            f"process loaded at startup "
+            f"({report['at_start']} -> {report['now']}); "
+            f"**this process is still running the old version**, and will not "
+            f"switch until it restarts. "
+            f"Changed: {', '.join(names)}")
     print(line)
     return line
 
 
-# ---------- critical_error 的診斷內容 ----------------------------------------
-# 這個模組所在的目錄。用**套件**根而不是 `PROJECT_ROOT`：`.venv/` 就在
-# `PROJECT_ROOT` 底下，拿專案根去比對的話，每一個 site-packages 的 frame 都會被
-# 認成「我們的」，摘要就完全失去意義。
+# ---------- critical_error diagnostic content ----------------------------------------
+# The directory this module lives in. Use the **package** root, not
+# `PROJECT_ROOT`: `.venv/` sits under `PROJECT_ROOT`, so comparing against the
+# project root would recognise every site-packages frame as "ours", and the
+# summary would lose all meaning.
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 
-# `critical_error.traceback` 的預算。判準是「**實測過的每一份 traceback 都要能完整
-# 放進去**」，不是「大概夠用」——這個欄位存在的理由就是事後判讀，截到的那一次剛好
-# 就是需要它的那一次。`WEBRunner.log` 全部 8 份（含 09-07 那三次 `MaxRetryError`
-# 的例外鏈，原始 7,452 字）折疊之後最大是 **3,575** 字（那一份幾乎全是我們自己的
-# frame，沒什麼可折的）。4,000 留了 12% 餘裕，同時仍然擋得住失控的遞迴
-# （`RecursionError` 會產生上千個 frame）。
+# The budget for `critical_error.traceback`. The criterion is "**every traceback
+# ever measured must fit whole**", not "roughly enough" -- the reason this field
+# exists is post-hoc reading, and the one that gets truncated is exactly the one
+# that needed it. All 8 in `WEBRunner.log` (including the exception chain of the
+# three 09-07 `MaxRetryError`s, 7,452 chars raw), after folding, are at most
+# **3,575** chars (that one is almost entirely our own frames, with little to
+# fold). 4,000 leaves 12% margin while still blocking runaway recursion (a
+# `RecursionError` produces thousands of frames).
 #
-# 大一點不痛：`critical_error` 實測 76 天只發生 7 次，而 `events.ndjson` 由 bot
-# 輪替。**這個數字要跟著實測走**——量法是 `_traceback_excerpt(raw, limit=10**9)`。
+# Larger does not hurt: `critical_error` measured 7 times in 76 days, and
+# `events.ndjson` is rotated by the bot. **This number must track measurement**
+# -- measure it with `_traceback_excerpt(raw, limit=10**9)`.
 _TRACEBACK_BUDGET = 4000
 
 
 def _traceback_excerpt(text: str, *, limit: int = _TRACEBACK_BUDGET) -> str:
-    """把 traceback 摘成「**我們自己的 frame 一定留著**」的版本。
+    """Condense a traceback into a version where **our own frames are always
+    kept**.
 
-    **原本是 `traceback.format_exc()[-1500:]`，而那剛好在最需要它的那一類故障上
-    把有用的部分全丟掉。** 實測全部 7 筆 `critical_error`：例外來自我們自己的程式
-    時，尾段 1500 字裡有 2–5 個我們的 frame、0 個第三方的；例外來自函式庫深處時
-    （09-07 那三次 `MaxRetryError`）是 **0 個我們的、4 個 urllib3 的**。
+    **It used to be `traceback.format_exc()[-1500:]`, and that throws away the
+    useful part on exactly the class of failure that needs it most.** Measured
+    over all 7 `critical_error`s: when the exception comes from our own code, the
+    trailing 1500 chars contain 2-5 of our frames and 0 third-party; when it
+    comes from deep in a library (the three 09-07 `MaxRetryError`s) it is **0 of
+    ours, 4 of urllib3's**.
 
-    **而且「改成留頭段」也修不好。** 同一份實測：我們的 frame 落在 7,452 字裡的
-    2564–4025，**頭尾都不是**。原因是例外鏈——Python 先印最內層的成因
-    （urllib3 的 `_new_conn` → `ConnectionRefusedError`），我們的 frame 在**第三段**
-    traceback 的開頭。所以這裡不做頭尾截斷，而是按**來源**篩：
+    **And "keep the head instead" does not fix it either.** Same measurement: our
+    frames land at 2564-4025 within 7,452 chars, **neither head nor tail**. The
+    reason is the exception chain -- Python prints the innermost cause first
+    (urllib3's `_new_conn` -> `ConnectionRefusedError`), and our frame is at the
+    start of the **third** traceback section. So this does not truncate head/tail,
+    it filters by **origin**:
 
-    * 未縮排的行（`Traceback (most recent call last):`、`During handling of the
-      above exception…`、最後的例外行）一律保留——例外鏈的骨架與最終死因。
-    * `File "…"` 落在本套件目錄底下的 frame，連同它的原始碼回音，一律保留。
-    * 連續的第三方 frame 只留**第一個**（那是我們交棒出去的那一格，會指名是哪個
-      函式庫），其餘折疊成一行 `[... 省略 N 個第三方 frame ...]`。urllib3 的重試是
-      遞迴的，所以那一串本來就幾乎完全一樣。
-    * 最後才套整體上限，而且是頭尾都留、中間標明省略了幾個字元——那是防遞迴爆炸的
-      保險，不是主要機制。
+    * Unindented lines (`Traceback (most recent call last):`, `During handling of
+      the above exception…`, the final exception line) are always kept -- the
+      skeleton of the exception chain and the final cause of death.
+    * A `File "…"` frame under this package's directory, together with its source
+      echo, is always kept.
+    * A run of consecutive third-party frames keeps only the **first** (that is
+      the one where we hand off, and it names which library), and the rest fold
+      into one line `[... omitted N third-party frames ...]`. urllib3's retry is
+      recursive, so that run is nearly identical anyway.
+    * Only last does the overall cap apply, keeping both head and tail and marking
+      how many chars were omitted in the middle -- that is the anti-recursion-blowup
+      fuse, not the main mechanism.
 
-    判讀提醒：這個欄位裡的**原始碼文字**在檔案被改過之後會騙人（`linecache` 是列印
-    當下才讀磁碟的，行號來自載入時的 code object）。所以同一個事件另外帶
-    `code_drift`——見 `code_drift_flag`。
+    Reading reminder: the **source text** in this field lies once the file has
+    been changed (`linecache` reads disk at print time, while the line numbers
+    come from the code object loaded at load time). So the same event also carries
+    `code_drift` -- see `code_drift_flag`.
     """
     kept: list[str] = []
     marker = str(_PACKAGE_ROOT)
     foreign_frames = 0
-    in_our_frame = True          # 判不出來就當成「我們的」→ 寧可留著
+    in_our_frame = True          # if unsure, treat it as "ours" -> rather keep it
 
     def flush() -> None:
         nonlocal foreign_frames
         if foreign_frames > 1:
-            kept.append(f"  [... 省略 {foreign_frames - 1} 個第三方 frame ...]")
+            kept.append(f"  [... omitted {foreign_frames - 1} third-party frames ...]")
         foreign_frames = 0
 
     for line in text.splitlines():
@@ -870,9 +1073,11 @@ def _traceback_excerpt(text: str, *, limit: int = _TRACEBACK_BUDGET) -> str:
                 if foreign_frames == 1:
                     kept.append(line)
             continue
-        # frame 底下的原始碼回音：只有**我們自己**的 frame 留。第三方 frame 的
-        # 回音佔的位置不小（Python 3.11+ 的 `...<10 lines>...` 區塊動輒兩百字），
-        # 而它要回答的問題「是哪個函式庫、哪一個函式」上面那行 `File` 已經答完了。
+        # The source echo beneath a frame: kept only for **our own** frames. A
+        # third-party frame's echo takes non-trivial space (Python 3.11+'s
+        # `...<10 lines>...` block is easily two hundred chars), and the question
+        # it answers -- which library, which function -- is already answered by
+        # the `File` line above it.
         if in_our_frame:
             kept.append(line)
     flush()
@@ -880,27 +1085,34 @@ def _traceback_excerpt(text: str, *, limit: int = _TRACEBACK_BUDGET) -> str:
     out = "\n".join(kept)
     if len(out) <= limit:
         return out
-    # 保險絲。尾段一定要留住：traceback 的**最後一行**就是例外型別與訊息。
+    # The fuse. The tail must be kept: the traceback's **last line** is the
+    # exception type and message.
     head = limit * 2 // 3
     tail = limit - head
     return (out[:head]
-            + f"\n  [... 中間再省略 {len(out) - head - tail} 個字元 ...]\n"
+            + f"\n  [... a further {len(out) - head - tail} chars omitted in the middle ...]\n"
             + out[-tail:])
 
 
 def code_drift_flag() -> bool | None:
-    """啟動之後磁碟上的程式碼有沒有變過（True／False／None＝判不出來）。
+    """Whether the code on disk has changed since startup (True / False / None =
+    cannot tell).
 
-    只給 `critical_error` 事件用，理由是一個實際踩過的判讀陷阱：traceback 印出來的
-    **原始碼文字**是列印當下才從磁碟讀的（`linecache`），而行號來自載入時的 code
-    object——檔案改過之後兩者就對不起來。2026-09-07 17:10 那一筆就是實例：frame 寫
-    `_note_transport_error`，印出來的文字卻是 `class BrowserGoneError(RuntimeError):`。
-    沒有這個旗標的話，讀 `events.ndjson` 的人無從判斷那份 traceback 的文字可不可信
-    （`report_code_drift()` 只印到 log，而 log 會被輪替掉）。
+    Only for the `critical_error` event, for the reason of a reading trap
+    actually hit: the **source text** a traceback prints is read from disk at
+    print time (`linecache`), while the line numbers come from the code object
+    loaded at load time -- once the file has changed, the two do not line up. The
+    2026-09-07 17:10 entry is an instance: the frame said `_note_transport_error`,
+    but the text printed was `class BrowserGoneError(RuntimeError):`. Without this
+    flag, whoever reads `events.ndjson` has no way to tell whether that
+    traceback's text can be trusted (`report_code_drift()` only prints to the log,
+    and the log gets rotated away).
 
-    **判讀規則：行號一律可信；原始碼文字只在 `code_drift` 為 False 時可信。**
+    **Reading rule: line numbers are always trustworthy; source text is
+    trustworthy only when `code_drift` is False.**
 
-    永不 raise：這是死亡路徑上的診斷欄位，不得再製造第二個例外。
+    Never raises: this is a diagnostic field on the death path, and must not
+    manufacture a second exception.
     """
     try:
         return _code_fingerprint.drift_report()["drifted"]
@@ -908,85 +1120,110 @@ def code_drift_flag() -> bool | None:
         return None
 
 
-# ---------- 「有批次在跑」的存活訊號 -----------------------------------------
+# ---------- The "a batch is running" liveness signal -----------------------------------------
 
 def claim_liveness_signal() -> int | None:
-    r"""沒有人認領 `webrunner.pid` 就寫自己的 pid 進去。回認領到的 pid，否則 None。
+    r"""If nobody has claimed `webrunner.pid`, write our own pid into it. Returns
+    the claimed pid, otherwise None.
 
-    正常情況下這個檔由**父行程**寫：bot 的 `_spawn_webrunner` 與
-    `start_webrunner.py` 在 spawn 的短臨界區內（持著 Chrome 槽）寫好 pid 才放槽，
-    之後整輪由這個檔當「有批次在跑」的長期訊號。⚠️ **Chrome 槽不是那個訊號**——它
-    只是 spawn 前後的毫秒級臨界區（實測：批次連續跑了好幾天，`chrome_slot.lock`
-    始終不存在）。
+    Normally this file is written by the **parent process**: the bot's
+    `_spawn_webrunner` and `start_webrunner.py` write the pid inside the short
+    critical section of the spawn (holding the Chrome slot) before releasing the
+    slot, after which the file serves as the long-lived "a batch is running"
+    signal for the whole run. ※ **The Chrome slot is not that signal** -- it is
+    only the millisecond-scale critical section around the spawn (measured: the
+    batch ran for days on end, and `chrome_slot.lock` never existed).
 
-    **裸跑（`py -3 axiomatic/webrunner_novelai.py`）沒有那個父行程，所以兩個訊號
-    一個都不存在。** 後果不只是「同時跑的 `verify_browser` 會開出自己的瀏覽器、
-    然後在下一個角色邊界被 `_kill_orphan_chrome` 的全機掃描殺掉」（症狀看起來像
-    瀏覽器自己壞了，原因卻在另一個行程裡）——更嚴重的是
-    `start_webrunner.py` 與 `run_batch.py` 的「已經有批次在跑就不要再起一個」也一起
-    失效，於是同一台機器上跑起**兩個** webrunner，搶同一份 `.chrome_profile_snap/`、
-    互相 nuclear sweep、從同一組 `todo_*.md` 重複取件。而 `install_autostart.py`
-    註冊的開機工作跑的正是 `start_webrunner.py`，所以那條路是**無人值守也到得了的**。
+    **A bare run (`py -3 axiomatic/webrunner_novelai.py`) has no such parent
+    process, so neither signal exists.** The consequence is not only "a
+    concurrent `verify_browser` opens its own browser and is then killed at the
+    next character boundary by `_kill_orphan_chrome`'s machine-wide sweep" (a
+    symptom that looks like the browser breaking on its own, while the cause is in
+    another process) -- worse, `start_webrunner.py`'s and `run_batch.py`'s "do not
+    start another if a batch is already running" fail too, and so **two**
+    webrunners start on the same machine, contending for one
+    `.chrome_profile_snap/`, nuclear-sweeping each other, and re-picking from the
+    same `todo_*.md`. And the boot task `install_autostart.py` registers runs
+    exactly `start_webrunner.py`, so that path is **reachable unattended**.
 
-    所以這裡補的是「**沒有人認領就自己認領**」，不是「一律覆寫」。
+    So what this adds is "**claim it yourself if nobody has**", not "overwrite
+    unconditionally".
 
-    ⚠️ **與父行程的競態是良性的，兩種順序都對。** 父行程是在 `Popen` **回來之後**
-    才寫的（`_supervisor.stream_child`：先 `Popen`、再 `on_spawn`），所以子行程確實
-    有機會先寫到——實測 `Popen` 只花 7ms 回來，而子行程要先啟動直譯器再 import
-    driver，實務上父行程一定先寫，但不能靠這個。真的反過來的話，檔案裡放的是子行程
-    自己的 pid，**那同樣是一個活著、而且就是這個批次的行程**，而**把關用的那幾支
-    讀取端問的都只是「有沒有批次在跑」**，不問那個 pid 是父寫的還是子寫的。收尾時
-    兩邊都只刪「還記著自己那一筆」的檔（見 `release_liveness_signal` 與
-    `start_webrunner._clear_pid_if_ours`），所以誰都不會誤刪對方的訊號。
+    ※ **The race with the parent process is benign, both orders are correct.**
+    The parent writes only **after `Popen` returns** (`_supervisor.stream_child`:
+    `Popen` first, then `on_spawn`), so the child really does have a chance to
+    write first -- measured, `Popen` returns in only 7ms while the child has to
+    start the interpreter first and then import the driver, so in practice the
+    parent always writes first, but do not rely on that. If it really is the other
+    way round, the file holds the child's own pid, **which is likewise a live
+    process, and precisely this batch's**, and **the gatekeeping readers only ask
+    "is a batch running"**, not whether that pid was written by the parent or the
+    child. On cleanup both sides delete only a file that "still records their own
+    entry" (see `release_liveness_signal` and
+    `start_webrunner._clear_pid_if_ours`), so neither will wrongly delete the
+    other's signal.
 
-    ⚠️ **上面那句以前寫的是「四個讀取端」，而那個數字既已過期、對本函式自己也不
-    成立（2026-09-21 修）。** 用 AST 掃過整份產品碼，讀 `webrunner.pid` 的函式有
-    **八個**，本函式就是其中之一——但它問的不是「有沒有批次在跑」，是「需不需要我
-    來認領這個訊號」，所以它從來就不在那句話涵蓋的範圍內。因此這裡不再點數字，改
-    成只講**把關用**的那一類。完整分類（三分法四支 ／ 刻意不是三分法的四支，每一
-    支都附理由）與雙向對帳住在 `axiomatic/test_pid_file_readers.py`：掃到卻沒分
-    類會紅，清單裡留著已經不讀這個檔的函式也會紅。
+    ※ **That sentence used to say "four readers", and that number was both stale
+    and untrue even for this function itself (fixed 2026-09-21).** Scanning the
+    whole product code by AST, **eight** functions read `webrunner.pid`, this one
+    among them -- but it does not ask "is a batch running", it asks "do I need to
+    claim this signal", so it was never within that sentence's scope. So the
+    number is no longer cited here, only the **gatekeeping** kind is described.
+    The full classification (four using the three-way test / four deliberately not
+    using it, each with its reason) and its two-way reconciliation live in
+    `axiomatic/test_pid_file_readers.py`: a function scanned but not classified
+    goes red, and a function left in the list that no longer reads this file goes
+    red too.
 
-    注意父行程寫的是**轉接殼**的 pid，不是 webrunner 自己的 `os.getpid()`
-    （`.venv\Scripts\python.exe` 是 redirector stub，實測父子 pid 不同）。兩個值都是
-    有效的存活訊號，所以這裡比的是「活著沒有」，不是「是不是我」。
+    Note the parent writes the pid of the **redirector shell**, not the
+    webrunner's own `os.getpid()` (`.venv\Scripts\python.exe` is a redirector
+    stub, and measured the parent and child pids differ). Both values are valid
+    liveness signals, so what is compared here is "alive or not", not "is it me".
 
-    ⚠️ **判不出來時要當成「有人在跑」**（`_chrome_slot._pid_alive` 判不出來回 True，
-    這裡就是要那個方向）：誤判成「沒人在跑」會**覆寫掉別人有效的訊號**，而那個訊號
-    正是所有下游「不要開第二套瀏覽器」判斷的唯一依據；誤判成「有人在跑」只是這一次
-    裸跑沒有發布訊號，回到修正前的狀態。用 `_chrome_slot` 的那一份而不是
-    `_process_control` 的，是因為後者判不出來時回 False——`CLAUDE.md` 記著那個分歧是
-    刻意的，挑哪一份要看「錯了要往哪邊倒」。也刻意**不再寫第四份** `_pid_alive`。
+    ※ **When it cannot tell, treat it as "someone is running"**
+    (`_chrome_slot._pid_alive` returns True when it cannot tell, which is exactly
+    the direction wanted here): misjudging as "nobody is running" would
+    **overwrite someone else's valid signal**, and that signal is the sole basis
+    for every downstream "do not open a second browser" decision; misjudging as
+    "someone is running" only means this one bare run publishes no signal,
+    returning to the pre-fix state. Using `_chrome_slot`'s copy rather than
+    `_process_control`'s is because the latter returns False when it cannot tell
+    -- `CLAUDE.md` records that divergence as deliberate, and which copy to use
+    depends on "which way the mistake should fall". Also deliberately **do not
+    write a fourth copy** of `_pid_alive`.
     """
     try:
         raw = WEBRUNNER_PID_FILE.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         raw = ""
     except (OSError, UnicodeDecodeError):
-        print("webrunner.pid 讀不出來；保守起見不認領存活訊號", file=sys.stderr)
+        print("cannot read webrunner.pid; conservatively not claiming the liveness signal", file=sys.stderr)
         return None
     if raw:
         try:
             other = int(raw)
         except ValueError:
-            print("webrunner.pid 的內容不是數字；保守起見不認領存活訊號",
+            print("webrunner.pid's content is not a number; conservatively not claiming the liveness signal",
                   file=sys.stderr)
             return None
         if other == os.getpid() or _chrome_slot._pid_alive(other):
-            return None          # 父行程（或別的批次）已經認領了 → no-op
+            return None          # the parent (or another batch) already claimed it -> no-op
     mine = os.getpid()
     if not _run_progress.atomic_write_text(WEBRUNNER_PID_FILE, str(mine)):
-        print("寫不進 webrunner.pid；這一輪沒有存活訊號", file=sys.stderr)
+        print("cannot write webrunner.pid; no liveness signal this run", file=sys.stderr)
         return None
-    print(f"  [liveness] 沒有父行程發布存活訊號，本行程自行認領（pid={mine}）")
+    print(f"  [liveness] no parent process published a liveness signal, this process claims it itself (pid={mine})")
     return mine
 
 
 def release_liveness_signal(claimed: int | None) -> None:
-    """收尾：**只在檔案仍然記著 `claimed` 時**才刪。永不 raise。
+    """Cleanup: delete **only while the file still records `claimed`**. Never
+    raises.
 
-    判準與 `start_webrunner._clear_pid_if_ours` 相同：父行程也會寫同一個檔，無條件
-    刪會把**別人的**存活訊號清掉，於是驗證端會在批次還跑著的時候開第二套瀏覽器。
+    Same criterion as `start_webrunner._clear_pid_if_ours`: the parent writes the
+    same file too, so an unconditional delete would clear **someone else's**
+    liveness signal, and then the verify side would open a second browser while
+    the batch is still running.
     """
     if claimed is None:
         return
@@ -995,7 +1232,7 @@ def release_liveness_signal(claimed: int | None) -> None:
     except (OSError, UnicodeDecodeError):
         return
     if raw != str(claimed):
-        return                   # 被父行程覆寫過 → 那筆是它的，讓它自己清
+        return                   # overwritten by the parent -> that entry is its, let it clean up
     try:
         WEBRUNNER_PID_FILE.unlink()
     except OSError:
@@ -1003,24 +1240,31 @@ def release_liveness_signal(claimed: int | None) -> None:
 
 
 def run_with_liveness_signal(entry) -> int:
-    """跑 `entry()`，期間盡量確保磁碟上有一個「有批次在跑」的訊號。
+    """Run `entry()`, doing its best to ensure a "a batch is running" signal is on
+    disk throughout.
 
-    掛在兩個變體的 `__main__` 而不是 `main()` 裡面：涵蓋整個行程（含
-    `_kill_orphan_chrome` 與建 driver 那十幾秒——正是驗證端最可能擠進來的窗），
-    `main()` 不必整段縮排，而且**隔離驗證模式走的是另一條分支**
-    （`_run_setup_verification`），所以它天生不會認領 pid。
+    Hooked into both variants' `__main__` rather than inside `main()`: it covers
+    the whole process (including `_kill_orphan_chrome` and the dozen-plus seconds
+    of building the driver -- precisely the window the verify side is most likely
+    to squeeze into), `main()` need not be indented as a whole, and **isolated
+    verification mode takes another branch** (`_run_setup_verification`), so it
+    inherently does not claim a pid.
 
-    ⚠️ **認領失敗絕對不可以擋住批次。** 這是一個純粹的旁路訊號；它如果有 bug，
-    最壞的後果應該是「回到修正前、沒有訊號」，而不是 webrunner 起不來——那會變成
-    supervisor 一直重生、rapid-fail 放棄，也就是**用一個可靠度改善換掉整個批次**。
-    所以認領包在 broad except 裡（收尾那半自己就承諾 never raise）。
+    ※ **A failed claim must never block the batch.** This is a purely side-channel
+    signal; if it has a bug, the worst outcome should be "back to the pre-fix
+    state, no signal", not the webrunner failing to start -- which would turn into
+    the supervisor respawning endlessly and rapid-fail giving up, i.e. **trading
+    the whole batch for a reliability improvement**. So the claim is wrapped in a
+    broad except (the cleanup half already promises never to raise).
     """
     try:
         claimed = claim_liveness_signal()
     except Exception as error:  # pylint: disable=broad-except
-        # `!r` 刻意保留：`claim_liveness_signal` 是檔案 I/O ＋ pid 探測，碰不到
-        # driver；`str(OSError)` 會把存活訊號檔的完整路徑帶出來。
-        print(f"認領存活訊號時出錯，略過（不影響批次）：{error!r}", file=sys.stderr)
+        # `!r` is kept on purpose: `claim_liveness_signal` is file I/O + pid
+        # probing, which cannot reach the driver; `str(OSError)` would carry out
+        # the liveness-signal file's full path.
+        print(f"error while claiming the liveness signal, skipped (does not affect the batch): {error!r}",
+              file=sys.stderr)
         claimed = None
     try:
         return entry()
@@ -1033,24 +1277,30 @@ def run_with_liveness_signal(entry) -> int:
 def emit_event(event_type: str, **data) -> None:
     """Append a structured event to events.ndjson for the Discord bot watcher.
 
-    **遙測絕不可以打斷批次。** 這是盡力而為的旁路：寫不出去就少一則通知，讓一個
-    無人值守的批次死在這裡是完全不成比例的代價（同 `dorossi_backend.
-    _dorossi_record_usage` 那條「記錄用量絕不能打斷一輪對話」）。
+    **Telemetry must never interrupt the batch.** This is a best-effort side
+    channel: if it cannot write, one notification is missing, and letting an
+    unattended batch die here is a completely disproportionate cost (same as
+    `dorossi_backend._dorossi_record_usage`'s "recording usage must never
+    interrupt a conversation round").
 
-    所以 except 不能只接 `OSError`——`json.dumps` 的失敗根本不是 OSError：
+    So the except cannot catch only `OSError` -- a `json.dumps` failure is not an
+    OSError at all:
 
-    * `TypeError` — 值不可序列化（`Path`、`datetime`、`set`、selenium 的
-      `WebElement`）。目前**所有**呼叫點傳的都是 str／int／float／bool／`list[str]`
-      （逐一核過），所以這是潛伏而非現行的 bug。最可能先中的是
-      `check_dom_request` 的 `data=diag`：那是**瀏覽器回來的資料**，
-      `dump_textareas_diag` 只檢查外層 `isinstance(result, list)`、不檢查元素，
-      `_DOM_DIAG_JS` 哪天多回一個 DOM 節點就會變成 `WebElement`。
-    * `ValueError` — 循環參照；**以及 `UnicodeEncodeError`（ValueError 的子類）**，
-      瀏覽器回來的字串帶落單代理字元（lone surrogate）時就會中，這條比循環參照
-      實際得多。
+    * `TypeError` -- an unserialisable value (`Path`, `datetime`, `set`,
+      selenium's `WebElement`). Currently **every** call site passes
+      str/int/float/bool/`list[str]` (checked one by one), so this is a latent,
+      not a live, bug. The most likely one to hit first is `check_dom_request`'s
+      `data=diag`: that is **data returned from the browser**, and
+      `dump_textareas_diag` only checks the outer `isinstance(result, list)`, not
+      the elements, so the day `_DOM_DIAG_JS` returns one more DOM node it becomes
+      a `WebElement`.
+    * `ValueError` -- a circular reference; **and `UnicodeEncodeError` (a subclass
+      of ValueError)**, which hits when a string returned from the browser
+      carries a lone surrogate, far more realistic than a circular reference.
 
-    先序列化、再開檔：不可序列化的值就不會留下一個空檔，而且一行要嘛整行寫進去、
-    要嘛完全沒寫——讀取端（bot 的 watcher）永遠不會讀到半行。
+    Serialise first, open the file second: an unserialisable value then leaves no
+    empty file behind, and a line is either written whole or not at all -- the
+    reader (the bot's watcher) never reads half a line.
     """
     record = {"ts": time.time(), "type": event_type, **data}
     try:
@@ -1058,8 +1308,9 @@ def emit_event(event_type: str, **data) -> None:
         with EVENTS_FILE.open("a", encoding="utf-8") as f:
             f.write(line)
     except (OSError, TypeError, ValueError) as error:
-        # `!r` 刻意保留：這三種例外 `args` 都非空，而 `str(OSError)` 會把
-        # `events.ndjson` 的完整主機路徑寫進 log（`/log tail` 會把它送出去）。
+        # `!r` is kept on purpose: all three exceptions have non-empty `args`,
+        # and `str(OSError)` would write `events.ndjson`'s full host path into the
+        # log (`/log tail` would send it out).
         print(f"emit_event({event_type}) failed: {error!r}", file=sys.stderr)
 
 
@@ -1074,9 +1325,11 @@ def wait_if_paused(label: str = "") -> None:
             return {"mode": "now"}
 
     def _write_pause(data: dict) -> None:
-        # 原子寫入（跨行程檔案的硬規則）。bot 那側寫這個檔一直是原子的，這側
-        # 卻是就地覆寫——半寫入的 JSON 會讓 `_read_pause` 解析失敗、退回
-        # `{"mode": "now"}`，也就是把「跑完這張再停」變成「立刻停」。
+        # Atomic write (the hard rule for cross-process files). The bot side has
+        # always written this file atomically, but this side did an in-place
+        # overwrite -- a half-written JSON makes `_read_pause` fail to parse and
+        # fall back to `{"mode": "now"}`, i.e. it turns "stop after this image"
+        # into "stop now".
         _run_progress.atomic_write_text(
             WEBRUNNER_PAUSE_FILE, json.dumps(data, ensure_ascii=False))
 
@@ -1125,7 +1378,8 @@ def wait_if_paused(label: str = "") -> None:
 # because it calls execute_script / jss) ------------------------------------
 
 def format_textareas_diag(diag: list[dict]) -> str:
-    """把 dump_textareas_diag 結果展成多行字串，給 webrunner.log 印。"""
+    """Expand the dump_textareas_diag result into a multi-line string for
+    webrunner.log to print."""
     if not diag:
         return "DOM diag: (no textareas / contenteditable found)"
     lines = [f"DOM diag: {len(diag)} text-fields"]
@@ -1149,51 +1403,68 @@ def format_textareas_diag(diag: list[dict]) -> str:
 # ---------- single-image (one-shot) path helper -----------------------------
 
 def _single_image_relative_path(save_path: Path) -> str:
-    """把 one-shot 圖的絕對路徑轉成 PROJECT_ROOT 相對的 POSIX 字串（contract
-    要求，例如 `output/_oneshot/<request_id>/<file>.png`）。轉相對失敗就退回
-    檔名本身（仍是合法 POSIX 片段），絕不丟例外。"""
+    """Convert a one-shot image's absolute path into a PROJECT_ROOT-relative
+    POSIX string (a contract requirement, e.g.
+    `output/_oneshot/<request_id>/<file>.png`). If making it relative fails, fall
+    back to the filename itself (still a valid POSIX segment); never throws."""
     try:
         return save_path.resolve().relative_to(PROJECT_ROOT).as_posix()
     except (ValueError, OSError):
         return save_path.name
 
 
-# ---------- 瀏覽器視窗最小化（兩個變體共用） ---------------------------------
+# ---------- Browser window hiding (shared by both variants) ---------------------------------
 #
-# 兩支 webrunner 本來各有一份**逐行相同**的實作，而且都自己掛 `win32gui` /
-# `win32process`：掃 psutil 找 cmdline 含 profile 路徑的瀏覽器行程 → 列舉視窗 →
-# 比對視窗所屬行程 → 最小化。同一件事兩份實作，修好的永遠只有其中一份，所以收成
-# 這裡一份，Win32 的部分全部轉呼叫桌面自動化函式庫。
+# The two webrunners each originally had a **line-for-line identical**
+# implementation, both hooking `win32gui` / `win32process` themselves: scan
+# psutil for browser processes whose cmdline contains the profile path ->
+# enumerate windows -> match windows to their owning process -> minimise. One
+# thing, two implementations, and only ever one of them gets fixed, so it is
+# consolidated into one copy here, with the Win32 parts all delegated to the
+# desktop-automation library.
 #
-# 為什麼要靠**行程**而不是視窗標題找：瀏覽器是 multi-process，視窗標題是當下網頁
-# 的標題（隨時在變），而且好幾個行程根本沒有視窗。擁有者才是穩定的鍵。
+# Why find by **process** rather than window title: the browser is
+# multi-process, the window title is the current page's title (constantly
+# changing), and several processes have no window at all. The owner is the stable
+# key.
 
 def find_browser_pids_for_profile(profile_dirs: list[Path]) -> set[int]:
-    """cmdline 指向這些 profile 目錄的瀏覽器行程 pid。
+    """The pids of browser processes whose cmdline points at these profile
+    directories.
 
-    比對前把路徑正規化成小寫、正斜線——cmdline 裡的寫法與 `Path` 的字串形式不見得
-    一致（反斜線 vs 正斜線、大小寫），直接字串比對會漏。
+    Before matching, normalise paths to lowercase and forward slashes -- the
+    spelling in cmdline is not necessarily consistent with `Path`'s string form
+    (backslash vs forward slash, case), and a direct string comparison would
+    miss.
 
-    **比對是邊界比對，不是子字串比對。** 本專案同時存在 `.chrome_profile` 與
-    `.chrome_profile_snap`（前者是登入用的來源、後者是 Chrome 真正開的那一份），
-    前者是後者的**嚴格前綴**，所以 `path in cmd` 會把跑在 snapshot 上的行程一併
-    算成 `.chrome_profile` 的。隔離驗證模式把 `CHROME_PROFILE_SNAPSHOT` 換成
-    `.chrome_profile_verify` 之後更明顯：`[.chrome_profile, .chrome_profile_verify]`
-    這組 wanted 會**連正式批次的瀏覽器一起選中**。目前唯一的呼叫端是
-    `hide_browser_windows`（誤配的後果只是把別人的視窗搬到螢幕外），但這支函式的
-    契約是「哪些行程屬於這個 profile」，一旦有人把它接到終止那一側，多抓就等於
-    **殺到不該殺的行程**——這個 repo 已經為了「殺太多」賠掉過一個跑了 78.7 小時
-    的批次。所以在來源這裡收緊，而不是要求每個呼叫端自己小心。
+    **The match is a boundary match, not a substring match.** This project has
+    both `.chrome_profile` and `.chrome_profile_snap` (the former is the source
+    used for login, the latter the copy Chrome actually opens), and the former is
+    a **strict prefix** of the latter, so `path in cmd` would count a process
+    running on the snapshot as `.chrome_profile`'s too. It is more obvious once
+    isolated verification mode swaps `CHROME_PROFILE_SNAPSHOT` for
+    `.chrome_profile_verify`: the wanted set
+    `[.chrome_profile, .chrome_profile_verify]` would **select the production
+    batch's browser as well**. The only caller right now is
+    `hide_browser_windows` (a mismatch only moves someone else's window
+    off-screen), but this function's contract is "which processes belong to this
+    profile", and the day someone wires it into the terminate side, over-matching
+    means **killing a process that should not be killed** -- this repo has already
+    lost a 78.7-hour batch to "killing too many". So tighten it at the source
+    rather than requiring every caller to be careful.
     """
     try:
         import psutil  # type: ignore
     except ImportError:
         return set()
-    # 邊界＝字串結尾、路徑分隔符（反斜線已正規化成 `/`）、空白或引號。psutil 的
-    # `cmdline()` 回的是**已經切好的 arg 清單**，所以實務上目標路徑後面只會是
-    # 「這個 arg 到此為止」（→ 空白或結尾）或「還有下一層」（→ `/`）；引號留給
-    # 少數會把整條命令列原封不動回傳的驅動版本。`_` 與英數字刻意**不在**邊界集合
-    # 裡——`_snap` / `_verify` 這種後綴正是要擋的東西。
+    # A boundary = end of string, a path separator (backslashes already
+    # normalised to `/`), whitespace or a quote. psutil's `cmdline()` returns an
+    # **already-split arg list**, so in practice what follows the target path is
+    # only "this arg ends here" (-> whitespace or end) or "there is a deeper
+    # level" (-> `/`); the quote is left for the few driver versions that return
+    # the whole command line verbatim. `_` and alphanumerics are deliberately
+    # **not** in the boundary set -- a `_snap` / `_verify` suffix is exactly what
+    # is to be blocked.
     wanted = [
         re.compile(re.escape(str(path).replace("\\", "/").lower())
                    + r"""(?=$|[/\s"'])""")
@@ -1203,11 +1474,14 @@ def find_browser_pids_for_profile(profile_dirs: list[Path]) -> set[int]:
         return set()
     found: set[int] = set()
     try:
-        # `attrs=` 只取便宜的 `name`，`cmdline()` 留給通過篩選的那幾筆逐一索取。
-        # 放進 `attrs=` 就是替**全機每一個行程**都讀一次 PEB，而這裡九成九會被
-        # 下一行的 name 判斷丟掉。本機實測（361 個行程、13 個瀏覽器行程）：
-        # 一起取 334 ms，先篩再取 121 ms。這支每次重啟瀏覽器都會跑一次，而
-        # `restart_chrome_every_n_characters` 預設 1 ＝ 每個角色一次。
+        # `attrs=` takes only the cheap `name`, and `cmdline()` is fetched one by
+        # one for the few that pass the filter. Putting it in `attrs=` reads the
+        # PEB once for **every process on the machine**, nine-tenths of which are
+        # discarded by the next line's name check. Measured locally (361
+        # processes, 13 browser processes): fetching together 334 ms, filter
+        # first then fetch 121 ms. This runs once every time the browser
+        # restarts, and `restart_chrome_every_n_characters` defaults to 1 = once
+        # per character.
         for proc in psutil.process_iter(attrs=["pid", "name"]):
             try:
                 if (proc.info.get("name") or "").lower() != "chrome.exe":
@@ -1221,46 +1495,63 @@ def find_browser_pids_for_profile(profile_dirs: list[Path]) -> set[int]:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
     except Exception as error:  # pylint: disable=broad-except
-        # `!r` 刻意保留：`try` 裡只有 psutil，碰不到 driver，而 psutil 的例外
-        # （含 `RuntimeError: SystemExtendedHandleInformation buffer too big`）
-        # `args` 非空，`repr()` 讀得到訊息。
+        # `!r` is kept on purpose: the `try` only touches psutil, cannot reach the
+        # driver, and psutil's exceptions (including
+        # `RuntimeError: SystemExtendedHandleInformation buffer too big`) have
+        # non-empty `args`, so `repr()` can read the message.
         print(f"find_browser_pids_for_profile failed: {error!r}", file=sys.stderr)
     return found
 
 
-# 瀏覽器視窗一律放在任何螢幕都照不到的地方，而且**不最小化**（擁有者要求
-# 2026-09-22：任何時候都不得在前景看到產生中的圖片預覽）。
+# Always place the browser window where no screen can see it, and **do not
+# minimise** (owner's request 2026-09-22: the in-progress image preview must
+# never be visible in the foreground at any time).
 #
-# 原本的做法是 `--start-maximized` 開窗、setup 完才最小化，圖與圖之間再最小化一次
-# 「以防點選或聚焦把它喚回來」。那個做法本身就是症狀的來源：視窗真的會被喚回前景，
-# 然後才被縮下去，中間那一下剛好看得到剛產出的圖；最小化／還原的系統動畫也會把
-# 視窗內容從工作列按鈕縮放出來。改成開窗時就放在 (-32000, -32000)，之後不論是什麼
-# 把它「喚回」、「還原」或「帶到前面」，它都還在那個座標——2026-09-22 在這台機器上
-# 實測：點選元素、截圖、`ShowWindow(SW_RESTORE)`＋`SetForegroundWindow`、先最小化
-# 再還原、CDP `Page.bringToFront`，視窗全程停在螢幕外，畫面照常繪製；
-# `--window-position` 也蓋得過 profile 裡記住的視窗位置（連「上次是最大化」也蓋得過）。
-# 繪製沒有停，靠的是 `_MEMORY_FLAGS` 裡原本就有的 `--disable-backgrounding-occluded-windows`
-# 等三個旗標——螢幕外的視窗對 Chrome 來說是被遮住的視窗。
+# The original approach opened the window with `--start-maximized`, minimised it
+# only after setup, and minimised again between images "in case a click or focus
+# woke it back up". That approach was itself the source of the symptom: the
+# window really did get woken to the foreground and only then shrunk, and in that
+# instant the just-generated image was visible; and the minimise/restore system
+# animation also scales the window content out from the taskbar button. Changed
+# to placing it at (-32000, -32000) at open time, so afterwards no matter what
+# "wakes", "restores" or "brings it to front", it is still at that coordinate --
+# measured on this machine 2026-09-22: clicking an element, screenshotting,
+# `ShowWindow(SW_RESTORE)` + `SetForegroundWindow`, minimising then restoring,
+# CDP `Page.bringToFront` -- the window stayed off-screen the whole time and the
+# frame kept rendering; `--window-position` also overrides the window position
+# remembered in the profile (even "last time it was maximised"). Rendering did
+# not stop thanks to the three flags already in `_MEMORY_FLAGS`
+# (`--disable-backgrounding-occluded-windows` etc.) -- an off-screen window is, to
+# Chrome, an occluded window.
 #
-# 大小固定 1920×1080 而不是跟著螢幕：原本最大化時的內容區大約就是這個大小，固定下來
-# 讓頁面版面不隨主機的螢幕解析度改變（DOM 流程是照這個版面寫的）。
+# The size is fixed at 1920x1080 rather than following the screen: the content
+# area when maximised was roughly this size originally, and fixing it keeps the
+# page layout from changing with the host's screen resolution (the DOM flow is
+# written against this layout).
 OFFSCREEN_WINDOW_POSITION = (-32000, -32000)
 OFFSCREEN_WINDOW_SIZE = (1920, 1080)
-# 左上角兩個座標都不大於這個值，就當成已經在螢幕外。多螢幕配置的座標實際上在 ±數千
-# 以內，所以這個門檻不會把任何一塊真的螢幕算成「螢幕外」；也不必剛好等於 -32000——
-# 系統或瀏覽器把它挪動幾個像素時不必再搬一次。
+# If both top-left coordinates are no greater than this value, treat it as
+# already off-screen. Multi-screen layout coordinates are actually within a few
+# thousand, so this threshold will not count any real screen as "off-screen"; nor
+# does it have to equal exactly -32000 -- if the system or browser nudges it a few
+# pixels, there is no need to move it again.
 _OFFSCREEN_EDGE = -20000
 
 
 def hide_browser_windows(profile_dirs: list[Path]) -> tuple[int, int]:
-    """把那些 profile 的瀏覽器視窗移回螢幕外，回 `(藏好的視窗數, 仍留在螢幕上的視窗數)`。
+    """Move those profiles' browser windows back off-screen; returns
+    `(windows hidden, windows still on screen)`.
 
-    **不最小化，也不還原。** 已經最小化的視窗本來就看不到，還原它反而會播放一次把
-    內容從工作列放大出來的動畫，所以原樣留著；它日後被還原時回到的是「最小化前的
-    位置」＝螢幕外。搬移用 `MoveWindow`，不會把視窗帶到前面、也不會搶走焦點。
+    **Does not minimise, and does not restore.** An already-minimised window is
+    invisible anyway, and restoring it would instead play an animation scaling the
+    content out of the taskbar, so it is left as is; when it is later restored it
+    returns to "the position before minimising" = off-screen. Moving uses
+    `MoveWindow`, which does not bring the window to front and does not steal
+    focus.
 
-    `(0, 0)` 代表一個視窗都沒找到（行程還沒起來、或桌面自動化函式庫不可用）——
-    呼叫端不得把它讀成「藏好了」。
+    `(0, 0)` means no window was found at all (the process has not started yet, or
+    the desktop-automation library is unavailable) -- the caller must not read it
+    as "hidden".
     """
     pids = find_browser_pids_for_profile(profile_dirs)
     if not pids:
@@ -1269,8 +1560,9 @@ def hide_browser_windows(profile_dirs: list[Path]) -> tuple[int, int]:
         import je_auto_control as ac  # type: ignore
         wm = ac.windows_window_manage
     except Exception as error:  # pylint: disable=broad-except
-        # `!r` 刻意保留：`try` 裡只有桌面自動化函式庫的 import，收到的是
-        # `ImportError`／`AttributeError`（`args` 非空），跟 selenium 無關。
+        # `!r` is kept on purpose: the `try` only touches the desktop-automation
+        # library's import, and what it catches is `ImportError` /
+        # `AttributeError` (non-empty `args`), unrelated to selenium.
         print(f"hide_browser_windows: backend unavailable: {error!r}",
               file=sys.stderr)
         return 0, 0
@@ -1294,72 +1586,81 @@ def hide_browser_windows(profile_dirs: list[Path]) -> tuple[int, int]:
                 else:
                     exposed += 1
         except Exception as error:  # pylint: disable=broad-except
-            # `!r` 刻意保留：桌面自動化函式庫的例外，不是 selenium 的。
+            # `!r` is kept on purpose: this is the desktop-automation library's exception, not selenium's.
             print(f"hide_browser_windows({pid}) failed: {error!r}",
                   file=sys.stderr)
             exposed += 1
     return hidden, exposed
 
 
-# ---------- chromedriver 的記錄檔（spawn 失敗唯一的 root cause 來源）---------
+# ---------- chromedriver's log (the only source of a spawn failure's root cause) ---------
 #
-# **兩個變體共用一份，而不是各抄一份。** 這一整組是純 `Path` 操作、完全不碰
-# driver，而它記載的度量（成長率、上限依據、中途修剪為什麼會被補零）是實測換來
-# 的——抄成兩份的話，下一次重量只會更新其中一份。同樣的理由已經讓
-# `hide_browser_windows` / `find_browser_pids_for_profile` 搬到這裡。
+# **The two variants share one copy instead of each keeping its own.** This whole group is
+# pure `Path` work that never touches the driver, and the measurements it records (growth
+# rate, the basis for the cap, why a mid-session trim gets zero-filled) were paid for by
+# measuring — copied twice, the next re-measurement would update only one of them. The same
+# reasoning already moved `hide_browser_windows` / `find_browser_pids_for_profile` here.
 #
-# **je 變體 2026-09-09 才接上。** 在那之前它一個都沒有，於是 `/run`（bot 的預設
-# 變體就是 je）遇到 Chrome 起不來時，只會拿到一句猜測——「likely Out of Memory
-# or a chromedriver/Chrome version mismatch」——而 5 分鐘的 startup window 一過，
-# `_watch_for_fallback` 就靜靜轉跑 selenium 變體，使用者連「je 為什麼死掉」這個
-# 問題都不會問。je 這一側**可以**產生這個檔：`wr.set_driver` 的 `**kwargs` 原封
-# 不動轉給 `webdriver.Chrome(...)`，所以傳一個 `service=ChromeService(
-# log_output=…)` 就行（實測見 `test_je_facade.py`）。
+# **The je variant was only wired up on 2026-09-09.** Before that it had none of this, so
+# when `/run` (the bot's default variant is je) hit a Chrome that would not start, all it got
+# was a guess — "likely Out of Memory or a chromedriver/Chrome version mismatch" — and once
+# the 5-minute startup window passed, `_watch_for_fallback` quietly switched to the selenium
+# variant, and the user never even asked "why did je die". The je side **can** produce this
+# file: `wr.set_driver` passes its `**kwargs` untouched to `webdriver.Chrome(...)`, so passing
+# a `service=ChromeService(log_output=…)` is enough (measured in `test_je_facade.py`).
 
 _CHROMEDRIVER_LOG = PROJECT_ROOT / "chromedriver.log"
-# 上一個 driver 工作階段的記錄。見 `_rotate_chromedriver_log`。
+# The previous driver session's log. See `_rotate_chromedriver_log`.
 _CHROMEDRIVER_LOG_PREV = PROJECT_ROOT / "chromedriver.prev.log"
-# `chromedriver.log` 的上限（見 `_trim_chromedriver_log`）。
+# The cap on `chromedriver.log` (see `_trim_chromedriver_log`).
 #
-# **觸發門檻 64 MB 的依據是「一個角色的工作階段實際會寫多少」**，2026-09-07 重量：
-# - 這個檔的大小取決於**單一 chromedriver 工作階段有多長**（它只在啟動時清空）。
-#   實測一段正在跑的工作階段：19:18:11 開始、00:56:41 最後一筆，5.64 小時寫了
-#   12,747,290 bytes ＝ **2.15 MB/小時（37 KB/分鐘）**。
-# - 工作階段長度 ＝ `images_per_character` ÷ **實際**產圖速率。實測速率 8.0 張/小時
-#   （數 `output/**/*.png` 的 mtime，13 個完整小時），`images_per_character=120`
-#   → **一個角色 15.0 小時 ≈ 28–32 MB**。
-# - 所以門檻取 64 MB ＝ 那個量的兩倍：健康的執行不會觸發，而「一個工作階段跑成好幾
-#   個角色的長度」（`restart_chrome_every_n_characters=0`，或速率掉到剩幾分之一）
-#   仍然會被抓到。
+# **The 64 MB trigger threshold is based on "how much one character's session actually
+# writes"**, re-measured 2026-09-07:
+# - This file's size depends on **how long a single chromedriver session is** (it is only
+#   cleared at startup). Measured on a session in progress: started 19:18:11, last entry
+#   00:56:41, 5.64 hours wrote 12,747,290 bytes = **2.15 MB/hour (37 KB/minute)**.
+# - Session length = `images_per_character` ÷ the **actual** image rate. Measured rate 8.0
+#   images/hour (counting the mtimes of `output/**/*.png` over 13 full hours), with
+#   `images_per_character=120` → **one character is 15.0 hours ≈ 28–32 MB**.
+# - So the threshold is 64 MB = twice that amount: a healthy run never triggers it, while
+#   "one session running as long as several characters" (`restart_chrome_every_n_characters=0`,
+#   or the rate dropping to a fraction) is still caught.
 #
-# **先前訂 8 MB 是錯的，記下來避免重犯**：當時的依據是「高過正常單角色量 5.4 MB」，
-# 但那 5.4 MB 是**某個角色跑到一半**的量，不是跑完的量。結果每個角色都會觸發一次
-# 警告——正好變成當初要避免的狼來了。量「跑到一半」當成「跑完」是這裡真正的教訓。
-# 順帶不再對齊兩支啟動器的 `LOG_MAX_BYTES`：那兩個管的是行導向的人看記錄，成長
-# 曲線完全不同，「全專案同一個數字好記」不是挑門檻的理由。
+# **The earlier 8 MB was wrong; recorded here so it is not repeated**: its basis was "above the
+# normal single-character amount of 5.4 MB", but that 5.4 MB was the amount **partway through**
+# a character, not at its end. As a result every character triggered the warning once —
+# exactly the crying wolf it was meant to avoid. Taking "halfway through" for "finished" is the
+# real lesson here. Incidentally it is no longer aligned with the two launchers'
+# `LOG_MAX_BYTES`: those govern line-oriented logs that people read, with an entirely different
+# growth curve, and "one number across the project is easy to remember" is no reason to pick a
+# threshold.
 #
-# **保留 256 KB 的依據是「還原一次失敗現場要多少」，不受上面那次重算影響：**
-# - 一次完整的 spawn 失敗現場在 `--log-level=INFO` 下量到 **1,090 bytes**
-#   （`Starting ChromeDriver` ＋ 帶著全部 Chrome 旗標與 `--user-data-dir` 的
-#   `COMMAND InitSession` ＋ `RESPONSE InitSession ERROR session not created`
-#   加上 Chrome 那一側的原因）。256 KB 是它的 240 倍。
-# - 唯一的讀取端 `_read_tail_text` 一次最多只讀 **64 KiB**，所以保留量必須
-#   ≥ 那個視窗，否則修剪完之後 tail 讀到的是被切短的一小截。256 KB ＝ 4 倍。
-# - 崩潰後的事後對帳想看的是「死掉之前那幾個 WebDriver 命令」。以上面重量到的
-#   37 KB/分鐘計，256 KB ≈ 最後 7 分鐘，夠看出死因。
+# **Keeping 256 KB is based on "how much it takes to reconstruct one failure", and is not
+# affected by the recalculation above:**
+# - One complete spawn-failure scene measured **1,090 bytes** at `--log-level=INFO`
+#   (`Starting ChromeDriver` + the `COMMAND InitSession` carrying every Chrome flag and
+#   `--user-data-dir` + `RESPONSE InitSession ERROR session not created`, plus the reason from
+#   Chrome's side). 256 KB is 240 times that.
+# - The only reader, `_read_tail_text`, reads at most **64 KiB** at a time, so the amount kept
+#   must be ≥ that window, or after a trim the tail read gets a truncated sliver. 256 KB = 4x.
+# - A post-crash reconciliation wants "the last few WebDriver commands before it died". At the
+#   37 KB/minute re-measured above, 256 KB ≈ the last 7 minutes, enough to see the cause.
 _CHROMEDRIVER_LOG_MAX_BYTES = 64 * 1024 * 1024
 _CHROMEDRIVER_LOG_KEEP_BYTES = 256 * 1024
 
 
 def _read_tail_text(path: Path, max_bytes: int = 64 * 1024) -> str:
-    """讀檔案**尾端**最多 `max_bytes` 的文字，不把整個檔載進記憶體。
+    """Read at most `max_bytes` of text from the **end** of a file, without loading the whole
+    file into memory.
 
-    `read_text()` 會讀整份。chromedriver 的記錄在一個角色之內可以長到數十 MB
-    （2026-08-29 實測：`--log-level=INFO` 每個 WebDriver 命令約 484 bytes，
-    `--verbose` 約 4370），而這個函式被呼叫的時機正好是**Chrome 剛剛起不來**——
-    那經常就是記憶體不夠的時候。要看的只有最後幾行，沒有理由付整份的代價。
+    `read_text()` reads the whole thing. chromedriver's log can grow to tens of MB within one
+    character (measured 2026-08-29: about 484 bytes per WebDriver command at
+    `--log-level=INFO`, about 4370 with `--verbose`), and this function is called precisely
+    when **Chrome has just failed to start** — which is often exactly when memory is short.
+    Only the last few lines matter; there is no reason to pay for the whole file.
 
-    從中間切下去第一行通常是半行，所以有 seek 過就丟掉第一行。
+    Cutting in the middle usually leaves a half line first, so after a seek the first line is
+    dropped.
     """
     with path.open("rb") as handle:
         handle.seek(0, os.SEEK_END)
@@ -1379,36 +1680,38 @@ def _dump_chromedriver_log_tail(lines: int = 25) -> None:
     cause — the verbose chromedriver log does (version mismatch, profile
     lock, OOM at launch …). Called when a spawn attempt fails.
 
-    讀不到就**明講**。原本這裡是 `except OSError: return`，於是「記錄沒被寫出來」
-    與「記錄是空的」都長得跟「一切正常、只是沒東西好印」一模一樣——而
-    `ChromeService` 當時傳的是 selenium 根本不認得的 `log_path`，檔案從來沒被
-    建立過。整整幾個月，唯一會揭穿這件事的就是這個 helper，而它選擇沉默。
+    Say so **explicitly** when it cannot be read. This used to be `except OSError: return`, so
+    "the log was never written" and "the log is empty" looked exactly like "all is well, just
+    nothing to print" — and `ChromeService` was being passed `log_path`, which selenium does
+    not recognise at all, so the file was never created. For months the only thing that would
+    have exposed this was this helper, and it chose silence.
 
-    **`.prev` 也一起印。** 這次 spawn 失敗的 `chromedriver.log` 只會有「這一次
-    起不來」的訊息；真正想看的常常是**上一個工作階段**怎麼死的（`_rotate_
-    chromedriver_log` 保留下來的那一份）。兩份都印、而且分別標明是哪一份——不標
-    的話兩段時間戳混在一起，讀的人會以為是同一個工作階段。
+    **`.prev` is printed as well.** The `chromedriver.log` of this failed spawn only holds the
+    messages of "this attempt failed to start"; what one actually wants is often **how the
+    previous session died** (the copy `_rotate_chromedriver_log` keeps). Print both, and label
+    each — unlabelled, the two sets of timestamps blur together and the reader takes them for
+    one session.
     """
-    for path, label in ((_CHROMEDRIVER_LOG_PREV, "chromedriver.prev.log（上一個"
-                         "工作階段——「跑到一半死掉」要看的是這一份）"),
-                        (_CHROMEDRIVER_LOG, "chromedriver.log（這一次）")):
+    for path, label in ((_CHROMEDRIVER_LOG_PREV, "chromedriver.prev.log (the previous "
+                         "session — the one to read for \"died partway through\")"),
+                        (_CHROMEDRIVER_LOG, "chromedriver.log (this attempt)")):
         try:
             text = _read_tail_text(path)
         except FileNotFoundError:
             if path is _CHROMEDRIVER_LOG_PREV:
-                continue          # 第一次啟動還沒有上一份，正常，不必出聲
-            print("--- chromedriver.log 讀不到（FileNotFoundError）——"
-                  "driver 的詳細記錄沒有被寫出來，這次的 spawn 失敗沒有 root "
-                  "cause 可看。檢查 ChromeService 的 log_output 參數。---",
+                continue          # the first launch has no earlier copy yet; normal, stay quiet
+            print("--- chromedriver.log cannot be read (FileNotFoundError) — "
+                  "the driver's detailed log was never written, so this spawn failure has no root "
+                  "cause to look at. Check ChromeService's log_output parameter. ---",
                   file=sys.stderr)
             continue
         except OSError as error:
-            print(f"--- {label} 讀不到（{type(error).__name__}）---",
+            print(f"--- {label} cannot be read ({type(error).__name__}) ---",
                   file=sys.stderr)
             continue
         tail = text.splitlines()[-lines:]
         if not tail:
-            print(f"--- {label} 是空的——driver 還沒來得及寫任何東西 ---",
+            print(f"--- {label} is empty — the driver has not had time to write anything yet ---",
                   file=sys.stderr)
             continue
         print(f"--- {label} (last {len(tail)} lines) ---", file=sys.stderr)
@@ -1418,60 +1721,68 @@ def _dump_chromedriver_log_tail(lines: int = 25) -> None:
 
 
 def _trim_chromedriver_log() -> None:
-    """把上一個 driver 工作階段留下的 `chromedriver.log` 封頂（保留尾段）。
+    """Cap the `chromedriver.log` left by the previous driver session (keeping the tail).
 
-    **硬性前提：呼叫的當下不得有任何 chromedriver 活著。** 這不是保守寫法，是
-    2026-09-06 量出來的——`trim_log` 走的是 `write_bytes()`（截斷後重寫），而
-    chromedriver 握著的是一個**位移會留在原地**的檔案控制代碼：
+    **Hard precondition: no chromedriver may be alive at the moment of the call.** This is not
+    caution for its own sake; it was measured on 2026-09-06 — `trim_log` goes through
+    `write_bytes()` (truncate, then rewrite), while chromedriver holds a file handle whose
+    **offset stays where it was**:
 
-        修剪前 5,170 bytes → 修剪後 746 bytes → 它再寫幾行 → 7,572 bytes，
-        其中 **4,424 個是 NUL**（作業系統把中間那段空洞補零）
+        before trim 5,170 bytes → after trim 746 bytes → it writes a few more lines → 7,572
+        bytes, of which **4,424 are NUL** (the OS zero-fills the hole in the middle)
 
-    也就是說在工作階段中途修剪不但**收不回空間**（檔案立刻長回比修剪前更大），
-    還會把要查的東西壓成一片亂碼——`_read_tail_text` 讀回來就是那堆補零。所以
-    這支只掛在「舊 driver 已經收掉、新的還沒起來」那條接縫上，也因此**不放在
-    `main()` 的 finally**：那裡的 `cur.quit()` 是包在 try/except pass 裡的，
-    quit 卡住的時候 chromedriver 還活著，正好踩中上面那個情形。
+    In other words, trimming mid-session not only **reclaims no space** (the file immediately
+    grows back larger than before the trim), it also turns what we want to inspect into
+    garbage — `_read_tail_text` reads back exactly that zero fill. So this only hangs on the
+    seam "the old driver is gone and the new one is not up yet", and that is also why it is
+    **not in `main()`'s finally**: the `cur.quit()` there is wrapped in try/except pass, and
+    when quit hangs chromedriver is still alive, which is exactly the case above.
 
-    修剪點的安全性由呼叫端保證：`build_stealth_driver()` 的兩條正式路徑進來之前
-    都剛跑完 `_kill_orphan_chrome()`（開機是 `main()`、週期性重啟是
-    `_restart_chrome_session`），那支會 psutil ＋ `taskkill /F /T /IM` 兩輪掃掉
-    每一個 `chromedriver.exe`。驗證模式那條路沒有掃（`_SUPPRESS_ORPHAN_SWEEP`），
-    但 `verify_browser.py` 會先拿 `_chrome_slot` 鎖並讓位給活著的 `webrunner.pid`，
-    所以那裡也不會有我們的 chromedriver 在跑。
+    The safety of the trim point is guaranteed by the callers: both production paths into
+    `build_stealth_driver()` have just run `_kill_orphan_chrome()` (at boot that is `main()`,
+    for periodic restarts `_restart_chrome_session`), which sweeps every `chromedriver.exe` in
+    two passes with psutil + `taskkill /F /T /IM`. The verify-mode path does not sweep
+    (`_SUPPRESS_ORPHAN_SWEEP`), but `verify_browser.py` first takes the `_chrome_slot` lock and
+    yields to a live `webrunner.pid`, so no chromedriver of ours runs there either.
 
-    **為什麼健康的執行看起來像沒作用，卻還是要有這一層。**
-    chromedriver 每次啟動會**清空** `--log-path` 指的檔（2026-09-06 實測：人工墊到
-    50,368 bytes，下次啟動後回到 366 bytes），所以正常情況下真正在封頂的是
-    chromedriver 自己，而上限等於「一個 chromedriver 工作階段的量」。這一層是把那個
-    上限變成**我們自己持有**的，因為讓它消失的方式不只一種、而且每一種都是無聲的：
+    **Why this layer is still needed even though it looks inert in a healthy run.**
+    chromedriver **clears** the file `--log-path` points to on every start (measured
+    2026-09-06: padded by hand to 50,368 bytes, back to 366 bytes after the next start), so
+    normally the thing actually capping it is chromedriver itself, and the cap equals "one
+    chromedriver session's worth". This layer turns that cap into **one we hold ourselves**,
+    because there is more than one way for it to vanish, and every one of them is silent:
 
-    1. `selenium.webdriver.common.service.Service.__init__` 裡真的有
+    1. `selenium.webdriver.common.service.Service.__init__` really does contain
        `if isinstance(log_output, str): self.log_output = open(log_output, "a+")`
-       ——**附加模式，永遠只長不消**。目前救我們的只是 `ChromiumService.__init__`
-       搶先一步把字串轉成 `--log-path=`（實測 `service.log_output` 是 -3＝DEVNULL）。
-       這層攔截哪天不見了，這個檔就變成純附加。
-    2. chromedriver 自己有 `--append-log`。有人為了跨重啟對帳而加上去，同樣結果。
-    3. 傳的若不是字串而是檔案物件，走的也是 Python 這一側的控制代碼。
-    另外，chromedriver 根本沒起來的那種失敗（Selenium Manager 解析不到、連
-    埠都綁不上）不會清空這個檔，於是 `_dump_chromedriver_log_tail` 讀到的是
-    **上一個工作階段**的尾巴——看起來像診斷、其實是舊資料。
+       — **append mode, it only ever grows**. The only thing saving us today is
+       `ChromiumService.__init__` turning the string into `--log-path=` first (measured:
+       `service.log_output` is -3 = DEVNULL). The day that interception goes away, this file
+       becomes append-only.
+    2. chromedriver itself has `--append-log`. Someone adding it to reconcile across restarts
+       gets the same result.
+    3. Passing a file object instead of a string also goes through a Python-side handle.
+    Also, a failure where chromedriver never started at all (Selenium Manager could not resolve
+    it, or the port could not even be bound) does not clear this file, so what
+    `_dump_chromedriver_log_tail` reads is the tail of **the previous session** — it looks like
+    a diagnosis but is actually stale data.
 
-    真正**還沒有**上限的是「單一工作階段內」的成長：實測約 2.15 MB/小時
-    （2026-09-07：5.64 小時寫了 12,747,290 bytes）。那段中途修剪不掉（見上），
-    所以這裡只能事後封頂 ＋ 講一聲。
+    What really has **no** cap yet is the growth "within a single session": measured at about
+    2.15 MB/hour (2026-09-07: 5.64 hours wrote 12,747,290 bytes). That cannot be trimmed
+    mid-session (see above), so all this can do is cap it afterwards + say so.
 
-    **警告的診斷要說對成因。** 檔案大小 ≈ 單一工作階段長度 × 那個速率，而工作階段
-    長度是 `images_per_character` ÷ **實際**產圖速率——`restart_chrome_every_n_
-    characters` 是以**角色**為單位、不是以時間為單位，所以它設 1 也完全可能是一個
-    十幾小時的工作階段。本機實測就是這個情形：該值＝1、`images_per_character=120`、
-    額度節流下 8.0 張/小時 → 一個角色 15 小時 ≈ 30 MB。
-    **先前那行警告寫「多半是 restart_chrome_every_n_characters=0」是錯的**：照著
-    去查會查到一個設成 1 的設定，然後找不到問題。`=0` 只是眾多讓工作階段變長的
-    原因之一，而且不是本機的情況。
+    **The warning's diagnosis must name the right cause.** File size ≈ single session length ×
+    that rate, and session length is `images_per_character` ÷ the **actual** image rate —
+    `restart_chrome_every_n_characters` counts in **characters**, not in time, so even set to 1
+    it can perfectly well be a session of more than ten hours. That is exactly the case
+    measured on this machine: that value = 1, `images_per_character=120`, 8.0 images/hour under
+    quota throttling → one character is 15 hours ≈ 30 MB.
+    **The earlier warning line saying "most likely restart_chrome_every_n_characters=0" was
+    wrong**: following it you find a setting of 1 and then cannot find the problem. `=0` is
+    only one of many reasons a session gets long, and it is not this machine's case.
 
-    順帶一提，這個檔裡含**實際打進頁面的提示詞內容**（`RESPONSE ExecuteScript
-    "…"`）。它已經在 `.gitignore` 裡，但不要隨手貼出去。
+    Incidentally, this file contains **the prompt text actually typed into the page**
+    (`RESPONSE ExecuteScript "…"`). It is already in `.gitignore`, but do not paste it around
+    casually.
     """
     try:
         size = _CHROMEDRIVER_LOG.stat().st_size
@@ -1480,16 +1791,17 @@ def _trim_chromedriver_log() -> None:
     if size <= _CHROMEDRIVER_LOG_MAX_BYTES:
         return
     print(
-        f"chromedriver.log 上一個工作階段留下 {size / (1024 * 1024):.1f} MB"
-        f"（上限 {_CHROMEDRIVER_LOG_MAX_BYTES // (1024 * 1024)} MB），"
-        f"只保留尾端 {_CHROMEDRIVER_LOG_KEEP_BYTES // 1024} KB。"
-        f"這個檔只在 chromedriver **啟動**時清空，所以大小 ≒ 單一 Chrome 工作"
-        f"階段的長度 × 約 2 MB/小時；而工作階段長度 ＝ images_per_character ÷ "
-        f"**實際**產圖速率，不是 restart_chrome_every_n_characters 的角色數。"
-        f"（實測：該值＝1、images_per_character=120、速率 8 張/小時，一個角色仍是 "
-        f"15 小時 ≒ 30 MB。）要查就先算那個乘積；真的異常時它會遠大於一個角色的"
-        f"份量——工作階段跑成好幾個角色那麼長（例如重啟被停用），或速率掉到剩幾"
-        f"分之一。",
+        f"chromedriver.log from the previous session is {size / (1024 * 1024):.1f} MB"
+        f" (cap {_CHROMEDRIVER_LOG_MAX_BYTES // (1024 * 1024)} MB), "
+        f"keeping only the last {_CHROMEDRIVER_LOG_KEEP_BYTES // 1024} KB. "
+        f"This file is only cleared when chromedriver **starts**, so its size ≒ the length of "
+        f"a single Chrome session × about 2 MB/hour; and session length = images_per_character "
+        f"÷ the **actual** image rate, not the character count in "
+        f"restart_chrome_every_n_characters. (Measured: that value = 1, "
+        f"images_per_character=120, a rate of 8 images/hour, and one character is still "
+        f"15 hours ≒ 30 MB.) To investigate, compute that product first; when something is "
+        f"really wrong it is far larger than one character's worth — a session running as long "
+        f"as several characters (e.g. restarts disabled), or the rate dropping to a fraction.",
         file=sys.stderr)
     trim_log(_CHROMEDRIVER_LOG,
              max_bytes=_CHROMEDRIVER_LOG_MAX_BYTES,
@@ -1497,108 +1809,124 @@ def _trim_chromedriver_log() -> None:
 
 
 def _rotate_chromedriver_log() -> None:
-    """把上一個工作階段的 `chromedriver.log` 保留成 `chromedriver.prev.log`。
+    """Keep the previous session's `chromedriver.log` as `chromedriver.prev.log`.
 
-    **沒有這一層，這個檔就永遠沒有「跑到一半死掉」那次的證據。** chromedriver 每次
-    啟動會清空 `--log-path` 指的檔，所以流程是：chromedriver 死掉 → webrunner
-    rc=1 → 監督者重生 → 新的 chromedriver 開同一個路徑並**截斷它**。實測
-    （2026-09-07）：11:44:54 崩潰、11:44:59 重生，而磁碟上那份 `chromedriver.log`
-    的第一筆是 **11:45:02**——崩潰後 8 秒。唯一可能記載死因的東西，被下一個
-    chromedriver 蓋掉了，而且沒有任何副本。
+    **Without this layer the file never holds evidence of a "died partway through" run.**
+    chromedriver clears the file `--log-path` points to on every start, so the sequence is:
+    chromedriver dies → webrunner rc=1 → the supervisor respawns → the new chromedriver opens
+    the same path and **truncates it**. Measured (2026-09-07): crash at 11:44:54, respawn at
+    11:44:59, and the first entry of the `chromedriver.log` on disk was **11:45:02** — 8
+    seconds after the crash. The only thing that could have recorded the cause of death was
+    overwritten by the next chromedriver, with no copy anywhere.
 
-    **這推翻了 `_dump_chromedriver_log_tail` 原本的理由。** 它的 docstring 說
-    「Selenium 的例外講不出成因、verbose 的 chromedriver log 講得出」——對**啟動
-    失敗**成立（那份 log 就是當次失敗的），對**跑到一半死掉**完全不成立：診斷工具
-    自己把它存在的目的所需要的證據銷毀了。
+    **This overturns `_dump_chromedriver_log_tail`'s original rationale.** Its docstring says
+    "Selenium's exception cannot name the cause, the verbose chromedriver log can" — true for
+    **startup failures** (that log belongs to the failure at hand), entirely false for **dying
+    partway through**: the diagnostic tool itself destroyed the evidence its purpose required.
 
-    位置與 `_trim_chromedriver_log` 完全相同、理由也相同：必須在
-    `ChromeService(...)` **之前**，那之後這個路徑就有 chromedriver 的行程握著了。
-    保留動作用 `os.replace`（同一個磁碟區的原子改名），所以不會出現「保留到一半
-    被砍掉」留下半份的情形。
+    Its position is exactly the same as `_trim_chromedriver_log`'s, for the same reason: it
+    must run **before** `ChromeService(...)`, after which a chromedriver process holds that
+    path. The keep step uses `os.replace` (an atomic rename on the same volume), so there is no
+    "killed halfway through keeping it" leaving half a copy behind.
 
-    **`.prev` 也納入同一個磁碟上限**：兩個檔各自最多
-    `_CHROMEDRIVER_LOG_MAX_BYTES`，合計上限翻倍是刻意接受的——一份 64 MB 的上限
-    本來就只有在異常時才會碰到（實測一個角色約 30 MB），而付這一倍換到的是「下一次
-    不明原因的死亡有證據可查」。先修剪再改名，所以 `.prev` 拿到的一定是已封頂的。
+    **`.prev` falls under the same disk cap**: each of the two files is at most
+    `_CHROMEDRIVER_LOG_MAX_BYTES`, and doubling the combined cap is deliberately accepted — a
+    64 MB cap is only ever reached when something is wrong (measured: about 30 MB per
+    character), and what the doubling buys is "the next unexplained death has evidence to look
+    at". It trims before renaming, so `.prev` always receives an already-capped file.
     """
     try:
         if not _CHROMEDRIVER_LOG.exists():
             return
         os.replace(_CHROMEDRIVER_LOG, _CHROMEDRIVER_LOG_PREV)
     except OSError as error:
-        # 純診斷輔助，絕不能擋住起 driver——但要出聲，否則「沒有 .prev」與
-        # 「保留失敗」在磁碟上長得一模一樣。
-        print(f"保留上一份 chromedriver.log 失敗（{type(error).__name__}）："
-              f"這一輪若崩潰將沒有前一個工作階段的記錄可查。", file=sys.stderr)
+        # Purely a diagnostic aid, must never block starting the driver — but it has to speak
+        # up, otherwise "no .prev" and "keeping it failed" look exactly alike on disk.
+        print(f"failed to keep the previous chromedriver.log ({type(error).__name__}): "
+              f"if this run crashes there will be no earlier session's log to look at.",
+              file=sys.stderr)
 
 
 # ---------- file helpers -----------------------------------------------------
 
 class CredentialsError(RuntimeError):
-    """憑證檔在，但讀不成一組可用的憑證。
+    """The credentials file exists but does not read as a usable set of credentials.
 
-    **型別化的理由與 `QueueDecodeError` 同源：裸的錯誤指著錯的地方。** 編碼不對
-    時 traceback 最後一行是 `read_text`，看起來像「檔案讀不到」——實際上檔案好好
-    的在那裡，只是編碼不對；欄位缺漏時丟的是裸 `KeyError`，只看得到一個字串，
-    看不出那是憑證檔缺了欄位。而這個讀取在兩支變體的 `main()` 裡**都沒有 try**，
-    所以它是整輪唯一的死因出口：訊息講不出「該做什麼」，代價就是有人得從一行
-    `read_text` 反推回去。
+    **The reason for a dedicated type is the same as `QueueDecodeError`'s: the bare error
+    points at the wrong place.** With the wrong encoding the traceback's last line is
+    `read_text`, which looks like "the file cannot be read" — when in fact the file is right
+    there, just in the wrong encoding; a missing field raises a bare `KeyError` that shows only
+    a string, with no hint that it is the credentials file missing a field. And this read has
+    **no try** in either variant's `main()`, so it is the run's only exit for this cause of
+    death: if the message cannot say "what to do", the cost is someone reasoning backwards from
+    a single `read_text` line.
 
-    **這個例外的訊息絕不含憑證值，而且那不是美觀問題。** 它只帶檔名、位元組
-    位置與 `error.reason`（編碼那一種），或缺漏的欄位名（欄位那一種）——不帶那個
-    解不開的位元組值、不帶任何已解碼的內容、也不帶 `creds` 的任何鍵值。裸的
-    `UnicodeDecodeError` 做不到這一點：它的訊息會把出問題的位元組值印出來
-    （`can't decode byte 0xff in position 12`），而這個檔案**整份都是憑證**。
-    訊息會進 log，而 log 送得到聊天平台，所以這條性質屬於外送邊界。
+    **This exception's message never contains a credential value, and that is not cosmetic.**
+    It carries only the file name, the byte position and `error.reason` (the encoding kind), or
+    the missing field names (the field kind) — not the undecodable byte value, not any decoded
+    content, and none of `creds`' keys or values. A bare `UnicodeDecodeError` cannot do that:
+    its message prints the offending byte value (`can't decode byte 0xff in position 12`), and
+    this file is **credentials from top to bottom**. The message goes into the log, and the log
+    can reach the chat platform, so this property sits on the outbound boundary.
 
-    同樣的理由，編碼那一種刻意用 `raise ... from None` 收掉例外鏈——這一點與
-    `_queue_decode_error` 的 `from error` **不同**，是刻意的分歧：佇列檔的內容
-    本來就不是秘密，保留鏈結換到的是更完整的診斷；憑證檔不是，而我們的訊息已經
-    帶了位置與原因，也就是人要修好它所需要的全部，鏈結只多帶那一個位元組值。
+    For the same reason, the encoding kind deliberately uses `raise ... from None` to drop the
+    exception chain — this **differs** from `_queue_decode_error`'s `from error`, and the
+    divergence is deliberate: a queue file's content was never secret, so keeping the chain
+    buys a fuller diagnosis; the credentials file is secret, and our message already carries
+    the position and the reason, i.e. everything a person needs to fix it — the chain would
+    only add that one byte value.
 
-    **只包「檔案在、但內容不對」。** `FileNotFoundError` 與其餘 `OSError`
-    （不存在／權限）照舊原樣往外拋：那是另一件事，呼叫端的註解也是照那樣寫的。
+    **Only "the file exists but its content is wrong" is wrapped.** `FileNotFoundError` and the
+    other `OSError`s (missing / permissions) still propagate as they are: that is a different
+    matter, and the callers' comments are written that way too.
     """
 
 
 def missing_credentials_message(path: Path) -> str:
-    """憑證檔不存在時要印的那段話。純函式，兩支變體共用一份。
+    """The text printed when the credentials file does not exist. A pure function, one copy
+    shared by both variants.
 
-    **它取代的是一份 traceback。** 全新 clone 第一次跑批次一定會走到這裡，而裸的
-    `FileNotFoundError` 給的最後一行是 `read_text`，看起來像「檔案讀不到」——讀的
-    人得自己反推「這個檔案是什麼、值要去哪裡拿、格式長什麼樣」。這三件事就是下面
-    這段話的全部內容。
+    **It replaces a traceback.** A brand-new clone always lands here on its first batch run,
+    and the bare `FileNotFoundError`'s last line is `read_text`, which looks like "the file
+    cannot be read" — the reader has to work out alone "what this file is, where the values
+    come from, and what the format looks like". Those three things are the entire content of
+    the text below.
 
-    訊息只帶**檔名**，不帶完整路徑：這一行會進 `webrunner.log`，而 log 送得到聊天
-    平台（`/log tail`），主機路徑在那裡是禁止外送的。
+    The message carries only the **file name**, not the full path: this line goes into
+    `webrunner.log`, and the log can reach the chat platform (`/log tail`), where host paths
+    must not be sent.
     """
     example = path.name.replace(".md", ".example.md")
     return (
-        f"webrunner: 找不到 {path.name}。這是出圖服務的登入帳密，repo 裡刻意沒有"
-        f"這個檔案。請把 {example} 複製成 {path.name}，改成你自己的帳號：" + "\n"
-        + f"    username: <你的帳號>" + "\n"
-        + f"    password: <你的密碼>" + "\n"
-        + "（以第一個冒號分隔，所以密碼裡可以有冒號。）詳細步驟見 docs/setup.md。")
+        f"webrunner: {path.name} not found. It holds the login credentials for the image "
+        f"service, and the repo deliberately does not ship it. Copy {example} to {path.name} "
+        f"and fill in your own account:" + "\n"
+        + f"    username: <your username>" + "\n"
+        + f"    password: <your password>" + "\n"
+        + "(Split on the first colon, so the password may contain colons.) "
+          "See docs/setup.md for the detailed steps.")
 
 
 def read_credentials(path: Path) -> tuple[str, str]:
-    """讀憑證檔，回 `(username, password)`。
+    """Read the credentials file and return `(username, password)`.
 
-    **解析語意是契約的一部分，不要動**：以第一個 `:` 分隔（所以值裡可以有冒號）、
-    key 取 `strip().lower()`、value 取 `strip()`、沒有冒號的行略過、重複的 key
-    後者覆蓋前者。
+    **The parsing semantics are part of the contract; do not change them**: split on the first
+    `:` (so a value may contain colons), the key is `strip().lower()`, the value is `strip()`,
+    lines without a colon are skipped, and a repeated key overrides the earlier one.
 
-    「檔案在、但讀不成一組憑證」一律轉成 `CredentialsError`（理由見該類別），
-    「檔案不在／權限」維持原樣往外拋。
+    "The file exists but does not read as a set of credentials" always becomes
+    `CredentialsError` (see that class for why); "the file is missing / permissions" still
+    propagates as is.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError as error:
-        # 只帶位置與原因，不帶 `error.object`、也不帶那個位元組的值；`from None`
-        # 的理由見 `CredentialsError`（被鏈上去的原始例外會把位元組值印出來）。
+        # Carry only the position and the reason, not `error.object` nor that byte's value; for
+        # why `from None`, see `CredentialsError` (the chained original exception would print
+        # the byte value).
         raise CredentialsError(
-            f"{path.name} 不是 UTF-8：第 {error.start} 個位元組起解不開"
-            f"（{error.reason}）。請把這個檔案重新存成 UTF-8 再跑。"
+            f"{path.name} is not UTF-8: it cannot be decoded from byte {error.start} onwards"
+            f" ({error.reason}). Re-save this file as UTF-8 and run again."
         ) from None
     creds: dict[str, str] = {}
     for raw in text.splitlines():
@@ -1606,60 +1934,67 @@ def read_credentials(path: Path) -> tuple[str, str]:
             continue
         key, _, value = raw.partition(":")
         creds[key.strip().lower()] = value.strip()
-    # 只講缺了哪個欄位名——那兩個名字是寫在這裡的字面值，不是讀進來的資料，所以
-    # 這句話不可能夾帶憑證內容。讀到了什麼（含其他鍵名）一個字都不印。
+    # Name only the missing field names — those two names are literals written here, not data
+    # read in, so this sentence cannot carry credential content. Nothing that was read
+    # (other key names included) is printed.
     missing = [field for field in ("username", "password") if field not in creds]
     if missing:
         raise CredentialsError(
-            f"{path.name} 少了 {'、'.join(missing)} 欄位。請確認每一行都是"
-            f"「欄位名: 值」的格式（`username` 與 `password` 兩行都要有）。"
+            f"{path.name} is missing the {' and '.join(missing)} field. Make sure every line has"
+            f" the form \"field name: value\" (both a `username` line and a `password` line are"
+            f" required)."
         )
     return creds["username"], creds["password"]
 
 
 class QueueDecodeError(RuntimeError):
-    """佇列檔（`todo_*.md` 與它們的 fallback）不是 UTF-8，讀不出來。
+    """A queue file (`todo_*.md` and their fallbacks) is not UTF-8 and cannot be read.
 
-    **這裡刻意跟本模組其他載入器相反：不退回空值，直接拋。** 那些載入器（設定
-    檔、鎖檔、進度檢查點）退回預設是安全的，因為「預設」跟「讀到的值」在下游
-    分得開。佇列不是——「空」在下游是一個**合法且會改變行為的值**：
+    **Here this deliberately does the opposite of this module's other loaders: it does not
+    fall back to an empty value, it raises.** Those loaders (config files, lock files, progress
+    checkpoints) can safely fall back to a default, because downstream "the default" and "the
+    value read" can be told apart. Queues cannot — downstream, "empty" is a **legitimate value
+    that changes behaviour**:
 
-    - `read_queues()` 看到某條佇列是空的，會替換成 fallback 檔（`prompt.md` /
-      `character1.md` / `character2.md` / `undesired.md`）。所以「讀不出來」會
-      安靜地變成「拿另一份內容產圖」，而且因為 fallback 模式不 pop，跑完還會
-      回 **rc=0** 說一切正常。使用者看到的是「跑完了」，拿到的是錯的圖。
-    - `todo_character2.md` 的空白列本身就是「這一配對不要 Character 2」；
-      `undesired.md` 空字串本身就是「不設負面提示詞」。下游沒有任何辦法把
-      「真的空」跟「解不開」分開。
+    - When `read_queues()` sees that a queue is empty, it substitutes the fallback file
+      (`prompt.md` / `character1.md` / `character2.md` / `undesired.md`). So "cannot be read"
+      quietly becomes "generate from different content", and since fallback mode does not pop,
+      the run even ends with **rc=0** saying all is well. The user sees "finished" and gets the
+      wrong images.
+    - A blank row in `todo_character2.md` itself means "no Character 2 for this pair"; an empty
+      `undesired.md` itself means "no negative prompt". Downstream has no way at all to tell
+      "really empty" apart from "undecodable".
 
-    而且沒有任何重試救得回來——要有人把檔案重新存成 UTF-8。所以正確的形狀是
-    **在開 Chrome 之前就大聲失敗**：`run_preflight()` 在 boot 之前呼叫
-    `read_queues()`，行程會在一秒內死掉，監督者的 rapid-fail giveup
-    （`rapid_fail_threshold_sec` 30 秒內連續 `rapid_fail_giveup_count` 5 次）
-    收手並通知，所以不會變成無限重生。
+    And no retry can rescue it — someone has to re-save the file as UTF-8. So the right shape
+    is **to fail loudly before Chrome opens**: `run_preflight()` calls `read_queues()` before
+    boot, the process dies within a second, and the supervisor's rapid-fail giveup
+    (`rapid_fail_giveup_count` = 5 consecutive failures within `rapid_fail_threshold_sec` = 30
+    seconds) stops and notifies, so it does not turn into endless respawning.
 
-    半寫入正好切在多位元組字元中間不是理論情形：`write_todo_characters` 為了讓
-    編輯器靜默重載而**刻意就地覆寫、不做原子寫入**（理由見該函式 docstring），
-    佇列檔正是這個 repo 裡唯一放棄寫入原子性的一類檔案。
+    A half-write landing right in the middle of a multi-byte character is not hypothetical:
+    `write_todo_characters` **deliberately overwrites in place without an atomic write** so the
+    editor reloads silently (see that function's docstring for why), and queue files are the
+    only class of file in this repo that gives up write atomicity.
     """
 
 
 def _queue_decode_error(path: Path, error: UnicodeDecodeError) -> QueueDecodeError:
-    """把裸的 `UnicodeDecodeError` 換成一個講得出「該做什麼」的錯誤。
+    """Replace the bare `UnicodeDecodeError` with an error that can say "what to do".
 
-    裸的那個 traceback 最後一行是 `read_text`，看起來像「檔案讀不到」；實際上
-    檔案好好的在那裡，只是編碼不對。訊息裡帶檔名與位元組位置，人才有得查。
+    The bare one's traceback ends on `read_text`, which looks like "the file cannot be read";
+    in fact the file is right there, just in the wrong encoding. The message carries the file
+    name and the byte position so a person has something to go on.
     """
     return QueueDecodeError(
-        f"{path.name} 不是 UTF-8：第 {error.start} 個位元組起解不開"
-        f"（{error.reason}）。請把這個檔案重新存成 UTF-8 再跑。"
+        f"{path.name} is not UTF-8: it cannot be decoded from byte {error.start} onwards"
+        f" ({error.reason}). Re-save this file as UTF-8 and run again."
     )
 
 
 def read_text_safe(path: Path) -> str:
-    """Fallback 檔的讀取端。**只吞「檔案不存在」**——不存在代表這條 fallback 沒
-    設定，回空字串是正確語意。其餘失敗（權限、編碼）一律往外拋，理由見
-    `QueueDecodeError`。"""
+    """The reader for fallback files. **Swallows only "file not found"** — not found means this
+    fallback is not configured, and returning an empty string is the right semantics. Every
+    other failure (permissions, encoding) propagates; see `QueueDecodeError` for why."""
     try:
         return path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
@@ -1674,9 +2009,9 @@ def read_todo_characters(path: Path, *, preserve_blank: bool = False) -> list[st
     (U+00A0) that often sneak in from copy/paste are normalised to regular
     spaces so NovelAI prompts don't carry invisible junk.
 
-    檔案不存在 → `[]`（佇列沒建立過，等同空佇列）。檔案在但不是 UTF-8 →
-    **拋 `QueueDecodeError`，不回 `[]`**；為什麼那個方向才對，見該類別的
-    docstring。"""
+    File missing → `[]` (the queue was never created, same as an empty queue). File present
+    but not UTF-8 → **raises `QueueDecodeError`, does not return `[]`**; for why that is the
+    right direction, see that class's docstring."""
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -1698,14 +2033,18 @@ def read_todo_characters(path: Path, *, preserve_blank: bool = False) -> list[st
 def write_todo_characters(path: Path, entries: list[str]) -> None:
     """Persist a todo list back to disk, one entry per line.
 
-    刻意用「就地覆寫」(path.write_text 同 inode)，**不要**改回 os.replace
-    原子寫入：使用者常把 todo_prompt.md 開在 IDE 裡看著佇列即時消化，
-    os.replace 換掉 inode 會被 PyCharm 當成「檔案被刪掉又重建」、每次 pop 都
-    跳 memory/disk 對話框；就地覆寫則讓沒有未存編輯的開啟檔靜默重載、不跳框。
-    代價是放棄原子性——但 todo 檔小、寫入毫秒級，硬殺剛好命中寫入窗的機率極
-    低，且 bot 來源編輯有 .backup/ + reconcile 保護。中斷續產的關鍵是 resume
-    checkpoint（webrunner_progress.json），那個在 _run_progress 仍維持原子。
-    On-disk 契約：非空清單以 "\n" 連接再加一個結尾 "\n"；空清單寫成 0 byte。"""
+    It deliberately "overwrites in place" (path.write_text, same inode); **do not** change it
+    back to an os.replace atomic write: users often keep todo_prompt.md open in an IDE to watch
+    the queue drain live, and os.replace swapping the inode makes PyCharm treat it as "the file
+    was deleted and recreated", popping the memory/disk dialog on every pop; overwriting in
+    place lets an open file with no unsaved edits reload silently, with no dialog.
+    The price is giving up atomicity — but todo files are small and writes take milliseconds,
+    so the odds of a hard kill landing exactly in the write window are tiny, and edits coming
+    from the bot are protected by .backup/ + reconcile. The key to resuming after an
+    interruption is the resume checkpoint (webrunner_progress.json), which stays atomic in
+    _run_progress.
+    On-disk contract: a non-empty list is joined with "\n" plus one trailing "\n"; an empty
+    list is written as 0 bytes."""
     text = "\n".join(entries)
     path.write_text(text + ("\n" if entries else ""), encoding="utf-8")
 
@@ -1718,29 +2057,30 @@ def reconcile_todo_with_disk(path: Path, remaining: list[str], *,
     version as the new authority so we never silently clobber the edit.
     Returns the list to treat as current (disk on divergence, else
     `remaining` unchanged)."""
-    # 用 read_todo_characters 讀，讓比較兩邊套用相同正規化（NBSP 轉空白；
-    # 一般 queue 跳過空白行，Character2 保留位置空白），避免排版差異造成
-    # 假性 divergence。
+    # Read it with read_todo_characters so both sides of the comparison get the same
+    # normalisation (NBSP to space; ordinary queues skip blank lines, Character2 keeps its
+    # positional blanks), so layout differences do not cause a false divergence.
     disk = read_todo_characters(path, preserve_blank=preserve_blank)
     if disk == remaining:
-        return remaining  # 常見的「沒被外部改動」路徑，純 no-op。
-    # 偵測到 divergence：把磁碟上的「原始」位元組（未正規化）備份起來，
-    # 採用磁碟版本當作新的權威來源，絕不蓋掉使用者 / bot 的編輯。
+        return remaining  # the common "not changed externally" path, a pure no-op.
+    # Divergence detected: back up the "raw" bytes on disk (not normalised), adopt the disk
+    # version as the new source of authority, and never overwrite the user's / the bot's edit.
     #
-    # 這裡走 read_bytes / write_bytes，**不解碼**。備份的職責是位元組級保真，
-    # 解一次碼再編回去既沒必要又會失真（`write_text` 會把 "\n" 翻成
-    # os.linesep）。更要緊的是：原本是 `read_text` + `except OSError: raw = ""`，
-    # 而 `UnicodeDecodeError` 是 `ValueError` 的子類別、**不是** `OSError`——
-    # 檔案不是 UTF-8 的時候那句會直接拋，正好是最需要留下備份的時候。就算把它
-    # 加進 except 元組也不對：那條路會寫出一個**空**的備份檔，然後照樣印
-    # 「原磁碟內容已備份到 X」——宣稱保住了、實際什麼都沒保住。備份存不下來就要
-    # 講「沒存下來」。
+    # This goes through read_bytes / write_bytes, **without decoding**. The backup's job is
+    # byte-level fidelity; decoding and re-encoding is unnecessary and lossy (`write_text`
+    # turns "\n" into os.linesep). More importantly: this used to be `read_text` +
+    # `except OSError: raw = ""`, and `UnicodeDecodeError` is a subclass of `ValueError`,
+    # **not** `OSError` — when the file is not UTF-8 that line raises outright, which is
+    # exactly when a backup is needed most. Adding it to the except tuple would not be right
+    # either: that path writes an **empty** backup file and still prints "the original disk
+    # content was backed up to X" — claiming it was saved while nothing was. If the backup
+    # cannot be saved, say "it was not saved".
     backup_name = ""
     try:
         raw = path.read_bytes() if path.exists() else b""
-        # 與 discord_bot.py 的 _backup_path_for 同樣的命名規則（時間戳 + 毫秒），
-        # 讓 bot 的 _reconstruct_undo_stack / !undo 能撿到這份備份。不可 import
-        # discord_bot（webrunner 不得 import bot），故在此就地重做這段命名。
+        # The same naming rule as discord_bot.py's _backup_path_for (timestamp + milliseconds),
+        # so the bot's _reconstruct_undo_stack / !undo can pick this backup up. discord_bot must
+        # not be imported (the webrunner must not import the bot), so the naming is redone here.
         backup_dir = PROJECT_ROOT / ".backup"
         backup_dir.mkdir(parents=True, exist_ok=True)
         ts = time.time()
@@ -1750,32 +2090,38 @@ def reconcile_todo_with_disk(path: Path, remaining: list[str], *,
         backup.write_bytes(raw)
         backup_name = backup.name
     except OSError as error:
-        # `!r` 刻意保留：只收得到 `OSError`，而 `str()` 會把 `.backup/` 的完整
-        # 主機路徑帶進 log。`repr()` 看得到 errno 與原因，看不到路徑。
-        print(f"reconcile_todo_with_disk: {path.name} 備份失敗: {error!r}",
+        # `!r` is kept on purpose: only `OSError` can arrive here, and `str()` would carry the
+        # full host path of `.backup/` into the log. `repr()` shows the errno and the reason,
+        # not the path.
+        print(f"reconcile_todo_with_disk: {path.name} backup failed: {error!r}",
               file=sys.stderr)
     if backup_name:
-        print(f"  WARN: {path.name} 在執行期間被外部修改；磁碟版本優先，"
-              f"原磁碟內容已備份到 {backup_name}（不覆寫該編輯）")
+        print(f"  WARN: {path.name} was modified externally during the run; the disk version "
+              f"wins, and the original disk content was backed up to {backup_name} (the edit is "
+              f"not overwritten)")
     else:
-        print(f"  WARN: {path.name} 在執行期間被外部修改；磁碟版本優先，"
-              f"但原磁碟內容**備份失敗**，這次編輯無法用 undo 復原")
+        print(f"  WARN: {path.name} was modified externally during the run; the disk version "
+              f"wins, but **backing up** the original disk content **failed**, so this edit "
+              f"cannot be restored with undo")
     return disk
 
 
-# Windows 保留裝置名（微軟「Naming Files, Paths, and Namespaces」列的整組，含
-# `COM0`／`LPT0` 與上標變體）。比對對「第一個 `.` 之前那一段」做、且大小寫不敏感
-# ——文件明說「這些名字後面直接接副檔名」一樣保留。
+# Windows reserved device names (the whole set listed in Microsoft's "Naming Files, Paths,
+# and Namespaces", including `COM0`/`LPT0` and the superscript variants). The comparison is
+# made on "the part before the first `.`", case-insensitively — the documentation says
+# outright that "these names followed immediately by an extension" are reserved too.
 #
-# ⚠️ **本機實測的行為與直覺不同，改這一段之前先看這裡**（Windows 11、
-# CPython 3.14）：`CON`／`AUX`／`PRN`／`COM1`／`NUL.txt` 當**目錄**其實都建得起來
-# 也寫得進去；真正壞掉的只有 `NUL` 一個，而它的壞法是最糟的那種——
-# `Path(box / "NUL").mkdir(parents=True, exist_ok=True)` **不會拋**（`exists()`
-# 回 True、`is_dir()` 回 False，因為那是 null 裝置），所以 `generate_loop` 一路
-# 往下跑，然後**每一張圖**的寫入都 `FileNotFoundError`。也就是說症狀不是「批次
-# 當場炸掉」，是「整個角色一張都存不下來」，最後靠 `consecutive_fail_abort`
-# 收場。整組都擋掉是刻意的：這是平台與版本相關的行為，不值得為了一個沒有人
-# 會拿來當角色名的字串去賭下一版 Windows 還是這樣。
+# ⚠️ **The behaviour measured on this machine is not what intuition says; read this before
+# changing this block** (Windows 11, CPython 3.14): `CON`/`AUX`/`PRN`/`COM1`/`NUL.txt` can
+# in fact all be created and written as **directories**; the only one that really breaks is
+# `NUL`, and it breaks in the worst way — `Path(box / "NUL").mkdir(parents=True,
+# exist_ok=True)` **does not raise** (`exists()` returns True, `is_dir()` returns False,
+# because it is the null device), so `generate_loop` carries on, and then writing **every
+# image** raises `FileNotFoundError`. So the symptom is not "the batch blows up on the spot"
+# but "not a single image of the whole character gets saved", finally ending via
+# `consecutive_fail_abort`. Blocking the whole set is deliberate: this is platform- and
+# version-dependent behaviour, and it is not worth betting that the next Windows still
+# behaves this way for a string nobody would use as a character name.
 _RESERVED_DEVICE_NAMES = frozenset(
     ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
     + [f"COM{i}" for i in range(10)] + ["COM¹", "COM²", "COM³"]
@@ -1784,67 +2130,78 @@ _RESERVED_DEVICE_NAMES = frozenset(
 
 
 def _is_safe_folder_component(name: str) -> bool:
-    """True iff `name` 可以接在 `OUTPUT_ROOT` 後面當**一層、且留在裡面**的資料夾名。
+    """True iff `name` can be appended to `OUTPUT_ROOT` as a folder name that is **one level
+    and stays inside it**.
 
-    **這是白名單斷言，不是字元黑名單**——差別就是 2026-09-10 那個缺陷的成因：
-    `character_folder_name` 的 `re.sub(r'[\\\\/:*?"<>|]+', ...)` 沒有 `.`，於是
-    佇列裡一行 `..` 原封不動變成資料夾名，而 `Path("output") / ".."`
-    **不會**被 pathlib 正規化（`parts=('output','..')`），`allocate_output_dir`
-    在那之後直接回傳它，`.resolve()` 就是 `PROJECT_ROOT`——一整個角色的圖安靜地
-    寫進 repo 根目錄，沒有例外也沒有警告。字元黑名單少列一個就破功，而且破功
-    時完全無聲；同樣的教訓 `discord_bot._is_unsafe_folder_name` 的 docstring
-    早就記過（它漏的是磁碟機冒號），只是沒有套用到這第二份。
+    **This is a whitelist assertion, not a character blacklist** — that difference is exactly
+    what caused the 2026-09-10 defect: `character_folder_name`'s
+    `re.sub(r'[\\\\/:*?"<>|]+', ...)` has no `.`, so a `..` line in the queue became the folder
+    name untouched, and `Path("output") / ".."` is **not** normalised by pathlib
+    (`parts=('output','..')`); `allocate_output_dir` then returned it as is, and its
+    `.resolve()` is `PROJECT_ROOT` — a whole character's images written quietly into the repo
+    root, with no exception and no warning. A character blacklist breaks the moment it misses
+    one entry, and it breaks in complete silence; `discord_bot._is_unsafe_folder_name`'s
+    docstring recorded the same lesson long ago (what it missed was the drive colon), it just
+    was never applied to this second copy.
 
-    各條規則**互不重疊**是刻意的（重疊的規則會互相遮蔽，變異測試會誤判成
-    「有守住」），所以每一條在下面都有一個只踩它的測試輸入：
+    The rules deliberately **do not overlap** (overlapping rules mask each other, and mutation
+    testing mistakes that for "guarded"), so each one below has a test input that trips it
+    alone:
 
-    | 規則 | 只踩這一條的輸入 |
+    | Rule | Input that trips only this rule |
     |---|---|
-    | 非空 | **沒有**——刻意重複，理由見下 |
-    | 頭尾沒有空白、尾端沒有點 | `"a."`、`"a "` |
-    | 沒有 `< 0x20` 的控制字元 | `"a\\tb"` |
-    | 不含 `..` | `"a..b"`、`"..foo"` |
-    | 沒有磁碟機／根、剛好一層 | `"C:x"`、`"a/b"` |
-    | 首段不是保留裝置名 | `"NUL"`、`"con"` |
+    | non-empty | **none** — deliberately redundant, see below for why |
+    | no leading/trailing whitespace, no trailing dot | `"a."`, `"a "` |
+    | no control characters `< 0x20` | `"a\\tb"` |
+    | no `..` | `"a..b"`, `"..foo"` |
+    | no drive/root, exactly one level | `"C:x"`, `"a/b"` |
+    | first segment is not a reserved device name | `"NUL"`, `"con"` |
 
-    **控制字元那條不是順手加的**：`"a\\tb"` 在本機 `mkdir` 會拋
-    `OSError 123`（ERROR_INVALID_NAME），而 `generate_loop` 的
-    `out_dir.mkdir(...)` 外面沒有 try，例外會一路衝到 `run_batch` 的外層
-    handler → `critical_error` → rc=1 → 監督者重生 → 下一輪讀到同一行佇列
-    再炸一次。佇列裡混進一個 tab 是很平常的事（貼上來的）。
+    **The control-character rule was not added in passing**: on this machine `mkdir` of
+    `"a\\tb"` raises `OSError 123` (ERROR_INVALID_NAME), and `generate_loop`'s
+    `out_dir.mkdir(...)` has no try around it, so the exception runs all the way to
+    `run_batch`'s outer handler → `critical_error` → rc=1 → the supervisor respawns → the next
+    round reads the same queue line and blows up again. A tab slipping into the queue is
+    perfectly ordinary (pasted in).
 
-    **`..` 那條擋的不是路徑穿越**（穿越已經被「剛好一層」那條擋掉了），是
-    **bot 與 webrunner 的鏡像一致性**：`discord_bot._is_unsafe_folder_name`
-    用子字串 `".." in name` 判定，所以只要我們產得出 `"a..b"` 這種名字，
-    webrunner 就會建一個 bot 打不開的資料夾（`/out sample` 對那個角色直接
-    失敗）。把它擋在投影這一端，兩邊才對得起來。代價是角色名裡真的有連續
-    兩點時會退回預設名，很罕見，而且退回是安全的。
+    **What the `..` rule blocks is not path traversal** (traversal is already blocked by the
+    "exactly one level" rule), it is **the mirror consistency between the bot and the
+    webrunner**: `discord_bot._is_unsafe_folder_name` decides by the substring
+    `".." in name`, so as long as we can produce a name like `"a..b"`, the webrunner creates a
+    folder the bot cannot open (`/out sample` fails outright for that character). Blocking it
+    on the projection side is what keeps the two in agreement. The price is that a character
+    name really containing two consecutive dots falls back to the default name — very rare,
+    and falling back is safe.
 
-    **「非空」那條在今天的 stdlib 下是重複的，但它有自己的測試，不要拿掉。**
-    `PureWindowsPath("").parts` 在本機（CPython 3.14.4）是 `()`，所以下面「剛好
-    一層」那條已經擋掉空字串了。留著它是因為那是 **stdlib 的實作細節，而且真的
-    變過**：`PurePath("")` 在 3.12 之前給的是 `PurePath('.')`。哪天它再變回
-    `parts == ('.',)`（長度 1），空字串就會一路通過，而 `OUTPUT_ROOT / ""`
-    **就等於 `OUTPUT_ROOT` 自己**（實測 True）——整個角色的圖倒進 `output/`
-    根目錄，把 `allocate_output_dir` 的編號邏輯一起弄亂，而且一樣是無聲的。
-    空字串**確實到得了這裡**（`".."` 經過上面那道尾端點正規化就是空字串），
-    所以這不是防禦一個不可能的輸入。
+    **The "non-empty" rule is redundant under today's stdlib, but it has its own test; do not
+    remove it.** `PureWindowsPath("").parts` on this machine (CPython 3.14.4) is `()`, so the
+    "exactly one level" rule below already blocks the empty string. It stays because that is
+    **a stdlib implementation detail, and it has really changed before**: before 3.12,
+    `PurePath("")` gave `PurePath('.')`. If it ever goes back to `parts == ('.',)` (length 1),
+    the empty string passes straight through, and `OUTPUT_ROOT / ""` **is `OUTPUT_ROOT`
+    itself** (measured True) — a whole character's images poured into the `output/` root,
+    scrambling `allocate_output_dir`'s numbering along the way, and just as silently. The
+    empty string **really can reach this point** (`".."` becomes the empty string after the
+    trailing-dot normalisation above), so this is not defending against an impossible input.
 
-    ⚠️ **它的守門在
-    `test_webrunner_shared.test_the_empty_name_rule_holds_if_pathlib_reverts_to_its_pre_312_shape`，
-    做法是 monkeypatch 這個模組的 `PureWindowsPath`。** 單純斷言
-    `_is_safe_folder_component("") is False` **殺不掉**「拿掉這條」的變異——變異
-    套用之後那句照樣是 False，因為擋它的是別條規則。一條規則今天被別條遮住時，
-    唯一問得出「它自己行不行」的方法就是把遮住它的那個前提拿掉。
-    （2026-09-10 之前這裡寫的是「變異會存活，已知且列冊」——一個長期掛在變異
-    報告上的 SURVIVED 就是在邀請下一個人把它刪掉，所以改成寫測試。）
+    ⚠️ **Its guard is
+    `test_webrunner_shared.test_the_empty_name_rule_holds_if_pathlib_reverts_to_its_pre_312_shape`,
+    which monkeypatches this module's `PureWindowsPath`.** Simply asserting
+    `_is_safe_folder_component("") is False` **cannot kill** the "remove this rule" mutant —
+    with the mutant applied that assertion is still False, because a different rule blocks
+    it. When a rule is masked by another one today, the only way to ask "does it work on its
+    own" is to remove the premise that masks it.
+    (Before 2026-09-10 this said "the mutant survives, known and on the list" — a SURVIVED
+    that hangs on the mutation report for a long time is an invitation for the next person to
+    delete the rule, so a test was written instead.)
     """
     if not name:
         return False
     if name != name.strip() or name != name.rstrip("."):
-        # Windows 建立目錄時會**默默**砍掉尾端的點與空白（實測：`mkdir("a.")`
-        # 產出的是 `a`），所以留著這種名字會讓磁碟上的名字與檢查點記的名字
-        # 不一致，而且 `"a"` 與 `"a."` 會撞進同一個資料夾。
+        # Windows **silently** strips trailing dots and spaces when creating a directory
+        # (measured: `mkdir("a.")` produces `a`), so keeping such a name makes the name on disk
+        # disagree with the one the checkpoint records, and `"a"` and `"a."` collide into
+        # the same folder.
         return False
     if any(ord(ch) < 32 for ch in name):
         return False
@@ -1852,66 +2209,77 @@ def _is_safe_folder_component(name: str) -> bool:
         return False
     pure = PureWindowsPath(name)
     if pure.drive or pure.root or len(pure.parts) != 1:
-        # `PureWindowsPath` 而不是 `Path`：`Path` 在 POSIX 上不認得 `C:` 是
-        # 磁碟機，同一支測試會在 Linux 上綠、在 Windows 上才紅。判定與平台
-        # 無關（理由與 `_is_unsafe_folder_name` 那邊一字不差）。
+        # `PureWindowsPath`, not `Path`: on POSIX `Path` does not recognise `C:` as a drive, so
+        # the same test would be green on Linux and red only on Windows. The decision is
+        # platform-independent (for exactly the same reason as in `_is_unsafe_folder_name`).
         return False
     return name.split(".", 1)[0].upper() not in _RESERVED_DEVICE_NAMES
 
 
 def _is_single_path_component(name: str) -> bool:
-    """True iff `name` 接到任何目錄後面時仍然只是**一層**——不會改到目錄。
+    """True iff `name` is still **one level** when appended to any directory — it cannot
+    change the directory.
 
-    這是比 `_is_safe_folder_component` **弱**的一條，刻意的。兩者的用途不同：
+    This is deliberately a **weaker** rule than `_is_safe_folder_component`. The two serve
+    different purposes:
 
-    | 守衛 | 問的問題 | 用在 |
+    | Guard | The question it asks | Used for |
     |---|---|---|
-    | `_is_safe_folder_component` | 能不能當一個**資料夾**名 | `output/` 底下的角色資料夾 |
-    | 這一支 | 接完之後還是不是單一元件 | 診斷截圖的**檔名**、LevelDB 的 `CURRENT` |
+    | `_is_safe_folder_component` | can it be a **folder** name | character folders under `output/` |
+    | this one | still a single component after joining? | diagnostic screenshot **file names**, LevelDB `CURRENT` |
 
-    對檔名套用前者會誤擋：它禁止尾端的點與 `..` 子字串，而
-    `f"ready_{char_name[:30]}"` 只要剛好切在一個點後面就會被擋掉，代價是一張
-    診斷截圖無聲消失——一個會亂叫的守門就是一個會被關掉的守門。
+    Applying the former to file names would wrongly block: it forbids trailing dots and the
+    `..` substring, and `f"ready_{char_name[:30]}"` gets blocked whenever the cut happens to
+    fall right after a dot, at the cost of a diagnostic screenshot silently vanishing — a
+    guard that cries wolf is a guard that gets switched off.
 
-    `PureWindowsPath` 不是 `Path`：POSIX 的 `Path` 不把 `\\` 當分隔符，用 `Path`
-    會讓判定跟著平台跑（同 `_is_safe_folder_component` 那邊一字不差的理由）。
+    `PureWindowsPath`, not `Path`: POSIX `Path` does not treat `\\` as a separator, so using
+    `Path` would make the decision follow the platform (for exactly the same reason as in
+    `_is_safe_folder_component`).
 
-    ⚠️ **它同時是接合守門認得的守衛名之一**（`test_bot_helpers._JOIN_GUARDS`）。
-    抽成具名函式不只是為了好讀：守衛性是靠「這個名字有沒有被餵進某支守衛」認出來
-    的，寫成行內運算式的話，接合站點會被判成沒守住。
+    ⚠️ **It is also one of the guard names the join guard recognises**
+    (`test_bot_helpers._JOIN_GUARDS`). Pulling it out into a named function is not just for
+    readability: guarding is recognised by "was this name fed into one of the guards", so
+    written as an inline expression, the join site would be judged unguarded.
 
-    ⚠️ **裸的 `".."` 要自己列一條，因為底下那個 round-trip 會放它過去**
-    （2026-09-11 補）。三行實測擺在一起，就看得出這裡從來沒有過政策：
+    ⚠️ **A bare `".."` needs its own rule, because the round-trip below lets it through**
+    (added 2026-09-11). Put three measurements side by side and it is clear there was never a
+    policy here:
 
-        PureWindowsPath(".").name  == ""    ->  "" != "."   ->  擋掉
-        PureWindowsPath("..").name == ".."  ->  原樣通過     ->  放行
-        PureWindowsPath("").name   == ""    ->  擋它的是 bool(name)
+        PureWindowsPath(".").name  == ""    ->  "" != "."   ->  blocked
+        PureWindowsPath("..").name == ".."  ->  passes as is ->  allowed
+        PureWindowsPath("").name   == ""    ->  blocked by bool(name)
 
-    也就是說 `.` 與 `..` 的答案**都是 pathlib 正規化的副作用，只是剛好一對一
-    錯**。那個不對稱不是「有人只擋到一半」——是整個判斷被外包給一個述詞，而那個
-    述詞問的是「能不能原樣通過正規化」，不是「會不會改到目錄」。實測
-    `base / ".."` 的 `mkdir` 與寫入**都會成功**（落在上一層），正是本函式第一句
-    宣稱擋掉的事。
+    In other words the answers for `.` and `..` are **both side effects of pathlib's
+    normalisation, one right and one wrong by chance**. That asymmetry is not "someone only
+    blocked half of it" — the whole decision was outsourced to a predicate, and that predicate
+    asks "does it survive normalisation unchanged", not "can it change the directory".
+    Measured: `mkdir` and writes on `base / ".."` **both succeed** (landing one level up),
+    which is exactly what this function's first sentence claims to block.
 
-    今天三個呼叫點都交不出裸的 `".."`：`snap` 守的是 `f"debug_{tag}.png"`，那個
-    字面前綴是結構性保證；`_leveldb_manifest_ok` 前一行有
-    `startswith("MANIFEST-")` 閘。所以這是**潛伏缺陷不是現行漏洞**。修它有兩個
-    理由：讓第一句的合約成真，以及讓 `_JOIN_GUARDS` 的帳目不再把它記成「已守
-    住」——那支只問「名字有沒有被守衛看過」，不問看過之後怎麼處置，所以守衛自己
-    的漏洞在它的帳上是綠的。
+    Today none of the three call sites can hand over a bare `".."`: `snap` guards
+    `f"debug_{tag}.png"`, whose literal prefix is a structural guarantee; `_leveldb_manifest_ok`
+    has a `startswith("MANIFEST-")` gate on the line before. So this is **a latent defect, not
+    a live hole**. There are two reasons to fix it: to make the first sentence's contract true,
+    and to stop `_JOIN_GUARDS`' books from recording it as "guarded" — that test only asks
+    "was the name seen by a guard", not what happens after, so a hole in the guard itself
+    shows up green on its books.
 
-    **刻意只收裸的 `".."`。** `"..."` / `" .."` 實測會塌回 base，但接下來的寫入是
-    `FileNotFoundError`——**大聲失敗**，跟 `".."` 的無聲寫到上一層不同級；
-    `"a.."` / `"..a"` / `"a..b"` 留在 base 底下、寫得進去，是**合法檔名**。往那個
-    方向收緊會當場擋掉 `"debug_ready_a."`，而那正是
-    `test_is_single_path_component_is_weaker_than_the_folder_guard` 用來證明「這支
-    比 `_is_safe_folder_component` 弱」的輸入——收緊等於把 §8.33 裁定不可合併的
-    三層嚴格度合併掉。實測 61 筆語料，這次修正只改變 **1** 筆，就是裸的 `".."`。
+    **Only the bare `".."` is taken, deliberately.** `"..."` / `" .."` do collapse back to the
+    base when measured, but the write that follows is `FileNotFoundError` — **a loud failure**,
+    a different class from `".."`'s silent write one level up; `"a.."` / `"..a"` / `"a..b"`
+    stay under the base and can be written, i.e. they are **legitimate file names**. Tightening
+    in that direction would block `"debug_ready_a."` on the spot, and that is exactly the input
+    `test_is_single_path_component_is_weaker_than_the_folder_guard` uses to prove "this one is
+    weaker than `_is_safe_folder_component`" — tightening would merge the three levels of
+    strictness that §8.33 ruled must not be merged. Measured over a 61-entry corpus, this fix
+    changes exactly **1** entry: the bare `".."`.
 
-    `"."` 不寫成明文特例，是為了不製造一個必然存活的變異（`name in (".", "..")`
-    改成 `name == ".."` 照樣全綠，因為擋 `"."` 的是別的機制）。它的前提改由測試
-    斷言 `PureWindowsPath(".").name != "."` 釘住——同 `_is_safe_folder_component`
-    那邊 `_PWP("").parts` 那一格的作法。
+    `"."` is not written as an explicit special case, so as not to create a mutant that is
+    bound to survive (`name in (".", "..")` changed to `name == ".."` stays all green, because
+    `"."` is blocked by a different mechanism). Its premise is instead pinned by a test
+    asserting `PureWindowsPath(".").name != "."` — the same approach as the `_PWP("").parts`
+    case in `_is_safe_folder_component`.
     """
     if name == "..":
         return False
@@ -1921,123 +2289,146 @@ def _is_single_path_component(name: str) -> bool:
 def character_folder_name(prompt: str) -> str:
     """Use the first half-width-comma segment as the human-readable name.
 
-    投影出來的一定是「`output/` 底下的**單一層**資料夾名」——不合格就退回預設
-    的 `"character"`（由 `allocate_output_dir` 去編號）。判定在
-    `_is_safe_folder_component`，那支的 docstring 有完整理由。
+    What it projects is always "a **single-level** folder name under `output/`" — anything
+    that does not qualify falls back to the default `"character"` (numbered by
+    `allocate_output_dir`). The decision lives in `_is_safe_folder_component`, whose docstring
+    has the full reasoning.
 
-    ⚠️ **這個函式只能往「更嚴」的方向改。** `discord_bot._alert_mentions()`
-    的 docstring 明寫警報訊息之所以不是 ping 放大器，靠的就是這裡的 `re.sub`
-    順手把 `<` `>` 換成底線（角色名是使用者用 `/todo char1 add` 填的），並警告
-    「哪天有人放寬它，或改成 POSIX 的字元集，這裡就會安靜地變回一個 ping 放大
-    器」。所以 2026-09-10 的修正是**保留原本的替換、在後面加一層白名單斷言**，
-    不是把黑名單換成一組更寬鬆的字元集。要動 regex 之前先讀那一段。
+    ⚠️ **This function may only be changed in the "stricter" direction.**
+    `discord_bot._alert_mentions()`'s docstring states outright that the only reason alert
+    messages are not a ping amplifier is that the `re.sub` here incidentally turns `<` `>`
+    into underscores (character names are filled in by users via `/todo char1 add`), and it
+    warns "the day someone loosens it, or switches to the POSIX character set, this quietly
+    turns back into a ping amplifier". So the 2026-09-10 fix **kept the original replacement
+    and added a whitelist assertion after it**, rather than swapping the blacklist for a looser
+    character set. Read that passage before touching the regex.
 
-    三個消費端：`run_batch`（真正建資料夾）、事件與進度紀錄、以及 bot 的
-    `/gen plan` 預覽（`discord_bot.py` 匯入這一支）。守衛只能放在這裡——放到
-    `allocate_output_dir` 會讓預覽與實跑分岔，正是模組邊界規則在防的漂移。
+    Three consumers: `run_batch` (which actually creates the folder), the event and progress
+    records, and the bot's `/gen plan` preview (`discord_bot.py` imports this function). The
+    guard can only live here — putting it in `allocate_output_dir` would make the preview and
+    the real run diverge, which is exactly the drift the module-boundary rule guards against.
     """
     head = prompt.split(",", 1)[0].strip() or "character"
     name = re.sub(r'[\\/:*?"<>|]+', "_", head)[:120]
-    # 先正規化尾端的點與空白，再斷言。順序不能反：Windows 自己就會砍掉它們，
-    # 所以砍掉之後的名字才是磁碟上真正的名字（`"Mr. Smith."` → `"Mr. Smith"`，
-    # 身分保住了）。切到 120 字也可能剛好切出一個尾端點或空白。
-    # 附帶效果：`"."`／`".."`／`"..."` 砍完都是空字串，一條規則就收乾淨——而且
-    # 三個都是真的有害，但**害法各不相同**（本機實測，CPython 3.14／Windows 11；
-    # 三個都 `resolve()` 得出乾淨的答案，差別全在「寫得進去嗎」）：
+    # Normalise trailing dots and whitespace first, then assert. The order cannot be reversed:
+    # Windows strips them by itself, so the name after stripping is the real name on disk
+    # (`"Mr. Smith."` → `"Mr. Smith"`, identity preserved). Cutting at 120 characters can also
+    # happen to leave a trailing dot or space.
+    # Side effect: `"."` / `".."` / `"..."` all become the empty string after stripping, so one
+    # rule cleans them all up — and all three really are harmful, but **each in a different
+    # way** (measured on this machine, CPython 3.14 / Windows 11; all three `resolve()` to a
+    # clean answer, the whole difference is in "can it be written to"):
     #
-    #   `output/..`   → 解析成 `PROJECT_ROOT`，**而且寫得進去**：圖直接落在
-    #                   專案根目錄。這是原本那個逃逸。
-    #   `output/.`    → 解析成 `output` 自己，**也寫得進去**：圖倒進 `output/`
-    #                   根目錄，把 `allocate_output_dir` 的編號邏輯一起弄亂。
-    #   `output/...`  → 也解析成 `output` 自己、`is_dir()` 還回 True，但
-    #                   **一個位元組都寫不進去**（`FileNotFoundError`）。所以它
-    #                   不是「倒進 output/」，是每一張圖都失敗，一路撞到
-    #                   `consecutive_fail_abort` 把整批收掉。`"...."` 同。
+    #   `output/..`   → resolves to `PROJECT_ROOT`, **and can be written to**: images land
+    #                   straight in the project root. This is the original escape.
+    #   `output/.`    → resolves to `output` itself, **also writable**: images pour into the
+    #                   `output/` root, scrambling `allocate_output_dir`'s numbering too.
+    #   `output/...`  → also resolves to `output` itself and `is_dir()` even returns True, but
+    #                   **not a single byte can be written** (`FileNotFoundError`). So it is
+    #                   not "pour into output/", it is every image failing, all the way until
+    #                   `consecutive_fail_abort` shuts the whole batch down. Same for `"...."`.
     #
-    # ⚠️ 這段原本把 `.` 與 `...` 寫成同一種行為。會特地訂正是因為**這個函式的
-    # docstring 寫錯過兩次**（見上面的紀錄），而每一次的代價都是下一個人照著錯的
-    # 敘述去推論。`is_dir()` 回 True 卻寫不進去，正是那種「看起來已經驗過了」的
-    # 形狀——判準要是「寫得進去嗎」，不是「解析成什麼」。
+    # ⚠️ This block originally described `.` and `...` as the same behaviour. It is corrected
+    # specifically because **this function's docstring has been wrong twice** (see the record
+    # above), and each time the cost was the next person reasoning from the wrong description.
+    # `is_dir()` returning True while nothing can be written is exactly the shape of "looks
+    # already verified" — the criterion must be "can it be written to", not "what does it
+    # resolve to".
     name = re.sub(r"[.\s]+\Z", "", name)
     return name if _is_safe_folder_component(name) else "character"
 
 
-# ---------- 批次期間不要讓作業系統打斷這個行程 -------------------------------
+# ---------- keep the operating system from interrupting this process during a batch ----------
 #
-# 2026-09-03 補、2026-09-20 訂正（訂正的內容在下面那一段，請連著讀）。無人值守
-# 的批次要跑好幾個小時，而這台機器**只支援 S0 低電源閒置**（Modern Standby；
-# `powercfg /a` 顯示 S1/S2/S3 全部不支援），系統事件記錄裡從 05-26 起有 1400 次
-# 「進入待命」——平均一天 14 次。沒有任何保護的話，待命期間行程會被 PLM（行程
-# 生命週期管理）暫停，批次就不會前進，而且從外面完全看不出來：行程還活著、沒有
-# 崩潰、log 就只是停在那裡。
+# Added 2026-09-03, corrected 2026-09-20 (the correction is in the passage below; read them
+# together). An unattended batch runs for hours, and this machine **only supports S0 low
+# power idle** (Modern Standby; `powercfg /a` shows S1/S2/S3 all unsupported); the system
+# event log has 1400 "entering standby" events since 05-26 — 14 a day on average. Without any
+# protection, the process gets suspended by PLM (process lifetime management) during standby,
+# the batch stops moving, and nothing shows from the outside: the process is still alive, it
+# has not crashed, the log has simply stopped.
 #
-# **為什麼不是只用 `SetThreadExecutionState`。** 那是 S3 時代的 API；微軟的文件
-# 明說它**擋不住** Modern Standby 的轉換。S0ix 機器要用電源要求物件
-# （`PowerCreateRequest` ＋ `PowerSetRequest`）搭配 `PowerRequestExecutionRequired`
-# ——那個要求型別本身就是「Modern standby only」。所以這裡以電源要求為主、
-# `SetThreadExecutionState` 為備援（給還有 S3 的舊機器）。
+# **Why not just `SetThreadExecutionState`.** That is an S3-era API; Microsoft's documentation
+# says outright that it **cannot block** Modern Standby transitions. S0ix machines need a power
+# request object (`PowerCreateRequest` + `PowerSetRequest`) with
+# `PowerRequestExecutionRequired` — that request type is itself "Modern standby only". So the
+# power request is the primary mechanism here, with `SetThreadExecutionState` as the fallback
+# (for older machines that still have S3).
 #
-# **訂正（2026-09-20，實測）：電源要求保的是「行程」，不是「系統」。**
-# `PowerRequestExecutionRequired` 的定義是「the calling process continues to run
-# instead of being suspended or terminated by process lifetime management (PLM)
-# mechanisms」——它讓**本行程**在 Modern Standby 期間繼續執行；它**不會**讓系統
-# 不進入 Modern Standby。只有在**傳統 S3** 機器上，一個生效中的
-# `PowerRequestExecutionRequired` 才會順帶隱含 `PowerRequestSystemRequired`，
-# 也就是只有那種機器上它才附帶擋住系統待命。這台機器沒有 S3，沒有那個附帶效果。
+# **Correction (2026-09-20, measured): the power request protects the "process", not the
+# "system".** `PowerRequestExecutionRequired` is defined as "the calling process continues to
+# run instead of being suspended or terminated by process lifetime management (PLM)
+# mechanisms" — it lets **this process** keep running during Modern Standby; it does **not**
+# keep the system from entering Modern Standby. Only on **traditional S3** machines does an
+# active `PowerRequestExecutionRequired` also imply `PowerRequestSystemRequired`, i.e. only on
+# those machines does it incidentally block system standby. This machine has no S3, so there
+# is no such side effect.
 #
-# 實測（2026-09-20，而且是在持有電源要求的情況下）：系統記錄
-# `Microsoft-Windows-Kernel-Power` 在 `04:25:49` 記下
-# 「[506] 系統正在進入現代待命 原因：Idle Timeout.」，而 `WEBRunner.log` 在那之後
-# 照樣一路產圖（05:04、05:05、……、09:32），中間沒有任何「[507] 結束現代待命」。
-# **系統真的睡了，批次也真的繼續跑。**
+# Measured (2026-09-20, and while holding the power request): the system log
+# `Microsoft-Windows-Kernel-Power` recorded at `04:25:49`
+# "[506] The system is entering Modern Standby Reason: Idle Timeout.", and `WEBRunner.log`
+# kept generating images after that (05:04, 05:05, ..., 09:32), with no "[507] exiting
+# Modern Standby" in between. **The system really did sleep, and the batch really did keep
+# running.**
 #
-# **結果一樣，敘述不一樣——而那個差別會害下一個人查錯方向。** 對批次而言「照樣
-# 一直產圖」正是我們要的結果，所以很容易覺得這只是措辭問題。不是：2026-09-20
-# 當天就是因為這裡原本寫著電源要求連 Modern Standby 一起擋，才去追「顯示卡當機
-# 是不是待命造成的」——最後是靠基準率排掉的（近三個月 1426 段已結束的待命區間
-# 佔整個視窗時間的 34.6%，而 12 次可判定的當機有 4 次落在待命中；4/12 ≒ 33%，
-# 正好是基準率，沒有相關性）。一句寫錯的註解換掉一次真正的除錯時間。
+# **Same outcome, different description — and that difference sends the next person looking
+# in the wrong direction.** For the batch, "kept generating images" is exactly the result we
+# want, so it is easy to think this is just wording. It is not: on 2026-09-20 itself, because
+# this said the power request also blocked Modern Standby, someone went chasing "was the
+# graphics card hang caused by standby" — in the end it was ruled out by the base rate (over
+# the last three months, 1426 completed standby intervals covered 34.6% of the whole window,
+# and 4 of the 12 datable hangs fell inside standby; 4/12 ≈ 33%, exactly the base rate, no
+# correlation). One wrong comment cost a real stretch of debugging time.
 #
-# **※ 用電池跑的時候這個要求會被系統撤銷。** 微軟文件：Modern Standby 機器在
-# **DC 電源**下，`system` 與 `execution required` 兩種電源要求會在「系統睡眠逾時
-# 過後 5 分鐘」被終止。也就是拔掉電源之後這個保護撐不過那 5 分鐘，行程就回到會被
-# PLM 暫停的狀態——而症狀正是這整段註解當初要防的那一個：行程還在、log 只是停住、
-# 從外面看不出來。要無人值守跑長批次就**插著電**；這一條程式端無解，只能寫在這裡
-# 讓下一個人查得到。
+# **※ When running on battery the system revokes this request.** Microsoft's documentation: on
+# a Modern Standby machine on **DC power**, both `system` and `execution required` power
+# requests are terminated "5 minutes after the system sleep timeout". So once unplugged, this
+# protection does not survive those 5 minutes and the process goes back to being suspendable
+# by PLM — and the symptom is exactly the one this whole comment was written to prevent: the
+# process is still there, the log has just stopped, nothing shows from outside. To run long
+# batches unattended, **keep it plugged in**; there is no fix for this on the code side, so it
+# is written here where the next person can find it.
 #
-# **刻意不要求螢幕保持開啟**（沒有 `ES_DISPLAY_REQUIRED`／`PowerRequestDisplay
-# Required`）：批次不需要看得見的螢幕，而讓別人的螢幕整夜亮著是很沒禮貌的事。
+# **Deliberately does not request that the display stay on** (no `ES_DISPLAY_REQUIRED` /
+# `PowerRequestDisplayRequired`): the batch needs no visible screen, and keeping someone
+# else's screen lit all night is rude.
 #
-# **ctypes 的 `argtypes`／`restype` 一定要寫**，理由與 CLAUDE.md 那條 PID 存活探測
-# 完全相同：`PowerCreateRequest` 回的是 64 位元 HANDLE，預設 `c_int` 會把它截斷，
-# 而**截斷後的 handle 仍然非零**，所以 `if not handle` 抓不到，整個功能會安靜地
-# 退化成「以為要求成功了、其實沒有」。
+# **ctypes `argtypes` / `restype` must be written**, for exactly the same reason as the PID
+# liveness probe rule in CLAUDE.md: `PowerCreateRequest` returns a 64-bit HANDLE, the default
+# `c_int` truncates it, and **the truncated handle is still non-zero**, so `if not handle`
+# does not catch it and the whole feature quietly degrades into "thinks the request succeeded
+# but it did not".
 _POWER_REQUEST_CONTEXT_VERSION = 0
 _POWER_REQUEST_CONTEXT_SIMPLE_STRING = 0x1
-_POWER_REQUEST_EXECUTION_REQUIRED = 3      # 保的是「本行程不被 PLM 暫停」
+_POWER_REQUEST_EXECUTION_REQUIRED = 3      # protects "this process is not suspended by PLM"
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 
 
 class StayAwake:
-    """批次期間請求作業系統不要打斷這個行程；`release()` 或行程結束就解除。
+    """Ask the operating system not to interrupt this process during a batch; `release()` or
+    the process ending lifts it.
 
-    **永不 raise**：這是加分項，不是批次的必要條件。拿不到就印一行往下跑——為了
-    一個省電設定而讓整批產圖起不來，方向是反的。
+    **Never raises**: this is a bonus, not a requirement for the batch. If it cannot be
+    obtained, print one line and carry on — keeping a whole batch of image generation from
+    starting over a power-saving setting would be backwards.
 
-    `active` 說明實際拿到了什麼：
+    `active` tells what was actually obtained:
 
-    * `"power-request"` —— `PowerRequestExecutionRequired`。它保的是**本行程**：
-      Modern Standby 期間不被 PLM 暫停或終止。它**不會**讓系統不進入 Modern
-      Standby（2026-09-20 實測；完整證據與「為什麼這個差別很重要」見上面那段
-      區塊註解）。只有傳統 S3 機器上它才順帶隱含 `PowerRequestSystemRequired`。
-      另外：DC 電源下它會在系統睡眠逾時後 5 分鐘被系統撤銷。
-    * `"execution-state"` —— 舊的 `SetThreadExecutionState` 旗標。只擋得住舊的
-      S3 閒置睡眠；Modern Standby 機器上它既擋不住待命，也保不住這個行程。
-    * `None` —— 兩個都沒拿到。
+    * `"power-request"` — `PowerRequestExecutionRequired`. It protects **this process**: not
+      suspended or terminated by PLM during Modern Standby. It does **not** keep the system
+      from entering Modern Standby (measured 2026-09-20; for the full evidence and "why this
+      difference matters", see the block comment above). Only on traditional S3 machines does
+      it also imply `PowerRequestSystemRequired`. Also: on DC power the system revokes it 5
+      minutes after the system sleep timeout.
+    * `"execution-state"` — the old `SetThreadExecutionState` flag. It only blocks the old S3
+      idle sleep; on a Modern Standby machine it neither blocks standby nor protects this
+      process.
+    * `None` — neither was obtained.
 
-    兩者對批次的**結果**可能看起來一樣（照樣一直產圖），但保證的東西不同，
-    所以 `run_batch` 那三行 log 會把 `active` 的字面值一起印出來。
+    To the batch the two may **look** the same (it keeps generating images), but what they
+    guarantee differs, so those three log lines in `run_batch` print `active`'s literal value
+    as well.
     """
 
     def __init__(self) -> None:
@@ -2063,14 +2454,14 @@ class StayAwake:
                             ("SimpleReasonString", wt.LPWSTR)]
 
             kernel32.PowerCreateRequest.argtypes = [ctypes.POINTER(_Context)]
-            kernel32.PowerCreateRequest.restype = wt.HANDLE   # 截斷會讓探測失效
+            kernel32.PowerCreateRequest.restype = wt.HANDLE   # truncation would break the probe
             kernel32.PowerSetRequest.argtypes = [wt.HANDLE, ctypes.c_int]
             kernel32.PowerSetRequest.restype = wt.BOOL
 
             context = _Context(_POWER_REQUEST_CONTEXT_VERSION,
                                _POWER_REQUEST_CONTEXT_SIMPLE_STRING, reason)
             handle = kernel32.PowerCreateRequest(ctypes.byref(context))
-            # INVALID_HANDLE_VALUE 是 -1，不是 0——只檢查 falsy 會漏掉它。
+            # INVALID_HANDLE_VALUE is -1, not 0 — checking only for falsy would miss it.
             if handle and handle != wt.HANDLE(-1).value:
                 if kernel32.PowerSetRequest(
                         handle, _POWER_REQUEST_EXECUTION_REQUIRED):
@@ -2079,12 +2470,15 @@ class StayAwake:
                     return self.active
                 kernel32.CloseHandle(handle)
         except Exception as error:  # pylint: disable=broad-except
-            # `!r` 刻意保留：`try` 裡只有 ctypes／WinDLL，碰不到 driver。
-            print(f"  [power] 電源要求拿不到（{error!r}）；改用舊 API",
+            # `!r` is kept on purpose: the `try` holds only ctypes / WinDLL and cannot reach
+            # the driver.
+            print(f"  [power] could not obtain a power request ({error!r}); falling back to the "
+                  f"old API",
                   file=sys.stderr)
 
-        # 備援：還有 S3 的機器靠這個就夠；S0ix 機器上它既擋不住待命、也保不住
-        # 行程不被 PLM 暫停，但拿著也沒有壞處。
+        # Fallback: on machines that still have S3 this is enough; on S0ix machines it neither
+        # blocks standby nor keeps the process from being suspended by PLM, but holding it does
+        # no harm.
         try:
             import ctypes
             import ctypes.wintypes as wt
@@ -2100,7 +2494,7 @@ class StayAwake:
         return self.active
 
     def release(self) -> None:
-        """冪等、永不 raise（會從 `finally` 被呼叫，可能已經放過了）。"""
+        """Idempotent, never raises (it is called from `finally` and may already be released)."""
         kernel32, handle, active = self._kernel32, self._handle, self.active
         self._handle, self.active = None, None
         if kernel32 is None:
@@ -2143,19 +2537,20 @@ def with_retry(label: str, func, max_attempts: int = 3,
         except BrowserGoneError:
             raise
         except Exception as error:  # pylint: disable=broad-except
-            # 視窗／session 已消失時重試是純浪費（每一步 setup 都會燒掉自己的
-            # 3 次），而且會把真正的死因埋在一串 "gave up" 底下。這裡把原始例外
-            # 也一併升級——`port.click()` 之類的變體 helper 會用寬 except 吞掉
-            # 再由 JS fallback 重丟，raw WebDriverException 是這樣漏出來的。
+            # Retrying once the window / session has vanished is pure waste (every setup step
+            # would burn its own 3 attempts), and it buries the real cause of death under a
+            # string of "gave up" lines. The original exception is escalated here too —
+            # variant helpers such as `port.click()` swallow it with a broad except and then
+            # re-raise it from the JS fallback, which is how a raw WebDriverException leaks out.
             if is_browser_gone_error(error):
                 raise BrowserGoneError(
                     f"browser session gone during {label} — "
                     f"{_long_error(error)}") from error
-            # `_short_error`：這一行是**每個** DOM 步驟、每次重試都會印一次的
-            # 重複行，所以走 180 字那一版。用 `!r` 的話 selenium 例外（`args`
-            # 是空的）只會印出一對空括號——而同一個 handler 往上兩行的
-            # `BrowserGoneError` 早就在用 `_long_error` 了：同一個例外物件，
-            # 兩種格式，一個有訊息一個沒有。
+            # `_short_error`: this line is a repeated line printed for **every** DOM step on
+            # every retry, so it uses the 180-character version. With `!r`, a selenium exception
+            # (whose `args` is empty) prints only an empty pair of parentheses — while the
+            # `BrowserGoneError` two lines up in the same handler already uses `_long_error`:
+            # the same exception object, two formats, one with the message and one without.
             print(f"  [{label}] attempt {attempt}/{max_attempts} raised: "
                   f"{_short_error(error)}")
             result = False
@@ -2212,34 +2607,36 @@ def allocate_output_dir(base_name: str, batch_start: float) -> Path:
 
 
 def dump_textareas_diag(port) -> list[dict]:
-    """Snapshot 頁面上所有 textarea / `contenteditable=true` 的關鍵屬性。
-    回 list of dicts；任何例外 swallow 回空 list。"""
+    """Snapshot the key attributes of every textarea / `contenteditable=true` on the page.
+    Returns a list of dicts; any exception is swallowed and an empty list returned."""
     try:
         result = port.execute_script(_DOM_DIAG_JS)
         return result if isinstance(result, list) else []
     except Exception as error:  # pylint: disable=broad-except
-        # `_short_error`：呼叫端是 `_fill_via_native_setter` 的比對不符分支與
-        # `find_undesired_textarea` 的找不到分支，兩個都是**每次填寫**都可能走到
-        # 的失敗路徑，所以算重複行。
+        # `_short_error`: the callers are `_fill_via_native_setter`'s mismatch branch and
+        # `find_undesired_textarea`'s not-found branch, both failure paths that **every fill**
+        # can take, so this counts as a repeated line.
         print(f"dump_textareas_diag failed: {_short_error(error)}",
               file=sys.stderr)
         return []
 
 
 def check_dom_request(port) -> None:
-    """Iteration 邊界呼叫；看到 DOM_REQUEST_FILE 就 dump 一份 textarea diag
-    然後 `emit_event('dom_result', ...)` 給 bot watcher 拉回 channel；
-    處理完不論成功失敗都刪掉請求檔，避免下次重複觸發。"""
+    """Called at iteration boundaries; when DOM_REQUEST_FILE is present, dump a textarea diag
+    and `emit_event('dom_result', ...)` for the bot watcher to pull back to the channel; the
+    request file is deleted once handled, success or failure, so it does not trigger again."""
     if not DOM_REQUEST_FILE.exists():
         return
     try:
-        # 內容暫不解析；目前只有「dump 全部」一種模式。未來可擴 cmd 欄。
+        # The content is not parsed yet; there is currently only one mode, "dump everything".
+        # A cmd field may be added later.
         DOM_REQUEST_FILE.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        # `UnicodeDecodeError` 是 `ValueError` 的子類別、不是 `OSError`，
-        # 單寫 `OSError` 接不住它。這裡的內容根本沒被用到，讓一個編碼壞掉的
-        # 請求檔把整輪批次炸掉毫無道理——未來真的解析 cmd 欄時，這個 except
-        # 要跟著改成「回報這個請求壞掉」而不是繼續當它是有效請求。
+        # `UnicodeDecodeError` is a subclass of `ValueError`, not `OSError`, so `OSError`
+        # alone cannot catch it. The content is not even used here, and letting a request file
+        # with broken encoding blow up the whole batch makes no sense — when the cmd field is
+        # actually parsed some day, this except must change to "report that this request is
+        # broken" instead of carrying on as if it were a valid request.
         pass
     try:
         diag = dump_textareas_diag(port)
@@ -2247,8 +2644,9 @@ def check_dom_request(port) -> None:
         print(f"check_dom_request: emitted dom_result with {len(diag)} entries")
     except Exception as error:  # pylint: disable=broad-except
         emit_event("dom_result", error=str(error))
-        # `_long_error`：一個 `dom_request.json` 最多走到一次（底下那段無論成敗
-        # 都把請求檔刪掉），所以是一次性診斷，不是重複行。
+        # `_long_error`: one `dom_request.json` reaches this at most once (the block below
+        # deletes the request file whether or not it succeeded), so it is a one-off diagnostic,
+        # not a repeated line.
         print(f"check_dom_request failed: {_long_error(error)}",
               file=sys.stderr)
     try:
@@ -2262,12 +2660,14 @@ def snap(port, tag: str) -> None:
         return
     name = f"debug_{tag}.png"
     if not _is_single_path_component(name):
-        # `tag` 只准貢獻**檔名片段**，不准改目錄。今天 26 個呼叫端的 tag 全是字面
-        # 值／整數／已消毒的角色名，所以這裡擋不掉任何一張合法的診斷截圖；它擋的是
-        # 「未來某個呼叫端把外部字串接進 tag」——`request_id` 就當過那個角色，實測
-        # `../../../evil` 會寫到 repo 外面（父目錄存在，所以是**寫得成功**的，不是
-        # 報錯）。為什麼用 `_is_single_path_component` 而不是那支更嚴的
-        # `_is_safe_folder_component`，理由寫在前者的 docstring 裡。
+        # `tag` may only contribute **a file-name fragment**, never change the directory.
+        # Today the tags of all 26 callers are literals / integers / sanitised character
+        # names, so this blocks no legitimate diagnostic screenshot; what it blocks is "some
+        # future caller splicing an external string into tag" — `request_id` once played that
+        # role, and measured, `../../../evil` writes outside the repo (the parent directory
+        # exists, so the write **succeeds**, it does not error). For why this uses
+        # `_is_single_path_component` rather than the stricter `_is_safe_folder_component`,
+        # see the former's docstring.
         print(f"[{tag}] screenshot skipped: tag is not a single filename")
         return
     shot = PROJECT_ROOT / name
@@ -2275,82 +2675,90 @@ def snap(port, tag: str) -> None:
         port.save_screenshot(str(shot))
         print(f"[{tag}] screenshot -> {shot}")
     except Exception as error:  # pylint: disable=broad-except
-        # `_short_error`：`snap()` 掛在二十幾個錯誤分支上，含 `generate_loop`
-        # 的每張圖失敗路徑——瀏覽器一死，這一行會跟著每一次失敗一起印。
+        # `_short_error`: `snap()` hangs off twenty-odd error branches, including
+        # `generate_loop`'s per-image failure path — once the browser dies, this line gets
+        # printed along with every single failure.
         print(f"[{tag}] screenshot failed: {_short_error(error)}")
 
 
 class BrowserGoneError(RuntimeError):
-    """瀏覽器上下文已經沒了——不是「慢」，是「不存在」。
+    """The browser context is gone — not "slow", but "does not exist".
 
-    當 hot-path helper 的 chromedriver 呼叫失敗、而且失敗是**永久性**的
-    （視窗被關掉、target 被摧毀、session 被刪除、chromedriver 連不上）時，
-    改丟這個例外而不是回平常的 None / False。理由：之後每一次呼叫都會用同樣
-    方式失敗，呼叫端的 poll／retry 預算全部是白燒的。
+    When a hot-path helper's chromedriver call fails and the failure is **permanent** (the
+    window was closed, the target destroyed, the session deleted, chromedriver unreachable),
+    this exception is raised instead of the usual None / False. Reason: every later call
+    would fail the same way, and the caller's poll / retry budget would all be burned for
+    nothing.
 
-    刻意繼承 `RuntimeError`：它會落進 `run_batch` 的外層 handler，路徑與
-    `_abort_if_chrome_crashed` 的 raise 完全相同——emit `critical_error`、
-    非零離開、監督者重生 Chrome（resume checkpoint 會把該角色接回去）。
-    **不要**把它加進任何變體的 `TRANSPORT_ERRORS` tuple；整個設計的重點就是
-    它不該被 `except port.TRANSPORT_ERRORS` 那些分支吸收掉。
+    It deliberately inherits `RuntimeError`: it lands in `run_batch`'s outer handler, on
+    exactly the same path as `_abort_if_chrome_crashed`'s raise — emit `critical_error`, exit
+    non-zero, the supervisor respawns Chrome (the resume checkpoint picks that character back
+    up). **Do not** add it to any variant's `TRANSPORT_ERRORS` tuple; the whole point of the
+    design is that it must not be absorbed by those `except port.TRANSPORT_ERRORS` branches.
     """
 
 
-# 例外壓成一行時的兩個長度。分成兩個是因為兩種用途的成本完全不同：
-#   `_short_error`（180）用在**會重複出現**的 log 行——poll 迴圈每轉一圈印一次，
-#     長訊息在這裡就是洗版。
-#   `_long_error`（400）用在**一次性**的地方：終結性的 raise（那句話會變成
-#     `critical_error` 事件的 message）、以及點不下去的診斷。這兩種的關鍵資訊都在
-#     訊息**尾巴**——`MaxRetryError` 的 `(Caused by NewConnectionError(... [WinError
-#     10061] ...))` 與 `element click intercepted` 的 `Other element would receive
-#     the click: <div class=…>`——而 180 字剛好會把兩者都切掉。
+# The two lengths used when squashing an exception into one line. There are two because the
+# costs of the two uses are completely different:
+#   `_short_error` (180) is for log lines that **repeat** — printed once per turn of a poll
+#     loop, where a long message is spam.
+#   `_long_error` (400) is for **one-off** places: a terminal raise (that sentence becomes the
+#     message of the `critical_error` event), and the diagnostic for a click that will not go
+#     through. In both, the key information sits at the **tail** of the message —
+#     `MaxRetryError`'s `(Caused by NewConnectionError(... [WinError 10061] ...))` and
+#     `element click intercepted`'s `Other element would receive the click: <div class=…>` —
+#     and 180 characters happens to cut off both.
 _SHORT_ERROR_LIMIT = 180
 _LONG_ERROR_LIMIT = 400
 
 
 # ---------------------------------------------------------------------------
-# 為什麼還有 34 個站點刻意保留 `{error!r}`
+# Why 34 sites still deliberately keep `{error!r}`
 #
-# 2026-09-12 全面盤點過這三個檔（兩個變體 ＋ 本模組）裡「直接把例外插進字串」
-# 的地方：**46 處**，其中只有 12 處換成上面這三支格式器。剩下的 34 處不是漏改，
-# 判準只有一句話——
+# On 2026-09-12 every place in these three files (the two variants + this module) that
+# "inserts an exception straight into a string" was inventoried: **46 sites**, of which only
+# 12 were switched to the three formatters above. The remaining 34 are not missed changes;
+# the criterion is a single sentence —
 #
-#     **這個 `try` 區塊有沒有可能丟出 selenium 例外？**
+#     **Can this `try` block raise a selenium exception?**
 #
-# 會的話必須改：`WebDriverException.__init__` 呼叫 `super().__init__()` 時
-# **不帶參數**，所以 `args` 是空的，`repr()` 只印得出一對空括號，訊息 100% 消失
-# （實測一個真的從 driver 丟回來的 `SessionNotCreatedException`：`str()` 752 字、
-# `repr()` 的訊息 0 字）。
+# If it can, it must change: `WebDriverException.__init__` calls `super().__init__()` **with
+# no arguments**, so `args` is empty and `repr()` prints only an empty pair of parentheses —
+# the message is 100% lost (measured on a `SessionNotCreatedException` really thrown back
+# from the driver: `str()` 752 characters, `repr()`'s message 0 characters).
 #
-# 不會的話，`!r` 反而是**比較好**的那一個，理由有兩層：
+# If it cannot, `!r` is actually the **better** one, for two reasons:
 #
-# 1. **不會洩漏主機路徑。** 這一族大多是檔案 I/O：`repr(OSError)` 是
-#    `FileNotFoundError(2, 'No such file or directory')`——**看不到路徑**；
-#    `str(OSError)` 是 `[Errno 2] ...: 'D:\Work\...'`，會把完整主機路徑寫進
-#    `webrunner.log`，而 `/log tail` 會把那個檔送進聊天平台（Secrecy Layer 1）。
-# 2. **這些例外的 `args` 本來就非空**（`OSError` / `psutil` / `ctypes` /
-#    `ImportError` / `json.JSONDecodeError`），`repr()` 讀得到訊息，改了只是雜訊。
+# 1. **It does not leak host paths.** Most of this family is file I/O: `repr(OSError)` is
+#    `FileNotFoundError(2, 'No such file or directory')` — **no path in sight**;
+#    `str(OSError)` is `[Errno 2] ...: 'D:\Work\...'`, which writes the full host path into
+#    `webrunner.log`, and `/log tail` sends that file into the chat platform (Secrecy Layer 1).
+# 2. **These exceptions' `args` are non-empty to begin with** (`OSError` / `psutil` /
+#    `ctypes` / `ImportError` / `json.JSONDecodeError`), `repr()` can read the message, and
+#    changing them would just be noise.
 #
-# ⚠️ **判準是「try 區塊碰不碰得到 driver」，不是「except 寫的是什麼型別」。**
-# 有 20 個保留站點的 handler 寫的是 `except Exception`，但 try 裡只有
-# `shutil.copy2` / `os.walk` / `psutil` / `ctypes` / `emit_event`——`except` 寬不
-# 代表收得到 selenium 例外。反過來說，把一個 `except OSError` 改寬成
-# `except Exception`，或是在既有的 try 裡加一句碰 `port` 的程式碼，就會讓那個
-# 站點越線，所以守門把「handler 的例外型別」也算進比對鍵裡。
+# ⚠️ **The criterion is "can the try block reach the driver", not "what type the except
+# names".** 20 of the kept sites have handlers written as `except Exception`, but their try
+# holds only `shutil.copy2` / `os.walk` / `psutil` / `ctypes` / `emit_event` — a broad
+# `except` does not mean it can receive a selenium exception. Conversely, widening an
+# `except OSError` to `except Exception`, or adding a line that touches `port` inside an
+# existing try, would push that site over the line, so the guard counts "the handler's
+# exception type" in its comparison key too.
 #
-# 守門：`test_selenium_facade.py` 的 `_EXCEPTION_REPR_EXEMPT`（雙向對帳，每一筆
-# 都要寫理由）。新增站點預設是**紅的**，要嘛改用格式器、要嘛連理由一起登記。
+# Guard: `test_selenium_facade.py`'s `_EXCEPTION_REPR_EXEMPT` (reconciled both ways, every
+# entry must give a reason). A new site is **red** by default: either switch it to a
+# formatter, or register it together with its reason.
 # ---------------------------------------------------------------------------
 
 
 def _one_line_error(error, limit: int) -> str:
-    """把例外壓成一行 `型別: 訊息`，截到 `limit` 字。
+    """Squash an exception into one line `Type: message`, cut to `limit` characters.
 
-    chromedriver 會在每個 WebDriverException 後面附上約 15 行的
-    `Stacktrace:`（C++ 符號位址）。對一個已死的 session 每 poll 一次就印一次
-    那串，就是「一次故障變成好幾頁雜訊」的來源，而且完全沒有診斷價值。完整
-    細節仍會經由 `raise ... from error` 的例外鏈，被 `run_batch` 格式化進
-    `critical_error` 事件的 traceback 欄位裡。
+    chromedriver appends roughly 15 lines of `Stacktrace:` (C++ symbol addresses) to every
+    WebDriverException. Printing that block on every poll against a dead session is where
+    "one fault turns into pages of noise" comes from, and it has no diagnostic value at all.
+    The full details still travel through the `raise ... from error` exception chain, and
+    `run_batch` formats them into the traceback field of the `critical_error` event.
     """
     text = str(error).split("Stacktrace:")[0]
     line = " ".join(text.split())
@@ -2358,84 +2766,96 @@ def _one_line_error(error, limit: int) -> str:
 
 
 def _short_error(error) -> str:
-    """重複出現的 log 行用這個（見 `_SHORT_ERROR_LIMIT` 上面的說明）。"""
+    """Use this for repeated log lines (see the note above `_SHORT_ERROR_LIMIT`)."""
     return _one_line_error(error, _SHORT_ERROR_LIMIT)
 
 
 def _long_error(error) -> str:
-    """一次性的地方用這個：終結性的 raise、以及點不下去的診斷。
+    """Use this for one-off places: terminal raises, and the diagnostic for a click that will
+    not go through.
 
-    **為什麼不共用 180 的那一版。** 兩種用途的關鍵資訊都在訊息尾巴：
+    **Why not share the 180 version.** In both uses the key information sits at the tail of
+    the message:
 
-    * `MaxRetryError` 的 `(Caused by NewConnectionError(…: [WinError 10061]
-      無法連線，因為目標電腦拒絕連線。))`——「連線被拒絕」是唯一能直接回答
-      「chromedriver.exe 是不是已經結束了」的證據，而且這一句會原封不動變成
-      `critical_error` 事件的 message（`BrowserGoneError` 的訊息就是它）。
-    * `element click intercepted` 的 `Other element would receive the click:
-      <div class=…>`——唯一能直接回答「是不是有東西蓋在關閉鈕上面」的證據，也正是
-      把點選從 JS 搬到 driver 換來的診斷。
+    * `MaxRetryError`'s `(Caused by NewConnectionError(…: [WinError 10061] No connection
+      could be made because the target machine actively refused it.))` — "connection refused"
+      is the only evidence that directly answers "has chromedriver.exe already exited", and
+      this sentence becomes the `critical_error` event's message untouched (it is
+      `BrowserGoneError`'s message).
+    * `element click intercepted`'s `Other element would receive the click: <div class=…>` —
+      the only evidence that directly answers "is something covering the close button", and
+      exactly the diagnostic that moving the click from JS to the driver bought us.
 
-    這條路一個額度週期最多跑兩次、終結性的 raise 一輪最多一次，長一點不會淹沒 log。
+    This path runs at most twice per quota cycle and a terminal raise at most once per round,
+    so being a bit longer does not flood the log.
     """
     return _one_line_error(error, _LONG_ERROR_LIMIT)
 
 
 def full_error_detail(error) -> str:
-    """`型別: 完整訊息`——**不截斷、不砍 `Stacktrace:`** 的鑑識用格式。
+    """`Type: full message` — the forensic format that **neither truncates nor cuts
+    `Stacktrace:`**.
 
-    ⚠️ **絕對不要換回 `{error!r}`。** selenium 的 `WebDriverException` 把訊息存在
-    `self.msg`，**`args` 是空的**，所以 `repr()` 只剩一對空括號。實測
-    （selenium 4.48.0，2026-09-12）：
+    ⚠️ **Never switch back to `{error!r}`.** selenium's `WebDriverException` stores the
+    message in `self.msg` and **`args` is empty**, so `repr()` leaves only an empty pair of
+    parentheses. Measured (selenium 4.48.0, 2026-09-12):
 
         e = SessionNotCreatedException(
             'session not created: This version of ChromeDriver only supports '
             'Chrome version 145\\nCurrent browser version is 152.0.7977.84 ...')
         e.args   -> ()
-        repr(e)  -> SessionNotCreatedException()      # 訊息 100% 消失
-        str(e)   -> 351 字元，含兩邊版本號與 Chrome 的實際路徑
+        repr(e)  -> SessionNotCreatedException()      # the message is 100% lost
+        str(e)   -> 351 characters, including both version numbers and Chrome's real path
 
-    **兩個數字，不要混用。** 上面那 351 是**自己建構**的例外（測試語料就是它）。
-    真的從 driver 丟回來的那一個是 **752 字元**——selenium 在訊息後面再接上
-    `Stacktrace:` 與一段無符號的回溯位址（實測 2026-09-12，chromedriver 145
-    對 Chrome 152）。兩個都對，量的是不同的物件；引用時要說清楚是哪一個。
+    **Two numbers; do not mix them up.** The 351 above is an exception **constructed by
+    hand** (it is the test corpus). The one really thrown back from the driver is **752
+    characters** — selenium appends `Stacktrace:` and a block of unsymbolised backtrace
+    addresses after the message (measured 2026-09-12, chromedriver 145 against Chrome 152).
+    Both are right, they measure different objects; say which one when quoting.
 
-    這不是假設性的：2026-08-25 11:38:50 的 spawn 失敗，記錄裡就只有
-    `Chrome spawn attempt 1/3 failed: SessionNotCreatedException()`「別的什麼都
-    沒有」，於是有人跑去翻一個當時根本還沒被建立的 `chromedriver.log`。
-    **訊息從來就不是空的，是我們自己的格式把它丟掉的。**
+    This is not hypothetical: for the 2026-08-25 11:38:50 spawn failure the log held only
+    `Chrome spawn attempt 1/3 failed: SessionNotCreatedException()` and "nothing else", so
+    someone went digging through a `chromedriver.log` that had not even been created yet.
+    **The message was never empty; our own format threw it away.**
 
-    ⚠️ **這個缺陷用一般的 `Exception('boom')` 測不出來**：那種例外 `args` 非空，
-    `repr()` 會帶上訊息，舊格式與新格式都會通過。要釘住它，語料必須是真的
-    selenium 例外（`args` 空、`msg` 有值）。
+    ⚠️ **This defect cannot be caught with an ordinary `Exception('boom')`**: such an
+    exception's `args` is non-empty, `repr()` includes the message, and both the old and the
+    new format pass. To pin it down, the corpus must be a real selenium exception (`args`
+    empty, `msg` set).
 
-    **型別名要留著。** `args` 非空的例外，`str()` 只有訊息、認不出類別，而
-    `SessionNotCreatedException` 與 `TimeoutException` 的區別本身就是第一層診斷。
+    **Keep the type name.** For an exception with non-empty `args`, `str()` has only the
+    message and the class cannot be recognised, and the difference between
+    `SessionNotCreatedException` and `TimeoutException` is itself the first layer of
+    diagnosis.
 
-    **為什麼不接到 `_one_line_error` 上（那個 400 字上限會咬人）。**
-    `_short_error` / `_long_error` 會截斷、也會砍掉 chromedriver 附的 C++
-    `Stacktrace:`，因為它們服務的是**會重複出現**的 log 行與**會變成
-    `critical_error` 事件 message** 的終結性 raise。這一支兩者都不是：它只在
-    spawn 失敗時出現，一次開機最多幾行、只寫 stderr，而有用的字（兩邊版本號、
-    Chrome 的實際路徑）排在 stack dump **前面**，所以那段 dump 只是可以忽略的
-    尾巴、長度有界。反過來，那 400 字上限現在是**剛好夠**而不是綽綽有餘：
-    `_one_line_error` 先砍掉 `Stacktrace:` 之後的整段、再把換行壓成空白，所以真實
-    那 752 字進去、出來剩 **350** 字，離 400 只有 **50** 字餘裕。多一句話就會被
-    切掉，而被切掉的症狀正好是這支函式要修的那一個：安靜地少掉診斷。
-    **不要好心「統一」它們**——這句勸阻本身守不住任何東西（實測：把這支改成
-    `return _long_error(error)`，2026-09-12 當時整份 `test_selenium_facade.py`
-    41 支全綠），所以另外配了
-    `test_the_forensic_format_keeps_what_the_one_line_helpers_throw_away`
-    真的去咬它。
+    **Why this is not routed through `_one_line_error` (that 400-character cap would bite).**
+    `_short_error` / `_long_error` truncate and also cut off the C++ `Stacktrace:` chromedriver
+    appends, because they serve log lines that **repeat** and terminal raises whose message
+    **becomes the `critical_error` event message**. This one is neither: it only appears when
+    a spawn fails, a few lines per boot at most, written only to stderr, and the useful words
+    (both version numbers, Chrome's real path) come **before** the stack dump, so that dump is
+    an ignorable tail of bounded length. Conversely, that 400-character cap is now **just
+    enough** rather than generous: `_one_line_error` first cuts everything after
+    `Stacktrace:` and then squashes newlines into spaces, so the real 752 characters go in and
+    **350** come out, only **50** characters short of 400. One more sentence and it gets cut,
+    and the symptom of being cut is exactly the one this function exists to fix: diagnostics
+    quietly going missing.
+    **Do not helpfully "unify" them** — this warning by itself guards nothing (measured:
+    changing this function to `return _long_error(error)` left all 41 tests of the whole
+    `test_selenium_facade.py` green as of 2026-09-12), so it comes paired with
+    `test_the_forensic_format_keeps_what_the_one_line_helpers_throw_away`, which really bites.
 
-    （與 MEMORY 那條「`repr(OSError)` 藏路徑、`str` 會露出來」不衝突：那條講的是
-    **送進聊天平台的字串**，這裡是寫進 stderr／log 的診斷，`CLAUDE.md` Layer 1
-    明寫「完整細節寫 stderr／log」。送出端仍由 bot 的 `_owner_detail` 把關。）
+    (This does not conflict with the MEMORY note "`repr(OSError)` hides the path, `str`
+    exposes it": that note is about **strings sent into the chat platform**, while this is a
+    diagnostic written to stderr / the log, and `CLAUDE.md` Layer 1 says outright "full
+    details go to stderr / the log". The sending side is still guarded by the bot's
+    `_owner_detail`.)
     """
     return f"{type(error).__name__}: {error}"
 
 
 def is_browser_gone_error(error) -> bool:
-    """`error` 是否代表「視窗／session 已永久消失」。"""
+    """Whether `error` means "the window / session is permanently gone"."""
     names = {cls.__name__ for cls in type(error).__mro__}
     if names & _SESSION_GONE_EXC_NAMES:
         return True
@@ -2444,16 +2864,18 @@ def is_browser_gone_error(error) -> bool:
 
 
 def _note_transport_error(where: str, error) -> None:
-    """Hot-path `except port.TRANSPORT_ERRORS` 的統一處理：記錄，必要時升級。
+    """Common handling for hot-path `except port.TRANSPORT_ERRORS`: log it, escalate when
+    needed.
 
-    暫時性卡頓 → 印一行就回去，呼叫端維持原本「回 sentinel 再 poll」的行為。
-    Session 已死 → 丟 `BrowserGoneError`，讓這一輪立刻收掉，而不是對著一個
-    死掉的瀏覽器把整個重試預算 poll 完。
+    A transient hiccup → print one line and return, and the caller keeps its original
+    "return a sentinel and poll again" behaviour. The session is dead → raise
+    `BrowserGoneError`, so this round is shut down at once instead of polling a dead browser
+    until the whole retry budget is spent.
     """
     if is_browser_gone_error(error):
-        # 終結性的 raise：這句話會原封不動變成 `critical_error` 事件的
-        # message，所以用留得比較長的那一版（`_long_error` 的 docstring 記著
-        # 為什麼——關鍵的 `(Caused by …[WinError 10061]…)` 在訊息尾巴）。
+        # A terminal raise: this sentence becomes the `critical_error` event's message
+        # untouched, so it uses the longer-kept version (`_long_error`'s docstring records
+        # why — the key `(Caused by …[WinError 10061]…)` is at the tail of the message).
         raise BrowserGoneError(
             f"browser session gone during {where} — {_long_error(error)}"
         ) from error
@@ -2461,10 +2883,11 @@ def _note_transport_error(where: str, error) -> None:
 
 
 def _browser_gone_reason(port) -> str | None:
-    """一次最便宜的 JS round-trip；瀏覽器沒了就回一句簡短原因，否則回 None。
+    """The cheapest possible JS round-trip; returns a short reason if the browser is gone,
+    otherwise None.
 
-    「暫時性失敗」也回 None——會走到這裡的呼叫點本來就有自己的失敗計數器，
-    那條路不該被這個探針搶走。
+    A "transient failure" also returns None — the call sites that reach this already have
+    their own failure counters, and that path should not be taken over by this probe.
     """
     try:
         alive = port.execute_script(_ALIVE_PROBE_JS)
@@ -2474,73 +2897,88 @@ def _browser_gone_reason(port) -> str | None:
         return None
     if alive == _ALIVE_PROBE_TOKEN:
         return None
-    # je 變體：wrapper 吞掉例外、一律回 None。這條路徑分不出「視窗被關掉」與
-    # 「暫時卡住」，但所有呼叫點都在「已經連續失敗過一輪」之後——那個時點重生
-    # 瀏覽器就是正確反應。
+    # je variant: the wrapper swallows exceptions and always returns None. This path cannot
+    # tell "the window was closed" from "temporarily stuck", but every call site comes after
+    # "a full round of consecutive failures already" — at that point respawning the browser
+    # is the right response.
     return f"alive probe returned {alive!r}"
 
 
 def _probe_browser_alive(port) -> str | None:
-    """額度等待迴圈用的極輕量存活探測。活著回 None，死了回一句簡短原因。
+    """An ultra-light liveness probe for the quota wait loop. Returns None when alive, and a
+    short reason when dead.
 
-    **絕不 raise，也絕不做任何補救。** 兩件事都是刻意的：
+    **Never raises, and never attempts any remedy.** Both are deliberate:
 
-    - 它跑在額度等待迴圈裡，任何往上丟的例外都會取代掉原本乾淨的「等完再重試」
-      路徑；所以連 `_browser_gone_reason` 自己壞掉都要吞下來（吞成一句原因，不是
-      吞成沉默——探針壞掉要看得見）。
-    - 偵測到死亡也**只記錄、不當場重啟**。中途重啟要重新登入並重填欄位，而那正是
-      本專案最貴一次故障的路徑（欄位只被部分填回去、安靜地用錯提示詞燒掉 10 張圖
-      /兩小時）。在等待中觸發它風險大於收益，交給既有復原流程在原本的時機跑。
+    - It runs inside the quota wait loop, and any exception thrown upwards would replace the
+      otherwise clean "wait it out, then retry" path; so even `_browser_gone_reason` itself
+      breaking must be swallowed (swallowed into a reason, not into silence — a broken probe
+      has to be visible).
+    - On detecting death it also **only records, and does not restart on the spot**. A
+      mid-run restart has to log in again and refill the fields, and that is exactly the path
+      of this project's most expensive failure ever (fields only partly refilled, quietly
+      burning 10 images / two hours with the wrong prompt). Triggering it during a wait is
+      more risk than benefit; leave it to the existing recovery flow at its usual time.
 
-    它唯一的產出是**時間**：把死亡時刻從「最久晚一小時」縮到 30 秒內。
-    等待迴圈整整一輪（預設 3600 秒）不對 driver 下任何指令，所以瀏覽器在等待期間
-    死掉的話，要到等完之後的第一個指令才會發現。實測（`WEBRunner.log` 2026-09-07
-    03:02 與 06:18 兩次）長這樣：
+    Its only output is **time**: it shrinks the moment of death from "up to an hour late" to
+    within 30 seconds. A full round of the wait loop (3600 seconds by default) issues no
+    command at all to the driver, so if the browser dies during the wait, it is only found at
+    the first command after the wait. Measured (`WEBRunner.log`, 2026-09-07 at 03:02 and
+    06:18) it looks like this:
 
-        ConnectionRefusedError: [WinError 10061] 無法連線，因為目標電腦拒絕連線。
+        ConnectionRefusedError: [WinError 10061] No connection could be made because the
+            target machine actively refused it.
         supervisor: webrunner exited rc=1 after 283379s (attempt 1); restarting
 
-    **WinError 10061 是「連線被拒絕」＝ 那個埠上沒有東西在聽 ＝ chromedriver.exe
-    自己已經結束了**，不是連線逾時、也不是 session 卡住。兩次的時間戳都剛好落在
-    60 分鐘等待結束後的第一個指令上，所以真正的死亡時刻在那一小時裡不可知——跟
-    任何活動對照都只能用猜的。（順帶排除一個看似合理的解釋：Selenium 4 那個
-    「閒置 300 秒砍掉 session」是 Grid／selenium-server 的 `--session-timeout`，
-    本專案是本機直接起 `ChromeService`、沒有 Grid，不適用。）
+    **WinError 10061 is "connection refused" = nothing is listening on that port =
+    chromedriver.exe itself has already exited**, not a connection timeout and not a stuck
+    session. Both timestamps fall exactly on the first command after a 60-minute wait ended,
+    so the real moment of death within that hour is unknowable — any comparison with other
+    activity is guesswork. (Incidentally ruling out a plausible explanation: Selenium 4's
+    "kill the session after 300 idle seconds" is Grid / selenium-server's
+    `--session-timeout`; this project starts `ChromeService` directly on the local machine
+    with no Grid, so it does not apply.)
 
-    **2026-09-10：死因大致查出來了，而且不在瀏覽器這一側——是我們自己的測試
-    工具。** 四次死亡（03:02／06:17／11:44／17:10）對得上四次事故：
-    `_browser_killguard.py` 的 docstring 記了**三**次（它寫於 17:06:41，所以記不到
-    第四次）。那一次是 17:07，
-    驗證防線本身的 `mutate_killguard.py` 探針在「兩層 taskkill 檢查一起拿掉」那個
-    變異底下真的執行了 `taskkill /IM chrome.exe`。**查這一族要三個檔案一起 grep**：
-    漏掉第四次的原因，跟這條結論本身講的是同一件事——答案分散在幾個檔案裡而彼此
-    沒有互相指涉。
+    **2026-09-10: the cause of death was mostly found, and it is not on the browser side — it
+    was our own test tooling.** The four deaths (03:02 / 06:17 / 11:44 / 17:10) match four
+    incidents: `_browser_killguard.py`'s docstring records **three** of them (it was written
+    at 17:06:41, so it could not record the fourth). That one was at 17:07, when the
+    `mutate_killguard.py` probe, which verifies the defence itself, really ran
+    `taskkill /IM chrome.exe` under the mutant "remove both taskkill checks together".
+    **To investigate this family, grep three files together**: the reason the fourth was
+    missed is the very thing this conclusion says — the answer is spread across several files
+    that do not reference one another.
 
-    死亡 #1 的證據是硬的：supervisor 記的 `after 283379s` ＝ 78.72 小時，而事故 #1
-    寫的是「毀掉一個已經跑了 78.7 小時的批次」——同一個批次、同一分鐘。
+    The evidence for death #1 is hard: the supervisor's `after 283379s` = 78.72 hours, and
+    incident #1 reads "destroyed a batch that had already been running for 78.7 hours" — the
+    same batch, the same minute.
 
-    **最後一次死亡是 17:07（防線自己的變異探針造成），此後零死亡。** 不要寫成
-    「防線落地之後零死亡」：以 17:06 為起算點實測是 52 次 `quota_blocked` /
-    50 次 `quota_resumed` / **1** 次 `critical_error`（就是 17:10:44 那一筆）；
-    52/50/**0** 那組數字是從 **17:11** 起算的，接到 17:06 上就不成立。
+    **The last death was at 17:07 (caused by the defence's own mutation probe), with zero
+    deaths since.** Do not write it as "zero deaths after the defence landed": counting from
+    17:06, the measurement is 52 `quota_blocked` / 50 `quota_resumed` / **1**
+    `critical_error` (the 17:10:44 one); the 52/50/**0** set of numbers counts from
+    **17:11**, and does not hold if attached to 17:06.
 
-    兩種死法的簽名不同，統計時不要合併：03:02／06:18／11:44 是
-    `ConnectionRefusedError`（chromedriver.exe 自己不見了）；17:07／17:10 是
-    `InvalidSessionIdException`（chromedriver.exe 還活著、chrome.exe 全部消失
-    ＝ `taskkill /IM chrome.exe` 的簽名）。
+    The two ways of dying have different signatures; do not merge them in statistics:
+    03:02 / 06:18 / 11:44 are `ConnectionRefusedError` (chromedriver.exe itself vanished);
+    17:07 / 17:10 are `InvalidSessionIdException` (chromedriver.exe still alive, every
+    chrome.exe gone = the signature of `taskkill /IM chrome.exe`).
 
-    ⚠️ **連帶更正一個框架錯誤：「都死在等額度的時候」是偵測假象，不是機制。**
-    四次死亡的時間戳全部落在 `quota_blocked` 之後 60.4～60.6 分鐘，也就是等待
-    結束後的第一個指令——那一小時是**唯一**不碰 driver 的窗口，所以發生在裡面
-    的任何一次死亡都只會在那個時刻被看見。對照組就在同一份記錄裡：另有一次死亡
-    出現在 `character_start` 之後 4.6 分鐘。所以不要再從「等待期間有什麼會殺掉
-    瀏覽器」出發找原因，那個相關性量到的是**我們什麼時候去看**。
+    ⚠️ **This also corrects a framing error: "they all died while waiting for quota" is a
+    detection artefact, not a mechanism.** All four deaths are timestamped 60.4–60.6 minutes
+    after `quota_blocked`, i.e. the first command after the wait ended — that hour is the
+    **only** window that does not touch the driver, so any death inside it is only seen at
+    that moment. The control group is in the same log: another death appears 4.6 minutes
+    after `character_start`. So stop looking for causes starting from "what during the wait
+    would kill the browser"; what that correlation measures is **when we go and look**.
 
-    **而且這條有直接證據，不只有對照組。** 第四次死亡是唯一一次本函式已經上線
-    的，`webrunner.log` 留著它抓到的那一行（全檔就這一行）：
-    `[09-07 17:07:44] [quota] …瀏覽器在等額度的期間死掉了（這一輪已等 3420s…）`
-    ——3420 秒 ＝ 57 分，比同一件事的 `critical_error`（17:10:44）**早三分鐘**。
-    同一次死亡的兩個時間戳擺在一起，就把「60.4 分」證明成回報延遲而不是機制。
+    **And there is direct evidence for this, not only the control group.** The fourth death
+    is the only one where this function was already live, and `webrunner.log` still holds the
+    line it caught (the only such line in the whole file):
+    `[09-07 17:07:44] [quota] …the browser died while waiting for quota (waited 3420s this
+    round…)` — 3420 seconds = 57 minutes, **three minutes earlier** than the same event's
+    `critical_error` (17:10:44). Put the two timestamps of the same death side by side, and
+    "60.4 minutes" is proven to be reporting delay, not a mechanism.
     """
     try:
         return _browser_gone_reason(port)
@@ -2549,12 +2987,13 @@ def _probe_browser_alive(port) -> str | None:
 
 
 def _abort_if_browser_gone(port, where: str) -> None:
-    """視窗／session 已消失就 raise `BrowserGoneError`（→ 監督者重生）。
+    """Raise `BrowserGoneError` (→ the supervisor respawns) if the window / session is gone.
 
-    與 `_abort_if_chrome_crashed` 是**互補**的兩種死法：那個抓的是「session
-    還活著、頁面變成 crash interstitial」（renderer 崩了），這個抓的是
-    「session 本身沒了」——後者連 `port.current_url()` 都會丟例外，所以
-    crash-page 偵測看到的只會是「讀不到、當作沒崩」，永遠不會替它收工。
+    It and `_abort_if_chrome_crashed` cover **complementary** ways of dying: that one catches
+    "the session is still alive but the page became a crash interstitial" (the renderer
+    crashed), this one catches "the session itself is gone" — in the latter even
+    `port.current_url()` raises, so crash-page detection only ever sees "unreadable, treat as
+    not crashed" and would never shut it down.
     """
     reason = _browser_gone_reason(port)
     if reason is not None:
@@ -2565,24 +3004,27 @@ def _abort_if_browser_gone(port, where: str) -> None:
 
 
 class GenerationBlockedError(RuntimeError):
-    """站方擋住生成，而且**重試不會有結果**（額度用完、方案到期…）。
+    """The site blocks generation, and **retrying will get nowhere** (quota used up, plan
+    expired…).
 
-    與 `BrowserGoneError` 的差別在收工方式，不在嚴重程度：瀏覽器沒了要**重生**
-    （新的 Chrome 就好了），這個要**停下來等人處理**（重生只會看到同一個對話框，
-    每輪還重跑一次登入 ＋ setup，就是使用者看到的「沒有自動停止」）。
+    The difference from `BrowserGoneError` is in how it wraps up, not in severity: a gone
+    browser needs a **respawn** (a new Chrome fixes it), this one needs to **stop and wait for
+    a human** (a respawn would only see the same dialog, rerunning login + setup every round,
+    which is the "it never stops by itself" users saw).
 
-    `run_batch` 專門接住它，emit `generation_blocked` 事件並回
-    `RC_GENERATION_BLOCKED`；兩個監督者都把這個 rc 當成「不要重生」。佇列與續跑
-    檢查點都不動——使用者處理完打 `/run` 就從原地接回去。
+    `run_batch` catches it specifically, emits a `generation_blocked` event and returns
+    `RC_GENERATION_BLOCKED`; both supervisors treat that rc as "do not respawn". The queue and
+    the resume checkpoint are left untouched — once the user has dealt with it, `/run` picks
+    up right where it left off.
     """
 
 
 def get_generation_block(port) -> dict | None:
-    """Tier 1：畫面上有沒有「要付錢／要處理帳號」的對話框或吐司。
+    """Tier 1: is there a dialog or toast on screen saying "pay up / deal with your account".
 
-    回 `{"text": ..., "pattern": ...}` 或 None。純讀取，永不 raise——
-    transport 例外交給 `_note_transport_error` 分流（session 沒了就升級成
-    `BrowserGoneError`，那是另一條收工路徑）。
+    Returns `{"text": ..., "pattern": ...}` or None. Read-only, never raises — transport
+    exceptions are routed by `_note_transport_error` (a gone session is escalated to
+    `BrowserGoneError`, which is a different wrap-up path).
     """
     try:
         return port.execute_script(_GENERATION_BLOCK_JS)
@@ -2592,22 +3034,25 @@ def get_generation_block(port) -> dict | None:
 
 
 def has_blocking_dialog(port) -> str | None:
-    """Tier 2：畫面上有沒有可見的 modal 對話框擋著（**不看字面**）。
+    """Tier 2: is a visible modal dialog blocking the screen (**text is not looked at**).
 
-    回對話框文字（截成 400 字，超過會在尾巴附全文長度）或 None。
+    Returns the dialog text (cut to 400 characters; beyond that the full length is appended at
+    the tail) or None.
 
-    **消費者有三個，不是 docstring 以前寫的一個**，而其中一個把 None 當成一個
-    「是」的答案，所以這裡的漏判不是漏偵測、是靜默的錯誤結果：
+    **There are three consumers, not the one the docstring used to name**, and one of them
+    treats None as a "yes" answer, so a miss here is not a missed detection but a silently
+    wrong result:
 
-    1. `dismiss_blocking_dialog` 的進度判準——**`None` ＝「關乾淨了」**
-       （`stop_reason = "closed"` → `return True`）。
-    2. `generate_loop` 在 `consecutive_fail_abort` 門檻上的 Tier 2 判定。
-    3. `generate_loop` 的收尾防線（`saved == 0` 而畫面上還有 modal）。
+    1. `dismiss_blocking_dialog`'s progress criterion — **`None` = "closed cleanly"**
+       (`stop_reason = "closed"` → `return True`).
+    2. `generate_loop`'s Tier 2 decision at the `consecutive_fail_abort` threshold.
+    3. `generate_loop`'s final line of defence (`saved == 0` while a modal is still on
+       screen).
 
-    所以這一題要**寧可回答「有」**：誤判只會讓 1 落到整頁 reload（安全）、
-    讓 2/3 在一個本來就已經死掉的角色上多停一次；漏判則會讓 1 對著一個它根本沒
-    碰到的對話框回報成功。長度上限就是這樣被拿掉的，理由寫在
-    `_BLOCKING_DIALOG_JS` 上面。
+    So this question must **err towards answering "yes"**: a false positive only drops 1 into
+    a full-page reload (safe), and makes 2/3 stop once more on a character that was already
+    dead; a miss makes 1 report success against a dialog it never even touched. That is how
+    the length cap came to be removed; the reasoning is written above `_BLOCKING_DIALOG_JS`.
     """
     try:
         return port.execute_script(_BLOCKING_DIALOG_JS)
@@ -2617,10 +3062,12 @@ def has_blocking_dialog(port) -> str | None:
 
 
 def describe_dialog_controls(port) -> str:
-    """把擋路對話框上的控制項清單整理成給 log 看的文字。純唯讀，不點任何東西。
+    """Turn the list of controls on a blocking dialog into text for the log. Purely
+    read-only, clicks nothing.
 
-    只在關閉失敗那條路上呼叫（每次額度用完最多一次），所以成本無關緊要；happy
-    path 完全不會執行到。回空字串代表拿不到（對話框剛好消失、或 JS 打不通）。
+    Only called on the close-failed path (at most once per quota exhaustion), so its cost does
+    not matter; the happy path never runs it. An empty string means it could not be obtained
+    (the dialog happened to vanish, or JS could not get through).
     """
     try:
         info = port.execute_script(_DIALOG_CONTROLS_DIAG_JS)
@@ -2630,8 +3077,9 @@ def describe_dialog_controls(port) -> str:
     if not isinstance(info, dict):
         return ""
     rows = info.get("controls") or []
-    head = (f"對話框 {info.get('w')}x{info.get('h')}，可點候選 "
-            f"{info.get('total')} 個（依離右上角的距離排序，列出前 {len(rows)} 個）：")
+    head = (f"dialog {info.get('w')}x{info.get('h')}, {info.get('total')} clickable "
+            f"candidates (sorted by distance from the top-right corner, first {len(rows)} "
+            f"listed):")
     lines = [head]
     for i, r in enumerate(rows, 1):
         lines.append(
@@ -2644,33 +3092,41 @@ def describe_dialog_controls(port) -> str:
 
 
 def _click_dismiss_target(port, element) -> str:
-    """把 `_DISMISS_DIALOG_JS` 挑好的那一顆按下去。回 `'real'` / `'synthetic'` /
-    `''`（兩種都按不動）。
+    """Press the one `_DISMISS_DIALOG_JS` picked. Returns `'real'` / `'synthetic'` / `''`
+    (neither kind of press worked).
 
-    **為什麼是 driver 層的真點選優先。** 站方會疊兩層對話框，兩層右上角關閉鈕的
-    class 完全一樣，但 JS 的 `el.click()` 只關得掉第一層（實測：第 1 層按下去畫面
-    真的換了、第 2 層按下去一個字都沒變，四個額度週期一致）。兩個機制上的差別都
-    只有真點選補得起來：
+    **Why a real driver-level click comes first.** The site stacks two layers of dialog, and
+    the top-right close buttons of both layers have exactly the same class, yet JS's
+    `el.click()` only closes the first layer (measured: pressing layer 1 really changed the
+    screen, pressing layer 2 changed not a single character, consistently across four quota
+    cycles). Both mechanical differences can only be made up by a real click:
 
-    * `el.click()` 是**直接對那顆元素派送**，只會往上冒泡；真點選是打在座標上，
-      `e.target` 是「那個座標上最上層的元素」。有東西蓋在上面時，只有真點選碰得到
-      那個 handler。
-    * `el.click()` 只派送 `click` 一種事件；真點選會走完整串
-      pointerdown / mousedown / mouseup / click。把關閉行為掛在 `onPointerDown` /
-      `onMouseDown` 是 modal 元件常見的寫法，那一類只有真點選收得到。
+    * `el.click()` **dispatches directly to that element** and only bubbles up; a real click
+      lands on a coordinate, and `e.target` is "the topmost element at that coordinate". When
+      something covers it, only a real click reaches that handler.
+    * `el.click()` dispatches only the `click` event; a real click goes through the whole
+      pointerdown / mousedown / mouseup / click sequence. Hanging the close behaviour on
+      `onPointerDown` / `onMouseDown` is a common pattern in modal components, and that kind
+      only ever receives a real click.
 
-    **走 `click_native` 而不是 `port.click`**：後者自己就會在失敗時**安靜地**退回
-    `execute_script` 的合成點選，於是「真點選成功了」與「真點選失敗、偷偷改用合成」
-    在外面長得一模一樣——那正是本專案記過四次的「log 報的是嘗試不是結果」。這裡要
-    的恰恰是分辨這兩者：真點選被 `ElementClickIntercepted` 擋下來，就是「有東西蓋在
-    上面」的直接證據，而它會連帶指名那個元素。所以退路由這裡自己走，一階一階都出聲。
+    **Goes through `click_native`, not `port.click`**: the latter itself **quietly** falls back
+    to an `execute_script` synthetic click on failure, so "the real click succeeded" and "the
+    real click failed and it secretly switched to synthetic" look exactly the same from
+    outside — which is exactly the "the log reports the attempt, not the result" this project
+    has recorded four times. Telling those two apart is precisely what is needed here: a real
+    click blocked by `ElementClickIntercepted` is direct evidence that "something is covering
+    it", and it names that element too. So the fallback is walked here, step by step, each
+    step speaking up.
 
-    `getattr` ＋ `callable` 是給精簡 port 用的（測試的假 port、其他驗證腳本）：
-    沒有這個方法就直接走合成點選，行為退回舊版，不會炸。
+    `getattr` + `callable` is for slimmed-down ports (the tests' fake ports, other
+    verification scripts): without that method it goes straight to the synthetic click,
+    behaviour falls back to the old version, and nothing blows up.
     """
     if element is None:
-        # JS 挑中了卻沒交出元素——只可能是 port 沒有把 WebElement 解包回來。
-        print("  [quota] 關閉動作挑中了控制項，但拿不到元素；改送 Escape",
+        # JS picked something but handed over no element — the only possibility is that the
+        # port did not unwrap the WebElement.
+        print("  [quota] the dismiss action picked a control but could not get the element; "
+              "sending Escape instead",
               file=sys.stderr)
         return ""
     native = getattr(port, "click_native", None)
@@ -2683,10 +3139,10 @@ def _click_dismiss_target(port, element) -> str:
                 raise BrowserGoneError(
                     "browser gone while dismissing a dialog: "
                     + _long_error(error)) from error
-            # 這一行就是這個改動買到的診斷：`element click intercepted` 會連帶
-            # 指名蓋在上面的那個元素。
-            print(f"  [quota] driver 真點選按不下去（{_long_error(error)}）；"
-                  "改用合成點選", file=sys.stderr)
+            # This line is the diagnostic this change bought: `element click intercepted`
+            # also names the element covering it.
+            print(f"  [quota] the real driver click would not go through ({_long_error(error)}); "
+                  "falling back to a synthetic click", file=sys.stderr)
     try:
         port.execute_script("arguments[0].click();", element)
         return "synthetic"
@@ -2695,78 +3151,100 @@ def _click_dismiss_target(port, element) -> str:
             raise BrowserGoneError(
                 "browser gone while dismissing a dialog: "
                 + _long_error(error)) from error
-        print(f"  [quota] 合成點選也按不下去（{_long_error(error)}）",
+        print(f"  [quota] the synthetic click would not go through either ({_long_error(error)})",
               file=sys.stderr)
     return ""
 
 
 def dismiss_blocking_dialog(port, max_rounds: int = 4) -> bool:
-    """關掉擋路的 modal 對話框，**關到沒有為止**。全部關乾淨（或本來就沒有）回 True。
+    """Close the blocking modal dialogs, **until there are none left**. Returns True when all
+    are closed cleanly (or there were none to begin with).
 
-    每一輪：JS **挑**一顆可以安全按的（文字 → aria-label → 右上角無字圖示鈕）並把
-    元素交回來 → driver 真點選 → 按不動退合成點選 → 都不行（或根本沒挑中）才送
-    Escape → **以結果為準**再問一次還有沒有 modal（「按了某個東西」不等於
-    「關掉了」）。全部關不掉才由呼叫端退回整頁 reload。
+    Each round: JS **picks** one that is safe to press (text → aria-label → text-less icon
+    button in the top-right corner) and hands the element back → a real driver click → if
+    that does not work, a synthetic click → only if neither works (or nothing was picked at
+    all) is Escape sent → **the result decides**: ask once more whether a modal is still
+    there ("pressed something" is not "closed it"). Only when nothing can be closed does the
+    caller fall back to a full-page reload.
 
-    絕不點任何帶付款語意的控制項。**判定點在「JS 不會回傳它」**，不在「不會 click
-    它」——按的動作已經搬到 Python，反例測試釘在 click 事件上等於什麼都沒驗。理由
-    與階梯細節見 `_DISMISS_DIALOG_JS` 的說明與 `_click_dismiss_target`。
+    Never clicks any control with payment semantics. **The decision point is "JS never
+    returns it"**, not "it is never clicked" — the pressing has moved into Python, so a
+    counter-example test pinned on the click event would verify nothing. For the reasoning
+    and the details of the ladder, see the notes on `_DISMISS_DIALOG_JS` and
+    `_click_dismiss_target`.
 
-    **為什麼是迴圈而不是單次（2026-09-07，這是本函式最重要的一段）。**
-    規則 3 上線後連續五個額度週期都印「關不掉」，看起來像「找對了卻按不動」。
-    推翻那個結論的不是任何一則訊息，而是 `describe_dialog_controls` 印出來的
-    **對話框尺寸**——它在規則 3 上線的那一刻換了：
+    **Why a loop rather than a single shot (2026-09-07; this is the most important passage
+    of this function).** After rule 3 went live, five quota cycles in a row printed "could
+    not close it", which looked like "found the right one but it will not press". What
+    overturned that conclusion was not any message, but the **dialog size** printed by
+    `describe_dialog_controls` — which changed the moment rule 3 went live:
 
-        11:44 之前 856x917 / 11 個候選（Subscribe、Pay As You Go、Get Started）× 65
-        11:44 之後 420x322 /  5 個候選（Unsubscribe、Update Payment Details）×  5
+        before 11:44  856x917 / 11 candidates (Subscribe, Pay As You Go, Get Started) × 65
+        after 11:44   420x322 /  5 candidates (Unsubscribe, Update Payment Details)   ×  5
 
-    而那份清單是**關閉動作跑完之後**才抓的。也就是說第一層付費牆真的被關掉了，
-    露出後面**第二層**（帳號管理）對話框，而單次關閉只看「還有沒有 modal」就回報
-    失敗、退化成整頁 reload。所以缺的是「再關一次」，不是換一種按法。
+    And that list was captured **after the dismiss action had run**. In other words the first
+    paywall layer really was closed, exposing a **second** (account management) dialog behind
+    it, and a single-shot dismiss that only asked "is there still a modal" reported failure
+    and degraded into a full-page reload. So what was missing was "close it once more", not a
+    different way of pressing.
 
-    **第二層對話框不吃合成點選，這是「關到沒有為止」之外還要 driver 點選的理由。**
-    迴圈上線後的四個額度週期都長一樣：第 1 層 @(805,21) 按下去畫面真的換了、第 2 層
-    @(369,21) 按下去**一個字都沒變**，早停判準當場收手，仍然落到整頁 reload。兩層那顆
-    關閉鈕的 class 一模一樣，所以差別合理的解釋在**元素之上**（有東西蓋著）或**事件
-    種類**（handler 掛在 pointerdown/mousedown），兩者都只有真點選補得起來。
+    **The second dialog does not respond to synthetic clicks; that is why a driver click is
+    needed on top of "until there are none left".** Every one of the four quota cycles after
+    the loop went live looked the same: pressing layer 1 @(805,21) really changed the screen,
+    pressing layer 2 @(369,21) changed **not a single character**, the early-stop criterion
+    gave up on the spot, and it still fell back to a full-page reload. The close buttons of
+    both layers have exactly the same class, so the plausible explanations for the difference
+    lie **above the element** (something covering it) or in the **kind of event** (the
+    handler hangs on pointerdown/mousedown), and both can only be made up by a real click.
 
-    順帶把「第二層是不是帳號出問題」查掉了：`has_blocking_dialog` 的回傳原文是
-    「You are subscribed to the Opus tier! Your subscription renews around
-    2026/09/18」，而那之後每小時照常回補、照常產圖（8.0 張/小時，與歷史基準 7.85
-    一致）。所以它只是藏在付費牆後面的帳號管理面板，正確處置是關掉它、不是叫人。
+    Along the way "is the second layer an account problem" was ruled out: the raw text
+    returned by `has_blocking_dialog` was "You are subscribed to the Opus tier! Your
+    subscription renews around 2026/09/18", and after that quota refilled every hour and
+    images were generated as usual (8.0 images/hour, consistent with the historical baseline
+    of 7.85). So it is just an account-management panel hidden behind the paywall, and the
+    right handling is to close it, not to call a human.
 
-    **進度判準用對話框文字，不是「按過了沒」。** 每一輪比對 `has_blocking_dialog`
-    的回傳：文字變了 ＝ 這一按有效、還有下一層可以繼續關；文字一模一樣 ＝ 這一按
-    什麼都沒改變，再按十次也一樣，直接收手讓呼叫端 reload。這是同一條「以結果為準」
-    的規則往前推一步——沒有它，一顆按不動的按鈕會白白吃掉 `max_rounds` 輪。
+    **The progress criterion is the dialog text, not "was it pressed".** Every round compares
+    `has_blocking_dialog`'s return: the text changed = that press worked and there is another
+    layer to keep closing; the text is identical = that press changed nothing, and pressing
+    ten more times would be the same, so give up and let the caller reload. This is the same
+    "the result decides" rule taken one step further — without it, a button that will not
+    press would eat `max_rounds` rounds for nothing.
 
-    **Escape 一輪只送一次、而且只送一次。** 對站方這兩層 modal 它實測 **218/218
-    無效**（13 天、真按鍵 ＋ 合成事件、三個派送目標都試過），但它是通用退路而不是
-    這個站台專用的：`verify_quota_dialog.py` 情境 12（keydown 只掛在 modal 元素上的
-    focus-trap 對話框）證明它在別的形狀上真的關得掉。拿掉它會讓那個情境退回整頁
-    reload；重複送則是純粹的副作用（Escape 在別的畫面上有別的意義）。
+    **Escape is sent once per round, and only once.** Against the site's two modal layers it
+    was measured **ineffective 218/218 times** (13 days, real key presses + synthetic events,
+    all three dispatch targets tried), but it is a generic fallback rather than one specific
+    to this site: `verify_quota_dialog.py` scenario 12 (a focus-trap dialog whose keydown hangs
+    only on the modal element) proves it really closes other shapes. Removing it would drop
+    that scenario back to a full-page reload; sending it repeatedly is pure side effect
+    (Escape means other things on other screens).
 
-    **成功率不要用 log 訊息去統計。** `WEBRunner.log` 裡「dismissed」153 筆對
-    「could not dismiss」65 筆，看起來成功率 70%——那 153 筆全是假的，來自這個函式
-    以前「在驗證之前就無條件印 dismissed」的缺陷（下面那段註解記著它）。看得出真相
-    的是一個**結構上的**矛盾：reload 只在 `not dismissed` 時才會發生，而每一天的
-    reload 次數都剛好等於當天的嘗試次數，包括那些「成功」的日子。
+    **Do not compute the success rate from log messages.** `WEBRunner.log` has 153
+    "dismissed" against 65 "could not dismiss", which looks like a 70% success rate — all 153
+    are false, coming from this function's old defect of "printing dismissed unconditionally
+    before verifying" (the comment below records it). What reveals the truth is a
+    **structural** contradiction: a reload only happens when `not dismissed`, and every day's
+    reload count exactly equals that day's attempt count, including the "successful" days.
 
-    關不掉時會去抓對話框上的控制項清單（`describe_dialog_controls`）。這不是除錯
-    殘留：關閉失敗會退化成整頁重新整理，而「站方沒放關閉鈕」與「放了但選擇器認不
-    出來」的處置完全相反，沒有這份清單就只能靠猜——在購買對話框上靠猜著放寬點選
-    規則是這裡最不該做的事。而這一次，正是那份清單（而不是任何一則 log 訊息）指出
-    真正的成因是第二層對話框。清單**每次都抓**，但只在「這個形狀第一次出現」時才
-    印出來（連同逐層的經過），理由與抓法見 `_report_dismiss_outcome`。
+    When it cannot close, it captures the list of controls on the dialog
+    (`describe_dialog_controls`). This is not leftover debugging: a failed close degrades into
+    a full-page refresh, and "the site put no close button" versus "it put one but the
+    selector cannot recognise it" call for opposite handling, so without this list it is all
+    guesswork — and loosening the click rules on a purchase dialog by guesswork is the last
+    thing to do here. And this time, it was exactly that list (not any log message) that
+    pointed to the real cause being a second dialog layer. The list is **captured every
+    time**, but only printed "the first time this shape appears" (together with the
+    layer-by-layer steps); for why and how it is captured, see `_report_dismiss_outcome`.
 
-    **這個函式自己不印任何東西**，只累積事實；敘述統一由
-    `_report_dismiss_outcome` 產出。加東西進來的時候請維持這條分工——它是「穩態下
-    每次被擋只留一行」那條性質的實作方式。
+    **This function prints nothing itself**, it only accumulates facts; the narrative is
+    produced solely by `_report_dismiss_outcome`. When adding things here, keep that division
+    of labour — it is how the property "in steady state each block leaves only one line" is
+    implemented.
     """
     escaped = False
-    seen_before = None          # 上一輪關完之後畫面上還剩的對話框文字
-    rounds: list[tuple[str, str]] = []   # (這一按是什麼, 按完的結果)
-    stop_reason = "rounds"      # 迴圈跑完都沒關掉 → 用完 round
+    seen_before = None          # the dialog text still on screen after the previous round
+    rounds: list[tuple[str, str]] = []   # (what this press was, the result after pressing)
+    stop_reason = "rounds"      # the loop ran out without closing it → rounds used up
     for _round_no in range(1, max_rounds + 1):
         try:
             plan = port.execute_script(_DISMISS_DIALOG_JS)
@@ -2774,30 +3252,32 @@ def dismiss_blocking_dialog(port, max_rounds: int = 4) -> bool:
             _note_transport_error("dismiss dialog", error)
             return False
         if plan is None:
-            # 第一輪＝本來就沒有對話框（沒有任何話要說，直接回去）；
-            # 之後＝上一輪把最後一層關乾淨了，而 `_BLOCKING_DIALOG_JS` 與挑選用的
-            # `_DISMISS_DIALOG_JS` 判準不同，所以會走到這裡。
+            # First round = there was no dialog to begin with (nothing to say, just return);
+            # later = the previous round closed the last layer cleanly, and
+            # `_BLOCKING_DIALOG_JS` and the picking `_DISMISS_DIALOG_JS` use different
+            # criteria, so it can end up here.
             if not rounds:
                 return True
             stop_reason = "closed"
             break
-        # JS 只負責**挑**，按的動作在這裡。回 'escape'（字串）＝一顆都沒挑中。
+        # JS only **picks**; the pressing happens here. 'escape' (a string) = nothing picked.
         action, how = "escape", ""
         if isinstance(plan, dict):
             action = str(plan.get("action") or "clicked:?")
             how = _click_dismiss_target(port, plan.get("el"))
-            # 用哪一種按法按下去的要寫進 log：真點選成功 vs 悄悄退回合成點選，
-            # 是判斷「這一層到底吃不吃合成事件」唯一的觀測點。
+            # Which way it was pressed must go into the log: a real click succeeding vs
+            # quietly falling back to a synthetic one is the only observation point for "does
+            # this layer respond to synthetic events at all".
             action = f"{action} [{how or 'unclickable -> escape'}]"
         if not how:
             if escaped:
                 stop_reason = "escape-spent"
-                break           # Escape 已經送過一次，再送只是副作用
+                break           # Escape was already sent once; sending it again is only side effect
             escaped = True
-            # 先試 driver 層的真按鍵：合成的 KeyboardEvent 是
-            # `isTrusted === false`，有些 focus-trap 函式庫會忽略它。port 沒有這個
-            # 方法也不算錯（測試用的假 port、其他驗證腳本的精簡 port 都可能沒有），
-            # 直接跳過往下走。
+            # Try the driver-level real key press first: a synthetic KeyboardEvent has
+            # `isTrusted === false`, and some focus-trap libraries ignore it. The port not
+            # having this method is not an error (the tests' fake ports and the slimmed-down
+            # ports of other verification scripts may lack it); just skip it and carry on.
             real_escape = getattr(port, "press_escape", None)
             if callable(real_escape):
                 try:
@@ -2810,21 +3290,25 @@ def dismiss_blocking_dialog(port, max_rounds: int = 4) -> bool:
                 _note_transport_error("dismiss dialog (escape)", error)
                 return False
         human_pause(0.6, 1.2)
-        # **判定要等驗證完才做，記錄要等整個迴圈結束才寫。** 兩件事分別修掉一個
-        # 缺陷：判定曾經在驗證之前就宣告「dismissed」（回傳值一直是對的，錯的只有
-        # 敘述——而看 log 的人是照敘述判斷的）；記錄則曾經每一輪印一行，於是每次被
-        # 擋固定產出 `max_rounds` 筆一模一樣的 `could not dismiss …（第 N/4 層）`。
-        # 現在只累積事實，敘述交給 `_report_dismiss_outcome`。
+        # **Judge only after verifying, and write the log only after the whole loop ends.**
+        # Each fixes one defect: the verdict used to announce "dismissed" before verifying
+        # (the return value was always right, only the narrative was wrong — and people
+        # reading the log judge by the narrative); the log used to print one line per round,
+        # so every block produced `max_rounds` identical `could not dismiss … (layer N/4)`
+        # lines. Now only facts are accumulated, and the narrative is left to
+        # `_report_dismiss_outcome`.
         remaining = has_blocking_dialog(port)
         if remaining is None:
             rounds.append((action, "closed"))
             stop_reason = "closed"
             break
         if seen_before is None:
-            # 第一輪沒有基準可比，所以只能說「還有對話框擋著」——不能說「換了」。
+            # The first round has no baseline to compare against, so all it can say is "a
+            # dialog is still blocking" — not "it changed".
             rounds.append((action, "still"))
         elif remaining == seen_before:
-            # 按了東西但畫面一個字都沒變 → 這一顆沒有作用，再按也一樣。
+            # Something was pressed but the screen did not change a single character → this
+            # button has no effect, and pressing again would be the same.
             rounds.append((action, "same"))
             stop_reason = "same"
             break
@@ -2836,131 +3320,161 @@ def dismiss_blocking_dialog(port, max_rounds: int = 4) -> bool:
 
 
 _DISMISS_VERDICT_TEXT = {
-    "closed": "關乾淨了",
-    "still": "還有對話框擋著",
-    "changed": "對話框換了（底下還有一層）",
-    "same": "畫面一個字都沒變",
+    "closed": "closed cleanly",
+    "still": "a dialog is still blocking",
+    "changed": "the dialog changed (there is another layer underneath)",
+    "same": "the screen did not change a single character",
 }
 _DISMISS_STOP_TEXT = {
-    "closed": "關乾淨了",
-    "same": "這一按沒有改變畫面，不再重試（避免空轉整組 round）",
-    "escape-spent": "Escape 已經送過一次，再送只是副作用；不再往下關",
-    "rounds": "連關 {max_rounds} 層仍有對話框擋著；不再往下關",
+    "closed": "closed cleanly",
+    "same": ("this press did not change the screen; not retrying (to avoid spinning through "
+             "the whole set of rounds)"),
+    "escape-spent": ("Escape was already sent once and sending it again is only side effect; "
+                     "not closing further"),
+    "rounds": "still blocked by a dialog after closing {max_rounds} layers in a row; not closing further",
 }
 
-# 「這個形狀我印過了」。key 是**摘要**不是原文：value 只是次數，整個 dict 不會隨
-# 執行時間長大到有意義的程度。**per-process 是刻意的**——重生之後重印一次是對的，
-# 那是新的行程、可能是新的程式碼、也可能是站方改版之後的第一次。
+# "I have printed this shape already". The key is a **digest**, not the raw text: the value
+# is just a count, so the whole dict never grows to any meaningful size over the run time.
+# **Per-process is deliberate** — reprinting once after a respawn is right: that is a new
+# process, possibly new code, and possibly the first time after the site changed.
 _DISMISS_LOG_SEEN: dict[str, int] = {}
 
 
 def _report_dismiss_outcome(port, rounds: list[tuple[str, str]],
                             stop_reason: str, max_rounds: int) -> None:
-    """關閉動作結束後**唯一**的記錄出口。第一次遇到某個形狀印全部，之後只印一行。
+    """The **only** log exit once the dismiss action has finished. The first time a given
+    shape is met it prints everything; after that, one line.
 
-    **為什麼要收敘述。** 分層關閉（規則 3）上線後（09-07 17:17 起）實測 25 個被擋
-    區塊 **0 次關得掉**，每一個區塊固定產出 2 行
-    `could not dismiss …（第 N/4 層）`（合計 50 行）外加一整份控制項清單——完全可
-    預測、資訊量為零，而且會隨 `max_rounds` 等比例長大。這正是 `discord_bot.log`
-    那 13,516/14,085 行 `rpc apply -> ok`（96%）的開頭形狀，而 `trim_log` 只留尾段：
-    **一個把有用訊息趕出記錄檔的記錄比不記錄還糟。**
+    **Why the narrative is condensed.** After layered dismissing (rule 3) went live (from
+    09-07 17:17), 25 blocked stretches were measured with **0 successful closes**, each one
+    producing a fixed 2 lines of `could not dismiss … (layer N/4)` (50 lines in total) plus a
+    whole control list — entirely predictable, zero information, and growing in proportion to
+    `max_rounds`. This is exactly the opening shape of `discord_bot.log`'s 13,516/14,085 lines
+    of `rpc apply -> ok` (96%), and `trim_log` keeps only the tail: **a log that pushes the
+    useful messages out of the log file is worse than no log.**
 
-    **收的是敘述，不是迴圈。** 迴圈是通用退路（`verify_quota_dialog.py` 情境 12
-    證明它在別的對話框形狀上真的關得掉），嘗試次數一次都沒有減少。
+    **What is condensed is the narrative, not the loop.** The loop is a generic fallback
+    (`verify_quota_dialog.py` scenario 12 proves it really closes other dialog shapes), and
+    not a single attempt was removed.
 
-    三條性質，缺一不可：
+    Three properties, none of which can be dropped:
 
-    1. **穩態下每次被擋只印一行**，而且行數不隨 `max_rounds` 成長。
-    2. **「關掉了」與「關不掉」仍然分得出來**——兩條路都帶著 `dismissed` /
-       `could not dismiss` 這兩個既有的可 grep 字串（歷史統計是照它們數的）。
-    3. **第一次遇到某個形狀仍然有完整資訊**：逐層的按法與結果、收手的理由、控制項
-       清單，一個都不少。
+    1. **In steady state each block prints only one line**, and the line count does not grow
+       with `max_rounds`.
+    2. **"Closed it" and "could not close it" can still be told apart** — both paths carry
+       the existing greppable strings `dismissed` / `could not dismiss` (historical
+       statistics are counted by them).
+    3. **The first time a shape is met there is still full information**: the press and the
+       result of each layer, the reason for giving up, the control list — nothing missing.
 
-    **形狀的定義包含控制項清單，這一點是載重的。** 09-07 那次「其實關掉了第一層、
-    露出第二層」的突破，靠的不是任何一則訊息，而是清單裡的**對話框尺寸**變了
-    （856x917 → 420x322）。所以清單照樣每次抓（失敗路徑一個額度週期最多一次，成本
-    無關緊要），只是拿它一起算形狀：站方改版 → 形狀變 → 自動恢復完整記錄。
-    只有成功路徑不抓（`happy path` 不該多付一次 JS 往返）。
+    **The shape's definition includes the control list, and that is load-bearing.** The
+    09-07 breakthrough of "it had actually closed the first layer, exposing a second" came
+    not from any message, but from the **dialog size** in the list changing (856x917 →
+    420x322). So the list is still captured every time (the failure path runs at most once
+    per quota cycle, so its cost does not matter), it is just folded into the shape: the site
+    changes → the shape changes → full logging resumes automatically.
+    Only the success path does not capture it (the `happy path` should not pay for an extra
+    JS round-trip).
     """
     dismissed = stop_reason == "closed"
     head = "dismissed" if dismissed else "could not dismiss"
-    # 成功就不抓清單（多一次 JS 往返沒有意義）；失敗一定抓，而且抓到的內容要算進
-    # 形狀裡——見 docstring。
+    # On success the list is not captured (an extra JS round-trip is pointless); on failure
+    # it is always captured, and what is captured counts towards the shape — see the
+    # docstring.
     inventory = "" if dismissed else describe_dialog_controls(port)
     shape = "|".join(f"{a}>{v}" for a, v in rounds) + f"#{stop_reason}#{inventory}"
     key = hashlib.sha256(shape.encode("utf-8")).hexdigest()[:16]
     seen = _DISMISS_LOG_SEEN.get(key, 0) + 1
     _DISMISS_LOG_SEEN[key] = seen
     if seen > 1:
-        print(f"  [quota] {head} blocking dialog（{len(rounds)} 層；本行程第 "
-              f"{seen} 次遇到同一個形狀 {key}，逐層經過與第 1 次相同，不再重印）")
+        print(f"  [quota] {head} blocking dialog ({len(rounds)} layers; occurrence {seen} of "
+              f"the same shape {key} in this process, layer-by-layer steps identical to "
+              f"occurrence 1, not reprinted)")
         return
-    print(f"  [quota] {head} blocking dialog（{len(rounds)} 層，形狀 {key}）："
+    print(f"  [quota] {head} blocking dialog ({len(rounds)} layers, shape {key}): "
           + _DISMISS_STOP_TEXT[stop_reason].format(max_rounds=max_rounds))
     for i, (action, verdict) in enumerate(rounds, 1):
-        print(f"  [quota]   第 {i} 層 via {action!r} → "
+        print(f"  [quota]   layer {i} via {action!r} → "
               + _DISMISS_VERDICT_TEXT[verdict])
     if dismissed:
         return
     if inventory:
         print("  [quota] " + inventory)
     else:
-        print("  [quota] 對話框控制項清單取不到——對話框在這一瞬間消失了，"
-              "或 JS 打不通。")
+        print("  [quota] the dialog control list could not be obtained — the dialog vanished "
+              "at that instant, or JS could not get through.")
 
 
 def wait_for_quota_recovery(port, batch_cfg: dict, *, label: str,
                             waited_sec: float = 0.0,
                             on_reload=None, on_idle=None) -> float:
-    """額度用完時：關掉對話框 → 等一段時間 → 回到呼叫端重試同一張圖。
+    """When quota runs out: close the dialog → wait a while → return to the caller to retry
+    the same image.
 
-    回傳「累計已等待的秒數」，呼叫端要把它傳回來，好讓 `quota_wait_max_sec`
-    的上限跨多輪累積。呼叫端要拿「上一輪等了多久」的話，取**回傳值與傳入值的
-    差**即可（`generate_loop` 就是這樣把它寫進 `quota_resumed.last_wait_sec`）
-    ——那是定義上就正確的，不必在呼叫端自己再讀一次設定。
+    Returns "the total seconds waited so far"; the caller must pass it back in, so that the
+    `quota_wait_max_sec` cap accumulates across rounds. A caller that wants "how long the
+    last round waited" just takes **the difference between the return value and the value
+    passed in** (that is how `generate_loop` writes it into `quota_resumed.last_wait_sec`) —
+    that is correct by definition, and the caller need not read the config again itself.
 
-    **`quota_wait_poll_sec` 不是吞吐量旋鈕。** 見下面的實測，別再為了跑快一點
-    去調它。
+    **`quota_wait_poll_sec` is not a throughput knob.** See the measurements below; stop
+    tuning it to go a bit faster.
 
-    設計重點（每一條都是刻意的）：
-    - **不結束行程**。等待整段發生在 `generate_loop` 裡面，所以監督者看不到
-      任何 rc、不會重生、不會重跑登入 ＋ setup。使用者要的「自動等到額度回復」
-      只有在行程活著的時候才成立。
-    - **不計入 `consecutive_fail_abort`**。被擋住不是失敗，是「還沒輪到」。
-    - **輪詢間隔固定（`quota_wait_poll_sec`），而且不要改成退避。** 2026-09-07
-      量過：`events.ndjson` 裡 214 個 `quota_blocked`（08-24 → 09-07）剛好橫跨
-      兩個設定值——08-25 07:10 之前是約 14 分鐘，之後是約 60 分鐘。以「同一個角色
-      相鄰兩次 `quota_blocked` 之間」為窗口、`image_index` 差為產出：
-      短輪詢期（窗口中位 14.3 分，n=43）**7.87 張/小時**、長輪詢期（窗口中位
-      67.8 分，n=151）**7.84 張/小時**——194 個窗口、兩週，差 0.4%。
-      （重算時要套同一個過濾：只取長度 ≤ 2 小時的窗口。長輪詢原始有 153 個，其中
-      一個長 36.5 小時只產 6 張，那是已知的 36 小時**停機**空窗、不是額度窗口；
-      不濾掉會把總和法拉到 6.50、結論整個反過來。中位數不受影響。）
-      全部 196 個窗口裡，**速率**的變異係數是 0.131 而**張數**是 0.427，窗口長度
-      與張數的相關 r=0.118：不變的是速率、會變的是張數，這是「持續滴入」而不是
-      「整點發一批」的形狀。也就是說**上限在帳號那一側，輪詢間隔完全影響不到它**。
-      調短只會把同樣的圖切成更多更小的爆發，而每一次醒來都要付一次
-      `dismiss_blocking_dialog`、實測 218/218 都關不掉而落到整頁 reload ＋
-      `on_reload` 重填——那正是這個專案出過最嚴重的一次故障（欄位部分沒填回去、
-      安靜地用錯提示詞燒掉 10 張圖 / 兩小時）的觸發路徑。從一天約 24 次醒來變成
-      約 200 次，是**下檔真實、上檔為零**。
-    - **等待期間照樣尊重暫停標記**（`wait_if_paused`），`/stop` 也照樣殺得掉。
-    - 每一輪重新關一次對話框：站方常常在等待期間又跳一次。
-    - `quota_wait_max_sec` 為 0 ＝ 無上限；設了正值且超過就丟
-      `GenerationBlockedError`，退回「乾淨停止、不重生」那條路（那代表這不是
-      會自己回補的額度，而是方案／帳號問題）。
-    - **`on_reload` 只在真的 reload 過之後才呼叫。** reload 會把頁面狀態打回站方
-      持久化的版本，剛填好、站方還沒存起來的提示詞會整段消失。呼叫端用它把欄位
-      重填回去；沒 reload 就沒動到狀態，不必付這個成本。實測依據見下面。
-    - **每個睡眠切片跑一次存活探測**（`_probe_browser_alive`）。這一整輪預設一小時
-      不對 driver 下任何指令，所以瀏覽器在等待期間死掉的話，要到等完之後的第一個
-      指令才會發現——最久晚一個小時，死亡時刻在那個區間裡完全不可知。探測把它釘在
-      30 秒內。**只記錄、不當場重啟**，理由見那支的 docstring。
-    - **`on_idle` 每個睡眠切片跑一次**，讓等待期間仍然服務得到插播的單圖請求。
-      沒有它的話，這一整段（預設一小時）對使用者是完全沒有反應的：bot 那邊的
-      `_SINGLE_IMAGE_PENDING_TTL_SEC` 只有 600 秒，十分鐘後就會把請求當成
-      「webrunner 沒服務就退出了」掃掉。而額度用完在這個帳號上是常態——實測一個
-      週期約 68 分鐘、其中 60 分鐘在等——等於使用者的即時產圖幾乎永遠會逾時。
+    Design points (every one of them deliberate):
+    - **Does not end the process**. The whole wait happens inside `generate_loop`, so the
+      supervisor sees no rc, does not respawn, and does not rerun login + setup. The
+      "automatically wait until quota recovers" users want only holds while the process is
+      alive.
+    - **Does not count towards `consecutive_fail_abort`**. Being blocked is not a failure, it
+      is "not your turn yet".
+    - **The poll interval is fixed (`quota_wait_poll_sec`), and must not become a backoff.**
+      Measured 2026-09-07: the 214 `quota_blocked` in `events.ndjson` (08-24 → 09-07)
+      happen to straddle two settings — about 14 minutes before 08-25 07:10, about 60 minutes
+      after. Taking "between two adjacent `quota_blocked` of the same character" as the
+      window and the `image_index` difference as output: the short-poll period (median window
+      14.3 minutes, n=43) did **7.87 images/hour**, the long-poll period (median window 67.8
+      minutes, n=151) **7.84 images/hour** — 194 windows, two weeks, a 0.4% difference.
+      (Apply the same filter when recomputing: only windows ≤ 2 hours long. The long-poll
+      period originally had 153, one of which was 36.5 hours long with only 6 images — the
+      known 36-hour **downtime** gap, not a quota window; not filtering it out drags the
+      sum-based figure to 6.50 and flips the conclusion entirely. The median is unaffected.)
+      Across all 196 windows, the coefficient of variation of the **rate** is 0.131 while
+      that of the **image count** is 0.427, and the correlation between window length and
+      image count is r=0.118: what stays constant is the rate, what varies is the count —
+      the shape of a "steady trickle", not a "batch released on the hour". In other words
+      **the cap is on the account side, and the poll interval cannot affect it at all**.
+      Shortening it only slices the same images into more, smaller bursts, and every wake-up
+      pays for a `dismiss_blocking_dialog`, which was measured to fail 218/218 times and fall
+      back to a full-page reload + an `on_reload` refill — exactly the trigger path of the
+      most serious failure this project has had (fields partly not refilled, quietly burning
+      10 images / two hours with the wrong prompt). Going from about 24 wake-ups a day to
+      about 200 is **real downside, zero upside**.
+    - **The pause marker is still honoured during the wait** (`wait_if_paused`), and `/stop`
+      can still kill it.
+    - The dialog is closed again every round: the site often pops it up again during the
+      wait.
+    - `quota_wait_max_sec` of 0 = no cap; when set positive and exceeded it raises
+      `GenerationBlockedError`, falling back to the "stop cleanly, no respawn" path (that
+      means this is not a quota that refills by itself, but a plan / account problem).
+    - **`on_reload` is only called after a reload actually happened.** A reload knocks the
+      page state back to the version the site persisted, and a prompt just filled in that
+      the site has not saved yet vanishes entirely. The caller uses it to refill the fields;
+      with no reload the state was not touched, and there is no need to pay that cost. See
+      below for the measured basis.
+    - **A liveness probe runs once per sleep slice** (`_probe_browser_alive`). A whole round
+      issues no command at all to the driver for an hour by default, so if the browser dies
+      during the wait, it is only found at the first command after the wait — up to an hour
+      late, with the moment of death completely unknowable within that span. The probe pins
+      it down to within 30 seconds. **It only records, and does not restart on the spot**;
+      for why, see that function's docstring.
+    - **`on_idle` runs once per sleep slice**, so interjected single-image requests are still
+      served during the wait. Without it this whole stretch (an hour by default) is
+      completely unresponsive to the user: the bot's `_SINGLE_IMAGE_PENDING_TTL_SEC` is only
+      600 seconds, so after ten minutes it sweeps the request away as "the webrunner exited
+      without serving it". And running out of quota is the norm on this account — measured,
+      one cycle is about 68 minutes, 60 of them spent waiting — which means the user's
+      instant image generation would almost always time out.
     """
     poll = float(batch_cfg.get("quota_wait_poll_sec", 3600.0))
     cap = float(batch_cfg.get("quota_wait_max_sec", 0.0))
@@ -2971,33 +3485,39 @@ def wait_for_quota_recovery(port, batch_cfg: dict, *, label: str,
             f"that refills — stopping instead of respawning.")
     dismissed = dismiss_blocking_dialog(port)
     if not dismissed:
-        # 關不掉：重新整理頁面。modal 是頁面狀態，reload 一定清得掉；登入用的是
-        # 持久化 cookie，所以 reload 不會把我們登出。
+        # Could not close it: refresh the page. A modal is page state, so a reload always
+        # clears it; login uses a persisted cookie, so a reload does not log us out.
         print("  [quota] dialog would not close; reloading the page")
         try:
             port.refresh()
         except port.TRANSPORT_ERRORS as error:
             _note_transport_error("reload after blocked dialog", error)
         time.sleep(8.0)
-        # reload 之後**必須**把欄位填回去。實測（`WEBRunner.log`
-        # 2026-08-24～08-27，65 次 reload）：61 次是在「這個角色已經存過圖」
-        # 之後發生的，全部順利接回去；唯一一次發生在角色剛填完欄位、還沒產出
-        # 任何一張圖的時候，接下來每一次 Generate 都無聲無息——沒有對話框、
-        # `get_main_image_src` 整整 180 秒都回 None——連燒 10 張圖、兩個小時，
-        # 直到 `consecutive_fail_abort` 才收工，而且 abort 訊息還誤指是
-        # 「Chrome 崩潰」。差別就在站方有沒有來得及把剛填的提示詞持久化。
-        # 這不只是卡住的問題：欄位**部分**被打回去（例如只掉了 Character 2）
-        # 會安靜地產出一整批用錯提示詞的圖，那比停下來糟得多。
+        # After a reload the fields **must** be refilled. Measured (`WEBRunner.log`
+        # 2026-08-24 to 08-27, 65 reloads): 61 happened after "this character had already
+        # saved images", and all picked up smoothly; the only exception happened right after
+        # the character's fields were filled and before a single image was produced, and every
+        # Generate after that silently did nothing — no dialog, `get_main_image_src` returning
+        # None for a full 180 seconds — burning 10 images and two hours in a row until
+        # `consecutive_fail_abort` shut it down, with the abort message even wrongly blaming
+        # "Chrome crashed". The difference was whether the site had managed to persist the
+        # prompt just filled in.
+        # This is not just about getting stuck: fields being **partly** knocked back (e.g.
+        # only Character 2 lost) quietly produces a whole batch of images with the wrong
+        # prompt, which is far worse than stopping.
         if on_reload is not None:
             on_reload()
-    # 事件節流：目標是「大約每小時一則」，免得長時間等待把頻道洗版。輪數要**跟著
-    # `poll` 換算**、不能寫死——原本寫死每 6 輪（配 10 分鐘輪詢剛好一小時），
-    # 預設一改成 1 小時就會變成六小時才回報一次。**跳過第 0 輪**——呼叫端已經在
-    # 被擋的當下發過 `quota_blocked`，同一時刻再發一則等於連貼兩句一樣的話。
+    # Event throttling: the goal is "about one per hour", so a long wait does not flood the
+    # channel. The round count must be **derived from `poll`**, not hard-coded — it used to
+    # be hard-coded to every 6 rounds (exactly an hour with a 10-minute poll), and once the
+    # default became 1 hour that turned into one report every six hours. **Round 0 is
+    # skipped** — the caller already emitted `quota_blocked` at the moment of being blocked,
+    # and another one at the same moment would be posting the same thing twice.
     #
-    # 這一段的前提是**每一輪等長**，而那個前提成立：`batch_cfg` 是 `run_batch`
-    # 每個角色重讀一次、再整份傳進 `generate_loop` 的，一次額度等待的累計完全
-    # 落在同一個角色之內，所以 `poll` 不可能在累計途中換值。
+    # This relies on **every round being the same length**, and that premise holds:
+    # `batch_cfg` is re-read by `run_batch` once per character and passed whole into
+    # `generate_loop`, and the total of one quota wait falls entirely within one character,
+    # so `poll` cannot change value partway through the total.
     every = max(1, round(3600.0 / poll)) if poll > 0 else 1
     cycle = int(waited_sec // poll) if poll > 0 else 0
     if cycle > 0 and cycle % every == 0:
@@ -3005,28 +3525,34 @@ def wait_for_quota_recovery(port, batch_cfg: dict, *, label: str,
                    next_retry_sec=round(poll, 1))
     print(f"  [quota] generation blocked during {label}; waited "
           f"{waited_sec / 60:.0f} min so far, retrying in {poll / 60:.0f} min")
-    # 切片睡：讓暫停標記與 `/stop` 有機會在等待中生效，而不是卡滿一整輪。
+    # Sleep in slices: gives the pause marker and `/stop` a chance to take effect during the
+    # wait, instead of blocking for a whole round.
     remaining = poll
     browser_alive = True
     while remaining > 0:
         wait_if_paused(f"{label} (quota wait)")
-        # 存活探測。放在切片的最前面：它是這裡最便宜的一次 round-trip，先問它才
-        # 能把死亡時刻釘在 30 秒內，而不是等 `on_idle` 先吐出一堆連帶的失敗訊息。
-        # **只記「活著 → 死了」那個轉換**：這個迴圈預設跑 120 圈，每圈都印一行就
-        # 等於沒有訊號（本專案已經記過兩次同一條原則）。同理不發事件——那會把對話
-        # 平台洗版，而且新事件型別要三邊對拉，這裡的價值是可診斷性，log 就夠了。
+        # Liveness probe. It goes at the very start of the slice: it is the cheapest
+        # round-trip here, and asking it first pins the moment of death to within 30 seconds,
+        # instead of waiting for `on_idle` to spit out a pile of knock-on failure messages
+        # first. **Only the "alive → dead" transition is logged**: this loop runs 120 turns
+        # by default, and a line per turn is no signal at all (this project has recorded the
+        # same principle twice). Likewise no event is emitted — that would flood the chat
+        # platform, and a new event type needs all three sides pulled together; the value
+        # here is diagnosability, and the log is enough.
         gone = _probe_browser_alive(port)
         if gone is None:
             browser_alive = True
         elif browser_alive:
             browser_alive = False
             elapsed = poll - remaining
-            print(f"  [quota] {time.strftime('%Y-%m-%d %H:%M:%S')} 瀏覽器在等額度"
-                  f"的期間死掉了（這一輪已等 {elapsed:.0f}s，累計 "
-                  f"{waited_sec + elapsed:.0f}s）：{gone}。這裡只記錄、不當場重啟"
-                  f"——重啟要重新登入並重填欄位，交給既有的復原流程在原本的時機跑。",
+            print(f"  [quota] {time.strftime('%Y-%m-%d %H:%M:%S')} the browser died while "
+                  f"waiting for quota (waited {elapsed:.0f}s this round, "
+                  f"{waited_sec + elapsed:.0f}s in total): {gone}. Only recording it, not "
+                  f"restarting on the spot — a restart means logging in again and refilling "
+                  f"the fields, so it is left to the existing recovery flow at its usual time.",
                   file=sys.stderr)
-        # 等額度的這一小時裡照樣要對使用者有反應，見 docstring 的 `on_idle`。
+        # Stay responsive to the user during this hour of waiting for quota; see `on_idle`
+        # in the docstring.
         if on_idle is not None:
             on_idle()
         slice_sec = min(30.0, remaining)
@@ -3036,17 +3562,19 @@ def wait_for_quota_recovery(port, batch_cfg: dict, *, label: str,
 
 
 def _abort_if_generation_blocked(port, where: str) -> None:
-    """Tier 1 命中就 raise `GenerationBlockedError`（→ 乾淨停止、不重生）。
+    """Raise `GenerationBlockedError` on a Tier 1 hit (→ stop cleanly, no respawn).
 
-    對話框全文只寫進 log（stderr）——它是站方的原始字串，不受我們控制，依
-    CLAUDE.md 保密規則不得送到對話平台。順帶：那行 log 就是回來收斂
-    `_GENERATION_BLOCK_JS` pattern 的唯一依據。
+    The dialog's full text is written only to the log (stderr) — it is the site's raw
+    string, outside our control, and under CLAUDE.md's secrecy rules must not be sent to the
+    chat platform. Incidentally, that log line is the only basis for coming back to tighten
+    the `_GENERATION_BLOCK_JS` patterns.
 
-    **文字後面那行印的是全文長度與離 `_TIER1_TEXT_CAP` 的餘裕。** 送進 log 的內容
-    一個字都沒有變多（照樣是 `slice(0, 400)`），多的只有一個整數。它要回答的問題
-    是「這道上限還剩多少餘裕」：站方的付費牆是整張定價表，多一列方案就可能跨過
-    1200，而**跨過去是靜默的**——Tier 1 直接當作沒有對話框。餘裕變成量到的數字，
-    下次就不必再猜。
+    **The line after the text prints the full length and the margin to `_TIER1_TEXT_CAP`.**
+    Not one more character of content goes into the log (it is still `slice(0, 400)`); the
+    only addition is an integer. The question it answers is "how much margin does this cap
+    have left": the site's paywall is a whole pricing table, one more plan row could cross
+    1200, and **crossing it is silent** — Tier 1 simply treats it as no dialog. With the
+    margin as a measured number, there is no need to guess next time.
     """
     hit = get_generation_block(port)
     if not hit:
@@ -3091,8 +3619,9 @@ def _is_chrome_crash_page(port) -> bool:
         url = port.current_url() or ""
         title = (port.get_title() or "").lower()
     except port.TRANSPORT_ERRORS as error:
-        # 只是卡頓 → 當作「沒崩」，照舊回落到呼叫端的失敗計數器；視窗／session
-        # 真的沒了 → `_note_transport_error` 會升級成 BrowserGoneError。
+        # Just a hiccup → treat it as "not crashed" and fall back to the caller's failure
+        # counter as before; the window / session really gone → `_note_transport_error`
+        # escalates it to BrowserGoneError.
         _note_transport_error("chrome crash probe", error)
         return False
     if "chrome-error://" in url:
@@ -3113,8 +3642,9 @@ def _try_chrome_refresh(port) -> bool:
         time.sleep(5.0)  # let the page settle before any post-snap
         return True
     except port.TRANSPORT_ERRORS as error:
-        # 這裡刻意**不**升級成 BrowserGoneError：呼叫端正要 raise 了，refresh
-        # 只是善後。壓成一行避免 chromedriver 的 Stacktrace 洗版。
+        # This deliberately does **not** escalate to BrowserGoneError: the caller is about to
+        # raise anyway, and the refresh is only clean-up. Squashed into one line so
+        # chromedriver's Stacktrace does not flood the log.
         print(f"  [warn] refresh after chrome crash failed: "
               f"{_short_error(error)}")
         return False
@@ -3152,23 +3682,27 @@ def click_via_js(port, element) -> None:
     port.execute_script("arguments[0].click();", element)
 
 
-# 同意橫幅上「拒絕」那顆的字面候選，依序完全比對。
+# The literal candidates for the "reject" button on the consent banner, matched exactly, in
+# order.
 #
-# 2026-08-30 用全新暫時 profile 實測站方首頁：橫幅上只有兩顆按鈕，字面是
-# `Accept All` 與 `Reject Non-Essential`——**站方根本沒有 `Reject All`**。
-# 原本的主要規則寫死比對 `Reject All`，所以從來沒有命中過一次；橫幅其實是靠
-# 下面那條寬鬆的「含 Reject」退路關掉的。又是一個「退路每次都被走 ＝ 主要路徑
-# 是死的」——差別在這次退路真的有效，所以外觀上完全正常。
+# Measured on the site's home page on 2026-08-30 with a brand-new temporary profile: the banner
+# has only two buttons, labelled `Accept All` and `Reject Non-Essential` — **the site has no
+# `Reject All` at all**. The original primary rule hard-coded a match on `Reject All`, so it
+# never hit even once; the banner was actually being closed by the loose "contains Reject"
+# fallback below. Yet another case of "the fallback is taken every time = the primary path is
+# dead" — the difference this time being that the fallback really works, so everything looks
+# perfectly normal.
 #
-# 為什麼還是要修：退路一旦被收緊（例如有人為了避免誤點而改成完全比對），同意
-# 處理就會無聲失效，而症狀是橫幅蓋住頁面導致的隨機點選失敗，離成因很遠。
+# Why fix it anyway: once the fallback is tightened (e.g. someone switches it to an exact
+# match to avoid misclicks), consent handling fails silently, and the symptom is random click
+# failures caused by the banner covering the page, far away from the cause.
 COOKIE_REJECT_LABELS = ("Reject Non-Essential", "Reject All")
 
 _COOKIE_CONSENT_JS = r"""
 const labels = arguments[0];
 const btns = Array.from(document.querySelectorAll('button'));
 const labelOf = b => (b.innerText || '').replace(/\s+/g, ' ').trim();
-// 1) 已知字面，完全相符。
+// 1) Known labels, exact match.
 for (const want of labels) {
   for (const b of btns) {
     if (b.offsetParent !== null && labelOf(b) === want) {
@@ -3177,7 +3711,8 @@ for (const want of labels) {
     }
   }
 }
-// 2) 退路：任何含 `Reject` 的按鈕。站方改字面時這條仍然接得住。
+// 2) Fallback: any button containing `Reject`. It still catches the case where the site
+// changes the label.
 for (const b of btns) {
   const t = labelOf(b);
   if (b.offsetParent !== null && /reject/i.test(t)) {
@@ -3185,10 +3720,12 @@ for (const b of btns) {
     return {clicked: t, present: true, ready: true};
   }
 }
-// 沒點到。回報「這一頁上到底有沒有同意提示」，讓呼叫端可以早退而不必空等
-// 到 timeout。只認**行動型**字面，而且 `^` 錨定是必要的：站方頁尾常駐一顆
-// `Manage Cookie Preferences`，少了錨定它永遠符合，早退條件就永遠不成立，
-// 這個最佳化會靜默失效（2026-08-30 實測，橫幅關掉後它仍然在）。
+// Nothing clicked. Report "is there a consent prompt on this page at all", so the caller
+// can leave early instead of waiting idly until the timeout. Only **action-type** labels
+// count, and the `^` anchor is essential: the site's footer permanently carries a
+// `Manage Cookie Preferences` button, and without the anchor it always matches, the
+// early-exit condition never holds, and this optimisation silently stops working
+// (measured 2026-08-30: it is still there after the banner is closed).
 const ACTION = /^(reject|accept|allow|agree|decline|deny)\b/i;
 let present = false;
 for (const b of btns) {
@@ -3200,21 +3737,25 @@ return {clicked: null, present: present,
 
 
 def reject_cookies(port, timeout: float = 15.0, settle: float = 2.0) -> bool:
-    """關掉 cookie 同意橫幅。沒有橫幅時**盡快**回來，不要空等到 timeout。
+    """Close the cookie consent banner. When there is no banner, return **as quickly as
+    possible** instead of waiting idly until the timeout.
 
-    正式 profile 是常駐的，同意早就存過了，所以「沒有橫幅」才是常態——實測
-    16/16 次都印 `cookie banner not found`，每次各燒滿 5 秒（登入頁）與 15 秒
-    （產圖頁），一次 setup 白花 20 秒。
+    The production profile is persistent and consent was saved long ago, so "no banner" is the
+    norm — measured, all 16/16 runs printed `cookie banner not found`, each burning the full 5
+    seconds (login page) and 15 seconds (generation page), so every setup wasted 20 seconds.
 
-    早退條件刻意保守：要 `document.readyState === 'complete'`，而且連續
-    `settle` 秒都看不到任何行動型同意按鈕才算數。橫幅存在但還不能點時
-    （present=True）條件不成立，照舊等滿 `timeout`。
+    The early-exit condition is deliberately conservative: it requires
+    `document.readyState === 'complete'`, and no action-type consent button seen for `settle`
+    consecutive seconds. When a banner is present but not yet clickable (present=True) the
+    condition does not hold, and it waits out the full `timeout` as before.
     """
-    # 兩個都量「經過多久」→ 一律走 **單調**時鐘。`time.time()` 在本機是
-    # `GetSystemTimePreciseAsFileTime()`、`adjustable=True`，NTP 的 step 修正／
-    # 手動改時鐘／虛擬機快照還原都會讓它往前或往後跳（**換時區與日光節約時間
-    # 不會**——它回的是 UTC epoch 秒）；拿它量間隔，往回跳一小時就
-    # 是這個迴圈多轉一小時，往前跳則是 settle 還沒滿就宣告「確定沒有橫幅」。
+    # Both measure "how much time has passed" → always use the **monotonic** clock.
+    # `time.time()` on this machine is `GetSystemTimePreciseAsFileTime()` with
+    # `adjustable=True`; NTP step corrections / changing the clock by hand / restoring a VM
+    # snapshot all make it jump forwards or backwards (**changing time zone and daylight
+    # saving time do not** — it returns UTC epoch seconds); measuring an interval with it, a
+    # jump back of an hour means this loop spins for an extra hour, and a jump forward
+    # declares "definitely no banner" before settle has elapsed.
     end = time.monotonic() + timeout
     quiet_since: float | None = None
     while time.monotonic() < end:
@@ -3229,8 +3770,9 @@ def reject_cookies(port, timeout: float = 15.0, settle: float = 2.0) -> bool:
             if quiet_since is None:
                 quiet_since = time.monotonic()
             elif time.monotonic() - quiet_since >= settle:
-                # 與下面的 timeout 訊息刻意不同字：一個是「確定沒有」、一個是
-                # 「等到最後仍不確定」，看 log 的人要分得出是哪一種。
+                # Deliberately worded differently from the timeout message below: one is
+                # "definitely none", the other "still unsure at the very end", and whoever
+                # reads the log must be able to tell which.
                 print("no cookie consent prompt on this page; skipping")
                 return False
         else:
@@ -3277,10 +3819,12 @@ def _find_model_trigger(port):
 
 
 def _dump_model_options(port) -> None:
-    """把下拉裡當下看得到的模型選項印進 log（stderr／log 檔，不外流到對話平台）。
+    """Print the model options currently visible in the dropdown into the log (stderr / the
+    log file, never leaking to the chat platform).
 
-    站方改寫選項字面時，這行 log 是唯一能直接看出「`model_candidates` 該改成什麼」
-    的證據——沒有它就只剩一張截圖要人工比對。純診斷，永不 raise。"""
+    When the site rewrites the option labels, this log line is the only evidence that
+    directly shows "what `model_candidates` should be changed to" — without it all that is
+    left is a screenshot to compare by hand. Purely diagnostic, never raises."""
     try:
         names = port.execute_script(
             """
@@ -3302,23 +3846,26 @@ def _dump_model_options(port) -> None:
 
 
 def select_model(port, target, timeout: float = 12.0) -> bool:
-    """在模型下拉裡選出 `target`，成功回 True。
+    """Select `target` in the model dropdown; returns True on success.
 
-    `target` 可以是單一字串，也可以是**候選字面的序列**——站方偶爾改寫選項文字
-    （這一輪就從 `V4.5 Full` 換成 `V5 Full`），依序嘗試、第一個命中就停，呼叫端
-    因此能把新舊字面一起丟進來而不必動這裡的邏輯。
+    `target` can be a single string or a **sequence of candidate labels** — the site
+    occasionally rewrites the option text (this round it changed from `V4.5 Full` to
+    `V5 Full`); they are tried in order and it stops at the first hit, so callers can pass
+    old and new labels together without touching the logic here.
 
-    比對維持「選項第一行**完全相等**」，刻意不做前綴比對：`NAI Diffusion V5`
-    這種前綴會同時命中 Full 與 Curated，選錯模型比選不到更難察覺（照樣產得出
-    圖，只是畫風不對）。
+    Matching stays "the option's first line is **exactly equal**", deliberately not a prefix
+    match: a prefix like `NAI Diffusion V5` would hit both Full and Curated, and selecting the
+    wrong model is harder to notice than selecting none (images still come out, just in the
+    wrong style).
 
-    所有候選都落空時，除了照舊 `snap()`，還會 `_dump_model_options()` 把當下看
-    得到的選項寫進 log。
+    When every candidate misses, besides `snap()` as before, `_dump_model_options()` also
+    writes the options visible at that moment into the log.
     """
     candidates = [target] if isinstance(target, str) else [t for t in target if t]
-    # 逾時是**間隔** → 單調時鐘（理由詳見 `reject_cookies`）。牆鐘往回跳會把
-    # 一次幾秒的 DOM 逾時變成幾小時的停頓——**卡住比失敗更難查**，監督者看到的
-    # 是一個還活著卻什麼都不做的行程；往前跳則讓它退化成只試一次。
+    # The timeout is an **interval** → monotonic clock (see `reject_cookies` for details). A
+    # wall clock jumping back turns a DOM timeout of a few seconds into a stall of hours —
+    # **getting stuck is harder to diagnose than failing**, since the supervisor sees a
+    # process that is alive yet doing nothing; jumping forward degrades it into a single try.
     end = time.monotonic() + timeout
     trigger = None
     while time.monotonic() < end:
@@ -3333,7 +3880,7 @@ def select_model(port, target, timeout: float = 12.0) -> bool:
     print(f"model trigger tag={trigger.tag_name} text={trigger.text[:60]!r}")
     port.click(trigger)
     human_pause(0.6, 1.1)
-    # 同上：選項出現的等待也是間隔 → 單調時鐘。
+    # Same as above: waiting for the options to appear is also an interval → monotonic clock.
     option_end = time.monotonic() + timeout
     while time.monotonic() < option_end:
         clicked = port.execute_script(
@@ -3367,28 +3914,31 @@ def select_model(port, target, timeout: float = 12.0) -> bool:
 
 
 def fill_textarea_like(port, element, text: str) -> bool:
-    """Fill textarea / input / contenteditable with `text`，atomic replace。
-    不走 `.send_keys(text)`、不走「先 clear 再寫」兩段式（會讓 React 在
-    中間 commit 空字串、之後 re-render 蓋回我們寫的值 — 觀察到主 prompt
-    填好之後又被清空就是這個 race）。
+    """Fill textarea / input / contenteditable with `text`, atomic replace.
+    Does not use `.send_keys(text)`, nor the two-step "clear, then write" (that lets React
+    commit an empty string in between and then re-render over the value we wrote — the main
+    prompt being cleared again right after it was filled is exactly this race).
 
-    機制：
-    - textarea / input：用 `Object.getOwnPropertyDescriptor(...).value.set`
-      一次寫進 value（繞過 React's value tracking）、`dispatchEvent('input')`
-      + `'change'` 讓 React 看到 user-input 事件、同步 component state、
-      最後 `blur()` 強制 commit。
-    - contenteditable：全選現有內容 → `document.execCommand('insertText', …)`。
-      這條路是 @testing-library/user-event 等框架推薦的寫法，會跑完整的
-      `beforeinput` / `input` event 序列，React 的 onChange 能正常收到。
-      execCommand 雖然 deprecated 但 Chrome 仍支援、且是目前最穩的方法。
-      退而求其次才走 `innerText = val` + dispatchEvent fallback。
+    Mechanism:
+    - textarea / input: write the value in one go with
+      `Object.getOwnPropertyDescriptor(...).value.set` (bypassing React's value tracking),
+      `dispatchEvent('input')` + `'change'` so React sees a user-input event and syncs the
+      component state, and finally `blur()` to force a commit.
+    - contenteditable: select the existing content → `document.execCommand('insertText', …)`.
+      This path is the approach recommended by frameworks such as
+      @testing-library/user-event; it runs the full `beforeinput` / `input` event sequence,
+      and React's onChange receives it normally. execCommand is deprecated, but Chrome still
+      supports it, and it is currently the most reliable method. Only as a second-best does
+      it fall back to `innerText = val` + dispatchEvent.
 
-    Anti-bot 模擬由主迴圈在「不同 fill 之間」的 `human_pause(0.8, 1.5)`
-    處理；單一 fill 內部不需要「逐字」假裝人類。
+    Anti-bot imitation is handled by the main loop's `human_pause(0.8, 1.5)` "between
+    different fills"; a single fill does not need to pretend to be a human "character by
+    character".
 
-    流程：(1) scroll + click 拿 focus (2) atomic replace 一次寫 (3) blur
-    強制 React commit (4) verify (5) 不一致就 re-click + 再寫一次 (6)
-    仍不一致只印 WARN，caller 的 `with_retry` 會再給機會。
+    Flow: (1) scroll + click to get focus (2) atomic replace in one write (3) blur to force a
+    React commit (4) verify (5) if it does not match, re-click + write once more (6) if it
+    still does not match, only print a WARN; the caller's `with_retry` gives it another
+    chance.
     """
     try:
         port.execute_script(
@@ -3404,11 +3954,12 @@ def fill_textarea_like(port, element, text: str) -> bool:
         except Exception:  # pylint: disable=broad-except  # nosec B110
             pass
     time.sleep(random.uniform(0.15, 0.35))
-    # Atomic replace（內部處理 textarea / contenteditable 兩種 path）。
+    # Atomic replace (handles both the textarea and contenteditable paths internally).
     _fill_via_native_setter(port, element, text)
-    # 寫完先收掉 autocomplete 下拉再 blur，避免下拉殘留被後續點選誤觸。
+    # After writing, close the autocomplete dropdown before blurring, so a leftover dropdown
+    # is not hit by a later click.
     _dismiss_autocomplete(port, element)
-    # Force React commit：blur 觸發 onBlur handler / component lifecycle。
+    # Force a React commit: blur triggers the onBlur handler / component lifecycle.
     try:
         port.execute_script("arguments[0].blur();", element)
     except Exception:  # pylint: disable=broad-except  # nosec B110
@@ -3428,7 +3979,7 @@ def fill_textarea_like(port, element, text: str) -> bool:
         pass
     time.sleep(random.uniform(0.2, 0.4))
     _fill_via_native_setter(port, element, text)
-    # retry 路徑同樣會重開下拉，一樣先 Escape 再 blur。
+    # The retry path reopens the dropdown too, so likewise Escape first, then blur.
     _dismiss_autocomplete(port, element)
     try:
         port.execute_script("arguments[0].blur();", element)
@@ -3441,8 +3992,8 @@ def fill_textarea_like(port, element, text: str) -> bool:
             f"  WARN: fill still mismatched after retry "
             f"({len(actual2)} vs {len(expected)} chars)"
         )
-        # 自動診斷：dump 一份 DOM textarea 屬性到 log，下次 debug 不必再
-        # 等使用者拍 screenshot 或回報。
+        # Automatic diagnosis: dump the DOM textarea attributes into the log, so the next
+        # debugging session need not wait for the user to take a screenshot or report back.
         for line in format_textareas_diag(dump_textareas_diag(port)).split("\n"):
             print(f"    {line}")
         return False
@@ -3450,14 +4001,14 @@ def fill_textarea_like(port, element, text: str) -> bool:
 
 
 def _fill_via_native_setter(port, element, text: str) -> None:
-    """Atomic replace via React-friendly mechanisms。一次寫 — 不分「clear」
-    跟「write」兩個步驟，避免 React 在中間 re-render commit 空字串。
+    """Atomic replace via React-friendly mechanisms. One write — no separate "clear" and
+    "write" steps, so React cannot re-render and commit an empty string in between.
 
-    - textarea / input：prototype value setter + input/change events
-    - contenteditable：selectNodeContents + execCommand('insertText')，
-      execCommand 失敗才 fallback 走 innerText 設定 + InputEvent
+    - textarea / input: prototype value setter + input/change events
+    - contenteditable: selectNodeContents + execCommand('insertText'); only if execCommand
+      fails does it fall back to setting innerText + an InputEvent
 
-    任何 JS exception swallow + print 一行；caller 會 verify 跟 retry。
+    Any JS exception is swallowed + one line printed; the caller verifies and retries.
     """
     try:
         port.execute_script(
@@ -3473,9 +4024,9 @@ def _fill_via_native_setter(port, element, text: str) -> None:
                 e.dispatchEvent(new Event('input', {bubbles: true}));
                 e.dispatchEvent(new Event('change', {bubbles: true}));
             } else {
-                // Contenteditable：全選 → execCommand('insertText') atomic
-                // replace。execCommand 觸發完整的 beforeinput / input event
-                // 鏈，React 的 onChange 才會 commit。
+                // Contenteditable: select all → execCommand('insertText') atomic
+                // replace. execCommand fires the full beforeinput / input event
+                // chain, which is what makes React's onChange commit.
                 try {
                     const range = document.createRange();
                     range.selectNodeContents(e);
@@ -3487,7 +4038,7 @@ def _fill_via_native_setter(port, element, text: str) -> None:
                 try { ok = document.execCommand('insertText', false, val); }
                 catch (_) { ok = false; }
                 if (!ok) {
-                    // Fallback：execCommand 拿不到的環境改 innerText 一次寫。
+                    // Fallback: where execCommand is unavailable, write innerText in one go.
                     e.innerText = val;
                     e.dispatchEvent(new InputEvent('input', {
                         bubbles: true, data: val, inputType: 'insertText'
@@ -3498,28 +4049,35 @@ def _fill_via_native_setter(port, element, text: str) -> None:
             element, text,
         )
     except Exception as error:  # pylint: disable=broad-except
-        # `_short_error`：`fill_textarea_like` 一次填寫最多呼叫它兩次（初寫 ＋
-        # 比對不符的重寫），而填寫本身又被 `with_retry` 包著重試。
+        # `_short_error`: `fill_textarea_like` calls this at most twice per fill (the first
+        # write + the rewrite after a mismatch), and the fill itself is wrapped in
+        # `with_retry` retries.
         print(f"  _fill_via_native_setter exception: {_short_error(error)}",
               file=sys.stderr)
 
 
 def driver_version_line(capabilities) -> str:
-    """把「這次 session 真的用到的」瀏覽器與 driver 版本組成一行。永不 raise。
+    """Put the browser and driver versions "this session really used" into one line. Never
+    raises.
 
-    版本一律從 driver 自己回報的 capabilities 取，不去查登錄檔或執行檔——要記的是
-    **這次 spawn 實際接上的那兩個東西**，不是「機器上裝了什麼」。取不到就是 `?`。
+    Versions always come from the capabilities the driver reports itself, not from the
+    registry or the executables — what matters is **the two things this spawn actually
+    connected to**, not "what is installed on the machine". Anything unavailable is `?`.
 
-    主版號不同時多加一句警告。那條路正常情況下走不到（chromedriver 拒絕驅動不同主版
-    號的 Chrome，spawn 會先失敗），留著是因為它便宜、而且萬一哪天那個檢查放寬了，
-    這正是當下唯一想看到的東西。
+    When the major versions differ, a warning is appended. That path is normally unreachable
+    (chromedriver refuses to drive a Chrome with a different major version, so the spawn fails
+    first); it stays because it is cheap, and should that check ever be relaxed, it is exactly
+    the one thing one would want to see at that moment.
 
-    **鍵名的來源，說清楚免得被當成已驗證**：`browserVersion` 是 W3C 的標準能力名，
-    在裝著的 selenium 原始碼裡查得到（`options.py` 的 `_BaseOptionsDescriptor`）；
-    `chromedriverVersion` 是 chromedriver 自己塞在 `chrome` 子字典裡回來的，
-    **沒有辦法在不開瀏覽器的情況下實測**——而這台機器上正式批次幾乎總是在跑，開第二個
-    Chrome 正是 `_chrome_slot` 存在的理由。所以這裡的設計是「猜錯也不會壞」：取不到就
-    印 `?`，那一行本身就會告訴你鍵名該修了，而且絕不影響已經成功的 spawn。
+    **Where the key names come from, spelled out so they are not taken as verified**:
+    `browserVersion` is the W3C standard capability name, findable in the installed selenium
+    source (`options.py`'s `_BaseOptionsDescriptor`); `chromedriverVersion` is put by
+    chromedriver itself into the `chrome` sub-dict it returns, and **cannot be measured
+    without opening a browser** — and on this machine a production batch is almost always
+    running, while opening a second Chrome is exactly why `_chrome_slot` exists. So the
+    design here is "a wrong guess breaks nothing": anything unavailable prints `?`, that line
+    itself tells you the key name needs fixing, and it never affects a spawn that already
+    succeeded.
     """
     caps = capabilities if isinstance(capabilities, dict) else {}
     browser = str(caps.get("browserVersion") or "?").strip() or "?"
@@ -3532,29 +4090,35 @@ def driver_version_line(capabilities) -> str:
     b_major, _, _ = browser.partition(".")
     d_major, _, _ = driver.partition(".")
     if b_major.isdigit() and d_major.isdigit() and b_major != d_major:
-        line += "  ** 主版號不符 **"
+        line += "  ** major version mismatch **"
     return line
 
 
 def log_driver_versions(capabilities) -> str:
-    """印出 `driver_version_line(...)` 並回傳它。永不 raise——這是 spawn 成功之後的
-    一行紀錄，不得有任何機會把成功的 spawn 變成失敗。
+    """Print `driver_version_line(...)` and return it. Never raises — this is a one-line
+    record after a successful spawn, and must not have any chance of turning a successful
+    spawn into a failure.
 
-    **為什麼值得一行**：Chrome 從 2026 年 9 月起改成**兩週一個主版本**，而
-    chromedriver 的主版號必須完全相符，否則 `webdriver.Chrome(...)` 丟
-    `SessionNotCreatedException`。本專案 2026-08-25 真的踩過一次，log 裡只有
-    `Chrome spawn attempt 1/3 failed: SessionNotCreatedException()`，別的什麼都沒有。
-    ⚠️ **這支函式原本的理由寫著「那個例外的訊息是空的」——2026-09-12 實測推翻，
-    已撤回。** 空的是 `args`，不是訊息：selenium 把訊息放在 `self.msg`，所以
-    `repr(e)` 回 `SessionNotCreatedException()` 而 `str(e)` 有 351 字元、含兩邊
-    版本號。那一行 log 是被**我們自己的 `{err!r}` 格式**丟掉的，2026-09-12 改由
-    `full_error_detail` 處理。**這件事本身是一課**：一個「診斷資料不存在」的結論，
-    在補新的診斷之前要先確認不是自己的格式化把它吃掉了——否則補上去的新機制會
-    掩蓋掉原缺陷，而原缺陷還在別的路徑上活著（實測當時還有 7 個同形狀的站點）。
-    這一行仍然值得留著，但理由換了：它在 spawn **成功**時就先把版本記下來，所以
-    失敗那一刻不必仰賴任何例外格式化，而且 `restart_chrome_every_n_characters`
-    預設 1 ＝ 每個角色都會重新記一次。這台機器無人值守跑好幾天，log 是唯一的鑑識
-    紀錄。
+    **Why it is worth a line**: from September 2026 Chrome moved to **a major version every
+    two weeks**, and chromedriver's major version must match exactly, otherwise
+    `webdriver.Chrome(...)` raises `SessionNotCreatedException`. This project really hit that
+    on 2026-08-25, and the log held only
+    `Chrome spawn attempt 1/3 failed: SessionNotCreatedException()`, nothing else.
+    ⚠️ **This function's original rationale said "that exception's message is empty" — it was
+    overturned by measurement on 2026-09-12 and has been withdrawn.** What is empty is
+    `args`, not the message: selenium puts the message in `self.msg`, so `repr(e)` returns
+    `SessionNotCreatedException()` while `str(e)` has 351 characters, including both version
+    numbers. That log line was thrown away by **our own `{err!r}` format**, and since
+    2026-09-12 it is handled by `full_error_detail`. **This is a lesson in itself**: before
+    adding new diagnostics for a conclusion of "the diagnostic data does not exist", first
+    confirm that your own formatting did not eat it — otherwise the new mechanism masks the
+    original defect, while the original defect lives on in other paths (measured at the
+    time: 7 more sites of the same shape).
+    This line is still worth keeping, but for a different reason: it records the versions as
+    soon as a spawn **succeeds**, so the moment of failure need not depend on any exception
+    formatting, and `restart_chrome_every_n_characters` defaults to 1 = recorded afresh for
+    every character. This machine runs unattended for days, and the log is the only forensic
+    record.
     """
     line = driver_version_line(capabilities)
     print(f"  [driver] {line}")
@@ -3562,13 +4126,15 @@ def log_driver_versions(capabilities) -> str:
 
 
 def _dismiss_autocomplete(port, element) -> None:
-    """收掉 NovelAI 的 tag autocomplete 下拉。
+    """Close NovelAI's tag autocomplete dropdown.
 
-    寫完字後游標停在文字尾端，NovelAI 會對最後一個 token 彈出建議下拉；
-    不關掉的話，後續的座標點選（展開 Character 區塊、按 Generate…）可能
-    誤觸下拉，把一個建議 tag 插進 prompt 尾端。合成 Escape 帶 keyCode/
-    which=27 以相容 React legacy 事件處理。失敗 swallow — 下拉沒收掉
-    也不能炸 run，產圖前的 verify_character_prompt 是第二道防線。"""
+    After typing, the caret sits at the end of the text and NovelAI pops up a suggestion
+    dropdown for the last token; if it is not closed, later coordinate clicks (expanding the
+    Character section, pressing Generate…) may hit the dropdown and insert a suggested tag at
+    the end of the prompt. The synthetic Escape carries keyCode/which=27 for compatibility
+    with React's legacy event handling. Failures are swallowed — a dropdown left open must not
+    blow up the run either; verify_character_prompt before generation is the second line of
+    defence."""
     try:
         port.execute_script(
             """
@@ -3610,19 +4176,21 @@ def fill_main_prompt(port, text: str) -> bool:
 def find_undesired_textarea(port):
     """Locate the main "Undesired Content" textarea on NovelAI.
 
-    NovelAI 的 React DOM 把 styled-component class 名混淆掉了，每次 deploy
-    都會變，所以這裡用三層 fallback 來找：
-      1. textarea / contenteditable 且 `aria-label` 含 "undesired"
-      2. 同樣的元素但用 `placeholder` 比對
-      3. 找文字 "Undesired Content" 的 label，往下找下一個 textarea
+    NovelAI's React DOM obfuscates the styled-component class names, and they change with
+    every deploy, so this looks for it with three layers of fallback:
+      1. textarea / contenteditable whose `aria-label` contains "undesired"
+      2. the same elements, but matched by `placeholder`
+      3. find the label with the text "Undesired Content", then the next textarea after it
 
-    **排除主 prompt 元素**（`find_prompt_areas()` 第一個可見項）— 觀察到
-    部分 deploy 的主 prompt placeholder 含 "undesired"（顯示「Add a prompt
-    or click to choose Undesired Content...」之類的提示），會誤命中。所以
-    任何 step 配對到 main prompt 那個 element 直接 reject、繼續找下一個。
+    **The main prompt element is excluded** (the first visible item of `find_prompt_areas()`)
+    — it has been observed that on some deploys the main prompt's placeholder contains
+    "undesired" (showing a hint along the lines of "Add a prompt or click to choose Undesired
+    Content..."), which would be a false hit. So any step that matches the main prompt's
+    element rejects it outright and keeps looking for the next one.
 
-    全部失敗就 `snap()` 拍張 debug 圖回 None；caller 應該把這當「跳過 fill」
-    而不是 abort 整個 run（NovelAI 會沿用上一輪殘留的 undesired 值）。
+    If everything fails it `snap()`s a debug image and returns None; the caller should treat
+    that as "skip the fill" rather than abort the whole run (NovelAI keeps the undesired
+    value left over from the previous round).
     """
     main_areas = find_prompt_areas(port)
     main_area = main_areas[0] if main_areas else None
@@ -3634,7 +4202,7 @@ def find_undesired_textarea(port):
             return False
         return True
 
-    # 1. aria-label（最穩，NovelAI 普遍會帶）
+    # 1. aria-label (the most reliable; NovelAI generally sets it)
     candidates = port.find_elements_xpath(
         "//*[(self::textarea or @contenteditable='true')"
         " and contains("
@@ -3654,8 +4222,8 @@ def find_undesired_textarea(port):
     for el in candidates:
         if _acceptable(el):
             return el
-    # 3. 'Undesired Content' label 之後第一個 textarea / contenteditable，
-    # 用 XPath `following::` axis 直接抓，不必爬 DOM tree。
+    # 3. The first textarea / contenteditable after the 'Undesired Content' label, grabbed
+    # directly with the XPath `following::` axis, with no need to climb the DOM tree.
     candidates = port.find_elements_xpath(
         "//*[normalize-space(text())='Undesired Content']"
         "/following::*[self::textarea or @contenteditable='true'][1]"
@@ -3664,7 +4232,8 @@ def find_undesired_textarea(port):
         if _acceptable(el):
             return el
     snap(port, "no_undesired_textarea")
-    # 自動診斷：找不到時直接 dump，讓 selector 調整有依據。
+    # Automatic diagnosis: dump straight away when nothing is found, so selector adjustments
+    # have something to go on.
     print("find_undesired_textarea: no acceptable element after 3 fallbacks")
     for line in format_textareas_diag(dump_textareas_diag(port)).split("\n"):
         print(f"  {line}")
@@ -3672,9 +4241,10 @@ def find_undesired_textarea(port):
 
 
 def fill_main_undesired(port, text: str) -> bool:
-    """Fill NovelAI 主 undesired content（negative prompt）textarea。
-    找不到時回 False、不丟例外、不 abort run — caller 應該繼續產圖、
-    NovelAI 會用上一輪殘留的值。空字串 `text` 仍會去 clear 該 textarea。"""
+    """Fill NovelAI's main undesired content (negative prompt) textarea.
+    Returns False when it cannot be found — no exception, no aborting the run; the caller
+    should keep generating, and NovelAI uses the value left over from the previous round. An
+    empty `text` still clears that textarea."""
     el = find_undesired_textarea(port)
     if el is None:
         return False
@@ -3691,15 +4261,19 @@ def fill_main_undesired(port, text: str) -> bool:
 
 
 def _click_gender(port, gender: str, timeout: float = 4.0) -> bool:
-    """點加角色之後跳出的性別選項（V4.5：Female／Male／…；V5：Female／Male／Other）。
+    """Click the gender option that pops up after adding a character (V4.5: Female / Male /
+    …; V5: Female / Male / Other).
 
-    不用 JS 的 `el.click()`：那個選單跟取樣器下拉一樣可能只聽 mousedown，JS click
-    會**靜默無效**（見 `robust_click`）。改成先取到元素、再走真實滑鼠點選。
-    取 `outerHTML` 最短的那個，避免點到只是包住選項的外層 wrapper。
+    Does not use JS's `el.click()`: like the sampler dropdown, that menu may listen only to
+    mousedown, so a JS click is **silently ineffective** (see `robust_click`). Instead it
+    gets the element first and then goes through a real mouse click. It takes the one with
+    the shortest `outerHTML`, to avoid clicking an outer wrapper that merely contains the
+    option.
     """
-    # 逾時是**間隔** → 單調時鐘（理由詳見 `reject_cookies`）。牆鐘往回跳會把
-    # 一次幾秒的 DOM 逾時變成幾小時的停頓——**卡住比失敗更難查**，監督者看到的
-    # 是一個還活著卻什麼都不做的行程；往前跳則讓它退化成只試一次。
+    # The timeout is an **interval** → monotonic clock (see `reject_cookies` for details). A
+    # wall clock jumping back turns a DOM timeout of a few seconds into a stall of hours —
+    # **getting stuck is harder to diagnose than failing**, since the supervisor sees a
+    # process that is alive yet doing nothing; jumping forward degrades it into a single try.
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         el = port.execute_script(
@@ -3726,26 +4300,30 @@ def _click_gender(port, gender: str, timeout: float = 4.0) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 角色卡定位（V4.5 → V5 的遷移核心）
+# Locating character cards (the core of the V4.5 → V5 migration)
 #
-# V4.5：角色名是純文字節點（`innerText === 'Character N'`），而且**只有目前
-#       focus 的那張卡**會顯示 prompt 欄，所以舊碼可以直接用
-#       `find_prompt_areas()[1]` 當「目前這個角色的欄位」。
-# V5  ：角色名變成**可改名的 `<input>`**，名字在 `placeholder`、`innerText` 是
-#       空字串 —— 所有靠 innerText 的偵測都會**靜默回 0／找不到**（不報錯）；
-#       而且展開後**每張卡的 prompt 欄同時可見**，`find_prompt_areas()` 會回
-#       `[主 prompt, char1, char2, …]`。
+# V4.5: the character name is a plain text node (`innerText === 'Character N'`), and **only
+#       the currently focused card** shows its prompt field, so the old code could simply
+#       use `find_prompt_areas()[1]` as "the field of the current character".
+# V5  : the character name became a **renameable `<input>`**, with the name in
+#       `placeholder` and `innerText` an empty string — every detection relying on
+#       innerText **silently returns 0 / not found** (no error); and once expanded, **every
+#       card's prompt field is visible at the same time**, so `find_prompt_areas()` returns
+#       `[main prompt, char1, char2, …]`.
 #
-# 所以這裡一律改成「先定位角色卡，再取那張卡自己的 prompt 欄」。index 算術
-# （`areas[1]`）在 V5 下會寫進**錯的卡**，而且錯了不會報錯、只會產出角色錯亂
-# 的圖 —— 是最難從結果察覺的一類失敗。
+# So everything here is changed to "locate the character card first, then take that card's
+# own prompt field". Index arithmetic (`areas[1]`) under V5 writes into **the wrong card**,
+# and being wrong raises no error, it just produces images with the characters mixed up —
+# the kind of failure hardest to notice from the results.
 #
-# 另外：V5 的 DOM 會桌面／行動**雙渲染**，同一個角色 input 會出現兩份、其中一
-# 份 `offsetParent === null`。任何掃描都必須濾掉不可見的那份，否則角色數會加倍。
+# Also: V5's DOM is **double-rendered** for desktop / mobile, so the same character input
+# appears twice, one copy with `offsetParent === null`. Every scan must filter out the
+# invisible copy, or the character count doubles.
 # ---------------------------------------------------------------------------
 
-# 補完整的 pointer/mouse 事件序列。給「只聽 mousedown / pointerdown」的元件當
-# 備援 —— 單純的 `el.click()` 對它們是**靜默**無效。
+# Fills in the complete pointer/mouse event sequence. A fallback for components that "only
+# listen to mousedown / pointerdown" — a plain `el.click()` is **silently** ineffective on
+# them.
 _MOUSE_SEQUENCE_JS = """
 const el = arguments[0];
 const opts = {bubbles: true, cancelable: true, view: window};
@@ -3757,11 +4335,11 @@ for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']
 return true;
 """
 
-# 角色卡相關的共用 JS。每個用到的 script 都把這段 prepend 進去（`execute_script`
-# 每次都是全新的 scope，沒有跨呼叫的全域可以放）。
+# Shared JS for character cards. Every script that needs it prepends this block
+# (`execute_script` gets a brand-new scope every time, with no cross-call global to put it in).
 _JS_CHAR_HELPERS = r"""
 function __charNameEls() {
-  // V5 優先：可改名的 input，名字在 placeholder。
+  // V5 first: the renameable input, with the name in placeholder.
   const out = [];
   for (const el of document.querySelectorAll('input')) {
     if (el.offsetParent === null) continue;
@@ -3769,7 +4347,7 @@ function __charNameEls() {
     if (/^Character \d+$/.test(ph)) out.push([el, ph]);
   }
   if (out.length) return out;
-  // V4.5 退路：純文字標題。
+  // V4.5 fallback: a plain-text heading.
   for (const el of document.querySelectorAll('div, span, button, label')) {
     if (el.offsetParent === null) continue;
     const t = (el.innerText || '').trim();
@@ -3785,7 +4363,8 @@ function __findCharName(want) {
   return null;
 }
 function __charHeaderRow(nameEl) {
-  // 標題列 = 往上第一個含 >=3 顆按鈕的祖先（上移／下移／勾／垃圾桶／展開）。
+  // Header row = the first ancestor up the tree with >=3 buttons (up / down / check / trash /
+  // unfold).
   let el = nameEl;
   for (let i = 0; i < 10 && el; i++) {
     el = el.parentElement;
@@ -3795,9 +4374,10 @@ function __charHeaderRow(nameEl) {
   return null;
 }
 function __charCard(nameEl) {
-  // 卡片 = 往上第一個「含至少一個可見 prompt 欄」的祖先；但若該祖先同時包住
-  // 不只一張卡的名稱欄，代表走過頭了（那是整個 Character Prompts 區塊），
-  // 回 null 讓呼叫端知道這張卡目前是收合的。
+  // Card = the first ancestor up the tree that "contains at least one visible prompt field";
+  // but if that ancestor also wraps the name field of more than one card, we went too far
+  // (that is the whole Character Prompts section), so return null to let the caller know
+  // this card is currently collapsed.
   let el = nameEl;
   for (let i = 0; i < 12 && el; i++) {
     el = el.parentElement;
@@ -3819,9 +4399,10 @@ function __charCard(nameEl) {
   return null;
 }
 function __cardIcon(nameEl, iconName) {
-  // V5 的卡片按鈕沒有 aria-label／title，但 CSS mask 的檔名有語意：
-  // directional_arrow_up / directional_arrow_down / check / trash / unfold。
-  // 檔名帶 content hash（trash.72ef2ba9.svg），所以只比對**基底名**。
+  // V5's card buttons have no aria-label / title, but the file names of the CSS masks are
+  // meaningful: directional_arrow_up / directional_arrow_down / check / trash / unfold.
+  // The file names carry a content hash (trash.72ef2ba9.svg), so only the **base name** is
+  // compared.
   const row = __charHeaderRow(nameEl);
   if (!row) return null;
   for (const b of row.querySelectorAll('button')) {
@@ -3840,11 +4421,13 @@ function __cardIcon(nameEl, iconName) {
 
 
 def robust_click(port, element) -> bool:
-    """真實滑鼠點選；點不動就補完整 pointer/mouse 事件序列。
+    """A real mouse click; if that does not work, fill in the full pointer/mouse event
+    sequence.
 
-    為什麼需要：V5 有些控制項（取樣器下拉、加角色後的性別選單）是只聽
-    mousedown/pointerdown 的元件，純 JS `el.click()` 對它們**靜默無效** ——
-    不丟錯、看起來點到了、實際沒反應。呼叫端一律要自己讀回驗證。
+    Why it is needed: some V5 controls (the sampler dropdown, the gender menu after adding a
+    character) are components that only listen to mousedown/pointerdown, and a plain JS
+    `el.click()` is **silently ineffective** on them — no error, looks like it clicked, but
+    nothing happens. Callers must always read back and verify themselves.
     """
     try:
         port.execute_script(
@@ -3861,8 +4444,8 @@ def robust_click(port, element) -> bool:
 
 
 def dispatch_mouse_sequence(port, element) -> bool:
-    """直接補 pointerdown→mousedown→pointerup→mouseup→click。用在「真的點了但
-    元件沒反應」的重試路徑。"""
+    """Directly fill in pointerdown→mousedown→pointerup→mouseup→click. Used on the retry path
+    for "it really was clicked but the component did not respond"."""
     try:
         port.execute_script(_MOUSE_SEQUENCE_JS, element)
         return True
@@ -3872,16 +4455,19 @@ def dispatch_mouse_sequence(port, element) -> bool:
 
 
 def find_character_name_element(port, label: str):
-    """回傳代表某張角色卡的「名稱元素」（V5 是 input、V4.5 是文字節點）。"""
+    """Return the "name element" representing a character card (an input on V5, a text node on
+    V4.5)."""
     return port.execute_script(
         _JS_CHAR_HELPERS + "return __findCharName(arguments[0]);", label)
 
 
 def character_card_area(port, label: str):
-    """回傳**該角色卡自己的** prompt 欄；卡片不存在或收合中回 None。
+    """Return **that character card's own** prompt field; None if the card does not exist or
+    is collapsed.
 
-    刻意不回 `find_prompt_areas()[N]`：V5 下所有角色欄同時可見，用 index 取會
-    在「Character 2 被移除」等情況下靜默取到別人的欄位。
+    Deliberately does not return `find_prompt_areas()[N]`: under V5 every character field is
+    visible at the same time, and taking one by index would silently get someone else's field
+    in cases such as "Character 2 was removed".
     """
     return port.execute_script(
         _JS_CHAR_HELPERS + """
@@ -3900,11 +4486,13 @@ def character_card_area(port, label: str):
 
 
 def ensure_character_expanded(port, label: str) -> bool:
-    """確保某張角色卡是展開的（prompt 欄看得到），回傳是否成功。
+    """Make sure a character card is expanded (its prompt field visible); returns whether that
+    succeeded.
 
-    V5 收合的卡片不顯示 prompt 欄，要按標題列的 `unfold` 圖示展開。V4.5 則是
-    點標題本身切換 focus —— 兩種都試，以「該卡的 prompt 欄是否出現」為準，
-    不靠回傳值猜。
+    A collapsed V5 card does not show its prompt field, and the header row's `unfold` icon
+    has to be pressed to expand it. On V4.5, clicking the heading itself toggles focus — both
+    are tried, judged by "does this card's prompt field appear", not by guessing from return
+    values.
     """
     if character_card_area(port, label) is not None:
         return True
@@ -3919,7 +4507,7 @@ def ensure_character_expanded(port, label: str) -> bool:
         human_pause(0.8, 1.2)
         if character_card_area(port, label) is not None:
             return True
-    # V4.5 退路：點標題列本身（那邊是 focus 語意，不是展開語意）。
+    # V4.5 fallback: click the header row itself (there it means focus, not expand).
     row = port.execute_script(
         _JS_CHAR_HELPERS + "return __charHeaderRow(arguments[0]);", name_el)
     if row is not None:
@@ -3930,16 +4518,18 @@ def ensure_character_expanded(port, label: str) -> bool:
 
 def click_add_character_control(port, gender: str = "Female",
                                 timeout: float = 8.0) -> bool:
-    """按下「加一個角色」並選性別。兩個 webrunner 變體共用這一份。
+    """Press "add a character" and pick a gender. Both webrunner variants share this copy.
 
-    V4.5 是一顆寫著 `Add Character` 的按鈕；**V5 換成「Character Prompts」標題
-    列裡一顆 44x40、沒有文字／沒有 aria-label／沒有 title 的圖示按鈕**，所以舊的
-    `//button[contains(., 'Add Character')]` 永遠找不到。這裡兩種都認：先找舊按
-    鈕，找不到就退到標題列的圖示鈕。性別選單 V5 是 Female／Male／Other。
+    V4.5 has a button labelled `Add Character`; **V5 replaced it with a 44x40 icon button in
+    the "Character Prompts" header row, with no text / no aria-label / no title**, so the old
+    `//button[contains(., 'Add Character')]` never finds anything. Both are recognised here:
+    look for the old button first, and fall back to the header row's icon button if it is
+    not found. The V5 gender menu is Female / Male / Other.
     """
-    # 逾時是**間隔** → 單調時鐘（理由詳見 `reject_cookies`）。牆鐘往回跳會把
-    # 一次幾秒的 DOM 逾時變成幾小時的停頓——**卡住比失敗更難查**，監督者看到的
-    # 是一個還活著卻什麼都不做的行程；往前跳則讓它退化成只試一次。
+    # The timeout is an **interval** → monotonic clock (see `reject_cookies` for details). A
+    # wall clock jumping back turns a DOM timeout of a few seconds into a stall of hours —
+    # **getting stuck is harder to diagnose than failing**, since the supervisor sees a
+    # process that is alive yet doing nothing; jumping forward degrades it into a single try.
     end = time.monotonic() + timeout
     btn = None
     while time.monotonic() < end:
@@ -3955,9 +4545,11 @@ def click_add_character_control(port, gender: str = "Female",
             break
         btn = port.execute_script(
             """
-            // 「Character Prompts」標題列：同時含該標題文字與至少一顆可見按鈕的
-            // 最小可見元素。用「最小且含 button」而不是往上走固定層數 —— 加了
-            // 角色卡之後 DOM 深度會變，寫死層數會漂掉。
+            // The "Character Prompts" header row: the smallest visible element that
+            // contains both that heading text and at least one visible button. "Smallest
+            // that contains a button" rather than walking up a fixed number of levels —
+            // the DOM depth changes once character cards are added, and a hard-coded
+            // depth would drift.
             let best = null, bestLen = Infinity;
             for (const el of document.querySelectorAll('div, span, section')) {
               if (el.offsetParent === null) continue;
@@ -4083,7 +4675,8 @@ def remove_character_slot(port, label: str) -> bool:
         const want = arguments[0];
         const header = __findCharName(want);
         if (!header) return null;
-        // V5 快路：圖示的 CSS mask 檔名就叫 trash.<hash>.svg，直接認它。
+        // V5 fast path: the icon's CSS mask file is literally named trash.<hash>.svg, so
+        // recognise it directly.
         const direct = __cardIcon(header, 'trash');
         if (direct) return direct;
         let card = header;
@@ -4133,9 +4726,10 @@ def remove_character_slot(port, label: str) -> bool:
                     && Math.abs((r.y + r.height / 2)
                               - (hr.y + hr.height / 2)) < 35;
                 });
-              // V5 的標題列順序是 上移／下移／勾／垃圾桶／**展開**，最右邊
-              // 那顆是 unfold 不是刪除 —— 舊的「取最右邊」會點錯而且回報成功。
-              // 先用 CSS mask 檔名排掉已知的非刪除圖示。
+              // V5's header row order is up / down / check / trash / **unfold**, so the
+              // rightmost button is unfold, not delete — the old "take the rightmost" would
+              // click the wrong one and report success. Rule out the known non-delete icons
+              // by CSS mask file name first.
               const notTrash = /directional_arrow|unfold|check/;
               const filtered = buttons.filter(b => {
                 const nodes = [b].concat(Array.from(b.querySelectorAll('*')));
@@ -4184,7 +4778,8 @@ def set_character2_enabled(port, enabled: bool) -> bool:
     if enabled:
         if have >= 2:
             return True
-        # 加角色的控制項在 V4.5／V5 長得完全不同，統一走共用實作。
+        # The add-character control looks completely different on V4.5 / V5, so always go
+        # through the shared implementation.
         if not click_add_character_control(port, "Female"):
             return False
         human_pause(0.5, 0.9)
@@ -4213,25 +4808,32 @@ def set_character2_enabled(port, enabled: bool) -> bool:
 
 
 def remove_all_character_slots(port) -> None:
-    """One-shot helper：把「所有」角色 SLOT 整個刪光（target 硬寫死為 0），讓單圖
-    的生成 UI 真的剩 0 個角色框、只留主 prompt。**只在 idle one-shot 路徑呼叫**
-    （in_band=False：serve 完 main() 直接 return 0、後面不再跑 batch；in-band 路徑
-    刪框會讓 _refill_character_fields 重填不回去 → batch 角色剩餘的圖以缺框產生）。
-    **2026-09-05 更正**：原本這裡寫「找不到 areas[1] 而靜默失敗」，那是舊的
-    index 取法。`fill_character_prompt` 早就改成先定位角色卡片，而且找不到卡片時
-    會印 `"{label} slot not present; cannot fill"` 並回 False——**不是靜默**。
-    結論沒變（in-band 不准刪框），但別再去找一個不存在的靜默失敗。
+    """One-shot helper: delete "every" character SLOT outright (target hard-coded to 0), so
+    the single-image generation UI really has 0 character boxes left, only the main prompt.
+    **Only called on the idle one-shot path** (in_band=False: after serving, main() returns 0
+    straight away and no batch runs after it; on the in-band path, deleting boxes would keep
+    _refill_character_fields from refilling them → the batch character's remaining images
+    would be generated with boxes missing).
+    **Correction 2026-09-05**: this used to say "silently fails because areas[1] cannot be
+    found", which was the old index-based lookup. `fill_character_prompt` long ago switched
+    to locating the character card first, and when no card is found it prints
+    `"{label} slot not present; cannot fill"` and returns False — **not silent**. The
+    conclusion is unchanged (in-band must not delete boxes), but stop looking for a silent
+    failure that does not exist.
 
-    NovelAI 的角色框編號為 Character 1..N，且只能從「尾端」乾淨移除（與
-    ensure_two_characters 同理，避免重新編號）。純 best-effort：不 raise（沿用既有
-    移除流程，呼叫端再以內容驗證）。
+    NovelAI numbers the character boxes Character 1..N, and they can only be removed cleanly
+    from "the tail" (same reason as ensure_two_characters: avoid renumbering). Purely
+    best-effort: does not raise (reuses the existing removal flow; the caller then verifies by
+    content).
 
-    **NovelAI 強制至少保留 1 個角色框**：最後一框沒有 trash 按鈕，
-    remove_character_slot 的 trash 搜尋找不到、退回 fallback 點到「該框最後一個
-    按鈕」（不是刪除鈕），不會真的刪掉卻仍回 True；本函式的 no-progress guard
-    （new_count >= have）因而在剩 1 框時 break。故本函式通常停在 1 框、且該框可能
-    殘留內容 — 呼叫端（idle one-shot serve）必須在呼叫本函式之後，把殘存的角色框
-    清成空字串（以 find_prompt_areas[1:] 為準、內容導向驗證），不能只靠 count==0。"""
+    **NovelAI forces at least 1 character box to remain**: the last box has no trash button,
+    so remove_character_slot's trash search finds nothing and falls back to clicking "the
+    last button of that box" (not the delete button), which does not really delete anything
+    yet still returns True; this function's no-progress guard (new_count >= have) therefore
+    breaks when 1 box is left. So this function usually stops at 1 box, and that box may
+    still hold leftover content — the caller (the idle one-shot serve) must, after calling
+    this function, clear the remaining character boxes to empty strings (going by
+    find_prompt_areas[1:], verified by content), and must not rely on count==0 alone."""
     have = count_characters(port)
     print(f"one-shot remove-all-slots: have {have}, target 0")
     # Trim from the tail (Character N, Character N-1, …) — copy
@@ -4251,13 +4853,15 @@ def remove_all_character_slots(port) -> None:
 
 
 def expand_character_section(port, label: str) -> bool:
-    """讓 Character N 的 prompt 欄變成可寫（存在且展開），成功回 True。
+    """Make Character N's prompt field writable (present and expanded); returns True on
+    success.
 
-    V4.5 的語意是「focus 這張卡」（只有 focus 的卡看得到欄位）；V5 的語意是
-    「展開這張卡」（展開後所有卡的欄位同時可見）。兩者的**可觀察結果**一樣：
-    這張卡自己的 prompt 欄拿得到。所以這裡一律以
-    `character_card_area()` 是否拿得到為準，不去猜是哪一種語意，也不再靠
-    「點了幾次／狀態有沒有變」這種脆弱訊號。
+    On V4.5 the meaning is "focus this card" (only the focused card shows its field); on V5
+    it is "expand this card" (once expanded, every card's field is visible at the same time).
+    The two have the same **observable result**: this card's own prompt field can be
+    obtained. So this always goes by whether `character_card_area()` can obtain it, without
+    guessing which meaning applies, and without relying on fragile signals like "how many
+    times was it clicked / did the state change".
     """
     return ensure_character_expanded(port, label)
 
@@ -4271,19 +4875,22 @@ def _read_textarea_value(port, element) -> str:
 
 
 def fill_character_prompt(port, character_index: int, text: str) -> bool:
-    """把 `text` 寫進 **Character N 自己的** prompt 欄。
+    """Write `text` into **Character N's own** prompt field.
 
-    **不再用 `find_prompt_areas()[1]`。** V4.5 只顯示 focus 那張卡的欄位，所以
-    index 1 剛好就是它；V5 展開後所有角色欄同時可見
-    （`areas = [主 prompt, char1, char2, …]`），沿用 index 1 會在「Character 2 被
-    移除」時把 **char1** 的內容洗掉——而且不會報錯，只會產出角色錯亂的圖，是最
-    難從結果察覺的一類失敗。改成先定位該角色的卡片、再取卡片內的欄位。
+    **No longer uses `find_prompt_areas()[1]`.** V4.5 only shows the focused card's field, so
+    index 1 happened to be it; on V5, once expanded, every character field is visible at the
+    same time (`areas = [main prompt, char1, char2, …]`), and keeping index 1 would wipe
+    **char1**'s content when "Character 2 was removed" — raising no error, just producing
+    images with the characters mixed up, the kind of failure hardest to notice from the
+    results. Changed to locate that character's card first, then take the field inside the
+    card.
     """
     label = f"Character {character_index}"
     if find_character_name_element(port, label) is None:
-        # 卡片根本不存在（空的 todo_character2 列會讓 set_character2_enabled 把
-        # 整張卡移除）。要求「清空」視為已達成（本來就沒內容）；要求寫入非空值
-        # 則回 False，讓呼叫端的 retry / skip 去處理。
+        # The card does not exist at all (an empty todo_character2 row makes
+        # set_character2_enabled remove the whole card). A request to "clear" counts as done
+        # (there was no content anyway); a request to write a non-empty value returns False,
+        # leaving it to the caller's retry / skip.
         print(f"  {label} slot not present; "
               + ("nothing to clear" if not text.strip() else "cannot fill"))
         return not text.strip()
@@ -4296,12 +4903,15 @@ def fill_character_prompt(port, character_index: int, text: str) -> bool:
         snap(port, f"missing_{label.lower().replace(' ', '_')}")
         return False
     existing = _read_textarea_value(port, el)
-    # 措辭必須自己講明這是**寫入前**的讀值。這是通用的 fill 記錄，而在
-    # verify → refill 這條路上它緊接在「欄位對不上，重填」後面出現，語意剛好
-    # 相反：讀的人會把它當成「重填之後的狀態」，於是一個空值看起來像「重填完
-    # 還是空的」——正好長得像本專案最貴那類失效（欄位被打回去，接著安靜產出
-    # 一整批用錯提示詞的圖）。它實際證明的是相反的事：重填前確實是空的，所以
-    # 這次重填有東西可修。留著它、只改措辭，因為那個證據本身有用。
+    # The wording must itself make clear that this is the value read **before writing**.
+    # This is the generic fill record, and on the verify → refill path it appears right after
+    # "the field does not match, refilling", where the meaning is exactly reversed: readers
+    # take it as "the state after refilling", so an empty value looks like "still empty after
+    # refilling" — which looks exactly like this project's most expensive class of failure
+    # (fields knocked back, then quietly producing a whole batch of images with the wrong
+    # prompt). What it actually proves is the opposite: the field really was empty before the
+    # refill, so this refill had something to fix. It stays and only the wording changed,
+    # because that evidence is itself useful.
     print(f"[{label}] card area before write: {existing[:60]!r}")
     port.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
     try:
@@ -4313,28 +4923,33 @@ def fill_character_prompt(port, character_index: int, text: str) -> bool:
 
 
 def verify_character_prompt(port, character_index: int, expected: str) -> bool:
-    """產圖前讀回 character 欄位、確認內容仍等於預期值。
+    """Read the character field back before generating and confirm its content still equals
+    the expected value.
 
-    fill 當下的 verify 擋不住「fill 之後」的污染：autocomplete 下拉殘留
-    被後續座標點選誤觸時，會把一個建議 tag 插進 prompt 尾端，且各條目
-    最後一個 token 不同、看起來像隨機 tag。不符時重填一次；仍不符只
-    WARN 繼續，不 abort（沿用現值比中斷整個 run 有用）。240 張共用同
-    一份 prompt、generate 迴圈內不碰欄位，所以每個角色批次驗一次即可。
+    The verify at fill time cannot catch pollution "after the fill": when a leftover
+    autocomplete dropdown is hit by a later coordinate click, a suggested tag gets inserted
+    at the end of the prompt, and since each entry's last token differs, it looks like a
+    random tag. On a mismatch it refills once; if it still does not match it only WARNs and
+    carries on, without aborting (keeping the current value is more useful than interrupting
+    the whole run). All 240 images share one prompt and the generate loop does not touch the
+    fields, so verifying once per character batch is enough.
 
-    跟 `fill_character_prompt` 一樣改成卡片導向——用 index 取欄位會在卡片數量
-    變動時比對到別人的欄位，誤判成 drift 之後「重填」反而把別的角色洗掉。
+    Like `fill_character_prompt`, it is card-oriented — taking a field by index would compare
+    against someone else's field when the number of cards changes, and after misjudging that
+    as drift, the "refill" would wipe out a different character instead.
 
-    **記錄合約：每一條路都要講出結局，包含成功那一條。** 讀記錄的人不該為了
-    知道「那個角色到底有沒有救回來」而去讀原始碼。三種結局各有一行：欄位空的
-    （note，穩態，見下面的分流註解）、欄位被污染（WARN ＋ 快照）、重填之後仍
-    然不對（WARN ＋ 快照 ＋ 回 False）。成功重填印
-    `refilled OK`。
+    **Logging contract: every path must state its outcome, including the successful one.**
+    Whoever reads the log should not have to read the source to know "was that character
+    rescued or not". Each of the three outcomes has its own line: the field was empty (note,
+    steady state, see the triage comment below), the field was polluted (WARN + snapshot),
+    still wrong after the refill (WARN + snapshot + returns False). A successful refill prints
+    `refilled OK`.
     """
     label = f"Character {character_index}"
     expected = expected.strip()
     try:
         if find_character_name_element(port, label) is None:
-            # 卡片不存在（見 fill_character_prompt 的同款守衛）。
+            # The card does not exist (see the same guard in fill_character_prompt).
             print(f"  {label} slot not present; verify "
                   + ("satisfied (nothing to check)" if not expected
                      else "skipped (slot missing)"))
@@ -4349,31 +4964,39 @@ def verify_character_prompt(port, character_index: int, expected: str) -> bool:
         actual = _read_textarea_value(port, el).strip()
         if actual == expected:
             return True
-        # 兩種 drift 的意義完全不同，所以嚴重度**照欄位的實際內容**分開：
+        # The two kinds of drift mean completely different things, so severity is split
+        # **by the field's actual content**:
         #
-        # * 讀回空的 ＝ 寫入沒有留在欄位裡。額度對話框關不掉時會整頁 reload，
-        #   而 reload 後的重填序列本身就會讓前一個角色欄短暫被打回空白。實測
-        #   （`WEBRunner.log` 2026-09-03～09-08）90 次 drift **全部**是這一種、
-        #   **全部**重填一次就好（`still mismatched after refill` 0 次、
-        #   `char*_drift` 快照 0 張），而且 90 次與 90 次 reload 一對一，沒有第
-        #   二個來源。也就是說它是這個站台 reload 之後的**穩態**，不是異常。
-        #   而「reload」本身也不是例外路徑：分層關閉（規則 3）上線之後
-        #   （09-07 17:17 起）18 次被擋 **0 次關得掉**，38 次角落點選全部失敗，
-        #   每一次都落到整頁 reload——所以它是這個站台目前**唯一實際發生**的
-        #   路徑，那一窗的 drift 20 次、`still mismatched` 一樣 0 次。兩個時間
-        #   窗、同一個結論。
-        #   每個正常週期都會響一次的 WARN 等於沒有 WARN——本 repo 已經為同一課
-        #   吃過一次虧（`discord_bot.log` 95.8% 的行都是同一句 `rpc apply ->`，
-        #   把真正有話說的 4% 淹掉），這裡是它的鏡像：嚇人的事情只喊了一半，
-        #   反而把讓人安心的那一半吞掉。所以降級成 note。
-        # * 讀回**非空但不同** ＝ 欄位裡有別的內容，那才是 docstring 講的
-        #   autocomplete 污染（建議 tag 被插進 prompt 尾端）。實測 0 次，真的
-        #   發生時要看得見，所以維持 WARN ＋ 快照。
+        # * Read back empty = the write did not stay in the field. When the quota dialog will
+        #   not close, the whole page is reloaded, and the refill sequence after a reload
+        #   itself briefly knocks the previous character field back to blank. Measured
+        #   (`WEBRunner.log` 2026-09-03 to 09-08): **all** 90 drifts were of this kind, and
+        #   **all** were fixed by a single refill (`still mismatched after refill` 0 times,
+        #   `char*_drift` snapshots 0), and the 90 drifts map one-to-one onto 90 reloads, with
+        #   no second source. In other words it is this site's **steady state** after a
+        #   reload, not an anomaly.
+        #   And the "reload" itself is not an exceptional path either: after layered
+        #   dismissing (rule 3) went live (from 09-07 17:17), 18 blocks were closed **0
+        #   times**, all 38 corner clicks failed, and every one of them fell back to a
+        #   full-page reload — so it is currently the **only path that actually happens** on
+        #   this site, and in that window there were 20 drifts and likewise 0
+        #   `still mismatched`. Two time windows, the same conclusion.
+        #   A WARN that fires once in every normal cycle is no WARN at all — this repo has
+        #   already paid for the same lesson once (95.8% of the lines in `discord_bot.log`
+        #   were the same `rpc apply ->` sentence, drowning the 4% that actually had
+        #   something to say), and this is its mirror image: shouting only half of the scary
+        #   part, and swallowing the reassuring half instead. So it is downgraded to a note.
+        # * Read back **non-empty but different** = there is other content in the field,
+        #   which is the autocomplete pollution the docstring talks about (a suggested tag
+        #   inserted at the end of the prompt). Measured 0 times; when it really happens it
+        #   has to be visible, so it stays WARN + snapshot.
         #
-        # 判準刻意用「欄位裡是什麼」而不是「哪個呼叫端叫的」：呼叫端傳進來的
-        # context 旗標會在新增呼叫點時被忘記（症狀是嚴重度靜靜地標錯），而內容
-        # 是從頁面本身讀回來的，不會跟現實脫節。降級的只有措辭——偵測、重填、
-        # 失敗時的 WARN 與回傳值都不動。
+        # The criterion is deliberately "what is in the field", not "which caller called":
+        # a context flag passed in by the caller gets forgotten when a new call site is added
+        # (the symptom is the severity being quietly mislabelled), while the content is read
+        # back from the page itself and cannot drift from reality. Only the wording is
+        # downgraded — detection, refill, the WARN on failure and the return value are all
+        # unchanged.
         if actual:
             print(f"  WARN: {label} drifted after fill "
                   f"({len(actual)} vs {len(expected)} chars); refilling")
@@ -4386,30 +5009,35 @@ def verify_character_prompt(port, character_index: int, expected: str) -> bool:
         el2 = character_card_area(port, label)
         if el2 is not None:
             if _read_textarea_value(port, el2).strip() == expected:
-                # **成功也要出聲。** 舊版在這裡直接 return True，於是記錄停在
-                # 「欄位對不上、重填了」就沒有下文，人要去讀原始碼才知道結局，
-                # 而那個半截的敘述剛好跟最貴的失效長得一樣。收掉這個迴圈只要
-                # 一行；沉默的成功是在要求讀記錄的人去讀程式碼。
+                # **Success has to speak up too.** The old version simply returned True
+                # here, so the log stopped at "the field did not match, refilled" with no
+                # follow-up, and people had to read the source to learn the outcome — and
+                # that half-told story looks exactly like the most expensive failure. Closing
+                # this loop takes one line; a silent success is asking whoever reads the log
+                # to go read the code.
                 print(f"  {label} refilled OK ({len(expected)} chars)")
                 return True
         print(f"  WARN: {label} still mismatched after refill; "
               f"continuing with current value")
-        # 快照挪到這裡：真正需要現場畫面的是「重填也救不回來」，不是那個每輪都
-        # 發生、每次都自己好的空白。上面非空的那一支仍然各自 snap 過了。
+        # The snapshot moved here: what really needs the on-site picture is "even the
+        # refill could not rescue it", not the blank that happens every round and fixes
+        # itself every time. The non-empty branch above still snaps on its own.
         snap(port, f"char{character_index}_still_mismatched")
         return False
     except Exception as error:  # pylint: disable=broad-except
-        # `_long_error`：一個角色批次只跑兩次（char1／char2），不是重複行；而
-        # 這裡最想看到的 `element click intercepted` 細節在訊息尾巴，180 字會切掉。
+        # `_long_error`: this runs only twice per character batch (char1 / char2), so it is
+        # not a repeated line; and the `element click intercepted` detail most wanted here is
+        # at the tail of the message, which 180 characters would cut off.
         print(f"  WARN: verify {label} failed: {_long_error(error)}")
         return False
 
 
 def _click_option_by_text(port, text: str, timeout: float = 5.0) -> bool:
     """Click the visible element whose own text node equals `text`."""
-    # 逾時是**間隔** → 單調時鐘（理由詳見 `reject_cookies`）。牆鐘往回跳會把
-    # 一次幾秒的 DOM 逾時變成幾小時的停頓——**卡住比失敗更難查**，監督者看到的
-    # 是一個還活著卻什麼都不做的行程；往前跳則讓它退化成只試一次。
+    # The timeout is an **interval** → monotonic clock (see `reject_cookies` for details). A
+    # wall clock jumping back turns a DOM timeout of a few seconds into a stall of hours —
+    # **getting stuck is harder to diagnose than failing**, since the supervisor sees a
+    # process that is alive yet doing nothing; jumping forward degrades it into a single try.
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         candidates = port.find_elements_xpath(f"//*[normalize-space(text())='{text}']")
@@ -4459,7 +5087,7 @@ def _open_resolution_dropdown(port) -> bool:
 
 
 def _number_input_by_aria(port, aria: str):
-    """回傳 aria-label 等於 `aria` 的可見 number input（V5 的 W／H 用）。"""
+    """Return the visible number input whose aria-label equals `aria` (for V5's W / H)."""
     return port.execute_script(
         """
         const want = arguments[0];
@@ -4484,7 +5112,8 @@ def _read_number_input_by_aria(port, aria: str):
 
 
 def _click_by_aria_label(port, aria: str) -> bool:
-    """點 aria-label 等於 `aria` 的可見元素（必要時往上找可點的祖先）。"""
+    """Click the visible element whose aria-label equals `aria` (climbing to a clickable
+    ancestor when needed)."""
     el = port.execute_script(
         """
         const want = arguments[0];
@@ -4511,13 +5140,15 @@ def _click_by_aria_label(port, aria: str) -> bool:
 
 
 def _select_resolution_v5(port, group: str, item: str) -> bool:
-    """V5 的解析度：類別下拉（Normal／Large／Wallpaper／Small／Custom）＋ 兩個
-    aria-label 為 `W`／`H` 的數字格。
+    """V5 resolution: a category dropdown (Normal / Large / Wallpaper / Small / Custom) + two
+    number boxes whose aria-labels are `W` / `H`.
 
-    **方向（Portrait／Landscape）在 V5 不再是選項**，只是「W 和 H 誰大」。所以
-    這裡用「選類別 → 需要時按 Swap width and height」達成，刻意**不**硬記每個
-    類別的像素值——那組數字會跟著站方改版變動，記死了會在改版當天靜默產出錯誤
-    尺寸；比大小則永遠成立。最後一律讀回 W/H 驗證。
+    **Orientation (Portrait / Landscape) is no longer an option on V5**, just "which of W and
+    H is larger". So this is done by "pick the category → press Swap width and height when
+    needed", and deliberately does **not** memorise each category's pixel values — those
+    numbers change whenever the site is revised, and memorised values would silently produce
+    the wrong size on the day of a revision; comparing sizes always holds. W/H are always read
+    back for verification at the end.
     """
     if not _click_by_aria_label(port, "Select a Resolution Category"):
         print("  [v5] resolution category control not found")
@@ -4578,11 +5209,12 @@ def _select_resolution_v5(port, group: str, item: str) -> bool:
 
 def select_resolution(port, group: str = "Normal", item: str = "Landscape",
                       timeout: float = 10.0) -> bool:
-    """把輸出解析度設成 `group` `item`（例：Normal Landscape）。
+    """Set the output resolution to `group` `item` (e.g. Normal Landscape).
 
-    兩條路徑：V4.5 是「Normal Landscape」這種單一預設集下拉；**V5 拆成類別下拉
-    ＋ W／H 數字格**，方向變成純粹的 W/H 大小關係。先試舊路徑（快、且在 V4.5
-    下是原本驗過的行為），失敗才走 V5 路徑。
+    Two paths: V4.5 has a single preset dropdown like "Normal Landscape"; **V5 split it into a
+    category dropdown + W / H number boxes**, and orientation became purely the size
+    relationship of W/H. The old path is tried first (fast, and on V4.5 it is the originally
+    verified behaviour), and only on failure does it take the V5 path.
     """
     if _select_resolution_preset(port, group, item, timeout=timeout):
         return True
@@ -4597,8 +5229,8 @@ def _select_resolution_preset(port, group: str = "Normal",
     The dropdown shows entries like "Portrait (832x1216)" / "Landscape (1216x832)";
     items are ordered Normal → Large, so the first match is the Normal preset."""
     if not _open_resolution_dropdown(port):
-        # 這在 V5 下是正常情況（沒有預設集下拉），不是錯誤——呼叫端會改走
-        # `_select_resolution_v5`。
+        # On V5 this is normal (there is no preset dropdown), not an error — the caller then
+        # switches to `_select_resolution_v5`.
         print("  no preset-style resolution dropdown on this page")
         return False
     clicked = port.execute_script(
@@ -4627,13 +5259,14 @@ def _select_resolution_preset(port, group: str = "Normal",
 
 
 def expand_advanced_settings(port) -> bool:
-    """點一下 Steps/Guidance/Seed/Sampler 那一列最右邊的圖示。
+    """Click the rightmost icon in the Steps/Guidance/Seed/Sampler row.
 
-    **這是一顆切換鈕（toggle），不是「展開鈕」。** 2026-08-22 實測：面板已經展開
-    時再點一次會把它**收起來**（`AI Settings` 底下的 Steps 列整個消失）。所以
-    **絕對不要無條件呼叫它**——面板的展開狀態會被瀏覽器 profile 記住，起始狀態
-    因此是不確定的。要「確保 Rescale 看得到」請呼叫 `ensure_rescale_visible()`，
-    那支是以結果為準、可安全重複呼叫的。
+    **This is a toggle button, not an "expand" button.** Measured 2026-08-22: clicking it
+    again while the panel is already expanded **collapses** it (the Steps row under
+    `AI Settings` disappears entirely). So **never call it unconditionally** — the panel's
+    expanded state is remembered by the browser profile, so the starting state is uncertain.
+    To "make sure Rescale is visible", call `ensure_rescale_visible()`, which goes by the
+    result and is safe to call repeatedly.
     """
     target = port.execute_script(
         """
@@ -4667,8 +5300,8 @@ def expand_advanced_settings(port) -> bool:
 
 
 def _has_variety_plus(port) -> bool:
-    """頁面上到底有沒有 Variety+ 這個控制項。V5 已移除，見
-    `configure_sampler_settings` 裡為什麼「沒有」不等於「失敗」。"""
+    """Whether the page has a Variety+ control at all. V5 removed it; see
+    `configure_sampler_settings` for why "absent" does not mean "failed"."""
     return bool(port.execute_script(
         """
         for (const el of document.querySelectorAll('div, span, label')) {
@@ -4785,26 +5418,31 @@ def read_numeric_setting(port, label: str):
 
 
 def first_present_numeric_label(port, labels):
-    """回傳這個版面上**真的存在**的第一個候選標籤；一個都沒有就回 None。
+    """Return the first candidate label that **really exists** on this layout; None if there
+    is none at all.
 
-    純唯讀——只讀值，一個字都不寫。判準與 `set_numeric_setting` **完全同構**
-    （同一組 `label, div, span`、同樣「往上找五層拿 `input[type='number']`」），
-    所以「探得到」等價於「set 找得到控制項」，不是另外一套猜法。
+    Purely read-only — it only reads values and writes not a single character. The criterion
+    is **exactly isomorphic** to `set_numeric_setting` (the same `label, div, span` set, the
+    same "climb five levels to get `input[type='number']`"), so "found by the probe" is
+    equivalent to "set can find the control", not a separate way of guessing.
 
-    為什麼需要它：候選清單裡帶冒號與不帶冒號的兩種寫法**各自對應一個站方版面**，
-    不是「新舊寫法、其中一個已經死了」。實測（2026-08-30，正式 log 共 11 次
-    setup）：
+    Why it is needed: the colon and no-colon spellings in the candidate list **each
+    correspond to one site layout**, not "old and new spellings, one of which is already
+    dead". Measured (2026-08-30, 11 setups in the production log):
 
-    * V5 版面的標籤是 `Steps` / `Prompt Guidance` / `Prompt Guidance Rescale`；
-    * V4.5 版面的是 `Steps:` / `Prompt Guidance:` / `Prompt Guidance Rescale:`。
+    * the V5 layout's labels are `Steps` / `Prompt Guidance` / `Prompt Guidance Rescale`;
+    * the V4.5 layout's are `Steps:` / `Prompt Guidance:` / `Prompt Guidance Rescale:`.
 
-    候選清單把帶冒號的排前面，於是跑 V5 的那 10 次、每個數值設定都先讓
-    `Steps:` 白跑兩輪「寫入＋等待＋驗證」才輪到 `Steps`，三個設定合計約 12 秒；
-    唯一一次 V4.5 則是 `Steps:` 一發命中。**固定順序必定有一邊踩空**——把順序
-    對調只是把成本換給另一個版面。問頁面才是對的做法。
+    The candidate list puts the colon forms first, so on the 10 V5 runs, every numeric
+    setting first let `Steps:` spin through two rounds of "write + wait + verify" for nothing
+    before `Steps` got its turn, about 12 seconds in total for the three settings; the single
+    V4.5 run hit `Steps:` at the first shot. **Any fixed order is bound to miss on one side**
+    — swapping the order only shifts the cost to the other layout. Asking the page is the
+    right approach.
 
-    探不到（全部回 None）不算錯：呼叫端照樣把整份候選清單依序試過去，行為與
-    沒有這個函式時一模一樣，最壞情況只是白花幾次純 JS 讀取。
+    Finding nothing (all None) is not an error: the caller still tries the whole candidate
+    list in order, exactly as if this function did not exist, and the worst case is only a
+    few wasted pure-JS reads.
     """
     for label in labels:
         if read_numeric_setting(port, label) is not None:
@@ -4820,9 +5458,10 @@ def set_numeric_setting_verified(port, label, value, retries: int = 4) -> bool:
         if actual is not None and abs(actual - float(value)) < 0.001:
             print(f"setting {label}={value} verified (actual {actual}) on attempt {attempt + 1}")
             return True
-        # 標籤要印出來。呼叫端會依序試好幾個候選標籤，不說是哪一個的話，
-        # 這行字在 log 裡就是孤兒——實機 log 裡連著兩行「失敗」接一行「成功」，
-        # 看起來像同一個標籤時好時壞，其實是兩個不同的候選。
+        # The label has to be printed. The caller tries several candidate labels in turn,
+        # and without saying which one, this line is an orphan in the log — in a real log two
+        # lines of "failed" followed by one of "succeeded" look like the same label working
+        # on and off, when in fact they are two different candidates.
         print(f"  [{label}] attempt {attempt + 1}: set returned {ok}, "
               f"actual={actual}")
         human_pause(0.5, 1.0)
@@ -4876,11 +5515,13 @@ def _has_rescale(port) -> bool:
 
 
 def _find_visible_text_element(port, text: str):
-    """回傳可見、**innerText 完全等於** `text` 的最小元素；找不到回 None。
+    """Return the smallest visible element whose **innerText exactly equals** `text`; None if
+    not found.
 
-    跟 `_click_option_by_text` 的差別：那支用 XPath 的 `text()`，只比對**直接文字
-    節點**，元素若把文字包在子節點裡就抓不到。這支比對 innerText，並取
-    `outerHTML` 最短者以避開外層 wrapper。
+    The difference from `_click_option_by_text`: that one uses XPath's `text()`, which only
+    matches **direct text nodes**, so it misses an element that wraps its text in a child
+    node. This one matches innerText, and takes the one with the shortest `outerHTML` to
+    avoid outer wrappers.
     """
     return port.execute_script(
         """
@@ -4900,19 +5541,23 @@ def _find_visible_text_element(port, text: str):
 
 
 def ensure_rescale_visible(port, max_attempts: int = 6) -> bool:
-    """確保 Prompt Guidance Rescale 欄位看得到，回傳是否成功。
+    """Make sure the Prompt Guidance Rescale field is visible; returns whether that succeeded.
 
-    **以結果為準，不數點選次數**——這是本函式唯一安全的寫法。相關的兩個控制項
-    都是**切換鈕**：`expand_advanced_settings()` 的圖示鈕、以及「Advanced
-    Settings」那一列。面板的展開狀態被瀏覽器 profile 記住，所以每次進頁的起始
-    狀態都不一定，任何「先無條件點一下」的作法都會在一半的起始狀態下**把面板關
-    掉**，接著兩個目標都消失、整個 setup 失敗（2026-08-22 就是這樣壞的：
-    `configure_sampler_settings` 進門先無條件 toggle 一次）。
+    **Goes by the result, not by counting clicks** — the only safe way to write this
+    function. Both relevant controls are **toggles**: the icon button of
+    `expand_advanced_settings()`, and the "Advanced Settings" row. The panel's expanded state
+    is remembered by the browser profile, so the starting state on each page visit varies,
+    and any approach that "clicks once unconditionally first" **closes the panel** in half of
+    the starting states, after which both targets vanish and the whole setup fails (that is
+    exactly how it broke on 2026-08-22: `configure_sampler_settings` toggled once
+    unconditionally on entry).
 
-    每一輪先看目標在不在，不在才動作，且兩種展開路徑都試：
-      1. 看得到「Advanced Settings」→ 點它（Rescale 就藏在它底下）；
-      2. 看不到 → 面板可能是收合的緊湊列，點 `expand_advanced_settings()` 的圖示
-         把 AI Settings 面板打開，下一輪自然會走到 (1)。
+    Each round first checks whether the target is there, and acts only if it is not, trying
+    both expansion paths:
+      1. "Advanced Settings" is visible → click it (Rescale hides underneath it);
+      2. not visible → the panel may be a collapsed compact row, so click
+         `expand_advanced_settings()`'s icon to open the AI Settings panel, and the next
+         round naturally reaches (1).
     """
     for attempt in range(1, max_attempts + 1):
         if _has_rescale(port):
@@ -4935,13 +5580,16 @@ def ensure_rescale_visible(port, max_attempts: int = 6) -> bool:
     return ok
 
 
-# 取樣器目標值。跟 Steps／Guidance 一樣寫死在共用模組——兩個 webrunner 變體共用
-# 同一組生成參數，只有模型字面是 per-variant 常數（因為它偶爾要跟著站方改版）。
+# The sampler target value. Like Steps / Guidance it is hard-coded in the shared module —
+# both webrunner variants share the same set of generation parameters; only the model label
+# is a per-variant constant (because it occasionally has to follow site revisions).
 TARGET_SAMPLER = "Euler Ancestral"
 
-# 取樣器下拉的已知字面。用途是「認出目前選中的是哪一個」：下拉的觸發元素本身就
-# 顯示當前值，站方沒給穩定的 aria-label 可抓，只能反過來用值去認元素。站方新增
-# 取樣器時在這裡補字串即可，邏輯不動。
+# The known labels of the sampler dropdown. Their purpose is "recognising which one is
+# currently selected": the dropdown's trigger element itself displays the current value, and
+# the site provides no stable aria-label to grab, so the element can only be recognised the
+# other way round, by its value. When the site adds a sampler, just add the string here; the
+# logic stays unchanged.
 _KNOWN_SAMPLERS = (
     "Euler Ancestral", "Euler", "DPM++ 2M SDE", "DPM++ 2M", "DPM++ SDE",
     "DPM++ 2S Ancestral", "DPM2 Ancestral", "DPM2", "DPM Fast", "DDIM V3",
@@ -4951,7 +5599,8 @@ _KNOWN_SAMPLERS = (
 
 
 def read_current_sampler(port):
-    """回傳目前顯示的取樣器字面；認不出來回 None（不是錯誤，見 `select_sampler`）。"""
+    """Return the currently displayed sampler label; None if it cannot be recognised (not an
+    error, see `select_sampler`)."""
     return port.execute_script(
         """
         const known = arguments[0];
@@ -4984,11 +5633,13 @@ def read_current_sampler(port):
 
 
 def _find_sampler_trigger(port):
-    """找出「點下去會展開取樣器下拉」的元素。
+    """Find the element that "opens the sampler dropdown when clicked".
 
-    三段式，愈後面愈寬鬆：(1) `Sampler` 標籤附近、顯示已知取樣器字面的最小元素；
-    (2) 全頁最小的已知取樣器字面元素（標籤被站方改名時的退路）；(3) `Sampler`
-    標籤同層裡第一個可點元素（目前值不在 `_KNOWN_SAMPLERS` 裡時的最後手段）。"""
+    Three stages, each looser than the last: (1) the smallest element near the `Sampler`
+    label that displays a known sampler label; (2) the smallest element on the whole page
+    with a known sampler label (the fallback for when the site renames the label); (3) the
+    first clickable element at the `Sampler` label's level (the last resort for when the
+    current value is not in `_KNOWN_SAMPLERS`)."""
     return port.execute_script(
         """
         const known = arguments[0];
@@ -5036,8 +5687,9 @@ def _find_sampler_trigger(port):
 
 
 def _dump_sampler_options(port) -> None:
-    """診斷用：把當下看得到的取樣器字面印進 log。與 `_dump_model_options` 同理，
-    站方改字面時這是唯一能直接看出該把 `TARGET_SAMPLER` 改成什麼的證據。"""
+    """Diagnostic: print the sampler labels currently visible into the log. For the same
+    reason as `_dump_model_options`, when the site changes the labels this is the only
+    evidence that directly shows what `TARGET_SAMPLER` should be changed to."""
     try:
         names = port.execute_script(
             """
@@ -5059,16 +5711,19 @@ def _dump_sampler_options(port) -> None:
 
 
 def _find_sampler_option(port, target: str):
-    """回傳下拉裡文字**完全等於** `target` 的選項元素；找不到回 None。
+    """Return the option element in the dropdown whose text **exactly equals** `target`; None
+    if not found.
 
-    兩個刻意的選擇：
+    Two deliberate choices:
 
-    * 比對**整段 innerText 完全相等**，不是「第一行相等」。V5 把選單分成
-      `RECOMMENDED` / `OTHER` 兩組，組容器的 innerText 是
-      `'OTHER\\nEuler\\nDPM++ 2S Ancestral\\n…'`——用第一行比對雖然濾得掉組
-      容器，但濾不掉「剛好只包一個選項」的外層 wrapper，而點 wrapper 是無效的。
-    * 優先 `[role="option"]`，再退到一般元素；同一輪裡取 `outerHTML` **最短**
-      的，因為最短者最貼近選項本體，外層 wrapper 一定比它長。
+    * Matches **the whole innerText exactly**, not "the first line is equal". V5 splits the
+      menu into two groups, `RECOMMENDED` / `OTHER`, and a group container's innerText is
+      `'OTHER\\nEuler\\nDPM++ 2S Ancestral\\n…'` — matching on the first line does filter out
+      the group containers, but not an outer wrapper that "happens to wrap just one option",
+      and clicking a wrapper does nothing.
+    * `[role="option"]` first, then ordinary elements; within one pass the one with the
+      **shortest** `outerHTML` wins, because the shortest is closest to the option itself,
+      and an outer wrapper is always longer.
     """
     return port.execute_script(
         """
@@ -5094,23 +5749,29 @@ def _find_sampler_option(port, target: str):
 
 def select_sampler(port, target: str = TARGET_SAMPLER,
                    timeout: float = 10.0) -> bool:
-    """把取樣器切到 `target` 並**讀回驗證**，驗過才回 True。
+    """Switch the sampler to `target` and **read it back to verify**; returns True only once
+    verified.
 
-    兩個細節值得記住：
+    Two details worth remembering:
 
-    1. 比對是**完全相等**，不是 `startsWith`／`includes`——選單裡
-       `Euler Ancestral` 與 `Euler` 是兩個不同的取樣器，名字卻是前綴關係，任何
-       寬鬆比對都會在這兩者之間選錯。而且選錯**照樣產得出圖**、只是取樣不對，
-       從結果幾乎看不出來，所以寧可比對失敗（會 dump 選項 ＋ snap）也不放寬。
-    2. 已經是目標值時直接回 True，不去點開下拉：下拉觸發元素顯示的就是當前值，
-       點開之後再點同一個字面等於把選單關掉，白跑一趟還可能誤觸別的控制項。
-       目前的 `TARGET_SAMPLER`（`Euler Ancestral`）**剛好就是網頁自己的預設**，
-       所以正常情況下每次 setup 都會走這條短路、log 印
-       `sampler already 'Euler Ancestral'`。**這不代表切換邏輯沒在運作**——
-       `.chrome_profile/` 會記住使用者上次選的值，站方也可能改預設，那時就會走
-       完整的點選 ＋ 讀回驗證路徑。
+    1. Matching is **exact equality**, not `startsWith` / `includes` — in the menu
+       `Euler Ancestral` and `Euler` are two different samplers whose names are prefixes of
+       each other, and any loose matching would pick the wrong one between them. And picking
+       the wrong one **still produces images**, just with the wrong sampling, which is nearly
+       impossible to tell from the results, so a failed match (which dumps the options +
+       snaps) is preferred over loosening it.
+    2. When it is already the target value, return True directly without opening the
+       dropdown: the dropdown's trigger element displays the current value, and clicking the
+       same label after opening it just closes the menu — a wasted trip that might also hit
+       another control. The current `TARGET_SAMPLER` (`Euler Ancestral`) **happens to be the
+       web page's own default**, so normally every setup takes this shortcut and the log
+       prints `sampler already 'Euler Ancestral'`. **That does not mean the switching logic
+       is not working** — `.chrome_profile/` remembers the value the user last picked, and
+       the site may change its default, at which point the full click + read-back
+       verification path is taken.
 
-    找不到選項／驗證失敗都會 `_dump_sampler_options()` ＋ `snap()` 留證據。
+    Option not found / verification failed both leave evidence via
+    `_dump_sampler_options()` + `snap()`.
     """
     current = read_current_sampler(port)
     if current == target:
@@ -5125,9 +5786,10 @@ def select_sampler(port, target: str = TARGET_SAMPLER,
     port.execute_script("arguments[0].scrollIntoView({block:'center'});", trigger)
     port.click(trigger)
     human_pause(0.6, 1.1)
-    # 逾時是**間隔** → 單調時鐘（理由詳見 `reject_cookies`）。牆鐘往回跳會把
-    # 一次幾秒的 DOM 逾時變成幾小時的停頓——**卡住比失敗更難查**，監督者看到的
-    # 是一個還活著卻什麼都不做的行程；往前跳則讓它退化成只試一次。
+    # The timeout is an **interval** → monotonic clock (see `reject_cookies` for details). A
+    # wall clock jumping back turns a DOM timeout of a few seconds into a stall of hours —
+    # **getting stuck is harder to diagnose than failing**, since the supervisor sees a
+    # process that is alive yet doing nothing; jumping forward degrades it into a single try.
     end = time.monotonic() + timeout
     option = None
     while time.monotonic() < end:
@@ -5140,14 +5802,16 @@ def select_sampler(port, target: str = TARGET_SAMPLER,
         _dump_sampler_options(port)
         snap(port, "sampler_option_not_found")
         return False
-    # 真實滑鼠點選優先。**不要**用 JS 的 `el.click()`：2026-08-21 實測，那樣做
-    # 選單保持開啟、取樣器完全沒變，因為這個下拉是 combobox 元件（頁面上有
-    # `aria-label="Select a sampler"` 的 input），它聽的是 mousedown 而不是
-    # click。JS click 只送 click，元件收不到 → 靜默無效。
+    # A real mouse click first. **Do not** use JS's `el.click()`: measured on 2026-08-21,
+    # doing that left the menu open and the sampler completely unchanged, because this
+    # dropdown is a combobox component (the page has an input with
+    # `aria-label="Select a sampler"`) that listens to mousedown rather than click. A JS click
+    # only sends click, so the component never receives it → silently ineffective.
     robust_click(port, option)
     human_pause(0.6, 1.0)
     if read_current_sampler(port) != target:
-        # 真實點選沒生效（元件可能只聽 pointerdown）：補完整事件序列再試一次。
+        # The real click did not take effect (the component may listen only to pointerdown):
+        # fill in the full event sequence and try once more.
         dispatch_mouse_sequence(port, option)
         human_pause(0.6, 1.0)
     actual = read_current_sampler(port)
@@ -5161,29 +5825,36 @@ def select_sampler(port, target: str = TARGET_SAMPLER,
 
 
 def configure_sampler_settings(port) -> bool:
-    # 直接交給 `ensure_rescale_visible()`：它以結果為準、兩種展開路徑都試、可安全
-    # 重複呼叫。**不要**在這裡先無條件 `expand_advanced_settings()`——那是切換鈕，
-    # 遇到「面板本來就開著」的起始狀態會反而把它收起來（2026-08-22 的實際故障）。
+    # Hand it straight to `ensure_rescale_visible()`: it goes by the result, tries both
+    # expansion paths, and is safe to call repeatedly. **Do not** call
+    # `expand_advanced_settings()` unconditionally here first — it is a toggle, and in the
+    # "panel already open" starting state it would collapse it instead (the actual failure on
+    # 2026-08-22).
     all_ok = with_retry("ensure_rescale_visible",
                         lambda: ensure_rescale_visible(port),
                         max_attempts=3, sleep_range=(1, 2))
     dump_advanced_labels(port)
-    # 先切取樣器、再設數值。順序是有意的：換取樣器時站方有可能把 Steps／Guidance
-    # 重設成該取樣器的預設值，反過來做就會把剛設好、剛驗過的值默默洗掉。
-    # 失敗與數值設定同級（一起併進 `all_ok`，會讓 `_setup_session` 整個回 False），
-    # 不是可有可無的裝飾——跑錯取樣器產出的圖看起來「差不多」，最難察覺。
+    # Switch the sampler first, then set the numbers. The order is intentional: when the
+    # sampler changes, the site may reset Steps / Guidance to that sampler's defaults, and
+    # doing it the other way round would quietly wipe the values just set and verified.
+    # A failure ranks the same as the numeric settings (folded into `all_ok` together, which
+    # makes `_setup_session` return False as a whole); it is not optional decoration —
+    # images made with the wrong sampler look "about the same", which makes it the hardest
+    # to notice.
     sampler_ok = select_sampler(port, TARGET_SAMPLER)
     print(f"setting Sampler={TARGET_SAMPLER} final -> {sampler_ok}")
     all_ok = sampler_ok and all_ok
     human_pause(0.5, 1.0)
-    # 每一組都是「同一個設定在不同站方版面下的標籤寫法」。原本這裡寫的是
-    # 「collapsed 與 expanded 檢視的標籤不同」——**那個說法是錯的**，正式 log
-    # 打臉了它：冒號的有無跟面板展開與否無關，跟**模型版面**有關。
-    #     V4.5：'Steps:'、'Prompt Guidance:'、'Prompt Guidance Rescale:'
-    #     V5  ：'Steps'、 'Prompt Guidance'、 'Prompt Guidance Rescale'
-    # （2026-08-30 從 11 次 setup 的 `visible setting labels:` 直接讀出來的。）
-    # 兩種寫法都還活著，所以一個都不能刪；順序則交給
-    # `first_present_numeric_label` 當場問頁面，不要在這裡排死。
+    # Each group is "the label spellings of the same setting under different site layouts".
+    # This used to say "the collapsed and expanded views have different labels" — **that
+    # claim was wrong**, and the production log disproved it: whether there is a colon has
+    # nothing to do with the panel being expanded, and everything to do with the **model
+    # layout**.
+    #     V4.5: 'Steps:', 'Prompt Guidance:', 'Prompt Guidance Rescale:'
+    #     V5  : 'Steps',  'Prompt Guidance',  'Prompt Guidance Rescale'
+    # (Read straight off the `visible setting labels:` of 11 setups on 2026-08-30.)
+    # Both spellings are still alive, so neither can be deleted; the order is left to
+    # `first_present_numeric_label` asking the page on the spot, not fixed here.
     setting_targets = [
         (("Steps:", "Steps"), 23),
         (("Prompt Guidance:", "Prompt Guidance", "Guidance:", "Guidance"), 6),
@@ -5191,14 +5862,16 @@ def configure_sampler_settings(port) -> bool:
           "Guidance Rescale:", "Guidance Rescale", "Rescale:", "Rescale"), 0),
     ]
     for labels, value in setting_targets:
-        # 先問頁面「哪一個候選真的存在」，再開始寫。候選清單混了兩個站方版面的
-        # 標籤寫法，固定順序必定有一邊每次都白跑——理由與實測見
-        # `first_present_numeric_label`。探不到就照原順序全部試過去。
+        # First ask the page "which candidate really exists", then start writing. The
+        # candidate list mixes the label spellings of two site layouts, and any fixed order
+        # is bound to spin for nothing on one side every time — for the reasoning and the
+        # measurements see `first_present_numeric_label`. If the probe finds nothing, try
+        # them all in the original order.
         ordered = list(labels)
         present = first_present_numeric_label(port, labels)
         if present is not None and present != ordered[0]:
-            print(f"  這個版面的標籤是 {present!r}（不是 {ordered[0]!r}）；"
-                  f"跳過不存在的候選")
+            print(f"  this layout's label is {present!r} (not {ordered[0]!r}); "
+                  f"skipping the candidates that do not exist")
             ordered.remove(present)
             ordered.insert(0, present)
         ok = False
@@ -5207,25 +5880,28 @@ def configure_sampler_settings(port) -> bool:
             if set_numeric_setting_verified(port, label, value, retries=2):
                 ok, used = True, label
                 break
-        # 報**真正成功的那個候選**，不是第一個候選。原本印 `labels[0]`，於是
-        # 正式 log 每次啟動都寫「setting Steps:=23 final -> True」——而 `Steps:`
-        # 其實每次都失敗，成功的是 `Steps`。以結果為準的判定配上以嘗試為準的
-        # 敘述，看 log 的人會得到相反的結論。失敗時把候選全列出來。
+        # Report **the candidate that really succeeded**, not the first candidate. This used
+        # to print `labels[0]`, so on every start the production log wrote "setting
+        # Steps:=23 final -> True" — while `Steps:` in fact failed every time and it was
+        # `Steps` that succeeded. A result-based verdict paired with an attempt-based
+        # narrative leads whoever reads the log to the opposite conclusion. On failure, all
+        # the candidates are listed.
         print(f"setting {used or ' / '.join(labels)}={value} final -> {ok}")
         all_ok = ok and all_ok
         human_pause(0.5, 1.0)
-    # Variety+：V4.5 有這個開關，**V5 已經整個移除**（2026-08-21 實機確認：
-    # 展開 Advanced Settings 之後 DOM 裡完全找不到這個標籤）。控制項不存在時
-    # 絕不能當成失敗——`configure_sampler_settings` 回 False 會讓
-    # `_setup_session` 整個回 False，監督者就會無限重生瀏覽器。
-    # 「存在但切不動」才算真失敗。
+    # Variety+: V4.5 has this switch, **V5 removed it entirely** (confirmed on the real site
+    # on 2026-08-21: after expanding Advanced Settings the label is nowhere in the DOM). A
+    # missing control must never be treated as a failure — `configure_sampler_settings`
+    # returning False makes `_setup_session` return False as a whole, and the supervisor would
+    # respawn the browser endlessly.
+    # Only "present but will not toggle" counts as a real failure.
     if _has_variety_plus(port):
         variety_ok = set_variety_plus(port, enable=True)
         print("Variety+ -> ON" if variety_ok
               else "WARN: could not toggle Variety+")
     else:
         variety_ok = True
-        print("Variety+ 控制項不存在（V5 已移除）；略過")
+        print("Variety+ control not present (removed in V5); skipping")
     return variety_ok and all_ok
 
 
@@ -5253,7 +5929,8 @@ def find_generate_button(port):
             """
         )
     except port.TRANSPORT_ERRORS as error:
-        # 卡頓 → 記錄後照舊回 sentinel；session 已死 → raise BrowserGoneError。
+        # A hiccup → log it and return the sentinel as before; the session is dead → raise
+        # BrowserGoneError.
         _note_transport_error("find_generate_button", error)
         return None
 
@@ -5290,7 +5967,8 @@ def get_main_image_src(port) -> str | None:
             """
         )
     except port.TRANSPORT_ERRORS as error:
-        # 卡頓 → 記錄後照舊回 sentinel；session 已死 → raise BrowserGoneError。
+        # A hiccup → log it and return the sentinel as before; the session is dead → raise
+        # BrowserGoneError.
         _note_transport_error("get_main_image_src", error)
         return None
 
@@ -5299,15 +5977,17 @@ def get_generation_error(port) -> dict | None:
     """Return a visible NovelAI generation error/toast, if one exists."""
     try:
         return port.execute_script(
-            # 吐司是**容器**，所以用嚴的那一支 `onScreen`（吐司幾乎都是
-            # position:fixed，而 `offsetParent` 對 fixed 一律回 null）。
+            # A toast is a **container**, so it uses the strict `onScreen` (toasts are
+            # almost always position:fixed, and `offsetParent` is always null for fixed).
             #
-            # ⚠️ **判準直接串接 `_JS_VISIBLE`，不要在這裡再抄一份。** 內嵌 JS
-            # 一樣接得到模組層常數——同檔另有五個常數就是這樣串的，`+` 一個字串
-            # 在函式裡跟在模組層完全一樣。而抄一份的代價不只是「兩邊要記得一起
-            # 改」：JS 的函式宣告會提升、後宣告的勝出，所以一個同名的
-            # `function visible` 會**覆蓋掉常數自己的版本**，連 `onScreen` 內部
-            # 呼叫到的都會變成抄本。
+            # ⚠️ **The predicate is concatenated straight from `_JS_VISIBLE`; do not copy it
+            # here again.** Embedded JS can reach module-level constants just the same — five
+            # other constants in this file are concatenated exactly that way, and `+`-ing a
+            # string inside a function is no different from doing it at module level. And the
+            # cost of a copy is not just "remember to change both sides": JS function
+            # declarations are hoisted and the later declaration wins, so a same-named
+            # `function visible` would **override the constant's own version**, and even the
+            # calls inside `onScreen` would end up using the copy.
             _JS_VISIBLE + r"""
             const selectors = [
               '[role="alert"]', '[aria-live="assertive"]',
@@ -5353,7 +6033,8 @@ def get_generation_error(port) -> dict | None:
             """
         )
     except port.TRANSPORT_ERRORS as error:
-        # 卡頓 → 記錄後照舊回 sentinel；session 已死 → raise BrowserGoneError。
+        # A hiccup → log it and return the sentinel as before; the session is dead → raise
+        # BrowserGoneError.
         _note_transport_error("generation-error check", error)
         return None
 
@@ -5362,35 +6043,40 @@ def wait_for_new_image(port, previous_src: str | None,
                        timeout: float = 120.0, *,
                        baseline_error: dict | None = None,
                        seen_srcs: Container[str] = ()) -> str | None:
-    """等到主圖區出現一張「還沒存過」的圖。
+    """Wait until an image that "has not been saved yet" appears in the main image area.
 
-    `seen_srcs` 是這一輪已經接受過的 src。**沒有它這個函式會把站方自己
-    換回來的舊圖當成新圖**：判準只有「跟 `previous_src` 不一樣」，而
-    `get_main_image_src` 挑的是「面積最大的可見 blob:/data: 圖」——面積用的是
-    `naturalWidth`，而縮圖的 naturalWidth 跟原圖一樣大，所以歷史區的縮圖跟主
-    圖同分；DOM 順序一變，挑中的就換成另一張舊圖。舊圖的 blob: URL 在同一份文
-    件裡是活的、而且跟當初存下來時一模一樣，所以「存過的 src 一律不算新圖」
-    剛好擋得住這條路。
+    `seen_srcs` is the set of srcs already accepted this round. **Without it this function
+    would take an old image the site swapped back in for a new one**: the only criterion is
+    "different from `previous_src`", and `get_main_image_src` picks "the largest visible
+    blob:/data: image" — the area uses `naturalWidth`, and a thumbnail's naturalWidth is as
+    large as the original's, so the history area's thumbnails tie with the main image; once
+    the DOM order changes, the pick switches to another old image. An old image's blob: URL is
+    alive within the same document and identical to when it was saved, so "a src that was
+    already saved never counts as a new image" blocks exactly that path.
 
-    實測而不是推論：2026-08-24～08-27 的 log 裡 402 次生成有 **92 次在 1 秒
-    內就「拿到新圖」**——光是下面那段穩定性確認就要 0.6 秒，生成本身要 4-7
-    秒，1 秒代表第一次 poll 就命中，也就是根本沒等。其中一次留下了鐵證：
-    第 57 張跟第 43 張的檔案 byte 完全相同。
+    Measured, not inferred: in the 2026-08-24 to 08-27 log, **92 of 402 generations "got a new
+    image" within 1 second** — the stability check below alone takes 0.6 seconds and the
+    generation itself takes 4-7 seconds, so 1 second means the first poll hit, i.e. it never
+    waited at all. One of them left hard proof: image 57 and image 43 were byte-for-byte
+    identical files.
 
-    **這個函式會 raise `GenerationBlockedError`**（不是只回 None）：等待期間
-    週期性地探測購買／方案對話框，命中就直接把這條路收掉，見
-    `BLOCK_PROBE_INTERVAL_SEC` / `BLOCK_PROBE_GRACE_SEC`。兩個呼叫路徑本來就
-    都接得住這個例外——batch 走 `generate_loop` 的額度等待，單圖走
-    `serve_single_image_request` 的收工回報。
+    **This function raises `GenerationBlockedError`** (it does not just return None): during
+    the wait it periodically probes for the purchase / plan dialog, and on a hit it shuts this
+    path down outright, see `BLOCK_PROBE_INTERVAL_SEC` / `BLOCK_PROBE_GRACE_SEC`. Both call
+    paths already catch this exception — the batch goes through `generate_loop`'s quota wait,
+    a single image through `serve_single_image_request`'s wrap-up report.
     """
-    # 這兩個截止時刻用**單調**時鐘。本模組還有六個同形狀的逾時迴圈刻意留在牆鐘
-    # ，這一個是例外，因為牆鐘往回
-    # 跳的後果在這裡跟別處**不同級**：`next_probe` 也是截止時刻，往回跳 Δ 會讓
-    # 額度對話框的探測**整整停擺 Δ**，同時 `end` 也不會到——於是被擋住卻沒人在看，
-    # 正好把 `BLOCK_PROBE_*` 當初要解決的那個病態（實測 65 次、合計 3 小時 16 分
-    # 的空等）原封不動搬回來。其餘那六個往回跳只是「多等 Δ」而已。
-    # 這裡也是全模組佔用時間最長的迴圈（每張圖都進來，正式 timeout 180 秒），
-    # 時鐘跳動最可能就落在它裡面。
+    # These two deadlines use the **monotonic** clock. Six other timeout loops of the same
+    # shape in this module deliberately stay on the wall clock; this one is the exception,
+    # because the consequence of the wall clock jumping back is **of a different class** here
+    # than elsewhere: `next_probe` is a deadline too, and a jump back of Δ would **stall the
+    # quota-dialog probe for a full Δ**, while `end` would not arrive either — so it is
+    # blocked with nobody watching, bringing back untouched exactly the pathology
+    # `BLOCK_PROBE_*` was introduced to fix (measured: 65 idle waits totalling 3 hours 16
+    # minutes). For the other six, a jump back only means "waiting Δ longer".
+    # This is also the loop that occupies the most time in the whole module (every image goes
+    # through it, with a production timeout of 180 seconds), so a clock jump is most likely to
+    # land inside it.
     end = time.monotonic() + timeout
     last = previous_src
     reported: set[str] = set()
@@ -5399,9 +6085,10 @@ def wait_for_new_image(port, previous_src: str | None,
         cur = get_main_image_src(port)
         if cur and cur != previous_src:
             if cur in seen_srcs:
-                # 這條 log 是「站方換回舊圖」唯一的觀測點。沒有它，這個 bug 在
-                # log 裡只表現成「這張圖產得特別快」，沒人看得出來——實際上它
-                # 安靜地跑了好幾天。同一個 src 只抱怨一次，別把 log 洗版。
+                # This log line is the only observation point for "the site swapped an old
+                # image back in". Without it, this bug shows up in the log only as "this image
+                # was generated especially fast", which nobody would notice — in fact it
+                # quietly ran for days. Complain only once per src, so the log is not flooded.
                 if cur not in reported:
                     reported.add(cur)
                     print("    the site is showing an image we already "
@@ -5416,15 +6103,18 @@ def wait_for_new_image(port, previous_src: str | None,
         if error_text and error_text != baseline_error:
             detail = error_text.get("text", "generation failed")
             print(f"    generation failure detected in UI: {detail}")
-            # 錯誤吐司本身可能就是「額度用完」。回 None 會讓呼叫端重試，對這種
-            # 失敗是白費的，所以先分流：擋住的話 raise，收工不重生。
+            # The error toast itself may be "quota used up". Returning None makes the caller
+            # retry, which is wasted effort for this kind of failure, so triage first: if
+            # blocked, raise, and wrap up without respawning.
             _abort_if_generation_blocked(port, "a generation failure toast")
             return None
-        # 購買／方案對話框跳出來就代表這張圖不會來了，繼續等只是空轉。理由與
-        # 兩個時間常數的實測依據見 `BLOCK_PROBE_INTERVAL_SEC` / `_GRACE_SEC`。
-        # raise 出去的 `GenerationBlockedError` 兩個呼叫路徑本來就都接得住：
-        # batch 走 `generate_loop` 的額度等待，單圖走 `serve_single_image_
-        # request` 的收工回報——這裡只是讓同一個決定早 3 分鐘發生。
+        # A purchase / plan dialog popping up means this image is not coming, and waiting
+        # longer is just spinning. For the reasoning and the measured basis of the two time
+        # constants, see `BLOCK_PROBE_INTERVAL_SEC` / `_GRACE_SEC`.
+        # Both call paths already catch the `GenerationBlockedError` raised from here: the
+        # batch goes through `generate_loop`'s quota wait, a single image through
+        # `serve_single_image_request`'s wrap-up report — this only makes the same decision
+        # happen 3 minutes earlier.
         now = time.monotonic()
         if now >= next_probe:
             next_probe = now + BLOCK_PROBE_INTERVAL_SEC
@@ -5462,17 +6152,19 @@ def download_image(port, src: str, save_path: Path) -> bool:
             src,
         )
     except port.TRANSPORT_ERRORS as error:
-        # 卡頓 → 記錄後照舊回 sentinel；session 已死 → raise BrowserGoneError。
+        # A hiccup → log it and return the sentinel as before; the session is dead → raise
+        # BrowserGoneError.
         _note_transport_error("download_image", error)
         return False
     if not data_url or "," not in data_url:
         print(f"download failed for {src}")
         return False
     _header, b64 = data_url.split(",", 1)
-    # base64 解碼 / 寫檔失敗（截斷的 data URL、磁碟滿、檔名被 AV 擋住…）以前
-    # 會直接往上炸穿 download_image_with_retry / generate_loop，讓整個 run 以
-    # critical_error 收場；改成回 False，交給既有的 3 次下載重試 +
-    # consecutive_fail 機制處理（與 transport error 的處理方式對稱）。
+    # A base64 decode / file write failure (a truncated data URL, a full disk, a file name
+    # blocked by AV…) used to blow straight through download_image_with_retry /
+    # generate_loop, ending the whole run with a critical_error; it now returns False and is
+    # left to the existing 3 download retries + the consecutive_fail mechanism (symmetric
+    # with how transport errors are handled).
     try:
         payload = base64.b64decode(b64)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5484,9 +6176,10 @@ def download_image(port, src: str, save_path: Path) -> bool:
     return True
 
 
-# `_serving_beat_within_sec` 用這兩個逾時算出單張產圖「服務中」訊號的承諾，所以它們
-# 必須是具名常數、而且是 `generate_one_image` 真正在用的那一份——寫回字面值的話，
-# 承諾會安靜地跟實際的等待長度分岔。`test_webrunner_shared` 用 AST 釘住這件事。
+# `_serving_beat_within_sec` uses these two timeouts to compute the promise of the
+# single-image "being served" signal, so they must be named constants, and the very copy
+# `generate_one_image` really uses — written back as literals, the promise would quietly
+# diverge from the actual wait length. `test_webrunner_shared` pins this down with an AST.
 GENERATE_CLICK_TIMEOUT_SEC = 15.0
 GENERATE_WAIT_TIMEOUT_SEC = 180.0
 
@@ -5498,9 +6191,10 @@ def click_generate(port, timeout: float = GENERATE_CLICK_TIMEOUT_SEC) -> bool:
     transport timeout and raw-bubble `urllib3.ReadTimeoutError`, which
     would crash the webrunner mid-batch. Return False on stall; caller
     `generate_one_image` already retries 4× with backoff."""
-    # 逾時是**間隔** → 單調時鐘（理由詳見 `reject_cookies`）。牆鐘往回跳會把
-    # 一次幾秒的 DOM 逾時變成幾小時的停頓——**卡住比失敗更難查**，監督者看到的
-    # 是一個還活著卻什麼都不做的行程；往前跳則讓它退化成只試一次。
+    # The timeout is an **interval** → monotonic clock (see `reject_cookies` for details). A
+    # wall clock jumping back turns a DOM timeout of a few seconds into a stall of hours —
+    # **getting stuck is harder to diagnose than failing**, since the supervisor sees a
+    # process that is alive yet doing nothing; jumping forward degrades it into a single try.
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         btn = find_generate_button(port)
@@ -5514,7 +6208,8 @@ def click_generate(port, timeout: float = GENERATE_CLICK_TIMEOUT_SEC) -> bool:
                 except port.TRANSPORT_ERRORS:
                     click_via_js(port, btn)
             except port.TRANSPORT_ERRORS as error:
-                # 卡頓 → 回 False 走重試；session 已死 → BrowserGoneError。
+                # A hiccup → return False and go through the retry; the session is dead →
+                # BrowserGoneError.
                 _note_transport_error("click_generate", error)
                 return False
             return True
@@ -5532,34 +6227,42 @@ def generate_one_image(port, previous_src: str | None,
     `retry_delay` seconds and retry up to `max_retries` times. Both params
     come from `batch_config.json` via `generate_loop`.
 
-    `seen_srcs`（選填）往下傳給 `wait_for_new_image`，見那邊的 docstring。
-    單圖路徑不傳，因為它只產一張、沒有「存過的」可言。
+    `seen_srcs` (optional) is passed down to `wait_for_new_image`; see the docstring there.
+    The single-image path does not pass it, because it produces only one image and has
+    nothing "already saved".
 
-    `on_attempt`（選填）在**每一次**嘗試開始時以嘗試序號呼叫一次。只有單張產圖的
-    服務路徑會傳（拿來發「服務中」訊號，見 `_emit_serving_beat`）；batch 不傳，行為
-    完全不變。放在每一次嘗試的開頭、而不是只在進函式時發一次：一次服務最多跑滿
-    `generate_max_retries` 次嘗試（預設 4 次、每次約 225 秒），合計遠超過 bot 原本
-    那個 600 秒的 TTL，只在開頭發一次的話，中間就是十幾分鐘的沉默。"""
+    `on_attempt` (optional) is called once with the attempt number at the start of **every**
+    attempt. Only the single-image serve path passes it (to emit the "being served" signal,
+    see `_emit_serving_beat`); the batch does not, and its behaviour is completely unchanged.
+    It goes at the start of each attempt rather than once on entering the function: one serve
+    runs at most `generate_max_retries` attempts (4 by default, about 225 seconds each), far
+    more in total than the bot's original 600-second TTL, and emitting only once at the start
+    would leave more than ten minutes of silence in between."""
     for attempt in range(1, max_retries + 1):
         if on_attempt is not None:
             on_attempt(attempt)
         print(f"    [generate attempt {attempt}/{max_retries}]")
         baseline_error = get_generation_error(port)
-        # 基準要用「按下去的那一刻螢幕上是什麼」，不是「上一張產完時是什麼」。
-        # 呼叫端的 `previous_src` 是上一張的結果，中間隔著 20-30 秒的圖間等待
-        # 和一次 DOM 請求輪詢；額度回補那條路上還隔著一次 `port.refresh()`，
-        # 而 blob: URL 是綁定文件的，reload 之後舊的那條就作廢了——拿它當基準
-        # 等於宣告「畫面上任何東西都算新圖」。讀不到就退回呼叫端給的值：傳輸
-        # 卡頓時 `get_main_image_src` 回 None，用 None 當基準才是真的危險。
+        # The baseline must be "what is on screen at the moment of pressing", not "what it was
+        # when the previous image finished". The caller's `previous_src` is the previous
+        # image's result, separated by a 20-30 second between-image wait and a DOM request
+        # poll; on the quota-refill path there is also a `port.refresh()` in between, and a
+        # blob: URL is bound to its document, so after a reload the old one is void — using
+        # it as the baseline amounts to declaring "anything on screen counts as a new image".
+        # If nothing can be read, fall back to the caller's value: during a transport stall
+        # `get_main_image_src` returns None, and using None as the baseline is what is
+        # really dangerous.
         displayed = get_main_image_src(port)
         baseline_src = displayed or previous_src
         if not click_generate(port):
-            # 「找不到 Generate 鈕」最常見的原因就是整個視窗已經沒了。先探一次
-            # （一次 JS round-trip），確認的話立刻收工——否則 je 變體（wrapper
-            # 吞掉例外、一律回 None）會把 4 次重試連同其間的 25-30s 等待整個
-            # 燒完，才輪到 generate_loop 的計數器慢慢爬。
+            # The most common reason for "the Generate button cannot be found" is that the
+            # whole window is already gone. Probe once (one JS round-trip), and if confirmed,
+            # wrap up at once — otherwise the je variant (whose wrapper swallows exceptions
+            # and always returns None) would burn all 4 retries along with the 25-30s waits in
+            # between before generate_loop's counter slowly climbs.
             _abort_if_browser_gone(port, "locating the Generate button")
-            # 第二個常見原因：購買／方案對話框整個蓋住頁面，鈕還在但點不到。
+            # The second common reason: a purchase / plan dialog covers the whole page, so the
+            # button is still there but cannot be clicked.
             _abort_if_generation_blocked(port, "locating the Generate button")
             print(f"    [generate retry {attempt}/{max_retries}] button not found")
             if attempt < max_retries:
@@ -5570,8 +6273,9 @@ def generate_one_image(port, previous_src: str | None,
             baseline_error=baseline_error, seen_srcs=seen_srcs)
         if new_src and new_src != previous_src:
             return new_src
-        # 等不到新圖有兩種可能：站方這次沒產出（值得重試），或視窗已經關掉
-        # （重試毫無意義）。探一次把兩者分開。
+        # Not getting a new image has two possible causes: the site produced nothing this
+        # time (worth retrying), or the window is already closed (retrying is pointless).
+        # Probe once to tell them apart.
         _abort_if_browser_gone(port, "waiting for a new image")
         _abort_if_generation_blocked(port, "waiting for a new image")
         if attempt < max_retries:
@@ -5586,13 +6290,15 @@ def generate_one_image(port, previous_src: str | None,
 
 
 def _file_digest(path: Path) -> str | None:
-    """存下來那張圖的內容雜湊，讀不到就回 None。
+    """A content hash of the saved image; None if it cannot be read.
 
-    這是**內容層**的防線，跟 `seen_srcs` 的 **URL 層**防線互補：URL 層擋的是
-    「站方把舊圖的 blob URL 再端出來一次」，但擋不到「站方替同一張舊圖重新
-    造了一條 blob URL」。內容一比就沒得躲。
+    This is the **content-level** line of defence, complementing the **URL-level** defence
+    of `seen_srcs`: the URL level blocks "the site serving an old image's blob URL again",
+    but cannot block "the site minting a new blob URL for the same old image". Compare the
+    content and there is nowhere to hide.
 
-    純診斷用途，所以讀檔失敗一律吞掉——不能為了一個旁路把產圖弄掛。
+    Purely diagnostic, so read failures are always swallowed — a side channel must not bring
+    image generation down.
     """
     try:
         return hashlib.blake2b(path.read_bytes(), digest_size=16).hexdigest()
@@ -5618,28 +6324,37 @@ def download_image_with_retry(port, src: str, save_path: Path,
 # identical) from both variants; all DOM goes through the injected `port`.
 
 
-# 單張產圖「服務中」訊號（`single_image_serving`）承諾裡的餘裕。一次嘗試除了按鈕與
-# 等圖兩個逾時之外，還有幾次 JS 探測（錯誤吐司、存活探針、購買框偵測），健康時合計
-# 不到十秒。chromedriver 卡頓不在保證範圍內，見 `_serving_beat_within_sec`。
+# The margin in the promise of the single-image "being served" signal
+# (`single_image_serving`). Besides the two timeouts for the button and the image, an attempt
+# also makes a few JS probes (error toast, liveness probe, purchase-dialog detection), under
+# ten seconds in total when healthy. chromedriver stalls are not covered by the guarantee; see
+# `_serving_beat_within_sec`.
 _SERVING_BEAT_MARGIN_SEC = 60.0
 
 
 def _serving_beat_within_sec(batch_cfg: dict) -> float:
-    """「下一則服務中訊號最晚多久會到」的承諾，單位秒。
+    """The promise of "how long until the next being-served signal arrives at the latest", in
+    seconds.
 
-    ＝ 按 Generate 的逾時 ＋ 等新圖的逾時 ＋ **目前生效的**重試間隔上限 ＋ 餘裕。
-    兩則訊號之間最長的一段就是一次完整的嘗試（`generate_one_image` 在每一次嘗試的
-    開頭發一則），所以承諾就從這幾個量算。預設設定下是 285 秒。
+    = the Generate click timeout + the new-image wait timeout + the **currently effective**
+    upper bound of the retry delay + a margin. The longest stretch between two signals is one
+    complete attempt (`generate_one_image` emits one at the start of every attempt), so the
+    promise is computed from these quantities. 285 seconds under the default config.
 
-    **由這一側算、隨事件送過去，bot 不要自己抄一份。** 前兩個是本模組的常數、第三
-    個是 `batch_config.json` 的值；bot 那側若自己寫一個「服務最多幾秒」，那就是一份
-    會安靜分岔的抄本——有人調高重試間隔，bot 就開始取消正在被服務的請求，症狀正是這
-    個訊號要消滅的那一種（圖產出來、沒有人收）。同 `quota_wait` 事件帶
-    `next_retry_sec` 的理由：把**當時生效的值**留在事件串流裡。
+    **It is computed on this side and sent with the event; the bot must not keep its own
+    copy.** The first two are constants of this module and the third is a
+    `batch_config.json` value; if the bot side wrote its own "a serve takes at most N
+    seconds", that would be a copy that quietly diverges — someone raises the retry delay and
+    the bot starts cancelling requests that are being served, which is exactly the symptom
+    this signal exists to eliminate (the image is produced and nobody collects it). Same
+    reason as the `quota_wait` event carrying `next_retry_sec`: keep **the value in effect at
+    the time** in the event stream.
 
-    只保證健康的路徑。chromedriver 卡頓時單次 JS 呼叫最久 120 秒，疊幾次就能超過
-    承諾，bot 可能提早放棄一筆最後其實會完成的請求。那是已經生病的路徑；承諾若要
-    蓋住它，健康時「服務者死了」的偵測就得多等好幾倍。
+    Only the healthy path is guaranteed. During a chromedriver stall a single JS call can take
+    up to 120 seconds, a few of which stacked up exceed the promise, and the bot may give up
+    early on a request that would in the end have completed. That is an already-sick path; to
+    cover it the promise would make "the server died" detection wait several times longer in
+    the healthy case.
     """
     delay_hi = max(float(v) for v in batch_cfg["generate_retry_delay_sec"])
     return (GENERATE_CLICK_TIMEOUT_SEC + GENERATE_WAIT_TIMEOUT_SEC + delay_hi
@@ -5648,59 +6363,77 @@ def _serving_beat_within_sec(batch_cfg: dict) -> float:
 
 def _emit_serving_beat(request_id: str, in_band: bool, phase: str,
                        batch_cfg: dict) -> None:
-    """發一則 `single_image_serving`：「這一筆正在被服務，而且服務者還活著」。
+    """Emit a `single_image_serving`: "this request is being served, and the server is still
+    alive".
 
-    bot 靠它分辨「正在服務、只是慢」與「服務者已經死了」。在這之前，背景程式從請求
-    寫進磁碟到 `single_image_done` 之間什麼都不發，bot 只量得到「距離送出多久」，
-    而那個量對帶內服務是錯的。
+    The bot relies on it to tell "being served, just slow" from "the server has already died".
+    Before this, the background program emitted nothing between the request being written to
+    disk and `single_image_done`, so the bot could only measure "how long since it was sent",
+    which is the wrong measure for in-band serving.
 
-    時機（每一則都在同一筆的 `single_image_done` **之前**，之後絕不再發）：
-    `start`＝過了兩道驗證、還沒碰瀏覽器；`generate`＝每一次 Generate 嘗試開始；
-    `download`＝開始下載。驗證沒過的請求（空 prompt、不安全的 request_id）不發。
+    Timing (each one comes **before** the same request's `single_image_done`, and never after
+    it): `start` = past both validations, before touching the browser; `generate` = at the
+    start of every Generate attempt; `download` = when the download starts. Requests that
+    fail validation (empty prompt, unsafe request_id) emit none.
 
-    **遙測絕不可以打斷批次，也絕不可以讓一張圖失敗。** `emit_event` 自己已經吞掉
-    寫檔與序列化的錯；這裡再包一層 broad except，是因為這一支在服務的 `try` **裡面**
-    被呼叫、還會經由 `on_attempt` 在 `generate_one_image` 裡面被呼叫——從這裡逸出的
-    任何東西都會被 `serve_single_image_request` 的 broad except 接住，一次好好的服務
-    就變成 `ok=false`。訊號寫不出去的代價是「bot 可能提早放棄」，拿一張圖去換不划算。
-    承諾的計算也放在 `try` 裡，理由相同。
+    **Telemetry must never interrupt the batch, and must never make an image fail.**
+    `emit_event` already swallows its own write and serialisation errors; the extra broad
+    except here is because this function is called **inside** the serve's `try`, and also
+    inside `generate_one_image` via `on_attempt` — anything escaping from here would be
+    caught by `serve_single_image_request`'s broad except, turning a perfectly good serve into
+    `ok=false`. The cost of the signal not being written is "the bot may give up early";
+    trading an image for that is not worth it. The promise computation is inside the `try`
+    too, for the same reason.
     """
     try:
         emit_event("single_image_serving", request_id=request_id,
                    in_band=bool(in_band), phase=phase,
                    beat_within_sec=_serving_beat_within_sec(batch_cfg))
     except Exception as error:  # pylint: disable=broad-except
-        # `!r` 刻意保留：`try` 裡只有 `emit_event` 與設定檔算術，碰不到 driver。
+        # `!r` is kept on purpose: the `try` holds only `emit_event` and config-file
+        # arithmetic, and cannot reach the driver.
         print(f"single_image_serving({phase}) failed; serve continues: "
               f"{error!r}", file=sys.stderr)
 
 
 def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
-    """產出「單張任意 prompt」的圖並 emit `single_image_done`。
+    """Produce an image for "a single arbitrary prompt" and emit `single_image_done`.
 
-    - 主 prompt 取自 req["prompt"]（必填）；char1 / char2 / undesired 為選填。
-    - 角色框處理依 `in_band` 分兩路：
-      * **idle one-shot**（in_band=False；bot 在 idle 時 spawn、serve 完 main()
-        直接 return 0，後面不再跑 batch）：把「多出來」的角色框從尾端刪光，再把
-        **殘存的角色框清成空字串**（不依請求的 char1 / char2 值保留任何內容）。
-        NovelAI 強制至少保留 1 個角色框（最後一框沒有刪除鈕、刪不掉），所以
-        「刪到 0」做不到；正確收尾是「刪到最小 + 清空殘存框」，讓生成時沒有任何
-        帶內容的角色。完全不填角色內容；殘留的 batch 角色特徵不會滲進這張圖。
-      * **in-band**（in_band=True；batch 進行中插一張即時生成）：絕不刪框 —
-        serve 完 generate_loop 會用 _refill_character_fields 重填「當前 batch
-        角色」，而那需要那些角色卡片仍存在：`fill_character_prompt` 是先定位
-        卡片再寫，卡片不在就回 False（並印一行），重填等於沒發生。
-        （2026-09-05 更正：原本寫「要 areas[1]」，那是改掉之前的 index 取法。）
-        刪框會讓 refill 靜默失敗、batch 角色剩餘的圖以缺框產生。故 in-band
-        沿用既有「清空空欄位 + verify 空字串」行為（框留著、refill 仍可用）。
-    - in-band 路徑產圖前對 char1 / char2 都跑 verify_character_prompt（框都留著，
-      連「清空」case 也驗，expected="" 即清空確認），保證上一個 batch 角色不會
-      因一次靜默失敗的清空而被產進這張單圖。idle 路徑因為框已全刪，不驗任何角色。
-    - 只產 1 張，存進 output/_oneshot/<request_id>/。
-    - **絕不**碰 resume checkpoint（webrunner_progress.json）— 那是 batch 角色
-      續產用的，one-shot 不該污染它。
-    - 整段包在 try/except：任何失敗都 emit `ok=false` 帶簡短 error，呼叫端仍會
-      刪掉請求檔，確保「每個 request_id 剛好一個 event、不重複觸發」。
+    - The main prompt comes from req["prompt"] (required); char1 / char2 / undesired are
+      optional.
+    - Character boxes are handled along two paths depending on `in_band`:
+      * **idle one-shot** (in_band=False; the bot spawns it while idle, and after serving,
+        main() returns 0 straight away with no batch after it): delete the "extra" character
+        boxes from the tail, then **clear the remaining character boxes to empty strings**
+        (keeping no content based on the request's char1 / char2 values). NovelAI forces at
+        least 1 character box to remain (the last box has no delete button and cannot be
+        deleted), so "delete down to 0" is impossible; the right finish is "delete down to
+        the minimum + clear the remaining box", so no character with content exists at
+        generation time. No character content is filled in at all; leftover batch character
+        traits do not seep into this image.
+      * **in-band** (in_band=True; one instant generation slotted in while a batch is
+        running): never delete boxes — after serving, generate_loop uses
+        _refill_character_fields to refill "the current batch character", and that needs
+        those character cards to still exist: `fill_character_prompt` locates the card first
+        and then writes, and when the card is missing it returns False (and prints a line),
+        so the refill effectively never happens.
+        (Correction 2026-09-05: this used to say "needs areas[1]", which was the index-based
+        lookup before it was changed.)
+        Deleting boxes would make the refill fail silently, and the batch character's
+        remaining images would be generated with boxes missing. So in-band keeps the existing
+        "clear the empty fields + verify empty strings" behaviour (boxes stay, refill still
+        works).
+    - Before generating, the in-band path runs verify_character_prompt on both char1 / char2
+      (the boxes all stay, and even the "clear" case is verified, with expected="" as the
+      clearing confirmation), guaranteeing the previous batch character is not generated
+      into this single image because of one silently failed clear. The idle path verifies no
+      character, since all boxes are already deleted.
+    - Produces only 1 image, saved into output/_oneshot/<request_id>/.
+    - **Never** touches the resume checkpoint (webrunner_progress.json) — that is for
+      resuming batch characters, and a one-shot must not pollute it.
+    - The whole thing is wrapped in try/except: any failure emits `ok=false` with a short
+      error, and the caller still deletes the request file, guaranteeing "exactly one event
+      per request_id, never triggered twice".
     """
     request_id = str(req.get("request_id") or "")
     prompt = req.get("prompt") or ""
@@ -5714,37 +6447,44 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
             print("serve_single_image_request: empty prompt; aborting")
             return
         if not _is_safe_folder_component(request_id):
-            # `request_id` 下面**直接當成輸出資料夾名**（`SINGLE_IMAGE_OUTPUT_ROOT
-            # / request_id`），而它來自磁碟上的請求檔、讀取端從來沒驗過。實測
-            # `C:\Windows\Temp\x` 會**整個取代 base**（`output/_oneshot` 消失）、
-            # `../../..` 走得出 repo，而緊接著就是 `mkdir(parents=True)` 加上把
-            # 下載的圖寫進去。今天安全靠的是唯一的寫入者只產十六進位——那是
-            # **寫入端**的性質，不是這裡宣告出來的，中間還隔著一個跨行程的 JSON
-            # 檔。同 `cmd_fav_show` 的 docstring：讀取端要自己講。
+            # `request_id` is used below **directly as the output folder name**
+            # (`SINGLE_IMAGE_OUTPUT_ROOT / request_id`), and it comes from the request file
+            # on disk, which the reading side never validated. Measured: `C:\Windows\Temp\x`
+            # **replaces the base entirely** (`output/_oneshot` disappears), `../../..` walks
+            # out of the repo, and right after that comes `mkdir(parents=True)` plus writing
+            # the downloaded image into it. Today's safety relies on the only writer producing
+            # only hexadecimal — a property of **the writing side**, not declared here, with a
+            # cross-process JSON file in between. As in `cmd_fav_show`'s docstring: the
+            # reading side has to state it itself.
             #
-            # 判成失敗、而不是退回 `unknown/`：路徑形狀的 id 必然不在 bot 的
-            # correlation map 裡（那份的鍵是 `_generate_request_id()` 產的），
-            # `_handle_single_image_done` 會直接忽略那則事件，所以那張圖不會有人
-            # 收到；而額度是這條產線的瓶頸。產一張注定沒人拿的圖是純損失。
+            # Treated as a failure rather than falling back to `unknown/`: a path-shaped id
+            # can never be in the bot's correlation map (whose keys are produced by
+            # `_generate_request_id()`), `_handle_single_image_done` would simply ignore that
+            # event, so nobody would receive the image; and quota is this pipeline's
+            # bottleneck. Producing an image nobody is destined to collect is pure loss.
             #
-            # 排在 prompt 檢查**之後**是刻意的：請求檔壞掉時 `req` 是 `{}`，
-            # `request_id` 與 `prompt` 同時為空，讓它繼續報 `empty prompt`，既有
-            # 的診斷語意與測試都不動。
+            # Placing it **after** the prompt check is deliberate: when the request file is
+            # broken `req` is `{}`, `request_id` and `prompt` are both empty, and letting it
+            # keep reporting `empty prompt` leaves the existing diagnostic semantics and tests
+            # untouched.
             emit_event("single_image_done", request_id=request_id, ok=False,
                        error="invalid request id")
             print(f"serve_single_image_request: unsafe request_id "
                   f"{request_id!r}; aborting", file=sys.stderr)
             return
-        # 設定在這裡就讀：「服務中」訊號要帶一個用**當時生效的**重試間隔算出來的
-        # 承諾，而第一則在碰瀏覽器之前就要發。`load_batch_config` 永不拋。
+        # Read the config right here: the "being served" signal must carry a promise computed
+        # from the retry delay **in effect at the time**, and the first one has to be emitted
+        # before touching the browser. `load_batch_config` never raises.
         batch_cfg = load_batch_config()
-        # 「開始服務」：排在兩道驗證早退之後（驗證沒過就不會被服務，不該宣稱在服務），
-        # 排在第一次寫欄位之前（bot 要知道的是「有人開始處理這一筆了」）。
+        # "Serving starts": placed after the two validation early-exits (a request that
+        # failed validation is not served and should not claim to be), and before the first
+        # field write (what the bot needs to know is "someone has started handling this
+        # one").
         _emit_serving_beat(request_id, in_band, "start", batch_cfg)
         print(f"serve_single_image_request: request_id={request_id!r} "
               f"in_band={in_band} prompt={prompt[:40]!r} char1={bool(char1)} "
               f"char2={bool(char2)} undesired={bool(undesired)}")
-        # 主 prompt。
+        # Main prompt.
         if not with_retry("oneshot_fill_main_prompt",
                           lambda: fill_main_prompt(port, prompt),
                           max_attempts=3, sleep_range=(2, 4)):
@@ -5752,10 +6492,13 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
                        error="main prompt replacement failed")
             return
         human_pause(0.8, 1.5)
-        # 角色框：處理依 in_band 分流（見 docstring）。
-        # in-band：刪框會破壞 batch refill，所以一律「填」（空值=清空），框留著。
-        # idle one-shot：稍後刪掉多餘框、再把殘存框清成空字串、不填任何角色內容，
-        # 故這裡完全不碰角色框（連有值的也不填，因為馬上就要刪光 + 清空）。
+        # Character boxes: handling splits on in_band (see the docstring).
+        # in-band: deleting boxes would break the batch refill, so always "fill" (empty value
+        # = clear), and the boxes stay.
+        # idle one-shot: extra boxes are deleted later, then the remaining box is cleared to an
+        # empty string, and no character content is filled in, so the character boxes are not
+        # touched here at all (not even the ones with values, since they are about to be
+        # deleted + cleared).
         if in_band:
             if not with_retry("oneshot_fill_char1",
                               lambda: fill_character_prompt(port, 1, char1),
@@ -5771,7 +6514,8 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
                            error="character 2 replacement failed")
                 return
             human_pause(0.6, 1.0)
-        # undesired：有值就填、空就清空 textarea。找不到欄位回 False 只 WARN。
+        # undesired: fill it if there is a value, clear the textarea if empty. A missing field
+        # returns False and only WARNs.
         if not with_retry("oneshot_fill_undesired",
                           lambda: fill_main_undesired(port, undesired),
                           max_attempts=3, sleep_range=(2, 4)):
@@ -5780,16 +6524,21 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
             return
         human_pause(0.8, 1.5)
         if not in_band:
-            # idle one-shot：把「多出來」的角色框從尾端刪光。NovelAI 強制至少保留 1 個角色框
-            # （最後一框沒有 trash 按鈕、刪不掉，見 remove_all_character_slots / remove_character_slot），
-            # 所以刪完通常仍剩 1 框、且該框可能殘留上一個 batch 的內容。光刪框不夠，必須再把
-            # 「殘存的角色框」清成空字串，否則殘留特徵會滲進這張單圖（實測症狀：只有 Character 2
-            # 被刪、Character 1 帶舊值）。
+            # idle one-shot: delete the "extra" character boxes from the tail. NovelAI forces
+            # at least 1 character box to remain (the last box has no trash button and cannot
+            # be deleted, see remove_all_character_slots / remove_character_slot), so after
+            # deleting there is usually still 1 box left, and it may hold leftover content
+            # from the previous batch. Deleting boxes alone is not enough; "the remaining
+            # character boxes" must then be cleared to empty strings, or the leftover traits
+            # seep into this single image (measured symptom: only Character 2 deleted,
+            # Character 1 carrying the old value).
             remove_all_character_slots(port)
             human_pause(0.4, 0.8)
-            # 清空殘存的角色框。不依賴「Character N」標題仍在（只剩 1 框時 NovelAI 可能不顯示
-            # 標題、count_characters 讀到 0 但 textarea 仍在），改以 find_prompt_areas 為準：
-            # index 0 是主 prompt，1.. 是角色框。逐框清成 ""（best-effort、不 raise）。
+            # Clear the remaining character boxes. Does not rely on the "Character N" heading
+            # still being there (with only 1 box left NovelAI may not show the heading, and
+            # count_characters reads 0 while the textarea is still present); goes by
+            # find_prompt_areas instead: index 0 is the main prompt, 1.. are the character
+            # boxes. Each box is cleared to "" (best-effort, does not raise).
             clear_ok = True
             for area in find_prompt_areas(port)[1:]:
                 try:
@@ -5797,12 +6546,13 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
                     human_pause(0.2, 0.4)
                 except Exception as clear_err:  # pylint: disable=broad-except
                     clear_ok = False
-                    # `_short_error`：這一行在「逐個角色框清空」的迴圈裡，
-                    # 一次請求可能印好幾行。
+                    # `_short_error`: this line sits in the "clear each character box" loop,
+                    # so one request may print several of them.
                     print("  WARN: idle one-shot clear character area failed: "
                           f"{_short_error(clear_err)}")
-            # 內容導向 verify：0 個角色框，或殘存的每個角色框 strip 後都為空。
-            # （count==0 是錯的成功判準 — 最後一框本來就刪不掉。）
+            # Content-oriented verify: 0 character boxes, or every remaining character box is
+            # empty after strip. (count==0 is the wrong success criterion — the last box can
+            # never be deleted in the first place.)
             residual = [a for a in find_prompt_areas(port)[1:]
                         if _read_textarea_value(port, a).strip()]
             if residual or not clear_ok:
@@ -5812,8 +6562,10 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
                 emit_event("single_image_done", request_id=request_id, ok=False,
                            error="character area clear failed")
                 return
-        # 產圖前驗角色值。in-band：兩個都驗（連清空 case，框都在）。
-        # idle one-shot：殘存框已在上面清空 + 內容導向 verify，這裡不再逐角色驗。
+        # Verify the character values before generating. in-band: verify both (including the
+        # clear case; the boxes are all there).
+        # idle one-shot: the remaining box was already cleared above + verified by content,
+        # so no per-character verification here.
         if in_band:
             if not with_retry(
                     "oneshot_verify_char1",
@@ -5831,20 +6583,23 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
                            error="character 2 verification failed")
                 return
         snap(port, f"oneshot_ready_{request_id[:24]}")
-        # 生成 1 張。`batch_cfg` 在上面發「開始服務」訊號之前就讀好了。
+        # Generate 1 image. `batch_cfg` was read above, before the "serving starts" signal.
         gen_max = batch_cfg["generate_max_retries"]
         gen_delay = batch_cfg["generate_retry_delay_sec"]
         dl_max = batch_cfg["download_max_retries"]
-        # `or "unknown"` 已由構造死掉——上面的 `_is_safe_folder_component` 對空字串
-        # 回 False，走不到這裡。拿掉它不只是清理死碼：`ROOT / (x or "y")` 的右運算元
-        # 是 `ast.BoolOp`，而接合守門的站點判準是 `ast.Name`，所以那個寫法**連一列
-        # 都不會產生**——不需要例外，也沒有任何地方記錄它沒被看過。改成裸名字之後
-        # 這個站點才進得了帳。
+        # `or "unknown"` is dead by construction — the `_is_safe_folder_component` above
+        # returns False for the empty string, so this point is never reached with one.
+        # Removing it is not just dead-code cleanup: in `ROOT / (x or "y")` the right operand
+        # is an `ast.BoolOp`, while the join guard's site criterion is `ast.Name`, so that
+        # form **produces not even one row** — no exemption needed, and nothing anywhere
+        # records that it was never looked at. Only as a bare name does this site make it
+        # onto the books.
         out_dir = SINGLE_IMAGE_OUTPUT_ROOT / request_id
         out_dir.mkdir(parents=True, exist_ok=True)
         previous_src = get_main_image_src(port)
-        # 每一次 Generate 嘗試開始時各發一則「服務中」：一次服務可以跑滿
-        # `generate_max_retries` 次嘗試（預設約 15 分鐘），只靠開頭那一則撐不住。
+        # Emit one "being served" at the start of every Generate attempt: a serve can run the
+        # full `generate_max_retries` attempts (about 15 minutes by default), which the single
+        # one at the start cannot cover.
         new_src = generate_one_image(
             port, previous_src, max_retries=gen_max, retry_delay=gen_delay,
             on_attempt=lambda _attempt: _emit_serving_beat(
@@ -5870,18 +6625,20 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
                    path=rel)
         print(f"serve_single_image_request: done -> {rel}")
     except GenerationBlockedError as error:
-        # batch 可以關掉對話框慢慢等額度回補，單圖不行：使用者正在等一則回覆。
-        # 但**一定要把對話框關掉**——留著會擋住後面接著跑的 batch。
+        # The batch can close the dialog and wait patiently for the quota to refill; a single
+        # image cannot: the user is waiting for a reply. But the dialog **must be closed** —
+        # left open, it would block the batch that runs next.
         print(f"serve_single_image_request: {error}", file=sys.stderr)
         dismiss_blocking_dialog(port)
         emit_event("single_image_done", request_id=request_id, ok=False,
                    error="quota unavailable")
         return
     except BrowserGoneError as error:
-        # 瀏覽器整個沒了：先把這筆請求收乾淨（呼叫端一定會刪請求檔，而每個
-        # request_id 必須剛好對到一個 single_image_done 事件），再往上傳，讓
-        # run_batch 的外層 handler 收工重生——吞掉它會讓後面每一筆請求／每一張
-        # batch 圖都對著死瀏覽器空轉。
+        # The browser is gone entirely: first close out this request cleanly (the caller
+        # always deletes the request file, and every request_id must map to exactly one
+        # single_image_done event), then propagate it, so run_batch's outer handler wraps up
+        # and respawns — swallowing it would leave every later request / every batch image
+        # spinning against a dead browser.
         emit_event("single_image_done", request_id=request_id, ok=False,
                    error="browser session lost")
         print(f"serve_single_image_request: {error}", file=sys.stderr)
@@ -5889,46 +6646,55 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
     except Exception as error:  # pylint: disable=broad-except
         emit_event("single_image_done", request_id=request_id, ok=False,
                    error=str(error)[:200])
-        # `_long_error`：一個請求只會走到一次，而且是那個請求的終結性回報。
+        # `_long_error`: a request only ever reaches this once, and it is that request's
+        # terminal report.
         print(f"serve_single_image_request failed: {_long_error(error)}",
               file=sys.stderr)
 
 
 def rest_until(port, wake_ts: float, *, slice_sec: float = 30.0) -> bool:
-    """排程休息（`schedule_limit_hours` 到點後的 `rest_hours`）的**切片**睡眠。
+    """**Sliced** sleep for the scheduled rest (the `rest_hours` after `schedule_limit_hours`
+    is reached).
 
-    原本這裡是一句 `time.sleep(rest_hours * 3600)`——預設 6 小時完全不醒。實測
-    2026-08-28：06:50:54 `character_done` 之後整整六小時沒有任何事件，外面看到
-    的跟「卡死」一模一樣。單一 `time.sleep` 同時擋掉三件事：
+    This used to be a single `time.sleep(rest_hours * 3600)` — 6 hours by default without
+    waking at all. Measured 2026-08-28: after the 06:50:54 `character_done` there was not a
+    single event for six whole hours, which from outside looked exactly like "hung". A single
+    `time.sleep` blocks three things at once:
 
-    1. `wait_if_paused` — 暫停標記最久要等六小時才生效；
-    2. `check_dom_request` — DOM 請求同樣要等六小時；
-    3. `check_single_image_request` — 更糟，bot 的
-       `_SINGLE_IMAGE_PENDING_TTL_SEC` 是 600 秒，所以休息期間送出的單圖請求
-       **必定**逾時，一次都不可能成功。
+    1. `wait_if_paused` — the pause marker could take up to six hours to take effect;
+    2. `check_dom_request` — DOM requests likewise wait six hours;
+    3. `check_single_image_request` — worse still: the bot's
+       `_SINGLE_IMAGE_PENDING_TTL_SEC` is 600 seconds, so single-image requests sent during
+       the rest **always** time out, and not one can ever succeed.
 
-    等額度那條路（`wait_for_quota_recovery`）早就是切片睡 + 每片服務一次，理由
-    寫在 `_serve_pending_requests` 的 docstring 裡：睡得比 TTL 久就要插播。休息
-    比等額度久六倍，卻反而沒做——照抄同一個做法。
+    The quota-wait path (`wait_for_quota_recovery`) has long been a sliced sleep + one serve
+    per slice, for the reason written in `_serve_pending_requests`'s docstring: sleeping longer
+    than the TTL requires interjecting. The rest is six times longer than the quota wait yet
+    did not do it — the same approach is copied here.
 
-    回傳「這段休息裡有沒有服務過 in-band 單圖請求」。有的話呼叫端必須把
-    `prev_*` 重設成 None，強制下一個 pair 重填每個欄位；單圖 serve 會覆寫主
-    prompt／角色／undesired，per-pair diff 會以為值沒變而跳過（同 4034 行那個
-    呼叫點）。這裡**不需要** `_refill_character_fields`——休息點在兩個角色之間，
-    上一個角色已經收工，沒有「當前角色的欄位」要救。
+    Returns "whether any in-band single-image request was served during this rest". If so,
+    the caller must reset `prev_*` to None, forcing the next pair to refill every field; a
+    single-image serve overwrites the main prompt / characters / undesired, and the per-pair
+    diff would think the values were unchanged and skip them (same as the call site at line
+    4034). `_refill_character_fields` is **not needed** here — the rest point is between two
+    characters, the previous character has already wrapped up, and there are no "current
+    character's fields" to rescue.
 
-    插播失敗只記 stderr 不往上拋：閒置數小時的 Chrome 偶爾抽風是常態，為了一次
-    抽風把整輪 batch 打掉不划算，而休息結束後緊接著就是
-    `restart_chrome_every_n_characters` 的重啟（預設 1＝每個角色都重啟），瀏覽器
-    本來就會換一份乾淨的。
+    A failed interjection is only logged to stderr and not propagated: a Chrome idling for
+    hours occasionally acting up is normal, knocking out the whole batch round over one
+    hiccup is not worth it, and right after the rest ends comes the
+    `restart_chrome_every_n_characters` restart (default 1 = restart for every character), so
+    the browser gets replaced with a clean one anyway.
     """
     served = False
-    # 牆鐘目標 → **單調**截止時刻，只換算這一次。休息預設六小時，期間的 NTP 校時、
-    # 手動改時間、時區／日光節約調整都會讓「還剩多久」整段偏掉：時鐘往回撥一小時就
-    # 多睡一小時，往前撥就少睡一小時，而 `rest_hours` 的語意是**時長**不是「睡到某個
-    # 鐘點」（呼叫端算的就是 `time.time() + rest_s`）。`wake_ts` 本身維持牆鐘值——呼叫端
-    # 要拿它印「幾點醒來」，也寫進 `schedule_rest` 事件給 `/rate`、`/eta` 用——所以
-    # 換算放在這裡，呼叫端不用動。
+    # Wall-clock target → a **monotonic** deadline, converted just this once. The rest is six
+    # hours by default, and NTP syncs, manual clock changes and time zone / daylight saving
+    # adjustments during it would skew "how much is left" wholesale: the clock set back an
+    # hour means an extra hour of sleep, set forward an hour means an hour less, while
+    # `rest_hours` means a **duration**, not "sleep until a certain time" (the caller computes
+    # exactly `time.time() + rest_s`). `wake_ts` itself stays a wall-clock value — the caller
+    # uses it to print "wakes at what time" and also writes it into the `schedule_rest` event
+    # for `/rate` and `/eta` — so the conversion lives here, and the caller need not change.
     deadline = time.monotonic() + max(0.0, wake_ts - time.time())
     while True:
         remaining = deadline - time.monotonic()
@@ -5940,28 +6706,32 @@ def rest_until(port, wake_ts: float, *, slice_sec: float = 30.0) -> bool:
             if check_single_image_request(port):
                 served = True
         except Exception as error:  # pylint: disable=broad-except
-            # `_short_error`：休息是以 30 秒為一片切出來的，預設 6 小時 ＝ 最多
-            # 720 片；瀏覽器在休息期間死掉的話，這一行會印 720 次。
+            # `_short_error`: the rest is cut into 30-second slices, 6 hours by default = up
+            # to 720 slices; if the browser dies during the rest, this line prints 720 times.
             print(f"  [rest] in-band request failed: {_short_error(error)}",
                   file=sys.stderr)
-        # 服務可能花掉不少時間，睡之前重新算一次剩餘，別睡過頭。
+        # Serving may take a good while, so recompute what is left before sleeping, to avoid
+        # oversleeping.
         time.sleep(max(0.0, min(slice_sec, deadline - time.monotonic())))
     return served
 
 
 def check_single_image_request(port, in_band: bool = True) -> bool:
-    """Iteration 邊界 poll：看到 SINGLE_IMAGE_REQUEST_FILE 就 serve 1 張、刪檔。
+    """Iteration-boundary poll: when SINGLE_IMAGE_REQUEST_FILE is present, serve 1 image and
+    delete the file.
 
-    回 True 表示「這圈確實服務了一個 in-band 單圖請求」，呼叫端（main 迴圈）
-    收到 True 後要把 prev_prompt / prev_e2 / prev_undesired 重設為 None，讓
-    batch 的下一個 pair 重填自己的所有欄位（否則 per-pair diff 會以為值沒變而
-    跳過、用到 one-shot 殘留的 prompt）。處理完不論成功失敗都刪掉請求檔，避免
-    下次重複觸發。**不碰 resume checkpoint**。
+    Returning True means "this turn really served an in-band single-image request"; on
+    receiving True the caller (the main loop) must reset prev_prompt / prev_e2 /
+    prev_undesired to None, so the batch's next pair refills all its own fields (otherwise the
+    per-pair diff would think the values were unchanged, skip them, and use the prompt left
+    over from the one-shot). The request file is deleted once handled, success or failure, so
+    it does not trigger again. **The resume checkpoint is not touched**.
 
-    `in_band`：是否在執行中的 batch 中插隊服務（預設 True，因為兩個 batch 內的
-    呼叫點都是 in-band）。只有 main() 啟動時的 idle one-shot 路徑會傳 False —
-    那條 serve 完直接 return 0、後面不跑 batch，可安全把所有角色框整個刪光（見
-    serve_single_image_request / remove_all_character_slots）。"""
+    `in_band`: whether this serve jumps the queue inside a running batch (default True,
+    because both call sites inside the batch are in-band). Only the idle one-shot path at
+    main() startup passes False — that one returns 0 straight after serving with no batch
+    after it, so it can safely delete every character box entirely (see
+    serve_single_image_request / remove_all_character_slots)."""
     if not SINGLE_IMAGE_REQUEST_FILE.exists():
         return False
     req: dict = {}
@@ -5971,11 +6741,12 @@ def check_single_image_request(port, in_band: bool = True) -> bool:
         if isinstance(parsed, dict):
             req = parsed
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        # `UnicodeDecodeError` 與 `json.JSONDecodeError` 都是 `ValueError` 的
-        # 子類別、彼此無繼承關係，所以兩個都要寫。這裡**刻意**吞掉（跟佇列讀取
-        # 端相反）：req 留空 → serve 拿不到 prompt → 發一則 ok=false 的
-        # `single_image_done` → finally 刪掉請求檔。一個壞掉的單圖請求只該讓那
-        # 個請求失敗，不該把正在跑的整批角色一起帶走。
+        # `UnicodeDecodeError` and `json.JSONDecodeError` are both subclasses of `ValueError`
+        # with no inheritance between them, so both must be listed. This **deliberately**
+        # swallows (the opposite of the queue readers): req stays empty → serve gets no
+        # prompt → emits an ok=false `single_image_done` → finally deletes the request file. A
+        # broken single-image request should only fail that request, not take the whole batch
+        # of characters currently running down with it.
         print(f"check_single_image_request: bad request file: {error!r}",
               file=sys.stderr)
     try:
@@ -5990,38 +6761,46 @@ def check_single_image_request(port, in_band: bool = True) -> bool:
 
 def _refill_character_fields(port, prompt: str, char1: str, char2: str,
                              undesired: str) -> bool:
-    """In-band 單圖 serve 會覆寫主 prompt / 角色 / undesired 欄位；batch 角色
-    跑到一半被插隊時，serve 完要把「當前角色」的欄位重填回去，否則這個角色
-    剩下的圖會用到 one-shot 的 prompt。每個欄位（包含空字串）都必須重填並
-    驗證；任何一步失敗就回 False，讓呼叫端中止，不能沿用殘留值繼續產圖。
+    """An in-band single-image serve overwrites the main prompt / character / undesired
+    fields; when a batch character is interrupted halfway, after serving "the current
+    character's" fields must be refilled, or the rest of that character's images would use
+    the one-shot's prompt. Every field (empty strings included) must be refilled and
+    verified; if any step fails it returns False so the caller aborts, rather than carrying on
+    generating with leftover values.
 
-    ⚠️ **四個 fill 必須全部做完，才輪到兩個 verify。不要把它們配對交錯。**
+    ⚠️ **All four fills must be finished before the two verifies. Do not pair and interleave
+    them.**
 
-    這不是風格偏好，是實測出來的：**填 Character 2 會把 Character 1 清空。**
-    2026-09-08 從 `WEBRunner.log` 數（09-03 誠實記錄上線之後的 90 次重填）：
+    This is not a style preference; it was measured: **filling Character 2 clears Character
+    1.** Counted from `WEBRunner.log` on 2026-09-08 (the 90 refills after honest logging went
+    live on 09-03):
 
-    * Character 1 在 verify 時讀到不符 **90/90**，而且**全部**是 `0 vs N`
-      （欄位是空的），從來不是 `N+k vs N`（被插入內容）；
-    * Character 2 讀到不符 **0/90**——所以干擾是**單向**的；
-    * 逐次對照：char1 在**寫入前**讀到的是正確內容、在 char2 填完之後才變空，
-      **90/90**。也就是說清空發生在 char2 那一步，不是頁面重載造成的。
+    * Character 1 read back a mismatch at verify time **90/90**, and **all** of them were
+      `0 vs N` (the field was empty), never `N+k vs N` (content inserted);
+    * Character 2 read back a mismatch **0/90** — so the interference is **one-way**;
+    * Compared one by one: char1 read the correct content **before writing** and became empty
+      only after char2 was filled, **90/90**. In other words the clearing happens at the char2
+      step, not because of a page reload.
 
-    現在這條路能自我修復，唯一的原因就是 verify 排在**兩個 fill 都做完之後**，
-    所以它看得到最後的狀態。把它整理成「填一個、驗一個」——
+    The only reason this path can repair itself now is that the verifies come **after both
+    fills are done**, so they see the final state. Tidying it into "fill one, verify one" —
 
         fill_char1 → verify_char1 → fill_char2 → verify_char2
 
-    ——是任何人看到這段都會想做的整理（配對更清楚、局部性更好），但那樣
-    `verify_char1` 會在 char2 把 char1 清空**之前**就通過，於是 **char1 整批空白，
-    而且一行 log 都不會有**：verify 綠、`still mismatched` 不出現、`with_retry`
-    也不失敗。後果正是本檔到處在警告的那一個——安靜地產出一整批用錯提示詞的圖，
-    而這次連 drift 警告都沒有。`test_webrunner_shared.py` 有一支行為測試釘住它
-    （用一個「填 char2 就清空 char1」的假 port 走完整條路，斷言**結束時兩個欄位
-    都正確**）。
+    — is the tidy-up anyone seeing this would want to do (clearer pairing, better locality),
+    but then `verify_char1` would pass **before** char2 clears char1, so **char1 is blank for
+    the whole batch, without a single log line**: verify green, no `still mismatched`, and
+    `with_retry` does not fail either. The consequence is exactly the one this file warns
+    about everywhere — quietly producing a whole batch of images with the wrong prompt, and
+    this time without even a drift warning. `test_webrunner_shared.py` has a behaviour test
+    pinning it down (walking the whole path with a fake port where "filling char2 clears
+    char1", and asserting **both fields are correct at the end**).
 
-    **刻意不在 `verify_char2` 之後再驗一次 char1。** 對稱的風險（重填 char1 反過來
-    清空 char2）目前有 0/90 的反證，為它多跑一輪等於為沒觀察到的方向付成本，還會讓
-    步驟表看起來更沒道理。真的出現 char2 的 drift 記錄時再加，那時也才知道要加幾輪。
+    **Deliberately does not verify char1 again after `verify_char2`.** The symmetric risk
+    (refilling char1 in turn clearing char2) currently has 0/90 counter-evidence; running an
+    extra round for it would pay a cost for a direction never observed, and would make the
+    step list look even less sensible. Add it when a char2 drift record really shows up — only
+    then will it be known how many rounds to add.
     """
     try:
         steps = (
@@ -6042,11 +6821,13 @@ def _refill_character_fields(port, prompt: str, char1: str, char2: str,
             human_pause(0.4, 0.8)
         return True
     except BrowserGoneError:
-        # 回 False 也會讓呼叫端 raise，但錯誤訊息會變成「欄位還原失敗」，把真正
-        # 的死因（瀏覽器沒了）埋掉。直接往上傳，保住診斷。
+        # Returning False would also make the caller raise, but the error message would
+        # become "field restore failed", burying the real cause of death (the browser is
+        # gone). Propagate it directly to keep the diagnosis.
         raise
     except Exception as error:  # pylint: disable=broad-except
-        # `_long_error`：一次插播服務／一次額度 reload 才走到一次，不是重複行。
+        # `_long_error`: reached only once per interjected serve / per quota reload, so it is
+        # not a repeated line.
         print(f"  WARN: re-fill after in-band one-shot failed: "
               f"{_long_error(error)}", file=sys.stderr)
         return False
@@ -6080,20 +6861,24 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
     out_dir.mkdir(parents=True, exist_ok=True)
     if out_dir.name != character_name:
         print(f"  using numbered output folder: {out_dir.name}/")
-    # 只用來量「這個角色跑了多久」（下面的 `character_done.elapsed_sec`），所以
-    # 用**單調**時鐘：一個角色動輒數小時，中間被 NTP 校時／改時區跳一下，回報的
-    # 時長就會離譜（往回跳還會變負數）。名字帶 `_mono` 是刻意的——這個值**不可以**
-    # 被拿去當絕對時間戳（寫進事件的 `ts=`、跟檔案 mtime 比、跟別的行程對時），
-    # monotonic 的零點每個行程都不一樣。要絕對時間點請另外取 `time.time()`。
+    # Only used to measure "how long this character ran" (`character_done.elapsed_sec`
+    # below), so it uses the **monotonic** clock: a character easily takes hours, and one jump
+    # from an NTP sync / time zone change along the way makes the reported duration absurd
+    # (a jump back can even make it negative). The `_mono` in the name is deliberate — this
+    # value **must not** be used as an absolute timestamp (written into an event's `ts=`,
+    # compared with file mtimes, synchronised with another process); monotonic's zero point
+    # differs in every process. For an absolute point in time, take `time.time()` separately.
     loop_start_mono = time.monotonic()
     emit_event("character_start", name=character_name, target=count,
                folder=out_dir.name, resumed=resume_count)
     consecutive_fails = 0
     page_recovery_tried = False
     fail_alert_sent = False
-    # Tier 2 的一次性額度：不認得字面的 modal 擋住時，先安全地關掉它再給一次
-    # 機會（站方偶爾會跳公告／問卷之類的東西）。同一個角色只放行一次——關掉後
-    # 又立刻擋住，就是真的需要人處理，不是隨手能關的東西。
+    # Tier 2's one-off allowance: when a modal with unrecognised text blocks the page, close
+    # it safely first and give it one more chance (the site occasionally pops up
+    # announcements / surveys and the like). Allowed only once per character — if it blocks
+    # again right after being closed, it really needs a human, and is not something that can
+    # be casually closed.
     tier2_dismissed = False
     # Seed `saved` with the images already on disk from a prior interrupted
     # run so the returned total (and the pop gate that compares it to the
@@ -6107,16 +6892,19 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
         start_index = 1
     remaining = max(0, count - resume_count)
     previous_src = get_main_image_src(port)
-    # 已經存過的 src。站方偶爾會把主圖區換回一張舊圖（原因見
-    # `wait_for_new_image` 的 docstring），這份紀錄是唯一擋得住「把同一張圖再
-    # 存一次」的東西。上限 50 是刻意的：要蓋住的只是「站方可能換回來的最近幾
-    # 張」，而無上限會讓一個極罕見的巧合（同一條 blob: URL 真的被重新指派）
-    # 永遠卡住那一格。
-    # 這兩份「看過的東西」**要跨角色共用**——`run_batch` 會把同一份傳進來。
-    # 瀏覽器文件在角色與角色之間不會重建（只有週期性的 `port.restart` 記憶體
-    # 沖洗才會），所以上一個角色的圖還躺在站方的歷史區裡，一樣可能被挑中。
-    # 每個角色各開一份等於每換一個角色就把防線清空一次。
-    # 沒傳就自己開一份，單獨呼叫（測試、je 變體）照樣有保護。
+    # The srcs already saved. The site occasionally swaps an old image back into the main
+    # image area (see `wait_for_new_image`'s docstring for why), and this record is the only
+    # thing that can stop "saving the same image again". The cap of 50 is deliberate: all it
+    # needs to cover is "the last few the site might swap back", while no cap would let an
+    # extremely rare coincidence (the same blob: URL really being reassigned) block that slot
+    # forever.
+    # These two "things seen" **are shared across characters** — `run_batch` passes the same
+    # ones in. The browser document is not rebuilt between characters (only the periodic
+    # `port.restart` memory flush does that), so the previous character's images still sit in
+    # the site's history area and can be picked just the same. Opening a fresh one per
+    # character would empty the defence every time the character changes.
+    # If none is passed, open one locally, so standalone calls (tests, the je variant) are
+    # still protected.
     if seen_srcs is None:
         seen_srcs = collections.deque(maxlen=50)
     if seen_digests is None:
@@ -6126,16 +6914,20 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
     duplicate_alert_sent = False
 
     def _serve_pending_requests() -> None:
-        """插播 bot 的 DOM／單圖請求，服務完把 batch 欄位填回去。
+        """Interject the bot's DOM / single-image requests, and refill the batch fields after
+        serving.
 
-        兩個呼叫點共用：圖與圖之間（原本就有），以及**等額度的那一小時裡**
-        （每個睡眠切片一次）。後者是必要的——bot 的
-        `_SINGLE_IMAGE_PENDING_TTL_SEC` 是 600 秒，而這裡預設睡 3600 秒。
+        Shared by two call sites: between images (as it always was), and **during the hour
+        of waiting for quota** (once per sleep slice). The latter is necessary — the bot's
+        `_SINGLE_IMAGE_PENDING_TTL_SEC` is 600 seconds, while this sleeps 3600 seconds by
+        default.
 
-        單圖 serve 會覆寫主 prompt／角色／undesired 欄位，所以服務完一定要把
-        「當前角色」的欄位重填回去，否則這個角色剩下的圖會用到 one-shot 的
-        prompt。額度沒回來的時候 serve 自己會被擋、回報失敗——那對使用者是快
-        速而誠實的答案，比在對話平台上乾等十分鐘再被掃成「沒服務」好。
+        A single-image serve overwrites the main prompt / character / undesired fields, so
+        after serving, "the current character's" fields must be refilled, or the rest of this
+        character's images would use the one-shot's prompt. While quota has not come back,
+        the serve itself gets blocked and reports failure — a quick and honest answer for the
+        user, better than waiting ten minutes on the chat platform and then being swept away
+        as "not served".
         """
         nonlocal previous_src
         check_dom_request(port)
@@ -6144,17 +6936,20 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
                 raise RuntimeError(
                     "failed to restore batch fields after in-band request")
             previous_src = get_main_image_src(port)
-            # 插播那張圖也要記進去，否則它會變成下一張 batch 圖的候選。
+            # The interjected image must be recorded too, or it becomes a candidate for the
+            # next batch image.
             if previous_src:
                 seen_srcs.append(previous_src)
 
     def _restore_fields_after_reload() -> None:
-        """額度那條路 reload 過頁面之後，把這個角色的欄位重填回去。
+        """After the quota path has reloaded the page, refill this character's fields.
 
-        `refill` 是 `run_batch` 傳進來的 `(prompt, char1, char2, undesired)`；
-        沒傳（je 變體 / 測試單獨呼叫）就什麼都不做——沒有可信的來源可填，硬填
-        反而更糟。填不回去就中止：帶著不確定的欄位繼續產圖會安靜地產出一整批
-        用錯提示詞的圖，比停下來讓監督者重生 ＋ 重跑 setup 糟得多。
+        `refill` is the `(prompt, char1, char2, undesired)` passed in by `run_batch`; when
+        it is not passed (the je variant / standalone test calls) nothing is done — with no
+        trustworthy source to fill from, forcing a fill would be worse. If the fields cannot
+        be refilled, abort: carrying on with uncertain fields would quietly produce a whole
+        batch of images with the wrong prompt, far worse than stopping and letting the
+        supervisor respawn + rerun setup.
         """
         if refill is None:
             return
@@ -6172,20 +6967,25 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
         ts = time.strftime("%Y%m%d_%H%M%S")
         target = out_dir / f"{character_name}_{i:04d}_{ts}.png"
         print(f"[{character_name}] generating {done_so_far}/{count} -> {target.name}")
-        # 額度用完（站方跳出購買／方案對話框）不是失敗，是「還沒輪到」：關掉對話
-        # 框、等額度回補、重試**同一張**。不計入 consecutive_fails、不結束行程，
-        # 所以監督者不會介入，也不會每輪重跑一次登入 ＋ setup。
-        # `quota_waited` 跨輪累積，`quota_wait_max_sec` 的上限才有意義；設 0
-        # （預設）就是無上限地等下去。
+        # Running out of quota (the site popping up a purchase / plan dialog) is not a
+        # failure, it is "not your turn yet": close the dialog, wait for the quota to refill,
+        # retry **the same image**. It does not count towards consecutive_fails and does not
+        # end the process, so the supervisor does not step in, and login + setup are not
+        # rerun every round.
+        # `quota_waited` accumulates across rounds, which is what makes the
+        # `quota_wait_max_sec` cap meaningful; 0 (the default) means waiting with no cap.
         quota_waited = 0.0
-        # 「上一輪等了多久」＝ 回傳值與傳入值的**差**，寫進 `quota_resumed` 的
-        # `last_wait_sec`。定義上就正確，所以不必在這裡自己再讀一次
-        # `quota_wait_poll_sec`——一份設定讀兩處遲早分歧。
+        # "How long the last round waited" = the **difference** between the return value and
+        # the value passed in, written into `quota_resumed`'s `last_wait_sec`. It is correct
+        # by definition, so `quota_wait_poll_sec` need not be read again here — one setting
+        # read in two places diverges sooner or later.
         #
-        # 固定間隔下這個值恆等於 `quota_wait_poll_sec`，看起來冗餘，但它是**唯一**
-        # 把當時生效的輪詢間隔留在事件串流裡的地方。2026-09-07 要回答「短輪詢會
-        # 不會比較快」時，只能靠比對相鄰事件的時間戳去反推 08-25 那次設定變更——
-        # 有這個欄位就是直接讀得到。收集成本是零，省下的是下一次的考古。
+        # With a fixed interval this value always equals `quota_wait_poll_sec` and looks
+        # redundant, but it is the **only** place that keeps the poll interval in effect at
+        # the time in the event stream. On 2026-09-07, answering "would a short poll be
+        # faster" meant reconstructing the 08-25 setting change by comparing the timestamps of
+        # adjacent events — with this field it can simply be read. The collection cost is
+        # zero; what it saves is the next round of archaeology.
         quota_last_wait = 0.0
         while True:
             try:
@@ -6206,14 +7006,16 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
                     on_reload=_restore_fields_after_reload,
                     on_idle=_serve_pending_requests)
                 quota_last_wait = quota_waited - before_wait
-        # 「回復了」要以**結果**為準。`generate_one_image` 重試燒完是回 None、
-        # 不是 raise，所以這裡照樣會 break 出來——原本無條件印「recovered」並發
-        # `quota_resumed`，於是使用者在對話平台上收到「額度回復了」的同時，背景
-        # 其實正要開始連續放棄十張圖。正式 log 裡 62 次「recovered」有 1 次是假
-        # 的，而那一次正是後面那場兩小時空轉的開頭。
+        # "Recovered" must be judged by the **result**. `generate_one_image` returns None,
+        # not raise, when its retries are used up, so this still breaks out — it used to
+        # print "recovered" and emit `quota_resumed` unconditionally, so the user received
+        # "quota has recovered" on the chat platform just as the background was about to give
+        # up on ten images in a row. Of the 62 "recovered" in the production log 1 was false,
+        # and that one was exactly the start of the two-hour idle spin that followed.
         if quota_waited > 0.0 and new_src:
-            # `last_wait_sec` 一併記下去：累計值單獨看不出當時的輪詢間隔是多少，
-            # 而那正是事後要判斷「這段記錄是哪個設定跑出來的」唯一需要的東西。
+            # `last_wait_sec` is recorded as well: the cumulative value alone does not show
+            # what the poll interval was at the time, and that is the one thing needed later
+            # to tell "which setting produced this stretch of records".
             print(f"  [quota] recovered after {quota_waited / 60:.0f} min "
                   f"(poll {quota_last_wait / 60:.0f} min); "
                   f"resuming `{character_name}`")
@@ -6244,31 +7046,33 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
                     f"image {i}/{count} for `{character_name}`; aborting "
                     f"so supervisor respawns Chrome."
                 )
-            # Fast-path #2：**這個工作階段從頭到尾沒出現過任何一張圖**就已經
-            # 放棄，代表問題不是「這一次沒生成」，而是頁面根本不在能生成的狀
-            # 態。實測 2026-08-24（`WEBRunner.log` 760-930 行）：站方把工作階
-            # 段收掉之後，40 次嘗試每一次都是
-            # `timed out waiting for new image (last src=None)`，連續放棄十張
-            # 圖、燒掉 **2 小時 28 分鐘**才由 `consecutive_fail_abort` 收工。
-            # 真正把它修好的是監督者重生時那一句
-            # `no session - going through /login flow`。
+            # Fast-path #2: giving up when **not a single image has appeared in this whole
+            # session** means the problem is not "this generation did not happen", but that
+            # the page is not in a state where it can generate at all. Measured 2026-08-24
+            # (`WEBRunner.log` lines 760-930): after the site closed the session, every one of
+            # 40 attempts was `timed out waiting for new image (last src=None)`, giving up on
+            # ten images in a row and burning **2 hours 28 minutes** before
+            # `consecutive_fail_abort` wrapped it up. What actually fixed it was the
+            # supervisor's respawn line `no session - going through /login flow`.
             #
-            # 判準用 `previous_src`，它已經在手上——那是「按下產生之前螢幕上那
-            # 張圖」。有 blob 值 ＝ 這個工作階段確實產出過圖、app 是活的，這次
-            # 失敗屬於偶發，不值得多花成本；是 None ＝ 一張都沒看過。**不要**
-            # 改用 `saved`：續跑進來的角色一開始 `saved` 就大於 0，可是頁面是
-            # 全新的，判斷會整個反過來。
+            # The criterion uses `previous_src`, which is already at hand — it is "the image
+            # on screen before Generate was pressed". A blob value = this session really has
+            # produced images and the app is alive, so this failure is sporadic and not worth
+            # extra cost; None = not a single image seen. **Do not** switch to `saved`: a
+            # resumed character starts with `saved` greater than 0 while the page is brand
+            # new, which would reverse the decision entirely.
             #
-            # 動作是 reload ＋ 重填，兩者都是現成、每小時被額度那條路走一次的
-            # 實作。工作階段還在 → 這只是一次便宜的復原（頁面卡住時真的救得
-            # 回來）；工作階段沒了 → 重填必定失敗，
-            # `_restore_fields_after_reload` 會 raise，監督者重生並重新登入。
-            # 148 分鐘因此縮成一張圖的時間。
+            # The action is reload + refill, both existing implementations that the quota
+            # path exercises once an hour. The session is still there → this is just a cheap
+            # recovery (it really does rescue a stuck page); the session is gone → the refill
+            # is bound to fail, `_restore_fields_after_reload` raises, and the supervisor
+            # respawns and logs in again. 148 minutes thereby shrink to the time of one image.
             #
-            # 一個角色只做一次。做完之後 `previous_src` 仍然是 None，不設旗標
-            # 的話接下來每一張失敗的圖都會再 reload 一次。
-            # `refill is None`（je 變體 / 單獨測試）時整段跳過：沒有可信來源可
-            # 填，reload 只會把欄位清空，比不動更糟。
+            # Done only once per character. Afterwards `previous_src` is still None, and
+            # without a flag every subsequent failed image would reload once more.
+            # When `refill is None` (the je variant / standalone tests) the whole block is
+            # skipped: with no trustworthy source to fill from, a reload would only clear the
+            # fields, worse than leaving them alone.
             if (previous_src is None and not page_recovery_tried
                     and refill is not None):
                 page_recovery_tried = True
@@ -6295,8 +7099,9 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
             # `main()`'s outer except, emits `critical_error`, exits non-
             # zero, supervisor respawns Chrome from scratch.
             if consecutive_fails >= fail_abort:
-                # Tier 2（不看字面）：連續失敗到門檻、而畫面上還有可見的 modal
-                # 擋著 → 需要人處理，不是崩潰。重生只會看到同一個對話框。
+                # Tier 2 (text not looked at): consecutive failures reached the threshold and
+                # a visible modal is still blocking the screen → it needs a human, it is not a
+                # crash. A respawn would only see the same dialog.
                 blocking = has_blocking_dialog(port)
                 if blocking and not tier2_dismissed:
                     tier2_dismissed = True
@@ -6319,13 +7124,15 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
                         f"`{character_name}` with a modal dialog blocking the "
                         f"page; stopping instead of respawning — needs a human."
                     )
-                # 這裡**不要**再宣稱「多半是 Chrome 崩潰」。走到這一行的時候，
-                # 那些原因已經一一被排除掉了：'Aw, Snap!' 崩潰頁在第一張失敗時
-                # 就查過（`_is_chrome_crash_page`）、session 沒了會由
-                # `_abort_if_browser_gone` 提早收工、modal 就是上面那個 if 的
-                # 條件。把已排除的原因寫成「likely cause」實際誤導過人：
-                # 2026-08-24 那次連續放棄十張圖、兩小時的空轉就是頁面狀態問題
-                # （額度 reload 把剛填的提示詞清掉），log 卻一路指向 Chrome。
+                # **Do not** claim "most likely a Chrome crash" here again. By the time this
+                # line is reached, those causes have each been ruled out: the 'Aw, Snap!'
+                # crash page was checked on the very first failed image
+                # (`_is_chrome_crash_page`), a lost session is wrapped up early by
+                # `_abort_if_browser_gone`, and a modal is exactly the condition of the if
+                # above. Writing already-excluded causes as the "likely cause" has actually
+                # misled people: the 2026-08-24 run that gave up on ten images in a row and
+                # spun idle for two hours was a page-state problem (the quota reload wiped the
+                # prompt just filled in), yet the log kept pointing at Chrome.
                 raise RuntimeError(
                     f"{consecutive_fails} consecutive image failures on "
                     f"`{character_name}` (image {i}/{count}); aborting so the "
@@ -6347,10 +7154,12 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
             # folder so a sudden kill resumes from the true count (cheap —
             # one atomic write per inter-image delay). Only on success.
             _run_progress.update_saved(saved)
-            # 內容層防線。同一個角色內出現 byte 完全相同的兩張，代表站方端出
-            # 了舊結果——這件事在 2026-08-27 之前**完全沒有徵狀**，是靠事後
-            # 比對輸出資料夾的雜湊才發現的。log 每次都寫，事件一個角色只發一
-            # 次（一輪壞掉可能連續幾十張，別把頻道洗版）。
+            # The content-level line of defence. Two byte-identical images within the same
+            # character mean the site served an old result — before 2026-08-27 this had
+            # **no symptom at all**, and was only discovered by comparing the hashes of the
+            # output folder afterwards. The log line is written every time; the event is
+            # emitted once per character (a bad stretch may run to dozens of images in a row,
+            # so do not flood the channel).
             digest = _file_digest(target)
             if digest and digest in seen_digests:
                 print(f"  [warn] image {i} is byte-identical to one already "
@@ -6360,26 +7169,30 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
                     duplicate_alert_sent = True
                     emit_event("duplicate_image", character=character_name,
                                image_index=i)
-                # 偵測到還不夠——重複的那張本來會**留在資料夾裡而且照樣算一
-                # 張**，於是「120 張」其實只有 119 張不同的內容，而計數與檔案
-                # 都不會說出來。2026-08-27 在正式輸出裡實際抓到一組：同一個角
-                # 色的 #0043（06:50:19）與 #0057（06:57:27）完全相同的
-                # 1,451,588 bytes，中間隔了 14 張、7 分鐘，src 那一層完全沒
-                # 反應（站方替同一張舊圖重新造了一條 blob URL）。
+                # Detecting it is not enough — the duplicate would otherwise **stay in the
+                # folder and still count as an image**, so "120 images" would really hold
+                # only 119 distinct contents, and neither the count nor the files would say
+                # so. On 2026-08-27 one pair was actually caught in production output: the
+                # same character's #0043 (06:50:19) and #0057 (06:57:27), an identical
+                # 1,451,588 bytes, 14 images and 7 minutes apart, with no reaction at all at
+                # the src level (the site minted a new blob URL for the same old image).
                 #
-                # 刪掉是**保留資訊**的操作，不是破壞：被刪的是第二份、內容與
-                # 留下的第一份逐 byte 相同，證據仍在（log ＋ 事件 ＋ 那張留著
-                # 的圖）。
+                # Deleting is an operation that **preserves information**, not destroys it:
+                # what is deleted is the second copy, byte-for-byte identical to the first one
+                # that stays, and the evidence remains (the log + the event + the image that
+                # is kept).
                 #
-                # 為什麼一定要連 `saved` 一起退回：**資料夾檔數是續跑的權威**
-                # （`_run_progress.folder_image_stats`）。只退計數不刪檔，磁碟
-                # 上仍是 120 張＝「這個角色做完了」，續跑就不會補；只刪檔不退
-                # 計數，檢查點的 `saved` 會比實際多。兩個一起動才對得起來。
+                # Why `saved` must be rolled back along with it: **the folder's file count is
+                # the authority for resuming** (`_run_progress.folder_image_stats`). Rolling
+                # back only the count without deleting the file leaves 120 images on disk =
+                # "this character is done", so a resume would not make it up; deleting the
+                # file without rolling back the count leaves the checkpoint's `saved` higher
+                # than reality. Only changing both together keeps them in agreement.
                 try:
                     target.unlink()
                 except OSError as error:  # pragma: no cover
-                    # `!r` 刻意保留：只收得到 `OSError`，`str()` 會印出那張圖的
-                    # 完整輸出路徑。
+                    # `!r` is kept on purpose: only `OSError` can arrive here, and `str()`
+                    # would print that image's full output path.
                     print(f"  [warn] could not remove the duplicate image: "
                           f"{error!r}", file=sys.stderr)
                 else:
@@ -6389,8 +7202,9 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
                 seen_digests.add(digest)
         else:
             snap(port, f"download_failed_{i:04d}")
-            # 下載走的是 in-page fetch；視窗沒了它也只會回 False。與生成路徑
-            # 對稱地探一次，別讓 fail 計數器慢慢爬到 abort。
+            # The download goes through an in-page fetch; with the window gone it also just
+            # returns False. Probe once, symmetrically with the generation path, rather than
+            # letting the fail counter slowly climb to the abort.
             _abort_if_browser_gone(port, f"downloading image {i}")
             consecutive_fails += 1
             if (not fail_alert_sent
@@ -6411,22 +7225,27 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
             delay = random.uniform(*inter_delay)
             print(f"  sleep {delay:.1f}s before next image")
             time.sleep(delay)
-            # 圖跟圖之間 poll DOM／單圖請求 — generate_loop 是長時間 hot
-            # path，在這裡查比 main loop top 反應快多了。同一個 closure 也掛在
-            # 額度等待的睡眠切片上，見 `_serve_pending_requests`。
+            # Poll DOM / single-image requests between images — generate_loop is the
+            # long-running hot path, so checking here responds much faster than at the top of
+            # the main loop. The same closure also hangs on the quota wait's sleep slices;
+            # see `_serve_pending_requests`.
             _serve_pending_requests()
-            # 把跑到螢幕上的瀏覽器視窗搬回螢幕外（`hide_browser_windows`）。開窗時
-            # 就已經在螢幕外，這裡只是保險：已經在外面的視窗不動、不最小化、不搶
-            # 焦點，所以重複呼叫便宜。參數名沿用 `minimize_fn` 只是為了不動幾十個
-            # 呼叫端；**不要**把最小化加回來——最小化／還原正是會讓剛產出的圖在
-            # 前景閃一下的那個動作（2026-09-22）。
+            # Move browser windows that ended up on screen back off screen
+            # (`hide_browser_windows`). Windows are already off screen when opened, so this is
+            # only insurance: a window already outside is left alone, not minimised, and does
+            # not steal focus, so repeated calls are cheap. The parameter keeps the name
+            # `minimize_fn` only to avoid touching dozens of callers; **do not** add
+            # minimising back — minimising / restoring is exactly the action that makes a
+            # freshly produced image flash in the foreground (2026-09-22).
             if minimize_fn is not None:
                 minimize_fn()
-    # 收尾防線：整個角色一張都沒存，而且畫面上還有 modal 擋著。
-    # 上面那道 Tier 2 掛在 `consecutive_fail_abort` 門檻上，所以
-    # `images_per_character` 比門檻小的角色（或提前跑完的）根本走不到它——
-    # 那種情況會安靜地回 saved=0，讓 run_batch 的零產出 backstop 慢慢兜，
-    # 診斷也退化成「什麼都沒產出」而不是「有東西擋著」。
+    # Final line of defence: not a single image of the whole character was saved, and a modal
+    # is still blocking the screen.
+    # The Tier 2 check above hangs on the `consecutive_fail_abort` threshold, so characters
+    # whose `images_per_character` is below the threshold (or that finished early) never
+    # reach it — that case would quietly return saved=0, leaving run_batch's zero-output
+    # backstop to catch it slowly, with the diagnosis degraded to "nothing was produced"
+    # instead of "something is blocking".
     if saved == 0 and remaining > 0:
         blocking = has_blocking_dialog(port)
         if blocking:
@@ -6441,9 +7260,10 @@ def generate_loop(port, character_name: str, batch_cfg: dict,
                saved=saved,
                target=count,
                folder=out_dir.name,
-               # 送的是**差值**不是時間點：bot 的 `_seconds_per_image` 拿它算
-               # `elapsed_sec / saved`，`_handle_event` 拿它 format 成時長，兩邊
-               # 都沒有跟 `now` 比對，所以換成 monotonic 語意不變、而且更準。
+               # What is sent is a **duration**, not a point in time: the bot's
+               # `_seconds_per_image` uses it to compute `elapsed_sec / saved`, and
+               # `_handle_event` formats it as a duration; neither compares it with `now`, so
+               # switching to monotonic keeps the meaning, and is more accurate.
                elapsed_sec=round(time.monotonic() - loop_start_mono, 1))
     return saved
 
@@ -6480,8 +7300,9 @@ def read_queues():
         fb_text = read_text_safe(CHARACTER2_FALLBACK_FILE)
         if fb_text:
             eff_2, fb_2 = [fb_text], True
-    # 空 todo_undesired 沿用 undesired.md 的整段內容；undesired.md 也空就
-    # 所有 entries 為空字串（fill_main_undesired 仍會把當前 textarea 清掉）。
+    # An empty todo_undesired falls back to the whole content of undesired.md; if
+    # undesired.md is empty too, all entries are empty strings (fill_main_undesired still
+    # clears the current textarea).
     real_u = read_todo_characters(TODO_UNDESIRED_FILE)
     eff_u, fb_u = list(real_u), False
     if not real_u:
@@ -6494,22 +7315,26 @@ def read_queues():
 
 
 def parse_run_mode(argv) -> str:
-    """從 argv 認出這一輪的模式（為什麼要宣告，見 `RUN_MODE_BATCH` 上面那段事故
-    紀錄）。回 `RUN_MODE_SINGLE_IMAGE_SERVER` 或 `RUN_MODE_BATCH`。
+    """Recognise this round's mode from argv (for why it has to be declared, see the incident
+    record above `RUN_MODE_BATCH`). Returns `RUN_MODE_SINGLE_IMAGE_SERVER` or
+    `RUN_MODE_BATCH`.
 
-    三條判定規則都是刻意的：
+    All three decision rules are deliberate:
 
-    * **只看 `argv[1:]`；`argv[0]` 永遠不算命中。** `argv[0]` 是被執行的腳本
-      路徑、不是選項，把它一起掃進來等於多開一個「repo 剛好被放在一個名字等於這個
-      旗標的路徑底下」就能翻轉模式的開關——而那是沒有人會想到要去查的地方。順帶
-      也讓呼叫端與測試可以安心地餵標準形狀的 `["prog", ...]`。
-    * **整個元素相等才算，不做前綴／子字串比對。** 於是 `--single-image-server=1`
-      與 `--no-single-image-server` 都**不會**命中。日後要支援那些形狀是一次刻意的
-      改動，不是手滑就會發生的事。
-    * **重複出現不影響結果；不認得的參數一律忽略、不報錯。** 這支只回答一個是非
-      題。要是連「有沒有不認得的參數」也一起扛，日後任何一個還沒接到這裡的新旗標
-      都會讓 webrunner 直接死在進入點：非零 rc → 監督者重生 → 同一份 argv → 再死
-      一次，把一次無害的參數漂移變成無限重生。
+    * **Only `argv[1:]` is looked at; `argv[0]` never counts as a hit.** `argv[0]` is the
+      path of the script being run, not an option, and scanning it too would add a switch
+      that flips the mode whenever "the repo happens to live under a path whose name equals
+      this flag" — somewhere nobody would ever think to check. It also lets callers and tests
+      safely feed the standard shape `["prog", ...]`.
+    * **Only whole-element equality counts; no prefix / substring matching.** So
+      `--single-image-server=1` and `--no-single-image-server` both do **not** hit.
+      Supporting those shapes later would be a deliberate change, not something that happens
+      by a slip of the hand.
+    * **Repeats do not change the result; unrecognised arguments are always ignored, with no
+      error.** This function answers one yes/no question. If it also took on "are there
+      unrecognised arguments", any new flag not yet wired up here would make the webrunner
+      die right at the entry point: non-zero rc → the supervisor respawns → the same argv →
+      dies again, turning a harmless argument drift into endless respawning.
     """
     return (RUN_MODE_SINGLE_IMAGE_SERVER
             if SINGLE_IMAGE_SERVER_FLAG in tuple(argv)[1:]
@@ -6521,17 +7346,19 @@ def run_preflight(oneshot_pending: bool) -> bool:
     True if there is work (or a pending one-shot). False (caller
     returns rc=1) when nothing to do — checked BEFORE Chrome boot.
 
-    `oneshot_pending` 的來源在 pass 3（2026-09-12）換過：兩支變體現在餵
-    `mode == RUN_MODE_SINGLE_IMAGE_SERVER`（**宣告**出來的模式），不再餵
-    `SINGLE_IMAGE_REQUEST_FILE.exists()`（**推論**）。差別是實質的：一個沒人
-    清掉的舊請求檔以前會讓一輪空佇列的批次白開一次 Chrome，然後掉進啟動分支
-    的劫持路徑（事故紀錄見 `RUN_MODE_BATCH` 上面那一段）。
+    The source of `oneshot_pending` changed in pass 3 (2026-09-12): both variants now feed it
+    `mode == RUN_MODE_SINGLE_IMAGE_SERVER` (the **declared** mode), no longer
+    `SINGLE_IMAGE_REQUEST_FILE.exists()` (an **inference**). The difference is substantive:
+    an old request file nobody cleared used to make a batch round with empty queues open
+    Chrome for nothing, and then fall into the startup branch's hijack path (see the incident
+    record above `RUN_MODE_BATCH`).
 
-    ⚠️ **參數名不要改。** 三個呼叫端裡有一個用的是關鍵字：repo 根目錄的
-    `run_batch.py`（`run_preflight(oneshot_pending=False)`，那支是主控台入口，
-    自己永遠不會是單圖伺服器——它只把工作轉交給 `start_webrunner.py`，而那支
-    組 argv 時不轉發自己的參數，所以子行程也永遠看不到旗標）。改名會讓它在
-    執行期丟 `TypeError`，而那是一個只有人手動跑才會走到的入口。
+    ⚠️ **Do not rename the parameter.** One of the three callers uses it as a keyword: the
+    repo root's `run_batch.py` (`run_preflight(oneshot_pending=False)`; that is the console
+    entry point and is itself never a single-image server — it only hands the work over to
+    `start_webrunner.py`, which does not forward its own arguments when building argv, so the
+    child process never sees the flag either). A rename would make it raise `TypeError` at
+    run time, at an entry point that is only reached when someone runs it by hand.
     """
     real0, eff0, fb0 = read_queues()
     preview_pairs = pair_todos(*eff0)
@@ -6554,43 +7381,49 @@ def run_preflight(oneshot_pending: bool) -> bool:
 
 
 def _serve_single_image_queue(port) -> None:
-    """常駐單圖伺服迴圈：把整條單圖佇列服務完，閒置夠久才回來。
+    """The resident single-image serve loop: serve the whole single-image queue, and return
+    only after being idle long enough.
 
-    `run_batch` 在 `mode == RUN_MODE_SINGLE_IMAGE_SERVER` 時呼叫這一支（模式由
-    argv 宣告，事故紀錄與規則見 `RUN_MODE_BATCH` 上面那一段）。setup 完成後不是
-    「serve 1 張就結束」：每服務掉一個請求就重設 idle 時鐘、立刻重 poll，閒置約
-    `idle_timeout` 秒沒有新請求才收工。每一次 serve 都是 idle one-shot
-    （`in_band=False` ＝ 刪光所有角色框、只留主 prompt），所以永遠不會把上一批的
-    角色滲進一次性圖裡。
+    `run_batch` calls this when `mode == RUN_MODE_SINGLE_IMAGE_SERVER` (the mode is declared
+    by argv; for the incident record and the rules see the passage above `RUN_MODE_BATCH`).
+    After setup it is not "serve 1 image and finish": every request served resets the idle
+    clock and polls again immediately, and it only wraps up after about `idle_timeout`
+    seconds idle with no new request. Every serve is an idle one-shot (`in_band=False` =
+    delete every character box, keeping only the main prompt), so the previous batch's
+    characters never seep into a one-shot image.
 
-    ⚠️ **進來的時候請求檔不保證存在，而且那是常態。** bot 是先 spawn 我們、再把
-    請求 pump 到磁碟上的，所以第一圈很可能什麼都撿不到——迴圈本來就會等，那個請求
-    通常在幾百毫秒內落地。這也正是呼叫端的閘門**不可以**再 `and` 上
-    `SINGLE_IMAGE_REQUEST_FILE.exists()` 的原因：那樣寫會讓一個真的單圖伺服器掉進
-    批次迴圈去跑整條 todo 佇列。
+    ⚠️ **On entry the request file is not guaranteed to exist, and that is the norm.** The
+    bot spawns us first and then pumps the request onto disk, so the first turn may well
+    pick up nothing — the loop waits anyway, and the request usually lands within a few
+    hundred milliseconds. That is exactly why the caller's gate **must not** also `and`
+    `SINGLE_IMAGE_REQUEST_FILE.exists()`: written that way, a real single-image server would
+    fall into the batch loop and run the whole todo queue.
     """
-    # 常駐單圖伺服迴圈的本地常數（不新增 module 常數——這是伺服迴圈專屬的調校值）。
-    idle_timeout = 120.0  # 閒置這麼久沒新請求就收工
+    # Local constants of the resident single-image serve loop (no new module constant — this
+    # is a tuning value specific to the serve loop).
+    idle_timeout = 120.0  # wrap up after this long idle with no new request
     print(f"single-image server: serving queue, idle timeout "
           f"{idle_timeout:.0f}s")
-    # idle 時鐘參考點。量的是「距離上次服務過了多久」＝間隔，所以走**單調**時鐘：
-    # 牆鐘往後跳（NTP 校時、使用者改時鐘）會讓這個伺服器關不掉，往前跳則會在還有
-    # 請求排隊時提早收工。
+    # The idle clock's reference point. It measures "how long since the last serve" = an
+    # interval, so it uses the **monotonic** clock: the wall clock jumping back (an NTP sync,
+    # the user changing the clock) would keep this server from ever shutting down, and
+    # jumping forward would wrap up early while requests are still queued.
     last_served_mono = time.monotonic()
     while True:
-        # check_single_image_request 只在「請求檔存在且確實服務了」時回 True。
+        # check_single_image_request returns True only when "the request file exists and
+        # was really served".
         served = check_single_image_request(port, in_band=False)
         if served:
             last_served_mono = time.monotonic()
-            continue  # 立即重 poll：可能還有排在後面的請求
-        # 這一圈沒東西可服務。
+            continue  # poll again immediately: more requests may be queued behind it
+        # Nothing to serve this turn.
         if time.monotonic() - last_served_mono >= idle_timeout:
             break
-        time.sleep(random.uniform(1.0, 2.0))  # 短間隔閒置 poll
+        time.sleep(random.uniform(1.0, 2.0))  # short-interval idle poll
     print(f"single-image server: idle {idle_timeout:.0f}s, shutting down")
-    # drain：補抓 bot 在我們最後一次 poll 與上面 break 判斷之間 os.replace 寫進來
-    # 的請求（只做一次 best-effort，不迴圈）。漏掉它的話那筆請求會一路卡到 bot 自己
-    # 的 inflight TTL 才自癒。
+    # drain: pick up a request the bot os.replace'd in between our last poll and the break
+    # decision above (done once, best-effort, no loop). Missing it would leave that request
+    # stuck until the bot's own inflight TTL heals it.
     check_single_image_request(port, in_band=False)
 
 
@@ -6604,57 +7437,66 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
     generate_loop. Returns the process rc; raises on critical error
     (caller's finally still quits + syncs the profile).
 
-    `mode` 宣告這一輪是批次（預設）還是單圖伺服器，來源是
-    `parse_run_mode(sys.argv)`，而下面那個啟動分支**只看它**（規則與事故紀錄寫在
-    `RUN_MODE_BATCH` 上面那一段）。**不可以再 `and` 上
-    `SINGLE_IMAGE_REQUEST_FILE.exists()`**——理由寫在那個分支旁邊，一句話是：真的
-    單圖伺服器跑到那裡時檔案可能還沒落地。預設值是 `RUN_MODE_BATCH`，所以沒有
-    宣告就是批次。
+    `mode` declares whether this round is a batch (the default) or a single-image server; it
+    comes from `parse_run_mode(sys.argv)`, and the startup branch below **looks only at it**
+    (the rules and the incident record are in the passage above `RUN_MODE_BATCH`). **It must
+    not also `and` `SINGLE_IMAGE_REQUEST_FILE.exists()`** — the reason is written next to that
+    branch, and in one sentence it is: when a real single-image server gets there, the file
+    may not have landed yet. The default is `RUN_MODE_BATCH`, so no declaration means batch.
 
-    不認得的 `mode` **退回批次並大聲印一行**，不丟例外。兩個理由：(a) 這個值只
-    可能來自 `parse_run_mode`，而它只回得出那兩個常數，所以第三種值代表呼叫端寫
-    錯了；而丟例外的時機是在 Chrome 都開起來之後，那一輪很可能已經超過
-    `rapid_fail_threshold_sec`，於是「寫錯一個字串」會變成監督者永遠重生。
-    (b) 退回批次是安全的那個方向：批次照樣會在配對邊界 in-band 服務掉待處理的
-    單圖請求，所以誤判成批次頂多是多跑了佇列上本來就要跑的東西；反過來
-    誤判成伺服器才是上面那段事故紀錄在講的「整條佇列被安靜跳過 ＋ 假的成功 rc」。
+    An unrecognised `mode` **falls back to batch and prints a loud line**, without raising.
+    Two reasons: (a) the value can only come from `parse_run_mode`, which can only return
+    those two constants, so a third value means the caller wrote it wrong; and the raise
+    would come after Chrome has already been opened, when that round has very likely passed
+    `rapid_fail_threshold_sec`, so "one mistyped string" would turn into the supervisor
+    respawning forever. (b) Falling back to batch is the safe direction: the batch still
+    serves pending single-image requests in-band at pair boundaries, so misjudging it as a
+    batch at most runs what was queued to run anyway; misjudging it the other way round, as a
+    server, is exactly the "whole queue quietly skipped + a fake success rc" the incident
+    record above describes.
     """
     if mode not in (RUN_MODE_BATCH, RUN_MODE_SINGLE_IMAGE_SERVER):
         print(f"unknown run mode {mode!r}; falling back to {RUN_MODE_BATCH!r}",
               file=sys.stderr)
         mode = RUN_MODE_BATCH
-    # 印出來是刻意的：那次事故是靠 log 重建的，而 log 裡當時**沒有**任何一行說得出
-    # 「這個行程認為自己是誰」，只看得到它做了什麼。
+    # Printed deliberately: that incident was reconstructed from the log, and at the time the
+    # log had **not one** line that could say "who this process thinks it is", only what it
+    # did.
     print(f"webrunner run mode: {mode}")
     print("webrunner shared revision: prompt-strict-retry-v5 "
           f"({Path(__file__).resolve()})")
-    # 整段批次期間請求作業系統不要打斷這個行程（**不是**請求系統不要進入待命——
-    # 那是兩件事，差別與實測見 `StayAwake` 上方的區塊註解）。放在 `run_batch` 而
-    # 不是各變體的 `main()` 裡，是因為這裡是兩個變體共用的那一層——寫在這裡就不會
-    # 有「只有一邊有」的漂移。`finally` 一定會跑到；就算沒跑到（行程被硬砍），電源
-    # 要求也會隨著行程消失而由 OS 收回，不會留下一個永遠生效的要求。
+    # Ask the operating system not to interrupt this process for the whole batch (**not** to
+    # keep the system from entering standby — those are two different things; for the
+    # difference and the measurements see the block comment above `StayAwake`). It lives in
+    # `run_batch` rather than in each variant's `main()` because this is the layer the two
+    # variants share — written here, there can be no "only one side has it" drift. `finally`
+    # always runs; even if it does not (the process is hard-killed), the OS reclaims the power
+    # request as the process disappears, so no request is left in effect forever.
     _awake = StayAwake()
     if load_batch_config().get("keep_system_awake", True):
         _got = _awake.acquire()
-        # 三條分支都把 `active` 的字面值一起印出來，這是刻意的：中文敘述會隨著
-        # 理解改變被重寫（這一段 2026-09-20 就被重寫過一次），而 `power-request`
-        # ／`execution-state` 這兩個 token 是程式真正的判斷依據，事後 grep log 才
-        # 問得出「那一輪到底拿到了哪一個」。
+        # All three branches deliberately print `active`'s literal value too: the prose gets
+        # rewritten as understanding changes (this passage was rewritten once on 2026-09-20),
+        # while the two tokens `power-request` / `execution-state` are what the program
+        # really branches on, and only by grepping the log afterwards can one ask "which one
+        # did that round actually get".
         if _got == "power-request":
-            print("  [power] 已取得電源要求（power-request）；系統照樣會進入"
-                  "待命，但這個行程不會被暫停")
+            print("  [power] power request obtained (power-request); the system still enters "
+                  "standby, but this process will not be suspended")
         elif _got == "execution-state":
-            # 這台機器只有 S0ix 的話，這條既擋不住待命、也保不住行程——講清楚比
-            # 假裝成功好。
-            print("  [power] 只拿到舊版執行狀態旗標（execution-state）；"
-                  "Modern Standby 機器上保不住這個行程")
+            # If this machine only has S0ix, this path neither blocks standby nor protects the
+            # process — saying so plainly beats pretending it succeeded.
+            print("  [power] only the old execution-state flag was obtained (execution-state); "
+                  "it does not protect this process on a Modern Standby machine")
         else:
-            print("  [power] 兩種電源要求都拿不到；待命期間這個行程可能會被暫停")
-    # 這兩個計數器**必須**在 try 外面：下面的 except 會讀它們來決定「這一輪到底
-    # 有沒有產出東西」，而例外可能發生在它們被指派之前（setup 階段）。
+            print("  [power] could not obtain either kind of power request; this process may be "
+                  "suspended during standby")
+    # These two counters **must** be outside the try: the except below reads them to decide
+    # "did this round actually produce anything", and the exception may happen before they
+    # are assigned (during setup).
     total_saved = 0
     produced = 0
-    # 整個瀏覽器工作階段共用一份（理由見 `generate_loop` 裡的註解）。
+    # Shared by the whole browser session (see the comment in `generate_loop` for why).
     session_srcs: collections.deque[str] = collections.deque(maxlen=50)
     session_digests: set[str] = set()
     try:
@@ -6665,25 +7507,29 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
             print("session setup failed; aborting")
             return 2
 
-        # 啟動單圖伺服分支。**模式是宣告出來的，不是從磁碟推論的**——推論錯過一
-        # 次，事故紀錄在 `RUN_MODE_BATCH` 上面那一段。整條路徑不跑 batch、永不增加
-        # `produced`（走不到後面的 rc=3 zero-save backstop；這裡 return 0 在那之
-        # 前）、也永不寫 resume checkpoint。
+        # The startup single-image serve branch. **The mode is declared, not inferred from
+        # disk** — the inference was wrong once, and the incident record is in the passage
+        # above `RUN_MODE_BATCH`. This whole path runs no batch, never increments `produced`
+        # (the rc=3 zero-save backstop further down is never reached; the return 0 here comes
+        # before it), and never writes the resume checkpoint.
         #
-        # ⚠️ **絕對不可以 `and` 上 `SINGLE_IMAGE_REQUEST_FILE.exists()`。** 它看起
-        # 來比較保險，實際上是今天這個缺陷的鏡像：bot 是**先 spawn、再把請求 pump
-        # 到磁碟上**的，所以一個真的單圖伺服器跑到這裡時，請求檔很可能還沒落地；
-        # 那樣寫會讓它掉進下面的批次迴圈去跑整條 todo 佇列，而且一樣安靜。
+        # ⚠️ **Never `and` `SINGLE_IMAGE_REQUEST_FILE.exists()` here.** It looks safer, but
+        # it is actually the mirror image of today's defect: the bot **spawns first and then
+        # pumps the request onto disk**, so when a real single-image server gets here, the
+        # request file may well not have landed yet; written that way, it would fall into the
+        # batch loop below and run the whole todo queue, just as silently.
         if mode == RUN_MODE_SINGLE_IMAGE_SERVER:
             print("run mode declared on argv: single-image server; "
                   "serving the one-shot queue")
             _serve_single_image_queue(port)
-            return 0  # 乾淨收工，不讓 supervisor 重生
+            return 0  # wrap up cleanly, so the supervisor does not respawn
         if SINGLE_IMAGE_REQUEST_FILE.exists():
-            # 批次路徑上看到請求檔**不刪**：它是帶內服務的輸入，批次迴圈頂端與圖
-            # 與圖之間的 `check_single_image_request` 會把它撿走。印一行是因為
-            # 「批次啟動時磁碟上已經躺著一個請求」正是 2026-06-27 那次事故的現場
-            # 特徵——log 裡要看得出這一輪是**刻意**沒有把它當成身分宣告。
+            # On the batch path a request file that is seen is **not deleted**: it is the
+            # input for in-band serving, and `check_single_image_request` at the top of the
+            # batch loop and between images will pick it up. One line is printed because "a
+            # request already lying on disk when the batch starts" is exactly the scene of the
+            # 2026-06-27 incident — the log has to show that this round **deliberately** did
+            # not treat it as an identity declaration.
             print("batch mode: a single-image request is already on disk; "
                   "it stays there and will be served in-band at the first "
                   "character boundary", file=sys.stderr)
@@ -6691,31 +7537,38 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
         # Count completed characters so we can cycle Chrome every N of them
         # (memory-flush — see `restart_chrome_every_n_characters`).
         chars_completed = 0
-        # 排程計時器：量的是「這一輪已經工作多久」（對 `schedule_limit_hours`），
-        # 純粹是間隔 → **單調**時鐘。牆鐘往後跳會讓休息被無限延後（那個休息時段
-        # 是刻意的），往前跳會沒必要地提早休息。
+        # Schedule timer: measures "how long this round has been working" (against
+        # `schedule_limit_hours`), purely an interval → **monotonic** clock. The wall clock
+        # jumping back would postpone the rest indefinitely (that rest period is deliberate),
+        # and jumping forward would rest early for no reason.
         #
-        # 對照組就在下面幾行：`iter_batch_start` 必須留在 `time.time()`，因為
-        # `allocate_output_dir` 拿它跟**檔案 mtime** 比（`max(mtimes) >=
-        # batch_start`），mtime 是牆鐘 epoch。判準是「這個值有沒有要離開本行程」：
-        # 要落地到磁碟／事件／跟別的行程比對 → `time.time()`；只在行程內量經過多久
-        # → `time.monotonic()`。兩者不可互換，monotonic 的零點每個行程都不同。
+        # The control group is a few lines below: `iter_batch_start` must stay on
+        # `time.time()`, because `allocate_output_dir` compares it against **file mtimes**
+        # (`max(mtimes) >= batch_start`), and mtimes are wall-clock epoch. The criterion is
+        # "does this value leave this process": landing on disk / in events / compared with
+        # another process → `time.time()`; only measuring elapsed time within the process →
+        # `time.monotonic()`. The two are not interchangeable; monotonic's zero point differs
+        # in every process.
         schedule_start_mono = time.monotonic()
-        # `batch_start` 是 per-iteration 的：每個 pair 在進 generate_loop 前
-        # 才取 `time.time()`。這讓「同樣 char_name 但 prompt / undesired
-        # 換了」的 pair 自動 fall through 到 `<name>_2` / `_3` … — 上一個
-        # iteration 寫進去的檔 mtime < 本 iteration 的 batch_start，
-        # `_folder_belongs_to_batch` 回 False，就會編號。
+        # `batch_start` is per-iteration: each pair takes `time.time()` only right before
+        # entering generate_loop. This makes a pair with "the same char_name but a changed
+        # prompt / undesired" automatically fall through to `<name>_2` / `_3` … — the files
+        # the previous iteration wrote have mtime < this iteration's batch_start,
+        # `_folder_belongs_to_batch` returns False, and it gets numbered.
         prev_prompt: str | None = None
         prev_e2: str | None = None
         prev_undesired: str | None = None
-        # 動態消耗的兩個 in-run 計數器（見 _queue_consume）：
-        # - produced：本輪已實際產出的角色數，給 chrome 重啟 cadence / log。
-        # - skip：本輪「未達門檻、保留在佇列前端、已嘗試過」的條目數（游標）。
-        #   每圈取 pairs[skip]，pop 時對游標位置 pop（skip==0 即舊 front-pop）。
+        # The two in-run counters of dynamic consumption (see _queue_consume):
+        # - produced: the number of characters actually produced this round, for the chrome
+        #   restart cadence / log.
+        # - skip: the number of entries this round that "did not reach the threshold, stay at
+        #   the front of the queue, and have been attempted" (the cursor).
+        #   Each turn takes pairs[skip], and a pop pops at the cursor position (skip==0 is the
+        #   old front-pop).
         skip = 0
-        # `len(pairs)` 在動態模型下每圈不同；postloop 的事件需要一個「本輪走過的
-        # pair 數」概念，用最後一圈算出的當前 pairs 數當代表。
+        # Under the dynamic model `len(pairs)` differs every turn; the post-loop event needs a
+        # notion of "the number of pairs this round went through", represented by the current
+        # pairs count computed on the last turn.
         last_pairs_len = len(pair_todos(*read_queues()[1]))
         # Set True when an `end` sentinel in the main prompt queue stops the
         # run early; lets the post-loop code skip the zero-save backstop and
@@ -6723,7 +7576,8 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
         end_sentinel_hit = False
         while True:
             wait_if_paused("pair boundary")
-            # 每圈重讀四個真實佇列、套 fallback → eff + fb 旗標。
+            # Every turn re-reads the four real queues and applies the fallbacks → eff + fb
+            # flags.
             real, eff, fb = read_queues()
             (real_p, real_1, real_2, real_u) = real
             (eff_p, eff_1, eff_2, eff_u) = eff
@@ -6736,9 +7590,10 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                 break
             pairs = decision.pairs
             last_pairs_len = len(pairs)
-            # `fallback_single`：真實佇列全空、但有 fallback 且本輪還沒產過 →
-            # 只產這一個就收工（不讓長度 1 的 fallback 把抽乾的真實佇列延長成
-            # 多餘幽靈角色）。產完在 pop 區尾段 break。
+            # `fallback_single`: the real queues are all empty, but there is a fallback and
+            # nothing has been produced this round yet → produce just this one and wrap up
+            # (so a length-1 fallback does not stretch a drained real queue into redundant
+            # ghost characters). After producing, it breaks at the end of the pop section.
             fallback_single = (
                 decision.action == _queue_consume.ACTION_FALLBACK_SINGLE)
             (prompt_entry, entry1, entry2, undesired_entry) = decision.batch
@@ -6753,8 +7608,8 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                 print(f"  encountered 'end' sentinel at cursor {skip} "
                       f"({len(pairs)} pair(s) this read); stopping run "
                       f"(later pairs skipped)")
-                # 從磁碟重讀的 real_p 移掉第一個 end 行再寫回（real_p 即此刻
-                # 磁碟內容，等同先 reconcile）。
+                # Remove the first end line from the re-read real_p and write it back (real_p
+                # is the disk content at this moment, equivalent to reconciling first).
                 for idx, rp in enumerate(real_p):
                     if _queue_consume.is_end_marker(rp):
                         real_p.pop(idx)
@@ -6768,26 +7623,29 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                 break
             char_name = character_folder_name(entry1) if entry1 else character_folder_name(entry2)
             print(f"\n=== {char_name} ===")
-            # 角色邊界的程式碼漂移檢查（純診斷，不改變任何行為）。放在角色橫幅
-            # 底下，漂移那一行才會緊貼著它、事後好對；`drifted is False` 時完全
-            # 不出聲，所以正常情況下這裡看不到任何東西。共用一份 → 兩個變體同時
-            # 生效，不需要各自複製。
+            # Code drift check at the character boundary (purely diagnostic, changes no
+            # behaviour). It sits under the character banner so the drift line lands right
+            # next to it and is easy to match up later; when `drifted is False` it stays
+            # completely silent, so normally nothing shows here. One shared copy → takes
+            # effect in both variants at once, with no need for each to copy it.
             report_code_drift()
-            # Iteration-boundary polling 點：bot 端 `!introspect_dom` 寫請求
-            # 檔後，這裡 fulfill 並 emit_event('dom_result')。
+            # Iteration-boundary polling point: after the bot side's `!introspect_dom` writes
+            # the request file, it is fulfilled here and emit_event('dom_result') is called.
             check_dom_request(port)
-            # In-band 單圖請求（batch 角色之間插一張即時生成）。serve 會覆寫
-            # 主 prompt / 角色 / undesired 欄位，所以服務完把 prev_* 重設 None，
-            # 強制下面這個 pair 重填自己每個欄位（否則 per-pair diff 會以為值
-            # 沒變而跳過、用到 one-shot 殘留值）— 跟 chrome 重啟後的重設同理。
+            # In-band single-image request (one instant generation slotted in between batch
+            # characters). The serve overwrites the main prompt / character / undesired
+            # fields, so after serving prev_* are reset to None, forcing the pair below to
+            # refill every one of its own fields (otherwise the per-pair diff would think the
+            # values were unchanged, skip them, and use the one-shot's leftover values) — same
+            # reason as the reset after a chrome restart.
             if check_single_image_request(port):
                 prev_prompt = None
                 prev_e2 = None
                 prev_undesired = None
-            # `human_pause(0.8, 1.5)` 放在每個成功 fill 後面，模擬「人類點完
-            # 一個欄位、停一下、再點下一個」的節奏；React component 也利用
-            # 這段空檔同步 state（避免上一個 fill 的 input event 還沒處理完
-            # 就接著被下個 fill 干擾）。
+            # `human_pause(0.8, 1.5)` goes after every successful fill, imitating the rhythm
+            # of "a human finishes one field, pauses, then clicks the next"; React components
+            # also use this gap to sync state (so the previous fill's input event is not
+            # interfered with by the next fill before it has been processed).
             if prompt_entry != prev_prompt:
                 print(f"  filling main prompt ({len(prompt_entry)} chars)")
                 if not with_retry(
@@ -6819,7 +7677,7 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                     continue
                 human_pause(0.8, 1.5)
             else:
-                # 同步 tracker 即可，不寫盤、不動 DOM。
+                # Just sync the tracker; no disk write, no DOM change.
                 prev_undesired = undesired_entry
             if not with_retry(
                     "set_character2_state",
@@ -6855,10 +7713,11 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                     continue
                 prev_e2 = entry2
                 human_pause(0.8, 1.5)
-            # fill 當下的 verify 擋不住 fill 之後的污染（autocomplete 下拉
-            # 被後續座標點選誤觸、把建議 tag 插進尾端），進 generate_loop
-            # 前再各驗一次。entry2 即使這輪沒重填也驗 — 欄位仍可能被上一
-            # 輪的點選污染。
+            # The verify at fill time cannot catch pollution after the fill (a leftover
+            # autocomplete dropdown hit by a later coordinate click, inserting a suggested tag
+            # at the end), so each is verified once more before entering generate_loop. entry2
+            # is verified even if it was not refilled this round — the field may still have
+            # been polluted by the previous round's clicks.
             character_prompts_ok = True
             for char_index, expected in ((1, entry1), (2, entry2)):
                 if char_index == 2 and not expected:
@@ -6878,9 +7737,9 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                 skip += 1
                 continue
             snap(port, f"ready_{char_name[:30]}")
-            # Per-iteration batch_start：每個 pair 各自的「現在」當基準，
-            # `allocate_output_dir` 看到 same-named folder 裡有更早的檔
-            # 就會編號到 `<name>_2` / `_3` …，prompt 換了就會分開存。
+            # Per-iteration batch_start: each pair's own "now" is the baseline, so when
+            # `allocate_output_dir` sees older files in a same-named folder it numbers the new
+            # one `<name>_2` / `_3` …, and a changed prompt gets saved separately.
             iter_batch_start = time.time()
             # Hot-reload batch params per character. Edits to batch_config.json
             # made mid-run take effect on the NEXT character (not mid-batch
@@ -6898,15 +7757,19 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
             resume_count = 0
             if produced == 0 and skip == 0:
                 prog = _run_progress.read_progress()
-                # `folder` 必須另外驗——`matches()` 只比對四個身分欄位，根本沒
-                # 看它。以前這裡直接 `OUTPUT_ROOT / prog["folder"]`，六種壞法
-                # （欄位缺、None、int、list、`../`、絕對路徑）全部中招；細節與
-                # 實測結果寫在 `_run_progress.resume_folder` 的 docstring。
+                # `folder` has to be validated separately — `matches()` only compares the
+                # four identity fields and never looks at it. This used to be a plain
+                # `OUTPUT_ROOT / prog["folder"]`, and all six ways of breaking it (field
+                # missing, None, int, list, `../`, an absolute path) got through; the
+                # details and measured results are in `_run_progress.resume_folder`'s
+                # docstring.
                 cand = _run_progress.resume_folder(prog, OUTPUT_ROOT)
-                # 這一串 elif 的每一條都要留下「為什麼沒接續」。之前只有身分
-                # 欄位不符那一條會講話，其餘全是無聲 fallthrough——2026-08-23
-                # 那次 `priestess` 連開四個編號資料夾、燒掉一個半小時、最後連
-                # `character_done` 都沒有，事後在 log 與 events 裡找不到半個字。
+                # Every branch of this elif chain has to leave a note of "why it did not
+                # resume". Before, only the identity-mismatch branch spoke; all the rest were
+                # silent fallthroughs — on 2026-08-23 `priestess` opened four numbered folders
+                # in a row, burned an hour and a half, and never even reached
+                # `character_done`, and afterwards not a single word about it could be found
+                # in the log or the events.
                 if prog is None:
                     print(f"  resume: no checkpoint on disk; starting "
                           f"`{char_name}` from image 1")
@@ -6924,11 +7787,13 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                           f"fresh. Diverging fields:")
                     for line in diffs:
                         print(f"    {line}")
-                    # 上面那幾行只活在 stdout。主控台會被關掉、記錄檔會被修剪，
-                    # 但「這一輪為什麼沒接續」是事後唯一想知道的事，所以再發一筆
-                    # 事件——events.ndjson 跨行程存活，bot 也讀得到。
-                    # 只送**欄位名稱**不送內容：欄位內容是提示詞全文，沒必要
-                    # 進事件檔或被轉貼出去；人看的 stored/current 留在上面的 log。
+                    # The lines above live only on stdout. The console gets closed and the log
+                    # file gets trimmed, but "why this round did not resume" is the one thing
+                    # anyone wants to know afterwards, so an event is emitted too —
+                    # events.ndjson survives across processes, and the bot can read it.
+                    # Only the **field names** are sent, not the content: the field content is
+                    # the full prompt text, which has no business going into the event file or
+                    # being reposted; the human-readable stored/current stays in the log above.
                     emit_event(
                         "resume_mismatch", name=char_name,
                         folder=prog.get("folder"),
@@ -6936,9 +7801,10 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                             prog, prompt_entry, entry1, entry2,
                             undesired_entry))
                 elif cand is None:
-                    # 身分欄位對得上、`folder` 卻不能用＝檢查點被改壞或被別的
-                    # 東西覆寫過。從第 1 張重來是唯一安全的選擇，但這不是正常
-                    # 情況，走 stderr 並發事件。
+                    # The identity fields match but `folder` is unusable = the checkpoint was
+                    # corrupted or overwritten by something else. Starting over from image 1
+                    # is the only safe choice, but this is not a normal situation, so it goes
+                    # to stderr and emits an event.
                     print(f"  resume: checkpoint matches `{char_name}` but its "
                           f"folder value is unusable "
                           f"({prog.get('folder')!r}); starting from image 1",
@@ -6947,16 +7813,18 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                                reason="bad_folder")
                 else:
                     existing, _ = _run_progress.folder_image_stats(cand)
-                    # 磁碟檔數是權威，但 checkpoint 的 saved 是備援：剛被硬殺後
-                    # 資料夾列舉可能短暫對不上（防毒鎖檔之類），取兩者較大值，
-                    # 再以 target 封頂。
+                    # The file count on disk is the authority, but the checkpoint's saved is
+                    # the backup: right after a hard kill the folder listing may briefly
+                    # disagree (antivirus locking files and the like), so take the larger of
+                    # the two, capped at the target.
                     stored_saved = prog.get("saved", 0)
                     if not isinstance(stored_saved, int) or stored_saved < 0:
                         stored_saved = 0
                     effective = min(max(existing, stored_saved), target_count)
                     if not cand.exists():
-                        # 檢查點指著的資料夾不見了——最常見是使用者自己清了
-                        # output/。真有 saved>0 的話就是有工作被丟掉，值得吭聲。
+                        # The folder the checkpoint points to is gone — most commonly the
+                        # user cleared output/ themselves. If saved>0, some work really was
+                        # thrown away, which is worth speaking up about.
                         print(f"  resume: the checkpoint folder for "
                               f"`{char_name}` is gone "
                               f"(checkpoint={stored_saved}); starting from "
@@ -6964,8 +7832,9 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                         emit_event("resume_unusable", name=char_name,
                                    reason="folder_missing", saved=stored_saved)
                     elif effective <= 0:
-                        # 上一輪在存下第一張之前就被打斷，沒有東西可以接。這是
-                        # 正常情形（不是故障），留 log、不發事件。
+                        # The previous round was interrupted before the first image was
+                        # saved, so there is nothing to continue. This is normal (not a
+                        # fault): log it, emit no event.
                         print(f"  resume: checkpoint for `{char_name}` has no "
                               f"images on disk yet; starting from image 1")
                     elif effective < target_count:
@@ -7032,19 +7901,24 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
             min_save_ratio = batch_cfg["min_save_ratio"]
             pop_threshold = max(1, math.ceil(target_count * min_save_ratio))
             if saved >= pop_threshold:
-                # 動態模型下「磁碟」就是權威：每圈一開始已用 read_queues() 重讀，
-                # real_* 即此刻磁碟內容。pop 前再 reconcile_todo_with_disk 一次以
-                # 沿用既有「外部編輯 → 備份原磁碟內容、磁碟優先」語意（這裡的
-                # reconcile 多半是 no-op，因為 real_* 才剛讀過；但若 generate_loop
-                # 跑了數分鐘期間又被改，這次 reconcile 會抓到並備份）。
-                # 只對「真正的佇列檔」對帳 / pop：fallback 模式（prompt.md /
-                # character2.md / undesired.md）時對應的 todo_*.md 是空檔，跟記憶體
-                # 裡的 [fallback] 必然不同，無條件對帳會每個角色都誤判成被外部改動、
-                # 寫出多餘的空備份。守衛條件跟下方 pop 一致。
+                # Under the dynamic model "disk" is the authority: every turn already
+                # re-reads with read_queues() at the start, so real_* is the disk content at
+                # this moment. reconcile_todo_with_disk is run once more before the pop to
+                # keep the existing "external edit → back up the original disk content, disk
+                # wins" semantics (the reconcile here is mostly a no-op, since real_* was just
+                # read; but if it was changed again during the minutes generate_loop ran,
+                # this reconcile catches it and backs it up).
+                # Only "real queue files" are reconciled / popped: in fallback mode
+                # (prompt.md / character2.md / undesired.md) the corresponding todo_*.md is an
+                # empty file, necessarily different from the in-memory [fallback], so an
+                # unconditional reconcile would misjudge every character as externally
+                # modified and write redundant empty backups. The guard condition matches the
+                # pop below.
                 def _pop_cursor(path, disk_list, entry, is_fb,
                                 reuse_tail=True, preserve_blank=False):
-                    """對單一佇列在游標位置 pop。disk_list 為此刻磁碟內容
-                    （read_queues 剛讀的 real_*）。回 (新清單, 是否真的 pop 了)。"""
+                    """Pop a single queue at the cursor position. disk_list is the disk
+                    content at this moment (the real_* read_queues just read). Returns (new
+                    list, whether it really popped)."""
                     if is_fb:
                         return disk_list, False
                     cur = reconcile_todo_with_disk(
@@ -7055,8 +7929,9 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                             len(cur), skip, is_last)):
                         return cur, False
                     ri = _queue_consume.pop_index(len(cur), skip)
-                    # front-match 守衛：游標位置那筆要等於剛消耗的 entry 才 pop，
-                    # 否則（使用者重排 / 刪除了該筆）跳過、不蓋掉編輯。
+                    # front-match guard: pop only when the entry at the cursor position
+                    # equals the entry just consumed; otherwise (the user reordered / deleted
+                    # it) skip, without overwriting the edit.
                     if cur[ri] != entry:
                         return cur, False
                     cur.pop(ri)
@@ -7089,7 +7964,8 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                 # (critical when adjacent pairs share identical prompts).
                 _run_progress.clear_progress()
             else:
-                # 未達門檻：不 pop，保留此條目在前端、游標越過（下輪 run 重試）。
+                # Below the threshold: no pop; keep this entry at the front and move the
+                # cursor past it (retried in the next run).
                 print(f"  WARN: only {saved}/{target_count} saved "
                       f"(< {pop_threshold} = {min_save_ratio:.0%} threshold); "
                       f"todo entry retained for retry")
@@ -7101,32 +7977,39 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
             if elapsed_h > schedule_limit_h:
                 rest_h = batch_cfg["rest_hours"]
                 rest_s = rest_h * 3600
-                # `rest_hours: 0` 是合法設定（＝不休息，只把計時器歸零）。零長
-                # 度的休息不該發事件，否則對話平台上會出現一則「休息 0 小時」。
+                # `rest_hours: 0` is a legitimate setting (= no rest, just reset the timer).
+                # A zero-length rest should not emit an event, or a "resting 0 hours" message
+                # would show up on the chat platform.
                 if rest_s > 0:
-                    # 這裡刻意**分成兩個變數**，不折衷成一個：
-                    #   * `rest_started_mono` 只量「實際休了多久」＝間隔 → 單調
-                    #     時鐘（休息預設 6 小時，最容易跨到一次 NTP 校時）。
-                    #   * `wake_ts` 是要**離開本行程**的絕對時間點：印給人看的
-                    #     「幾點醒來」、寫進 `schedule_rest` 事件給 bot 的
-                    #     `_resting_until` 拿去跟它自己的 `time.time()` 比對
-                    #     （`wake <= now` ＝ 休息已過期）。monotonic 的零點每個
-                    #     行程都不一樣，這個值換成 monotonic 就完全沒有意義。
-                    # **這是本檔 `time.time() + N` 唯一刻意保留的一處。** 其餘
-                    # 七處 DOM 輪詢逾時（`select_model` 兩處、`_click_gender`、
-                    # `click_add_character_control`、`_click_option_by_text`、
-                    # `select_sampler`、`click_generate`）已全部改成單調時鐘；
-                    # 下一個做同類掃描的人請**不要**把這一行一起「修好」——它不是
-                    # 逾時判定，是要離開本行程的絕對時間點。
+                    # This is deliberately **split into two variables**, not merged into
+                    # one:
+                    #   * `rest_started_mono` only measures "how long it actually rested" =
+                    #     an interval → monotonic clock (the rest is 6 hours by default, the
+                    #     most likely to straddle an NTP sync).
+                    #   * `wake_ts` is an absolute point in time that **leaves this
+                    #     process**: the "wakes at what time" printed for people, written into
+                    #     the `schedule_rest` event for the bot's `_resting_until` to compare
+                    #     with its own `time.time()` (`wake <= now` = the rest has expired).
+                    #     monotonic's zero point differs in every process, so this value
+                    #     would be completely meaningless as monotonic.
+                    # **This is the only `time.time() + N` deliberately kept in this file.**
+                    # The other seven DOM polling timeouts (`select_model` twice,
+                    # `_click_gender`, `click_add_character_control`,
+                    # `_click_option_by_text`, `select_sampler`, `click_generate`) have all
+                    # been switched to the monotonic clock; whoever does the next sweep of
+                    # this kind, please **do not** "fix" this line along with them — it is not
+                    # a timeout check, it is an absolute point in time that leaves this
+                    # process.
                     rest_started_mono = time.monotonic()
                     wake_ts = time.time() + rest_s
                     wake_at = time.strftime(
                         "%Y-%m-%d %H:%M:%S", time.localtime(wake_ts))
                     print(f"  schedule limit ({schedule_limit_h}h) exceeded; "
                           f"resting {rest_h}h (wake at {wake_at})")
-                    # 休息是**刻意**的閒置，不是卡死——但外面分不出來：`/rate`
-                    # 的「超過一小時沒有新圖」警告在休息的每一分鐘都會亮。發事
-                    # 件讓 bot 能講清楚，也讓 `/rate` / `/eta` 有依據。
+                    # Resting is **deliberate** idling, not a hang — but from outside the two
+                    # cannot be told apart: `/rate`'s "no new image for over an hour" warning
+                    # would light up for every minute of the rest. Emitting an event lets the
+                    # bot explain it, and gives `/rate` / `/eta` something to go on.
                     emit_event("schedule_rest", character=char_name,
                                rest_sec=round(rest_s, 1),
                                wake_ts=round(wake_ts, 1),
@@ -7135,17 +8018,20 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                         prev_prompt = None
                         prev_e2 = None
                         prev_undesired = None
-                    # 實際休了多久要**量**、不要拿設定值充數：暫停標記會把休息
-                    # 拉長，插播單圖也會。
+                    # How long it actually rested must be **measured**, not stood in for by
+                    # the config value: the pause marker stretches the rest, and so do
+                    # interjected single images.
                     emit_event("schedule_resumed", character=char_name,
                                rested_sec=round(
                                    time.monotonic() - rest_started_mono, 1))
                 schedule_start_mono = time.monotonic()
                 print("  resumed; schedule timer reset to 0")
 
-            # `fallback_single`：真實佇列全空、本輪只產這一個 fallback 角色 →
-            # 產完（已 pop / clear）即收工，不再重讀（避免長度 1 的 fallback
-            # 把抽乾的真實佇列延長成幽靈角色）。放在 chrome 重啟前，省去無謂重啟。
+            # `fallback_single`: the real queues are all empty and this round produces only
+            # this one fallback character → once produced (already popped / cleared), wrap up
+            # without re-reading (so a length-1 fallback does not stretch a drained real
+            # queue into ghost characters). Placed before the chrome restart, to save a
+            # pointless restart.
             if fallback_single:
                 break
 
@@ -7153,8 +8039,9 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
             # to flush the renderer before it OOMs on the long run. Done at the
             # character boundary (not mid-character) so no batch is interrupted.
             # Skipped when nothing is left to generate (run about to end anyway):
-            # 動態模型沒有固定的「最後一批」，所以用 read_queues()+decide() 偷看
-            # 下一圈會不會 BREAK，會就跳過重啟（白重啟再 teardown 浪費時間）。
+            # the dynamic model has no fixed "last batch", so peek with read_queues()+decide()
+            # at whether the next turn will BREAK, and if so skip the restart (restarting for
+            # nothing and then tearing down wastes time).
             chars_completed += 1
             restart_every_chars = batch_cfg.get(
                 "restart_chrome_every_n_characters", 0)
@@ -7195,9 +8082,11 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                        elapsed_sec=round(
                            time.monotonic() - schedule_start_mono, 1))
         elif produced > 0 and total_saved == 0:
-            # rc=3 backstop：實際嘗試生成了至少一個角色（produced>0）卻 0 存檔，
-            # 是沒被認成 crash interstitial 的死頁（登出 / React 沒掛上 / 維護）。
-            # 回 0 會讓 supervisor 當「乾淨收工」不重生 → 佇列卡死。回非 0 重生。
+            # rc=3 backstop: at least one character was actually attempted (produced>0) yet
+            # 0 files were saved — a dead page not recognised as a crash interstitial (logged
+            # out / React not mounted / maintenance). Returning 0 would make the supervisor
+            # treat it as a "clean finish" and not respawn → the queue is stuck. Return
+            # non-zero so it respawns.
             print("WARN: generated character(s) but saved 0 images — treating as "
                   "a broken session; exiting non-zero so supervisor respawns.",
                   file=sys.stderr)
@@ -7213,28 +8102,36 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                        elapsed_sec=round(
                            time.monotonic() - schedule_start_mono, 1))
     except GenerationBlockedError as error:
-        # 站方擋住生成、重試不會有結果 → 乾淨停止，**不**讓監督者重生。
-        # 事件刻意不帶對話框原文：那是站方的原始字串，依保密規則不得送到對話
-        # 平台（bot 端只會貼一句固定的中文提示）。全文已寫進 stderr／log。
+        # The site blocks generation and retrying will get nowhere → stop cleanly, and do
+        # **not** let the supervisor respawn.
+        # The event deliberately does not carry the dialog's raw text: that is the site's raw
+        # string, which under the secrecy rules must not be sent to the chat platform (the bot
+        # side only ever posts a fixed Chinese notice). The full text is already written to
+        # stderr / the log.
         print(f"generation blocked; stopping without respawn: {error}",
               file=sys.stderr)
         emit_event("generation_blocked", saved=total_saved, produced=produced)
         return RC_GENERATION_BLOCKED
     except Exception as error:  # pylint: disable=broad-except
-        # `message` 走 `_long_error`：裸的 `str(error)` 沒有長度上限，而且會把
-        # chromedriver 附的十幾行 C++ `Stacktrace:` 整段帶進事件檔。
-        # `traceback` 走 `_traceback_excerpt`：舊的 `format_exc()[-1500:]` 在例外
-        # 來自函式庫深處時會把我們自己的 frame 全部切掉（實測 09-07 三次，我們的
-        # frame 一個都不剩）。`code_drift` 說明那份 traceback 的原始碼文字可不可信。
+        # `message` goes through `_long_error`: a bare `str(error)` has no length cap, and
+        # would carry chromedriver's dozen-plus lines of C++ `Stacktrace:` into the event
+        # file wholesale.
+        # `traceback` goes through `_traceback_excerpt`: the old `format_exc()[-1500:]` cut
+        # off all of our own frames when the exception came from deep inside a library
+        # (measured three times on 09-07, with not one of our frames left). `code_drift`
+        # says whether the source text in that traceback can be trusted.
         emit_event("critical_error",
                    message=_long_error(error),
                    code_drift=code_drift_flag(),
                    traceback=_traceback_excerpt(traceback.format_exc()))
-        # 「這一輪嘗試過生成、卻一張都沒存」＝零產出。回 rc=3（與下面走完整輪的
-        # zero-save backstop 同一個值）而不是讓例外炸穿成 rc=1，監督者才有辦法
-        # 數「連續幾輪零產出」並在該放棄的時候放棄——否則慢速失敗（每輪都要跑
-        # 完 consecutive_fail_abort 才死）永遠碰不到 rapid-fail 那道閘。
-        # 有存到圖的崩潰照舊往上炸：那是真的該無限重生的情況。
+        # "This round attempted generation yet saved not a single image" = zero output.
+        # Returning rc=3 (the same value as the full-round zero-save backstop below) rather
+        # than letting the exception blow through as rc=1 is what lets the supervisor count
+        # "how many rounds in a row had zero output" and give up when it should — otherwise a
+        # slow failure (each round has to run through consecutive_fail_abort before dying)
+        # never reaches the rapid-fail gate.
+        # A crash after images were saved still blows up as before: that is the case that
+        # really should respawn indefinitely.
         if produced > 0 and total_saved == 0:
             print("WARN: run produced no images at all before aborting; "
                   "exiting rc=3 so the supervisor can count zero-progress "
@@ -7242,7 +8139,8 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
             return RC_ZERO_PROGRESS
         raise
     finally:
-        # 每一條離開路徑都要放掉：正常結束、rc=3／rc=4、以及往上炸的例外。
-        # `release()` 冪等且永不 raise，所以放在這裡不會蓋掉真正的失敗原因。
+        # Every exit path must release it: a normal finish, rc=3 / rc=4, and exceptions
+        # blowing up. `release()` is idempotent and never raises, so putting it here cannot
+        # mask the real cause of failure.
         _awake.release()
     return 0

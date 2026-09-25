@@ -1,30 +1,41 @@
-"""桌面自動化原語（bot-only helper，被動模組）。
+"""Desktop-automation primitives (bot-only helper, passive module).
 
-`discord_bot.py` 的 GUI 控制指令（滑鼠 / 視窗 / 剪貼簿 / 螢幕 / 文字與圖片
-定位 / 巨集 / shell）把「怎麼做」放在這裡，只留「怎麼回話」在 bot。
+`discord_bot.py`'s GUI-control commands (mouse / window / clipboard / screen /
+text and image location / macro / shell) keep the "how to do it" here, leaving
+only the "how to reply" in the bot.
 
-設計約束：
+Design constraints:
 
-* **自動化本身不在這裡實作。** 打字、文字辨識與跨詞比對、樣板比對、UI 元素樹、
-  截圖的 DPI 換算——全部轉呼叫桌面自動化函式庫（`je_auto_control`，本機以可編輯
-  模式指向原始碼樹）。函式庫缺什麼就補進函式庫，不要在這裡繞過去：同一件事有
-  兩份實作，修好的永遠只有其中一份。本模組留下的是**參數解析**、**本機環境
-  政策**（辨識引擎路徑、語言資料位置、選語言）、**去識別化**，以及需要 event
-  loop 才能做的**中止與逾時**。
-* **不 import `discord`、不 import `discord_bot`**（後者會循環）。本模組只用
-  stdlib ＋ 選用的 `je_auto_control` / `psutil` / `Pillow`，所以
-  可以直接被測試載入、也可以被別的行程重用。
-* **全部是同步阻塞函式。** bot 是單一 event loop，呼叫端必須用
-  `asyncio.to_thread` 包起來；`wait_text` / `wait_window` / `run_shell` 動輒
-  數秒到數分鐘，直接在 loop 上跑會讓整個 bot 失去回應。
-* **錯誤一律轉成 `GuiError`，訊息由本模組自己寫死**（泛用、不含主機路徑 /
-  外部服務名 / 原始例外文字），呼叫端可以直接把 `str(error)` 回給使用者而不
-  違反 CLAUDE.md 的 Secrecy 硬性規定。真正的細節由呼叫端自行寫 stderr。
+* **The automation itself is not implemented here.** Typing, text recognition
+  and cross-word matching, template matching, the UI element tree, the DPI
+  conversion for screenshots—all of it delegates to the desktop-automation
+  library (`je_auto_control`, pointed at the source tree in editable mode
+  locally). Whatever the library lacks is added to the library, not worked
+  around here: with two implementations of the same thing, only one of them
+  ever gets fixed. What this module keeps is **argument parsing**, **local
+  environment policy** (recognition-engine path, language-data location,
+  language selection), **de-identification**, and the **abort and timeout**
+  handling that needs an event loop.
+* **Does not import `discord` or `discord_bot`** (the latter would be circular).
+  This module uses only stdlib plus the optional `je_auto_control` / `psutil` /
+  `Pillow`, so it can be loaded directly by tests and reused by another process.
+* **Every function is synchronous and blocking.** The bot is a single event
+  loop, so the caller must wrap these in `asyncio.to_thread`; `wait_text` /
+  `wait_window` / `run_shell` routinely take seconds to minutes, and running
+  them on the loop directly would make the whole bot unresponsive.
+* **Errors are always turned into `GuiError`, with messages hardcoded by this
+  module** (generic, containing no host path / external service name / raw
+  exception text), so the caller can send `str(error)` straight to the user
+  without violating CLAUDE.md's hard Secrecy requirement. The real details are
+  written to stderr by the caller.
 
-**多螢幕陷阱**：`je_auto_control.screen_size()` 只回主螢幕解析度，
-`PIL.ImageGrab.grab()` 預設也只截主螢幕，但滑鼠座標是整個虛擬桌面的座標
-（副螢幕在右邊時 x 會超過主螢幕寬度）。所以 `screen_info()` 同時回報主螢幕與
-虛擬桌面範圍，截圖預設仍是主螢幕、要整個虛擬桌面得明講 `all`。
+**Multi-monitor trap**: `je_auto_control.screen_size()` returns only the primary
+resolution, and `PIL.ImageGrab.grab()` also captures only the primary screen by
+default, but mouse coordinates span the whole virtual desktop (with a secondary
+monitor on the right, x exceeds the primary width). So `screen_info()` reports
+both the primary screen and the virtual-desktop bounds, screenshots still
+default to the primary screen, and capturing the whole virtual desktop must be
+requested explicitly with `all`.
 """
 from __future__ import annotations
 
@@ -33,7 +44,7 @@ import math
 import ntpath
 import os
 import re
-import subprocess  # nosec B404 — `!sh` 的執行後端，呼叫端限擁有者
+import subprocess  # nosec B404 — the execution backend for `!sh`, owner-only at the caller
 import sys
 import time
 from pathlib import Path
@@ -44,29 +55,33 @@ MACRO_DIR = PROJECT_ROOT / "macros"
 
 
 class GuiError(Exception):
-    """使用者可見的失敗。訊息保證是本模組寫死的泛用字串，可直接回給對話平台。"""
+    """A user-visible failure. The message is guaranteed to be a generic string
+    hardcoded by this module, safe to send straight to the chat platform."""
 
 
 class GuiAborted(GuiError):
-    """使用者主動要求中止。
+    """The user actively requested an abort.
 
-    刻意繼承 `GuiError`：不知道有這個型別的呼叫端照樣接得到、照樣拿得到一句安全
-    的訊息。知道的呼叫端（巨集執行器）則分開處理——「被停下來」不是「失敗」，
-    回報成失敗會讓 `!macro stop` 每次都印一行紅字。
+    Deliberately subclasses `GuiError`: a caller that does not know this type
+    still catches it and still gets a safe message. A caller that does know it
+    (the macro executor) handles it separately—"was stopped" is not "failed",
+    and reporting it as a failure would make `!macro stop` print a red line
+    every time.
     """
 
 
 # --------------------------------------------------------------------------
-# 後端載入
+# Backend loading
 # --------------------------------------------------------------------------
-# je_auto_control 的 import 有明顯成本（會拉 cv2 / numpy），而且在沒有桌面
-# session 的環境會直接爆。所以延遲載入 ＋ 快取，並把失敗折成 GuiError。
+# Importing je_auto_control has a noticeable cost (it pulls in cv2 / numpy) and
+# blows up outright in an environment with no desktop session. So load it lazily
+# plus cache, and fold any failure into GuiError.
 _AC: Any = None
 _AC_TRIED = False
 
 
 def load_ac() -> Any:
-    """回傳 je_auto_control 模組；載不進來就丟 `GuiError`。"""
+    """Return the je_auto_control module; raise `GuiError` if it cannot load."""
     global _AC, _AC_TRIED  # pylint: disable=global-statement
     if not _AC_TRIED:
         _AC_TRIED = True
@@ -77,28 +92,30 @@ def load_ac() -> Any:
             print(f"[gui] je_auto_control unavailable: {error!r}", file=sys.stderr)
             _AC = None
     if _AC is None:
-        raise GuiError("桌面控制功能未安裝或無法在此環境使用。")
+        raise GuiError("Desktop control is not installed or unavailable in this environment.")
     return _AC
 
 
 def _window_api():
-    """回傳套件的視窗操作模組；不在 Windows 或載不進來就丟 `GuiError`。
+    """Return the library's window-operations module; raise `GuiError` if not on
+    Windows or it cannot load.
 
-    這裡曾經改走 pywin32，因為套件的 `list_windows()` 回的 hwnd 是
-    `ctypes.LP_c_long` 指標物件而不是 int（`int(hwnd)` 會丟 `ValueError`），
-    而且 `close_window_by_title` 做的其實是最小化。兩個都已在套件端修掉
-    （回呼原型改成 `HWND`、`close` 改送 `WM_CLOSE` 並另開 `minimize`），
-    所以這裡回到單一實作。
+    This once switched to pywin32, because the library's `list_windows()`
+    returned an hwnd that was a `ctypes.LP_c_long` pointer object rather than an
+    int (`int(hwnd)` raised `ValueError`), and `close_window_by_title` actually
+    did a minimise. Both have been fixed on the library side (the callback
+    prototype was changed to `HWND`, and `close` now sends `WM_CLOSE` with a
+    separate `minimize`), so this returns to a single implementation.
     """
     try:
         from je_auto_control.wrapper import auto_control_window  # type: ignore
         return auto_control_window
     except ImportError as error:
-        raise GuiError("視窗控制功能未安裝（僅 Windows 可用）。") from error
+        raise GuiError("Window control is not installed (Windows only).") from error
 
 
 # --------------------------------------------------------------------------
-# 參數解析
+# Argument parsing
 # --------------------------------------------------------------------------
 COORD_MAX = 65535
 HOTKEY_TOKEN_RE = re.compile(r"^[a-zA-Z0-9_]+$")
@@ -111,8 +128,9 @@ MOUSE_BUTTONS = {
     "r": "mouse_right",
     "middle": "mouse_middle",
     "m": "mouse_middle",
-    # 側鍵。很多程式把「上一頁 / 下一頁」綁在這兩顆上，少了它們就有一類操作
-    # 只能繞路用快捷鍵模擬。
+    # Side buttons. Many programs bind "back / forward" to these two, and
+    # without them a whole class of actions can only be simulated the long way
+    # round with keyboard shortcuts.
     "x1": "mouse_x1",
     "back": "mouse_x1",
     "x2": "mouse_x2",
@@ -121,50 +139,54 @@ MOUSE_BUTTONS = {
 
 
 def parse_coord(raw: str, label: str) -> int:
-    """把單一座標字串轉成 int，超出 ±COORD_MAX 就丟 `GuiError`。
+    """Convert a single coordinate string to an int; raise `GuiError` if it is
+    outside ±COORD_MAX.
 
-    **允許負數**：座標是整個虛擬桌面的座標，副螢幕擺在主螢幕左邊或上面時，
-    上面那半的 x / y 本來就是負的（本機實測虛擬桌面從 y = -164 起算）。把下限
-    釘在 0 會讓那些位置永遠點不到。
+    **Negatives are allowed**: coordinates span the whole virtual desktop, and
+    with a secondary monitor placed to the left of or above the primary, the x /
+    y of the upper half are naturally negative (measured locally, the virtual
+    desktop starts at y = -164). Pinning the lower bound at 0 would make those
+    positions unreachable forever.
     """
     try:
         value = int(str(raw).strip())
     except (TypeError, ValueError) as error:
-        raise GuiError(f"{label} 必須是整數。") from error
+        raise GuiError(f"{label} must be an integer.") from error
     if not -COORD_MAX <= value <= COORD_MAX:
-        raise GuiError(f"{label} 必須介於 -{COORD_MAX} 到 {COORD_MAX}。")
+        raise GuiError(f"{label} must be between -{COORD_MAX} and {COORD_MAX}.")
     return value
 
 
 def parse_size(raw: str, label: str) -> int:
-    """寬 / 高：必須是正整數。"""
+    """Width / height: must be a positive integer."""
     value = parse_coord(raw, label)
     if value <= 0:
-        raise GuiError(f"{label} 必須大於 0。")
+        raise GuiError(f"{label} must be greater than 0.")
     return value
 
 
 def parse_xy(parts: list[str]) -> tuple[int, int]:
-    """`["500", "300"]` → `(500, 300)`。"""
+    """`["500", "300"]` → `(500, 300)`."""
     if len(parts) != 2:
-        raise GuiError("需要兩個座標值：`<x> <y>`。")
+        raise GuiError("Two coordinate values are required: `<x> <y>`.")
     return parse_coord(parts[0], "x"), parse_coord(parts[1], "y")
 
 
 def parse_button(raw: str) -> str:
-    """把 `left` / `r` / `middle` 之類轉成 je_auto_control 的按鍵名。"""
+    """Convert `left` / `r` / `middle` and the like into a je_auto_control button name."""
     key = (raw or "left").strip().lower()
     if key not in MOUSE_BUTTONS:
         raise GuiError(
-            "滑鼠鍵只能是 `left` / `right` / `middle` / `back` / `forward`。")
+            "The mouse button must be `left` / `right` / `middle` / `back` / `forward`.")
     return MOUSE_BUTTONS[key]
 
 
-# 底層鍵名表用的是 Win32 虛擬鍵的原始名稱，跟一般人（與本專案所有說明文件）
-# 寫的名字對不上：表裡**沒有** `ctrl`／`alt`／`enter`／`esc`／`win`／
-# `backspace`，只有 `control`／`menu`／`return`／`escape`／`lwin`／`back`。
-# 沒有這層對應的話，`!hotkey ctrl+s`、`!hotkey alt+f4`、巨集裡的 `hotkey enter`
-# ——也就是文件裡每一個範例——全部會失敗。
+# The low-level key-name table uses the raw Win32 virtual-key names, which do
+# not match what ordinary people (and all of this project's documentation)
+# write: the table has **no** `ctrl` / `alt` / `enter` / `esc` / `win` /
+# `backspace`, only `control` / `menu` / `return` / `escape` / `lwin` / `back`.
+# Without this mapping layer, `!hotkey ctrl+s`, `!hotkey alt+f4`, `hotkey enter`
+# in a macro—that is, every example in the docs—would all fail.
 KEY_ALIASES = {
     "ctrl": "control", "lctrl": "lcontrol", "rctrl": "rcontrol",
     "alt": "menu", "lalt": "lmenu", "ralt": "rmenu",
@@ -182,38 +204,47 @@ KEY_ALIASES = {
     "numpad3": "num3", "numpad4": "num4", "numpad5": "num5",
     "numpad6": "num6", "numpad7": "num7", "numpad8": "num8",
     "numpad9": "num9",
-    # 這四個的目標在 `_EXTRA_KEY_CODES`（底層表沒有）。微軟對這四顆的定義是「任何
-    # 國家／地區都是 `+` `,` `-` `.` 那顆鍵」，所以取這種好讀的名字不會說謊；
-    # `oem_1` 那一類依鍵盤配置而異，**刻意不給**別名，見 `_EXTRA_KEY_CODES`。
+    # These four target `_EXTRA_KEY_CODES` (the low-level table lacks them).
+    # Microsoft defines these four as "the `+` `,` `-` `.` key for any
+    # country/region", so these readable names do not lie; the `oem_1` family
+    # varies by keyboard layout, so it is **deliberately given no** alias, see
+    # `_EXTRA_KEY_CODES`.
     "plus": "oem_plus", "comma": "oem_comma",
     "minus": "oem_minus", "period": "oem_period",
 }
 
-# 底層鍵名表（192 筆）**叫不出名字**的虛擬鍵。值是微軟 "Virtual-Key Codes
-# (Winuser.h)" 的官方定義（2026-09-21 對過）；函式庫的 `press_keyboard_key` /
-# `release_keyboard_key` / `hotkey` / `post_key_to_window` 都收整數鍵碼，所以
-# 本專案內部一律用名字（巨集文字、`_HELD_INPUTS`、回覆），**只在交給函式庫的那
-# 一刻**由 `_library_key` 換成整數。
+# Virtual keys the low-level key-name table (192 entries) **cannot name**. The
+# values are Microsoft's official "Virtual-Key Codes (Winuser.h)" definitions
+# (checked 2026-09-21); the library's `press_keyboard_key` /
+# `release_keyboard_key` / `hotkey` / `post_key_to_window` all take integer key
+# codes, so this project uses names internally throughout (macro text,
+# `_HELD_INPUTS`, replies) and only converts to integers with `_library_key`
+# **at the moment of handing off to the library**.
 #
-# 沒有這張表的後果（2026-09-21 實測）：錄製時按著 ctrl 按 `=`，轉步驟時反查不到
-# 名字 → 產出 `# 未知按鍵` → 存檔前被丟掉，錄製回報「N 步」、重播少一步；而且
-# `parse_key_name` 查同一張表，所以 `hotkey ctrl+=`（縮放）、`ctrl+/`（註解）這些
-# 組合連手寫都寫不出來。
+# The consequence of not having this table (measured 2026-09-21): recording
+# ctrl held while pressing `=` cannot be reverse-looked-up to a name when
+# converting to steps → produces `# unknown key` → dropped before saving, so
+# the recording reports "N steps" and replays one short; and `parse_key_name`
+# consults the same table, so combinations like `hotkey ctrl+=` (zoom) and
+# `ctrl+/` (comment) cannot even be written by hand.
 #
-# 取名規則是**誠實優先**：
-# * `oem_plus` / `oem_comma` / `oem_minus` / `oem_period`：微軟寫「For any
-#   country/region」，與鍵盤配置無關；
-# * `oem_1`～`oem_8`、`oem_102`：微軟寫「It can vary by keyboard」——**不要**取成
-#   `semicolon` / `slash` / `backtick` / `lbracket`，那些名字在非美式配置上會說謊
-#   （同一顆鍵印出來的是別的字）；
-# * `oem_clear`：底層表也沒有；
-# * `launch_app2`：底層表**有**，但只有大寫的 `LAUNCH_APP2`，而 `parse_key_name`
-#   會先轉小寫，所以那顆鍵從來寫不出來、錄到也會被丟掉；
-# * `browser_home`：底層表缺了這一顆（它前後的 `browser_favorites`、
-#   `volume_mute` 都在），多媒體鍵盤上那顆「首頁」錄到會被丟掉。
+# The naming rule is **honesty first**:
+# * `oem_plus` / `oem_comma` / `oem_minus` / `oem_period`: Microsoft says "For any
+#   country/region", independent of keyboard layout;
+# * `oem_1`–`oem_8`, `oem_102`: Microsoft says "It can vary by keyboard"—so **do
+#   not** name them `semicolon` / `slash` / `backtick` / `lbracket`, because those
+#   names lie on a non-US layout (the same key prints a different character);
+# * `oem_clear`: the low-level table lacks it too;
+# * `launch_app2`: the low-level table **has** it, but only as uppercase
+#   `LAUNCH_APP2`, and `parse_key_name` lowercases first, so that key can never
+#   be written and would be dropped even when recorded;
+# * `browser_home`: the low-level table is missing this one (its neighbours
+#   `browser_favorites` and `volume_mute` are both present), so the "home" key
+#   on a multimedia keyboard would be dropped when recorded.
 #
-# 名字必須全小寫、只含英數與底線（`parse_key_name` 的字面規則），而且不得跟底層表
-# 同名卻指向別的鍵——兩條都有測試。
+# Names must be all lowercase, containing only letters, digits and underscores
+# (`parse_key_name`'s literal rule), and must not share a name with the
+# low-level table while pointing at a different key—both are tested.
 _EXTRA_KEY_CODES: dict[str, int] = {
     "oem_1": 0xBA,
     "oem_plus": 0xBB,
@@ -233,38 +264,52 @@ _EXTRA_KEY_CODES: dict[str, int] = {
     "browser_home": 0xAC,
 }
 
-# 底層表**有**、但指向錯的鍵的名字 → 正確的虛擬鍵碼。跟 `_EXTRA_KEY_CODES` 是兩回事：
-# 那張補的是底層表叫不出來的鍵，這張蓋掉的是底層表叫錯的鍵。
+# Names the low-level table **does** have, but pointing at the wrong key → the
+# correct virtual-key code. This is a different thing from `_EXTRA_KEY_CODES`:
+# that one adds keys the low-level table cannot name, this one overrides keys the
+# low-level table names wrongly.
 #
-# `down`：底層把滑鼠事件常數併進了鍵盤表，`"down"` 是 `0x80`（滑鼠側鍵按下的事件
-# 旗標）——而 `0x80` 同時是 `VK_F17`。方向鍵「下」在那張表裡只叫 `vk_down`
-# （`0x28`），其餘三個方向 `up`／`left`／`right` 都是對的。所以手寫的
-# `hotkey down`、`keydown down`、`/input key press down` 一直**安靜地**按成 F17。
-# F17 本身照樣寫得出來（`f17`）。
+# `down`: the low level merged the mouse-event constants into the keyboard table,
+# and `"down"` is `0x80` (the event flag for a mouse side-button press)—while
+# `0x80` is also `VK_F17`. The "down" arrow key is only called `vk_down` (`0x28`)
+# in that table; the other three directions `up` / `left` / `right` are all
+# correct. So a hand-written `hotkey down`, `keydown down` or
+# `/input key press down` was **silently** pressing F17 all along. F17 itself can
+# still be written (`f17`).
 #
-# 真正的修法在上游那張表（`<AutoControlGUI 的本機 checkout>` 的
-# `wrapper/_platform_windows.py`，那是另一個專案，**不要**去改它）。上游 2026-09-22 在
-# 原始碼樹修好了，但**套件庫的發佈版還沒有**（0.0.222 仍是 0x80），而 fresh clone 裝的是
-# 發佈版——所以這一筆要留到發佈之後，那時連同測試的 `_FIXED_UPSTREAM_AWAITING_RELEASE`
-# 那一筆一起刪掉。在修好的表上它與底層一致（都是 0x28），留著不會改變任何行為。
+# The real fix belongs in that upstream table (`wrapper/_platform_windows.py` in
+# `<the local AutoControlGUI checkout>`, which is another project—**do not** go
+# and change it). Upstream fixed it in the source tree on 2026-09-22, but **the
+# package index's release does not have it yet** (0.0.222 is still 0x80), and a
+# fresh clone installs the release—so this entry stays until after that release,
+# at which point it is deleted together with the `_FIXED_UPSTREAM_AWAITING_RELEASE`
+# entry in the tests. On the fixed table it agrees with the low level (both
+# 0x28), so keeping it changes no behaviour.
 #
-# 2026-09-21 掃過底層表裡全部 19 個不是虛擬鍵的名字（滑鼠事件、`KEYEVENTF_*` 旗標、
-# `MapVirtualKey` 的型別常數），只有 `down` 是一般人會當成按鍵打出來的名字；其餘
-# （`move`、`leftup`、`wheel`、`xbutton1`…）不是任何鍵盤上的鍵，刻意不動。
+# On 2026-09-21 all 19 names in the low-level table that are not virtual keys
+# (mouse events, `KEYEVENTF_*` flags, `MapVirtualKey` type constants) were
+# scanned, and only `down` is a name an ordinary person would type as a key; the
+# rest (`move`, `leftup`, `wheel`, `xbutton1`…) are not keys on any keyboard and
+# are deliberately left alone.
 _LIBRARY_NAME_OVERRIDES: dict[str, int] = {
     "down": 0x28,
 }
 
 
 def _library_key(key: str | int) -> str | int:
-    """本專案的鍵名 → 交給函式庫的鍵碼。**所有**送鍵給函式庫的地方都要經過這裡。
+    """This project's key name → the key code handed to the library. **Every**
+    place that sends a key to the library must go through here.
 
-    覆寫表與補充表裡的名字換成整數（前者底層表叫錯、後者底層表查不到）；其餘原樣
-    交出去，讓函式庫自己查表——那條路本來就會動，也保留它原本的錯誤行為。整數原樣
-    通過（`write()` 補救路徑拿到的鍵碼本來就是函式庫表裡的值）。
+    Names in the override table and the extra table are converted to integers
+    (the former are named wrongly by the low-level table, the latter cannot be
+    found in it); everything else is handed over as-is for the library to look up
+    itself—that path already works, and keeps its original error behaviour.
+    Integers pass through unchanged (the key codes the `write()` fallback path
+    receives are already values from the library's table).
 
-    覆寫表**一定要先查**：被覆寫的名字底層表裡也有（只是指錯），原樣交出去就會被
-    底層查成錯的那個鍵。
+    The override table **must be checked first**: an overridden name also exists
+    in the low-level table (just pointing at the wrong key), so handing it over
+    as-is would have the low level resolve it to the wrong key.
     """
     if isinstance(key, str):
         if key in _LIBRARY_NAME_OVERRIDES:
@@ -274,89 +319,102 @@ def _library_key(key: str | int) -> str | int:
 
 
 def _library_keys(keys: list[str]) -> list[str | int]:
-    """`_library_key` 的清單版（組合鍵用）。"""
+    """The list version of `_library_key` (for key combinations)."""
     return [_library_key(key) for key in keys]
 
 
 def parse_hotkey_tokens(raw: str) -> list[str]:
-    """`"ctrl+shift+t"` → `["control", "shift", "t"]`（已套用別名並驗證）。
+    """`"ctrl+shift+t"` → `["control", "shift", "t"]` (aliases applied and
+    validated).
 
-    每個 token 都會查鍵名表——不驗的話，打錯的鍵名要等到真的送出去才失敗，
-    而且錯誤訊息會變成底層那句無法預期的內部字串。
+    Every token is looked up in the key-name table—without validation, a
+    mistyped key name would only fail once it was actually sent, and the error
+    message would become the low level's unpredictable internal string.
     """
     tokens = [t.strip() for t in (raw or "").strip().lower().split("+") if t.strip()]
     if not tokens:
-        raise GuiError("請給按鍵組合，例如 `ctrl+s`。")
+        raise GuiError("Give a key combination, e.g. `ctrl+s`.")
     return [parse_key_name(token) for token in tokens]
 
 
 def parse_duration(raw: str, *, maximum: float) -> float:
-    """秒數字串 → float，並套用上限（避免一個 `wait 99999` 綁住工作執行緒）。
+    """Seconds string → float, with a cap applied (so one `wait 99999` cannot tie
+    up the worker thread).
 
-    **`nan` 必須在這裡擋掉，不能只靠下面那兩道範圍檢查。** `float("nan")` 是一次
-    合法的轉換，而 nan 的所有比較都回 False，所以 `value < 0` 與 `value > maximum`
-    **兩道都放行**——同一個形狀已經記在 `_batch_config._is_finite_number`。放行的
-    後果不是「等很久」，是**永遠不會結束**：本模組每個等待迴圈都寫成
-    `deadline = time.monotonic() + timeout` 配 `if time.monotonic() >= deadline`，
-    而 `x >= nan` 恆為 False，逾時那一行永遠不成立。2026-09-08 實測
-    `wait_window(…, nan)` 輪詢四十次仍未逾時。
+    **`nan` must be blocked here; the two range checks below cannot be relied on
+    alone.** `float("nan")` is a legal conversion, and every comparison with nan
+    returns False, so `value < 0` and `value > maximum` **both let it through**—the
+    same shape is already recorded in `_batch_config._is_finite_number`. The
+    consequence of letting it through is not "a long wait" but **never
+    finishing**: every wait loop in this module is written as
+    `deadline = time.monotonic() + timeout` with
+    `if time.monotonic() >= deadline`, and `x >= nan` is always False, so the
+    timeout line never holds. Measured 2026-09-08: `wait_window(…, nan)` polled
+    forty times and still had not timed out.
 
-    走 bot 那一側更糟：`/win wait`、`/locate text wait`、`/locate ui wait` 的秒數
-    同樣經過這裡，而它們是 `asyncio.to_thread` 且**不帶中止回呼**——卡住的工作
-    執行緒沒有任何人收得回來，`/macro stop` 也搆不到。
+    The bot side is worse: the seconds for `/win wait`, `/locate text wait` and
+    `/locate ui wait` also go through here, and those run in `asyncio.to_thread`
+    **without an abort callback**—a stuck worker thread cannot be reclaimed by
+    anyone, and `/macro stop` cannot reach it either.
 
-    `inf` 本來就被上限那道擋掉（`inf > maximum` 是 True），漏的只有 nan。
+    `inf` is already blocked by the cap (`inf > maximum` is True); only nan
+    slipped through.
     """
     try:
         value = float(str(raw).strip())
     except (TypeError, ValueError) as error:
-        raise GuiError("秒數必須是數字。") from error
+        raise GuiError("Seconds must be a number.") from error
     if not math.isfinite(value):
-        raise GuiError("秒數必須是有限的數字。")
+        raise GuiError("Seconds must be a finite number.")
     if value < 0:
-        raise GuiError("秒數不能是負的。")
+        raise GuiError("Seconds cannot be negative.")
     if value > maximum:
-        raise GuiError(f"秒數上限是 {maximum:g} 秒。")
+        raise GuiError(f"The maximum is {maximum:g} seconds.")
     return value
 
 
 def parse_region(parts: list[str]) -> list[int]:
-    """`["x", "y", "w", "h"]` → `[left, top, right, bottom]`（PIL bbox 格式）。
+    """`["x", "y", "w", "h"]` → `[left, top, right, bottom]` (PIL bbox format).
 
-    使用者輸入用「左上角 ＋ 寬高」，因為那是看著螢幕最直覺的寫法；PIL 要的是
-    兩個角，所以這裡換算。寬高必須為正，否則 `ImageGrab` 會回一張 0 像素的圖
-    然後在存檔時才爆掉。
+    The user enters "top-left corner + width and height", because that is the
+    most intuitive way to write it while looking at the screen; PIL wants two
+    corners, so this converts. Width and height must be positive, otherwise
+    `ImageGrab` returns a 0-pixel image that only blows up at save time.
     """
     if len(parts) != 4:
-        raise GuiError("區域需要四個值：`<x> <y> <寬> <高>`。")
+        raise GuiError("A region needs four values: `<x> <y> <width> <height>`.")
     left = parse_coord(parts[0], "x")
     top = parse_coord(parts[1], "y")
-    width = parse_size(parts[2], "寬")
-    height = parse_size(parts[3], "高")
+    width = parse_size(parts[2], "width")
+    height = parse_size(parts[3], "height")
     return [left, top, left + width, top + height]
 
 
 # --------------------------------------------------------------------------
-# 中止感知的等待
+# Abort-aware waiting
 # --------------------------------------------------------------------------
-# 每一個 `wait_*` 都是「輪詢 → 睡一下 → 再輪詢」。沒有這一段的話，`!macro stop`
-# 說是「在步驟之間生效」，實際上要等目前這個等待步驟跑到逾時才停得下來——
-# `MACRO_MAX_WAIT_SEC` 是 120 秒，等於中止指令有兩分鐘完全沒有反應。
+# Every `wait_*` is "poll → sleep a little → poll again". Without this section,
+# `!macro stop` claims to "take effect between steps", but in practice it could
+# only stop once the current wait step ran to its timeout—`MACRO_MAX_WAIT_SEC` is
+# 120 seconds, which means the abort command had two full minutes of no response.
 #
-# 睡眠切成小段而不是一次睡完：中止的反應時間由 `_ABORT_POLL_SEC` 決定，跟等待
-# 步驟自己的輪詢間隔無關（`wait_text` 一輪要三秒，不該連帶讓中止慢三秒）。
+# The sleep is cut into small slices rather than slept in one go: the abort
+# response time is set by `_ABORT_POLL_SEC`, independent of the wait step's own
+# polling interval (one round of `wait_text` takes three seconds, which should not
+# make the abort three seconds slower too).
 _ABORT_POLL_SEC = 0.2
 
 
 def _check_abort(should_abort: Callable[[], bool] | None) -> None:
-    """被要求中止就丟 `GuiAborted`。`None` 代表沒有人管，直接放行。"""
+    """Raise `GuiAborted` if an abort was requested. `None` means nobody is
+    watching, so let it through."""
     if should_abort is not None and should_abort():
-        raise GuiAborted("已依要求中止。")
+        raise GuiAborted("Aborted as requested.")
 
 
 def _sleep_abortable(seconds: float,
                      should_abort: Callable[[], bool] | None) -> None:
-    """睡 `seconds` 秒，中途每 `_ABORT_POLL_SEC` 檢查一次中止。"""
+    """Sleep `seconds` seconds, checking for an abort every `_ABORT_POLL_SEC`."""
     if should_abort is None:
         time.sleep(max(0.0, seconds))
         return
@@ -370,13 +428,15 @@ def _sleep_abortable(seconds: float,
 
 
 # --------------------------------------------------------------------------
-# 螢幕
+# Screen
 # --------------------------------------------------------------------------
 def virtual_bounds() -> tuple[int, int, int, int] | None:
-    """虛擬桌面的 `(x, y, 寬, 高)`，**邏輯（DPI 虛擬化後）座標**。
+    """The virtual desktop's `(x, y, width, height)`, in **logical (post DPI
+    virtualisation) coordinates**.
 
-    這一組數字就是滑鼠 API 用的座標空間。取不到（非 Windows）時回 None，
-    呼叫端退回只看主螢幕。
+    These numbers are exactly the coordinate space the mouse API uses. Returns
+    None when unavailable (not Windows), and the caller falls back to looking at
+    the primary screen only.
     """
     try:
         from je_auto_control.utils.monitor_layout import (  # type: ignore
@@ -388,16 +448,18 @@ def virtual_bounds() -> tuple[int, int, int, int] | None:
 
 
 def screen_info() -> dict[str, Any]:
-    """主螢幕解析度 ＋ 虛擬桌面範圍 ＋ 螢幕數量。
+    """Primary screen resolution + virtual desktop bounds + number of monitors.
 
-    多螢幕時 `!click` 的座標是虛擬桌面座標，所以使用者需要看得到虛擬桌面的
-    範圍才知道副螢幕的 x 從哪裡開始。取不到虛擬桌面資訊時只回主螢幕。
+    With multiple monitors, `!click` coordinates are virtual-desktop coordinates,
+    so the user needs to see the virtual desktop's bounds to know where the
+    secondary monitor's x starts. When virtual-desktop information is unavailable,
+    only the primary screen is returned.
     """
     ac = load_ac()
     try:
         primary = list(ac.screen_size())
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("讀取螢幕資訊失敗。") from error
+        raise GuiError("Failed to read screen information.") from error
     info: dict[str, Any] = {
         "primary": (int(primary[0]), int(primary[1])),
         "virtual": virtual_bounds(),
@@ -409,19 +471,23 @@ def screen_info() -> dict[str, Any]:
         )
         info["monitors"] = max(1, len(enumerate_monitors()))
     except Exception:  # pylint: disable=broad-except  # nosec B110
-        pass  # 列舉不到（非 Windows 等）：只回主螢幕就好
+        pass  # Cannot enumerate (not Windows, etc.): returning the primary screen is enough
     return info
 
 
 def _grab_virtual_logical():
-    """整個虛擬桌面的截圖，**換算成滑鼠座標的那個空間**。
+    """A screenshot of the whole virtual desktop, **converted into the mouse's
+    coordinate space**.
 
-    換算本身在函式庫的 `grab_logical` 裡（OCR 與樣板比對共用同一個原語）。它處理
-    的坑是：`ImageGrab.grab(all_screens=True)` 會先把自己設成 DPI-aware 再抓，
-    回來的是**實體像素**，而本行程 DPI-unaware，滑鼠 API 用的是虛擬化後的邏輯
-    像素——本機實測邏輯 3456×1244 vs 截圖 3840×1244（副螢幕 125% 縮放），照截圖
-    數出來的 x=2500 點下去會差 116 px。截圖存在的意義就是讓人找出要點哪裡，對不
-    上等於這個功能是壞的。
+    The conversion itself lives in the library's `grab_logical` (OCR and template
+    matching share the same primitive). The pitfall it handles:
+    `ImageGrab.grab(all_screens=True)` first makes itself DPI-aware and then
+    grabs, returning **physical pixels**, while this process is DPI-unaware and
+    the mouse API uses virtualised logical pixels—measured locally, logical
+    3456×1244 vs screenshot 3840×1244 (secondary monitor at 125% scaling), so
+    clicking an x=2500 counted off the screenshot lands 116 px off. The whole
+    point of a screenshot is to let someone find where to click; if it does not
+    line up, the feature is broken.
     """
     return _logical_frame(None)[0]
 
@@ -433,19 +499,23 @@ GIF_MAX_EDGE = 960
 
 def capture_gif(dest: Path, *, seconds: float = 5.0, fps: float = 3.0,
                 region: list[int] | None = None) -> int:
-    """連拍一段時間存成動畫 GIF，回影格數。
+    """Shoot continuously for a while and save it as an animated GIF; return the
+    frame count.
 
-    單張截圖看不出**過程**：進度條有沒有在動、動畫卡在哪一格、按下去之後畫面
-    閃了什麼。這裡補上那一段。
+    A single screenshot cannot show a **process**: whether the progress bar is
+    moving, which frame an animation is stuck on, what flashed on screen after a
+    click. This fills that gap.
 
-    三個上限是刻意的：時間、影格率、以及把長邊縮到 `GIF_MAX_EDGE`。整個桌面
-    3456×1244 拍 45 張不縮圖是好幾十 MB，送不出去也沒人想看——會動比清晰重要，
-    真要看細節本來就該用 `!screen` 截那一塊。
+    The three caps are deliberate: duration, frame rate, and shrinking the long
+    edge to `GIF_MAX_EDGE`. Forty-five unshrunk frames of a whole 3456×1244
+    desktop come to several tens of MB, which cannot be sent and nobody wants to
+    watch—motion matters more than sharpness, and anyone who really needs the
+    detail should use `!screen` to capture that area anyway.
     """
     try:
         from PIL import Image  # type: ignore  # noqa: F401
     except ImportError as error:
-        raise GuiError("截圖功能未安裝。") from error
+        raise GuiError("Screenshot support is not installed.") from error
     span = max(0.5, min(float(seconds), GIF_MAX_SECONDS))
     rate = max(1.0, min(float(fps), GIF_MAX_FPS))
     interval = 1.0 / rate
@@ -465,89 +535,102 @@ def capture_gif(dest: Path, *, seconds: float = 5.0, fps: float = 3.0,
             if rest > 0:
                 time.sleep(rest)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("連拍失敗。") from error
+        raise GuiError("Continuous capture failed.") from error
     if not frames:
-        raise GuiError("沒有拍到任何影格。")
+        raise GuiError("No frames were captured.")
     try:
         frames[0].save(str(dest), save_all=True, append_images=frames[1:],
                        duration=int(interval * 1000), loop=0, optimize=True)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("連拍存檔失敗。") from error
+        raise GuiError("Failed to save the continuous capture.") from error
     return len(frames)
 
 
 def capture(dest: Path, *, region: list[int] | None = None,
             all_screens: bool = False) -> None:
-    """截圖存成 PNG。`region` 是 `[left, top, right, bottom]`（邏輯座標）。
+    """Save a screenshot as PNG. `region` is `[left, top, right, bottom]`
+    (logical coordinates).
 
-    擷取走函式庫的 `grab_logical`：它涵蓋所有螢幕、把畫面換算回點選座標空間，
-    區域裁切也在**換算完的圖上**做（`ImageGrab` 的 `bbox` 是在實體像素空間裁的，
-    縮放過的螢幕上會裁錯位置）。不走 `je_auto_control.screenshot()`：那個固定
-    `ImageGrab.grab()`（只有主螢幕）又多繞一趟 cv2 色彩空間轉換。
+    Capture goes through the library's `grab_logical`: it covers every monitor,
+    converts the picture back into the click coordinate space, and does the
+    region crop **on the converted image** too (`ImageGrab`'s `bbox` crops in
+    physical-pixel space, which crops the wrong spot on a scaled monitor). It does
+    not go through `je_auto_control.screenshot()`: that one is fixed to
+    `ImageGrab.grab()` (primary screen only) and takes an extra detour through a
+    cv2 colour-space conversion.
     """
     try:
         image, _origin_x, _origin_y = load_ac().grab_logical(
             _region_xywh(region), all_screens=(all_screens or region is not None))
         image.save(str(dest))
     except GuiError:
-        raise                      # 後端載不進來的訊息比「截圖失敗」有用
+        raise                      # "the backend cannot load" is more useful than "screenshot failed"
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] capture failed: {error!r}", file=sys.stderr)
-        raise GuiError("截圖失敗。") from error
+        raise GuiError("Screenshot failed.") from error
 
 
 def pixel_color(x: int, y: int) -> tuple[int, int, int]:
-    """取單點顏色，回 `(r, g, b)`。
+    """Read a single pixel's colour, returning `(r, g, b)`.
 
-    底層在不同平台回傳的型別不一致（Windows 是 COLORREF int、其他平台是
-    tuple），所以這裡統一正規化再回傳。
+    The low level returns inconsistent types across platforms (a COLORREF int on
+    Windows, a tuple elsewhere), so this normalises it before returning.
     """
     ac = load_ac()
     try:
         raw = ac.get_pixel(x, y)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("讀取像素顏色失敗。") from error
+        raise GuiError("Failed to read the pixel colour.") from error
     if isinstance(raw, (tuple, list)) and len(raw) >= 3:
         return int(raw[0]), int(raw[1]), int(raw[2])
     if isinstance(raw, int):
-        # Win32 COLORREF 是 0x00BBGGRR
+        # A Win32 COLORREF is 0x00BBGGRR
         return raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF
-    raise GuiError("讀取像素顏色失敗。")
+    raise GuiError("Failed to read the pixel colour.")
 
 
 # --------------------------------------------------------------------------
-# 滑鼠 / 鍵盤
+# Mouse / keyboard
 # --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
-# 送出去的輸入到得了嗎
+# Does the input we send actually arrive
 # --------------------------------------------------------------------------
-# 送出去的滑鼠鍵盤事件可能**安靜地消失**：API 回成功、實際上什麼都沒發生。這是
-# 這個專案最在意的那種失敗——不是崩潰，是靜默的錯誤結果，而下指令的人不在電腦
-# 前面，只會看到「已點選 (500, 300)」然後納悶為什麼沒反應。
+# Mouse and keyboard events we send can **silently vanish**: the API reports
+# success and in fact nothing happens. This is the kind of failure this project
+# cares about most—not a crash but a silently wrong result, and the person who
+# issued the command is not at the computer, so they only see "clicked
+# (500, 300)" and wonder why nothing responded.
 #
-# 兩種成因要用兩種偵測，函式庫兩個都有：
+# The two causes need two kinds of detection, and the library has both:
 #
-# * **工作站鎖定／UAC 安全桌面**：`input_desktop_available()` 問輸入桌面，免費
-#   且沒有副作用，所以輸入原語每次送出前都問（函式庫那邊快取兩秒）。
-# * **有東西在過濾注入的輸入**（前景是有防作弊的遊戲時會這樣）：
-#   `input_reaches_system()` 得**真的送一個鍵**去試，所以只放在診斷指令上，不放
-#   進每個輸入原語——每次點選前都送一個鍵比問題本身還糟。本機實測過：那種情況下
-#   `OpenInputDesktop` 回正常、完整性等級也跟我們一樣（都是 Medium），只有實際
-#   送鍵才看得出來。
+# * **Workstation locked / UAC secure desktop**: `input_desktop_available()`
+#   asks about the input desktop, which is free and has no side effects, so every
+#   input primitive asks before sending (the library caches it for two seconds).
+# * **Something is filtering injected input** (this happens when the foreground
+#   is a game with anti-cheat): `input_reaches_system()` has to **actually send a
+#   key** to test, so it is only used by diagnostic commands, not put into every
+#   input primitive—sending a key before every click would be worse than the
+#   problem itself. Measured locally: in that situation `OpenInputDesktop`
+#   returns normally and the integrity level matches ours (both Medium); only
+#   actually sending a key reveals it.
 def input_desktop_available() -> bool:
-    """現在送得進滑鼠鍵盤事件嗎（工作站沒鎖、不在安全桌面上）。"""
+    """Can mouse and keyboard events be sent right now (workstation not locked,
+    not on the secure desktop)."""
     try:
         return bool(load_ac().input_desktop_available())
     except Exception as error:  # pylint: disable=broad-except
-        # 查不出來就當成可用：這只是為了給出更好的錯誤訊息，不該反過來擋住操作。
+        # If it cannot be determined, treat it as available: this exists only to
+        # give a better error message and must not end up blocking the operation.
         print(f"[gui] input desktop probe failed: {error!r}", file=sys.stderr)
         return True
 
 
 def input_reaches_system() -> bool:
-    """送出去的鍵盤事件真的進得了系統嗎。**這會送出一個按鍵**（F13）。
+    """Do the keyboard events we send actually reach the system. **This sends a
+    key press** (F13).
 
-    只給診斷用（`!doctor` / `!screen info`）。回 True 也可能只是「測不出來」。
+    For diagnostics only (`!doctor` / `!screen info`). True may also just mean
+    "could not be measured".
     """
     try:
         return bool(load_ac().input_reaches_system())
@@ -557,9 +640,11 @@ def input_reaches_system() -> bool:
 
 
 def _require_input_desktop() -> None:
-    """送輸入之前確認桌面收得到。**放開類的操作不呼叫這個**——那是復原路徑。"""
+    """Before sending input, confirm the desktop can receive it. **Release-type
+    operations do not call this**—that is the recovery path."""
     if not input_desktop_available():
-        raise GuiError("電腦目前是鎖定狀態，送不進滑鼠鍵盤操作；請先解鎖。")
+        raise GuiError("The computer is currently locked, so mouse and keyboard input cannot be sent; "
+                       "please unlock it first.")
 
 
 def mouse_position() -> tuple[int, int]:
@@ -567,9 +652,9 @@ def mouse_position() -> tuple[int, int]:
     try:
         pos = ac.get_mouse_position()
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("讀取滑鼠座標失敗。") from error
+        raise GuiError("Failed to read the mouse position.") from error
     if not pos:
-        raise GuiError("讀取滑鼠座標失敗。")
+        raise GuiError("Failed to read the mouse position.")
     return int(pos[0]), int(pos[1])
 
 
@@ -579,16 +664,18 @@ def mouse_move(x: int, y: int) -> None:
     try:
         ac.set_mouse_position(x, y)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("移動滑鼠失敗。") from error
+        raise GuiError("Failed to move the mouse.") from error
 
 
 def mouse_click(button: str, x: int | None = None, y: int | None = None,
                 *, times: int = 1, interval: float = 0.06) -> None:
-    """點選；`times=2` 就是雙擊。
+    """Click; `times=2` is a double-click.
 
-    雙擊刻意用「同一個座標連點兩次 ＋ 短間隔」而不是找底層的 double-click
-    API —— je_auto_control 沒有雙擊原語，而 Windows 判定雙擊只看兩次點選的
-    時間差與位移，連點就夠。間隔取 60ms，遠低於預設的 500ms 判定閾值。
+    A double-click is deliberately "click the same coordinate twice + a short
+    interval" rather than a low-level double-click API—je_auto_control has no
+    double-click primitive, and Windows decides a double-click only from the time
+    gap and the displacement between two clicks, so clicking twice is enough. The
+    interval is 60ms, far below the default 500ms threshold.
     """
     _require_input_desktop()
     ac = load_ac()
@@ -601,15 +688,17 @@ def mouse_click(button: str, x: int | None = None, y: int | None = None,
             else:
                 ac.click_mouse(button, x, y)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("滑鼠點選失敗。") from error
+        raise GuiError("Mouse click failed.") from error
 
 
 def mouse_drag(x1: int, y1: int, x2: int, y2: int, button: str = "mouse_left",
                *, steps: int = 24, settle: float = 0.08) -> None:
-    """按住起點拖到終點再放開。
+    """Press at the start point, drag to the end point, then release.
 
-    中間刻意分成多段慢慢移動：很多應用程式（檔案總管、繪圖軟體、遊戲）用
-    滑鼠移動事件判定拖曳，一次瞬移到終點會被當成「按下又放開」而不是拖曳。
+    The movement in between is deliberately split into many slow steps: many
+    applications (File Explorer, drawing software, games) detect a drag from
+    mouse-move events, and teleporting straight to the end point is taken as
+    "press then release" rather than a drag.
     """
     _require_input_desktop()
     ac = load_ac()
@@ -627,20 +716,24 @@ def mouse_drag(x1: int, y1: int, x2: int, y2: int, button: str = "mouse_left",
         time.sleep(settle)
         ac.release_mouse(button, x2, y2)
     except Exception as error:  # pylint: disable=broad-except
-        # 拖曳中途失敗會把滑鼠鍵卡在按下狀態，整個桌面等於被鎖住。這裡盡力
-        # 補放開，失敗也不再往上冒（原始錯誤比較重要）。
+        # A failure midway through a drag leaves the mouse button stuck down,
+        # which effectively locks the whole desktop. Make a best effort to
+        # release it here, and do not propagate a failure of that either (the
+        # original error matters more).
         try:
             ac.release_mouse(button, x2, y2)
         except Exception:  # pylint: disable=broad-except  # nosec B110
             pass
-        raise GuiError("滑鼠拖曳失敗。") from error
+        raise GuiError("Mouse drag failed.") from error
 
 
 def mouse_scroll(amount: int, x: int | None = None, y: int | None = None) -> None:
-    """滾輪。正值往上、負值往下（跟大多數 API 的慣例一致）。
+    """Scroll wheel. Positive scrolls up, negative scrolls down (matching most
+    APIs' convention).
 
-    注意底層會把 x/y 夾在**主螢幕**範圍內，所以副螢幕上的定點捲動請先
-    `mouse move` 過去再不帶座標捲動。
+    Note the low level clamps x/y to the **primary screen**, so to scroll at a
+    point on a secondary monitor, first `mouse move` there and then scroll without
+    coordinates.
     """
     _require_input_desktop()
     ac = load_ac()
@@ -650,19 +743,22 @@ def mouse_scroll(amount: int, x: int | None = None, y: int | None = None) -> Non
         else:
             ac.mouse_scroll(int(amount), x, y)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("滾輪捲動失敗。") from error
+        raise GuiError("Scrolling failed.") from error
 
 
 # --------------------------------------------------------------------------
-# 打字
+# Typing
 # --------------------------------------------------------------------------
 def type_text(text: str) -> None:
-    """把文字當成鍵盤輸入送到目前焦點視窗。
+    """Send text as keyboard input to the currently focused window.
 
-    直接交給底層的 `write()`。它會逐字元決定路徑：鍵名表裡有的送虛擬鍵、沒有的
-    （標點、中日文、表情符號）送 Unicode 字元事件、換行與 Tab 送真正的 Enter /
-    Tab 鍵。**這一段刻意不在本專案重做**——同一件事只該有一份實作，而它屬於桌面
-    自動化函式庫，不屬於這個 bot。
+    Handed straight to the low-level `write()`. It chooses a path per character:
+    characters in the key-name table are sent as virtual keys, those that are not
+    (punctuation, Chinese/Japanese, emoji) as Unicode character events, and
+    newline and Tab as real Enter / Tab keys. **This part is deliberately not
+    re-implemented in this project**—the same thing should have only one
+    implementation, and it belongs to the desktop-automation library, not to this
+    bot.
     """
     _require_input_desktop()
     if not text:
@@ -671,36 +767,46 @@ def type_text(text: str) -> None:
     try:
         ac.write(text)
     except Exception as error:  # pylint: disable=broad-except
-        # 失敗時補一輪放開，理由與 `press_hotkey` 完全相同：底層的
-        # `type_keyboard` 是「按下 → 放開」而中間**沒有 finally**，所以按下之後
-        # 若放開那一步失敗，那個鍵就留在按下的狀態。這條路徑同樣繞過本模組宣稱
-        # 的三層保險（`_HELD_INPUTS` 登記／`release_all_inputs`／逾時自動放開只
-        # 掛在 `key_down`／`key_up` 上），所以 `/input key status` 會說什麼都沒按
-        # 住、`/input key clear` 也放不掉。
+        # On failure, run one round of releases, for exactly the same reason as
+        # `press_hotkey`: the low-level `type_keyboard` is "press → release" with
+        # **no finally** in between, so if the release step fails after the press,
+        # that key stays pressed. This path also bypasses the three layers of
+        # safety this module claims (the `_HELD_INPUTS` registry /
+        # `release_all_inputs` / the timed auto-release only hang off `key_down` /
+        # `key_up`), so `/input key status` would say nothing is held and
+        # `/input key clear` could not release it either.
         #
-        # 這一側比組合鍵更難自己恢復：卡住的是**一般字元鍵**，Windows 會持續自動
-        # 重複，畫面上就是那個字被無限打出來，而下指令的人不在電腦前面。
-        # （組合鍵那條卡的是修飾鍵；這條 `write(is_shift=False)` 不碰 shift。）
+        # This side is harder to recover from on its own than a key combination:
+        # what gets stuck is an **ordinary character key**, which Windows keeps
+        # auto-repeating, so that character gets typed on screen endlessly while
+        # the person who issued the command is not at the computer.
+        # (The combination path gets a modifier stuck; this
+        # `write(is_shift=False)` does not touch shift.)
         stuck = _undo_write_press(ac, text)
         raise GuiError(
-            "鍵盤輸入失敗（這段文字含有無法直接鍵入的字元）；"
-            f"已重新放開這段文字會用到的 {len(stuck)} 個按鍵，鍵盤不會卡住。"
+            "Keyboard input failed (this text contains characters that cannot be typed directly); "
+            f"the {len(stuck)} key(s) this text would use have been released again, "
+            "so the keyboard will not get stuck."
         ) from error
 
 
-# `write()` 把換行／Tab／退格轉成真正的按鍵，不是打出那個控制字元。這份對照要跟
-# 底層的 `WRITE_CONTROL_KEYS` 一致；讀得到就用它的，讀不到才用這份備份（那是內部
-# 常數，不保證一直在，但即使漂掉了，最壞情況也只是少放開一個鍵）。
+# `write()` turns newline / Tab / backspace into real key presses rather than
+# typing that control character. This mapping must match the low-level
+# `WRITE_CONTROL_KEYS`; use that one when it can be read, and only fall back to
+# this copy when it cannot (it is an internal constant, not guaranteed to stay,
+# but even if it drifts, the worst case is releasing one key too few).
 _WRITE_CONTROL_KEYS_FALLBACK = {"\n": "return", "\r": "return",
                                 "\t": "tab", "\x08": "back"}
 
-# 一段文字最多回收幾個相異按鍵。正常 ASCII 文字的相異字元遠小於這個數；設上限
-# 只是不讓一段病態的長字串把「補救」本身變成幾百次輸入事件。
+# The most distinct keys to reclaim for one piece of text. Ordinary ASCII text has
+# far fewer distinct characters than this; the cap only stops a pathological long
+# string from turning the "remedy" itself into hundreds of input events.
 _UNDO_WRITE_MAX_KEYS = 64
 
 
 def _write_control_keys(ac: Any) -> dict:
-    """底層的「控制字元 → 按鍵名」對照，讀不到就用備份。永不 raise。"""
+    """The low level's "control character → key name" mapping, or the fallback
+    copy when it cannot be read. Never raises."""
     for holder in (ac, getattr(ac, "wrapper", None)):
         table = getattr(holder, "WRITE_CONTROL_KEYS", None)
         if isinstance(table, dict) and table:
@@ -717,14 +823,17 @@ def _write_control_keys(ac: Any) -> dict:
 
 
 def keys_a_write_could_press(ac: Any, text: str) -> list:
-    """這段文字交給 `write()` 時，**可能被按下**的那些鍵（去重、有上限）。
+    """The keys that **may get pressed** when this text is handed to `write()`
+    (deduplicated, capped).
 
-    純查表、不送任何輸入事件，所以測得起來。順序沿用文字裡第一次出現的順序，
-    讓失敗訊息與 log 讀起來可預期。
+    Pure table lookup, sending no input events, so it can be tested. The order
+    follows each key's first appearance in the text, so failure messages and logs
+    read predictably.
 
-    對照的是底層 `write()` 的分支：控制字元 → `WRITE_CONTROL_KEYS`；表裡有的
-    字元 → 鍵碼；表裡沒有的 → 走 Unicode 事件（**不按任何鍵**，所以不列入）；
-    再不行的空白 → `space`。
+    It mirrors the branches of the low-level `write()`: control character →
+    `WRITE_CONTROL_KEYS`; a character in the table → its key code; one not in the
+    table → a Unicode event (**presses no key**, so it is not listed); whitespace
+    that still does not fit → `space`.
     """
     control = _write_control_keys(ac)
     table = getattr(ac, "keyboard_keys_table", None)
@@ -748,18 +857,22 @@ def keys_a_write_could_press(ac: Any, text: str) -> list:
         elif char in table:
             _add(table[char])
         elif char.isspace():
-            # Unicode 那條不按鍵，所以只有「表裡沒有、但是空白」才會走 space。
+            # The Unicode path presses no key, so only "not in the table, but
+            # whitespace" goes through space.
             _add("space")
     return out
 
 
 def _undo_write_press(ac: Any, text: str) -> list:
-    """`write()` 送到一半失敗時，把這段文字可能還按著的鍵放開一輪。回實際放掉的。
+    """When `write()` fails partway, run one round of releases for the keys this
+    text may still be holding down. Returns the ones actually released.
 
-    與 `_undo_hotkey_press` 同一個立場：**只放這一次呼叫自己可能按下的鍵**，不做
-    「順手把所有修飾鍵都放掉」的大掃除——使用者可能正握著 ctrl 站在鍵盤前面。
-    放開一個沒按住的鍵是安全的（作業系統對已彈起的鍵不做事，`key_up` 的 docstring
-    是同一個立場），所以不需要知道失敗前打到第幾個字。
+    Same stance as `_undo_hotkey_press`: **release only the keys this one call may
+    itself have pressed**, with no "release every modifier while we are at it"
+    sweep—the user may be standing at the keyboard holding ctrl. Releasing a key
+    that is not held is safe (the OS does nothing for a key already up; `key_up`'s
+    docstring takes the same stance), so there is no need to know how many
+    characters were typed before the failure.
     """
     released: list = []
     try:
@@ -779,14 +892,18 @@ def _undo_write_press(ac: Any, text: str) -> list:
 
 
 def _undo_hotkey_press(ac: Any, tokens: list[str]) -> list[str]:
-    """組合鍵送到一半失敗時，把可能還按著的鍵反向放開一輪。回真的放掉了哪些。
+    """When a key combination fails partway, run one round of releases in reverse
+    for the keys that may still be held. Returns which ones were actually
+    released.
 
-    只放**我們自己要求按下的那幾個鍵**，不做「順手把所有修飾鍵都放掉」的大掃除
-    ——使用者可能正握著 ctrl 在鍵盤前面，替他放開是另一種靜默的錯。
+    Release **only the keys we ourselves asked to press**, with no "release every
+    modifier while we are at it" sweep—the user may be at the keyboard holding
+    ctrl, and releasing it for them is another kind of silent error.
 
-    放開一個沒按住的鍵是安全的：底層送的是放開事件，作業系統對已經彈起的鍵不做
-    事（`key_up` 的 docstring 也是同一個立場）。所以這裡不需要知道失敗前到底按到
-    第幾個，全部倒著放一次就好。
+    Releasing a key that is not held is safe: the low level sends a release event,
+    and the OS does nothing for a key that is already up (`key_up`'s docstring
+    takes the same stance). So there is no need to know how far the presses got
+    before the failure; releasing them all once in reverse is enough.
     """
     released: list[str] = []
     for token in reversed(tokens):
@@ -800,22 +917,28 @@ def _undo_hotkey_press(ac: Any, tokens: list[str]) -> list[str]:
 
 
 def press_hotkey(tokens: list[str]) -> None:
-    """送出組合鍵（依序按下、再反向放開）。
+    """Send a key combination (press in order, then release in reverse).
 
-    **失敗時一定要補一輪反向放開。** 底層 `je_auto_control.hotkey` 是
-    「for 按下 → for 放開」而中間**沒有 finally**，2026-08-30 在這台機器上實測
-    （把底層 press/release 換成假的記錄器，完全不碰真實桌面）：三鍵組合在第二個
-    鍵按下時丟例外，呼叫序列只有 `press ctrl` / `press shift`，**一次 release 都
-    沒有**——ctrl 與 shift 就這樣留在按下的狀態。
+    **On failure, always run one round of reverse releases.** The low-level
+    `je_auto_control.hotkey` is "for press → for release" with **no finally** in
+    between. Measured on this machine on 2026-08-30 (with the low-level
+    press/release swapped for fake recorders, never touching the real desktop): a
+    three-key combination raising on the second key press produced a call
+    sequence of only `press ctrl` / `press shift`, **without a single
+    release**—ctrl and shift were simply left pressed.
 
-    這條路徑會繞過本模組宣稱的三層保險，因為那三層（`_HELD_INPUTS` 登記、
-    `release_all_inputs`、逾時自動放開）只掛在 `key_down` / `key_up` 上：組合鍵
-    從頭到尾不登記，所以 `/input key status` 會說什麼都沒按住、`/input key clear`
-    放不掉、也沒有任何逾時計時器。後果是整台電腦像壞掉一樣（alt 卡住之後每個按鍵
-    都變成選單快捷鍵），而下指令的人不在電腦前面。
+    This path bypasses the three layers of safety this module claims, because
+    those three layers (the `_HELD_INPUTS` registry, `release_all_inputs`, the
+    timed auto-release) only hang off `key_down` / `key_up`: a key combination is
+    never registered from start to finish, so `/input key status` would say
+    nothing is held, `/input key clear` could not release it, and there is no
+    timeout timer at all. The result is the whole computer acting broken (with alt
+    stuck, every key press becomes a menu shortcut) while the person who issued
+    the command is not at the computer.
 
-    而且這不是只有打錯鍵名才會發生：鍵名先經過 `parse_key_name`，真正的觸發是
-    作業系統層在兩次按下之間失敗（UAC 畫面插進來、輸入被安全桌面擋掉）。
+    Nor does this only happen with a mistyped key name: key names go through
+    `parse_key_name` first, and the real trigger is the OS layer failing between
+    two presses (a UAC screen cutting in, input blocked by the secure desktop).
     """
     _require_input_desktop()
     ac = load_ac()
@@ -823,57 +946,75 @@ def press_hotkey(tokens: list[str]) -> None:
         ac.hotkey(_library_keys(tokens))
     except Exception as error:  # pylint: disable=broad-except
         _undo_hotkey_press(ac, tokens)
-        raise GuiError("送出按鍵組合失敗（可能是不存在的鍵名）；"
-                       "已把這組鍵重新放開，鍵盤不會卡住。") from error
+        raise GuiError("Sending the key combination failed (possibly a key name that does not exist); "
+                       "the keys have been released again, so the keyboard will not get stuck.") from error
 
 
 # --------------------------------------------------------------------------
-# 按住 / 放開（修飾鍵＋點選、遊戲、長按）
+# Hold / release (modifier + click, games, long press)
 # --------------------------------------------------------------------------
-# `press_hotkey` 是「按下馬上放開」，做不到「按住 W 走三秒」「按住 ctrl 連點五個
-# 檔案」「按住左鍵畫一條線再放開」。這裡把 down / up 拆開。
+# `press_hotkey` is "press and release at once", which cannot do "hold W and walk
+# for three seconds", "hold ctrl and click five files" or "hold the left button,
+# draw a line, then release". This splits down / up apart.
 #
-# 代價是**狀態會留在主機上**：一個沒放開的鍵會讓整台電腦像壞掉一樣（alt 卡住之
-# 後每個按鍵都變成選單快捷鍵），而且下指令的人不在電腦前面、看不到卡住了。所以
-# 三層保險，缺一不可：
+# The price is that **state stays on the host**: one key left unreleased makes the
+# whole computer act broken (with alt stuck, every key press becomes a menu
+# shortcut), and the person who issued the command is not at the computer and
+# cannot see that it is stuck. So there are three layers of safety, and none can
+# be dropped:
 #
-# 1. 每次按住都登記進 `_HELD_INPUTS`，`held_inputs()` 隨時查得到；
-# 2. `release_all_inputs()` 一次全放（`!key clear`、巨集結束都會呼叫）；
-# 3. 呼叫端另外掛逾時自動放開（`release_input_if_stale`）——按下去就忘了是常態。
+# 1. Every hold is registered in `_HELD_INPUTS`, and `held_inputs()` can look it
+#    up at any time;
+# 2. `release_all_inputs()` releases everything at once (called by `!key clear`
+#    and at the end of a macro);
+# 3. The caller additionally hangs a timed auto-release on it
+#    (`release_input_if_stale`)—pressing something and forgetting it is the norm.
 #
-# 三層都靠同一個不變式撐著：**一筆登記只有在「放開真的送出去了」之後才會離開
-# `_HELD_INPUTS`**（`_release_keys`）。放開失敗的那一筆照樣留著、按下時間不變，所
-# 以 `/input key status` 看得到它、下一次 `/input key clear`／`/host panic`／巨集收尾／
-# 逾時重試都會再放一次。
-# 在 2026-09-21 之前是「不管成功與否都拿掉」，放開失敗的鍵於是從三層保險裡一起消
-# 失——正是這段註解要防的那個「卡住了卻看不到」。
+# All three layers rest on the same invariant: **a registry entry only leaves
+# `_HELD_INPUTS` after "the release was actually sent"** (`_release_keys`). An
+# entry whose release failed stays, with its press time unchanged, so
+# `/input key status` can see it and the next `/input key clear` / `/host panic` /
+# macro wrap-up / timeout retry will all release it again.
+# Before 2026-09-21 it was "removed whether or not it succeeded", so a key whose
+# release failed vanished from all three layers at once—exactly the "stuck but
+# invisible" this comment exists to prevent.
 _HELD_INPUTS: dict[tuple[str, str], float] = {}
 
-# 沒有人主動放開時，多久之後自動放開。由呼叫端負責排程（本模組沒有 event loop）。
+# When nobody releases it, how long before it is released automatically.
+# Scheduling is the caller's job (this module has no event loop).
 INPUT_HOLD_MAX_SEC = 300.0
 
-# 逾時自動放開**失敗**時再試幾次、間隔多久（呼叫端排程，理由見 bot 的
-# `_auto_release_input`）。放開會失敗的主要成因是作業系統當下不收合成輸入（函式庫
-# 在 `SendInput` 回 0 時丟例外：輸入被別的執行緒擋住、安全桌面），那是會自己過去的
-# 狀態，所以值得重試；但不設上限的話，一個永遠放不掉的鍵會變成一個永遠活著、每隔
-# 一段時間就寫一行 log 的背景工作。試完還放不掉就留在 `/input key status` 裡給人處理。
+# How many more times, and how far apart, to retry when the timed auto-release
+# **fails** (scheduled by the caller; see the bot's `_auto_release_input` for the
+# reasons). The main cause of a failed release is the OS not accepting synthetic
+# input at that moment (the library raises when `SendInput` returns 0: input
+# blocked by another thread, the secure desktop), a state that passes on its own,
+# so it is worth retrying; but without a cap, a key that can never be released
+# would become a background task that lives forever and writes a log line every so
+# often. If it still cannot be released after the retries, it stays in
+# `/input key status` for a human to deal with.
 INPUT_RELEASE_RETRIES = 3
 INPUT_RELEASE_RETRY_SEC = 60.0
 
 
 def parse_key_name(raw: str) -> str:
-    """驗證鍵名。不合法就丟 `GuiError`，不讓任意字串進到底層鍵名表。
+    """Validate a key name. Raise `GuiError` if it is invalid, so arbitrary
+    strings never reach the low-level key-name table.
 
-    後端載不進來時只做字面檢查、不擋——這個函式也被巨集的**存檔驗證**呼叫，
-    在沒有桌面 session 的環境（測試、CI）存一個巨集不該因為缺後端而失敗。
+    When the backend cannot load, only the literal check is done and nothing is
+    blocked—this function is also called by the macro's **save-time validation**,
+    and saving a macro in an environment with no desktop session (tests, CI)
+    should not fail for lack of a backend.
 
-    `_EXTRA_KEY_CODES` 與 `_LIBRARY_NAME_OVERRIDES` 的名字不必問底層表（前者那張表
-    本來就沒有、後者那張表裡的值是錯的），回傳的仍是**名字**；換成整數是
-    `_library_key` 在送出那一刻才做的事。
+    Names in `_EXTRA_KEY_CODES` and `_LIBRARY_NAME_OVERRIDES` need not be checked
+    against the low-level table (the former are not in that table at all, the
+    latter have wrong values there); what is returned is still the **name**;
+    converting it to an integer is what `_library_key` does at the moment of
+    sending.
     """
     key = (raw or "").strip().lower()
     if not key or not HOTKEY_TOKEN_RE.match(key):
-        raise GuiError("鍵名只能是英數字與底線。")
+        raise GuiError("A key name may only contain letters, digits and underscores.")
     key = KEY_ALIASES.get(key, key)
     if key in _EXTRA_KEY_CODES or key in _LIBRARY_NAME_OVERRIDES:
         return key
@@ -882,32 +1023,33 @@ def parse_key_name(raw: str) -> str:
     except GuiError:
         return key
     if isinstance(table, dict) and key not in table:
-        raise GuiError("不認得這個鍵名。")
+        raise GuiError("Unknown key name.")
     return key
 
 
 def key_down(name: str) -> str:
-    """按住某個鍵不放。"""
+    """Hold a key down."""
     key = parse_key_name(name)
     _require_input_desktop()
     ac = load_ac()
     try:
         ac.press_keyboard_key(_library_key(key))
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("按下按鍵失敗。") from error
+        raise GuiError("Failed to press the key.") from error
     _HELD_INPUTS[("key", key)] = time.monotonic()
     return key
 
 
 def key_up(name: str) -> str:
-    """放開某個鍵。**沒按住也照樣送放開事件**——重點是讓卡住的鍵能被解掉，
-    而不是堅持狀態一致（bot 重啟後 `_HELD_INPUTS` 是空的，但鍵還按著）。"""
+    """Release a key. **The release event is sent even if it is not held**—the
+    point is to free a stuck key, not to insist on consistent state (after a bot
+    restart `_HELD_INPUTS` is empty, but the key is still pressed)."""
     key = parse_key_name(name)
     ac = load_ac()
     try:
         ac.release_keyboard_key(_library_key(key))
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("放開按鍵失敗。") from error
+        raise GuiError("Failed to release the key.") from error
     _HELD_INPUTS.pop(("key", key), None)
     return key
 
@@ -922,7 +1064,7 @@ def mouse_button_down(button: str, x: int | None = None,
         else:
             ac.press_mouse(button, x, y)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("按下滑鼠鍵失敗。") from error
+        raise GuiError("Failed to press the mouse button.") from error
     _HELD_INPUTS[("mouse", button)] = time.monotonic()
 
 
@@ -935,12 +1077,12 @@ def mouse_button_up(button: str, x: int | None = None,
         else:
             ac.release_mouse(button, x, y)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("放開滑鼠鍵失敗。") from error
+        raise GuiError("Failed to release the mouse button.") from error
     _HELD_INPUTS.pop(("mouse", button), None)
 
 
 def held_inputs() -> list[tuple[str, str, float]]:
-    """目前按住不放的鍵 / 滑鼠鍵：`[(kind, 名稱, 已按住秒數), …]`。"""
+    """Keys / mouse buttons currently held down: `[(kind, name, seconds held), …]`."""
     now = time.monotonic()
     return sorted(
         ((kind, name, now - since) for (kind, name), since in _HELD_INPUTS.items()),
@@ -949,51 +1091,64 @@ def held_inputs() -> list[tuple[str, str, float]]:
 
 
 def input_pressed_at(kind: str, name: str) -> float | None:
-    """某個鍵是什麼時候按下去的；沒按住回 None。給呼叫端排逾時自動放開用。"""
+    """When a key was pressed; None if it is not held. For the caller to schedule
+    the timed auto-release."""
     return _HELD_INPUTS.get((kind, name))
 
 
 def held_snapshot() -> set[tuple[str, str]]:
-    """目前按住的集合。給「只放開自己按下去那些」用（見 `release_added_since`）。"""
+    """The set currently held. For "release only the ones we pressed ourselves"
+    (see `release_added_since`)."""
     return set(_HELD_INPUTS)
 
 
 def release_all_inputs() -> list[str]:
-    """全部放開，回被放開的名稱。單一失敗不中斷——重點是盡量把桌面解鎖。
+    """Release everything, returning the names released. A single failure does not
+    stop it—the point is to unlock the desktop as far as possible.
 
-    放不掉的那幾個**不在回傳值裡、也不會從登記裡消失**；要知道有幾個放不掉，用
-    `release_all_inputs_report`。
+    The ones that could not be released **are not in the return value and do not
+    leave the registry**; to learn how many could not be released, use
+    `release_all_inputs_report`.
     """
     return _release_keys(list(_HELD_INPUTS))[0]
 
 
 def release_all_inputs_report() -> tuple[list[str], list[str]]:
-    """同 `release_all_inputs`，另外回放不掉的那些：`(已放開, 放不掉)`。
+    """Same as `release_all_inputs`, additionally returning the ones that could not
+    be released: `(released, stuck)`.
 
-    給要**對人回報**的呼叫端（`/input key clear`、`/host panic`）：只回「已放開 N 個」
-    的話，放不掉的那一個就安靜地少算一個，而下指令的人正好看不到鍵盤。
+    For callers that **report to a person** (`/input key clear`, `/host panic`):
+    replying only "released N" would silently leave out the one that could not be
+    released, and the person who issued the command is exactly the one who cannot
+    see the keyboard.
     """
     return _release_keys(list(_HELD_INPUTS))
 
 
 def release_added_since(snapshot: set[tuple[str, str]]) -> list[str]:
-    """只放開 snapshot 之後才按下去的。
+    """Release only what was pressed after the snapshot.
 
-    巨集結束時用這個而不是 `release_all_inputs`：使用者可能在跑巨集之前就自己
-    `!key down ctrl` 按著，巨集不該替他放開。放不掉的那幾個同樣留在登記裡。
+    A macro uses this rather than `release_all_inputs` when it finishes: the user
+    may have done `!key down ctrl` themselves before running the macro, and the
+    macro should not release it for them. The ones that cannot be released also
+    stay in the registry.
     """
     return _release_keys([k for k in _HELD_INPUTS if k not in snapshot])[0]
 
 
 def release_input_if_stale(kind: str, name: str, pressed_at: float) -> bool:
-    """按住超過上限時自動放開；回傳有沒有真的放。
+    """Automatically release a hold that exceeded the limit; return whether it
+    was actually released.
 
-    比對 `pressed_at` 是刻意的：使用者可能放開後又按同一個鍵，這時舊的逾時計時
-    器不該把新的那次放掉。時間戳不同就代表不是同一次按住。
+    Comparing `pressed_at` is deliberate: the user may release and then press the
+    same key again, and the old timeout timer must not release the new press. A
+    different timestamp means it is not the same hold.
 
-    放開**失敗**時回 False，而那一筆的按下時間原封不動——所以同一個計時器拿同一個
-    `pressed_at` 再叫一次就是重試（呼叫端據此分辨「不是同一次按住」與「放開失敗」：
-    前者之後 `input_pressed_at` 已經不等於 `pressed_at`，後者還相等）。
+    When the release **fails** it returns False, and that entry's press time is
+    left untouched—so the same timer calling again with the same `pressed_at` is a
+    retry (the caller uses this to tell "not the same hold" from "release failed":
+    after the former, `input_pressed_at` no longer equals `pressed_at`; after the
+    latter it still does).
     """
     if _HELD_INPUTS.get((kind, name)) != pressed_at:
         return False
@@ -1002,17 +1157,23 @@ def release_input_if_stale(kind: str, name: str, pressed_at: float) -> bool:
 
 def _release_keys(keys: list[tuple[str, str]]
                   ) -> tuple[list[str], list[str]]:
-    """逐一放開，回 `(已放開的名稱, 放不掉的名稱)`。
+    """Release one by one, returning `(names released, names that could not be
+    released)`.
 
-    **只有放開成功的才從 `_HELD_INPUTS` 拿掉。** 放開丟例外時那個鍵很可能還按著，
-    這時把登記拿掉等於讓它從三層保險裡一起消失：`/input key status` 說沒有按住任何
-    鍵、`/input key clear` 的計數少一個、逾時計時器再也找不到它。留著的那一筆按下時
-    間不變，逾時計時器的比對因此照樣成立。
+    **Only successfully released ones are removed from `_HELD_INPUTS`.** When a
+    release raises, that key is very likely still pressed, and removing its entry
+    then would make it vanish from all three layers of safety at once:
+    `/input key status` says no key is held, `/input key clear`'s count is one
+    short, and the timeout timer can never find it again. The entry that stays
+    keeps its press time, so the timeout timer's comparison still holds.
 
-    載不進後端時**什麼都不拿掉**、全部算放不掉。那一支在正式執行時其實走不到：登記
-    只在按下**成功之後**才寫入，按得下去代表 `load_ac()` 早就成功過，而它把模組快取
-    在 `_AC`、之後不會再變回 None。刻意不寫成 `clear()`（原本是）：走得到的唯一情形是
-    有人重設了快取，那時候這些鍵照樣可能按著，清掉就是同一個「卡住了卻看不到」。
+    When the backend cannot load, **nothing is removed** and everything counts as
+    not released. In a real run that branch is actually unreachable: an entry is
+    only written **after** a successful press, and a successful press means
+    `load_ac()` already succeeded, which caches the module in `_AC` and never goes
+    back to None. It is deliberately not written as `clear()` (it used to be): the
+    only way to reach it is someone resetting the cache, and at that point these
+    keys may still be pressed, so clearing them is the same "stuck but invisible".
     """
     try:
         ac = load_ac()
@@ -1036,29 +1197,33 @@ def _release_keys(keys: list[tuple[str, str]]
 
 
 def paste_text(text: str) -> None:
-    """把文字放進剪貼簿再送 `ctrl+v`。
+    """Put text on the clipboard and then send `ctrl+v`.
 
-    `type_text` 走的是逐字元的鍵盤模擬，打不出中日文與大多數非 ASCII 字元；
-    要輸入這些內容唯一可靠的路徑就是剪貼簿 ＋ 貼上。
+    `type_text` uses per-character keyboard simulation, which cannot type
+    Chinese/Japanese or most non-ASCII characters; the only reliable way to enter
+    such content is clipboard + paste.
     """
     set_clipboard(text)
     time.sleep(0.05)
-    # 一定要經過別名層：底層鍵名表**沒有** `ctrl`（只有 `control`），而組合鍵會
-    # 原樣交給函式庫查表。這裡原本寫死 `["ctrl", "v"]`，所以每一次貼上都在函式庫
-    # 查表那一步失敗（2026-09-21 對真表實測：`_resolve_keycode("ctrl")` 丟
-    # `AutoControlCantFindKeyException`）；測試用的假後端什麼名字都收，看不出來。
+    # This must go through the alias layer: the low-level key-name table has
+    # **no** `ctrl` (only `control`), and a key combination is handed to the
+    # library's table lookup as-is. This used to hardcode `["ctrl", "v"]`, so every
+    # paste failed at the library's lookup step (measured against the real table
+    # on 2026-09-21: `_resolve_keycode("ctrl")` raises
+    # `AutoControlCantFindKeyException`); the fake backend used in tests accepts
+    # any name, so it never showed.
     press_hotkey(parse_hotkey_tokens("ctrl+v"))
 
 
 # --------------------------------------------------------------------------
-# 剪貼簿
+# Clipboard
 # --------------------------------------------------------------------------
 def get_clipboard() -> str:
     ac = load_ac()
     try:
         return ac.get_clipboard() or ""
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("讀取剪貼簿失敗。") from error
+        raise GuiError("Failed to read the clipboard.") from error
 
 
 def set_clipboard(text: str) -> None:
@@ -1066,66 +1231,75 @@ def set_clipboard(text: str) -> None:
     try:
         ac.set_clipboard(text)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("寫入剪貼簿失敗。") from error
+        raise GuiError("Failed to write to the clipboard.") from error
 
 
 def get_clipboard_image(dest: Path) -> bool:
-    """剪貼簿裡若是圖片就存到 `dest`，回 True；不是圖片回 False。
+    """If the clipboard holds an image, save it to `dest` and return True;
+    return False if it is not an image.
 
-    「截了圖貼到剪貼簿」是很常見的一步，但 `get_clipboard()` 只看得到文字，
-    圖片對它來說等於空的——使用者會以為剪貼簿是空的。
+    "Take a screenshot onto the clipboard" is a very common step, but
+    `get_clipboard()` only sees text, so to it an image is as good as
+    empty—the user would think the clipboard is empty.
 
-    套件回的是 PNG 位元組，`dest` 一律用 `.png`。
+    The library returns PNG bytes, so `dest` always uses `.png`.
     """
     try:
         payload = load_ac().get_clipboard_image()
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("讀取剪貼簿圖片失敗。") from error
+        raise GuiError("Failed to read the clipboard image.") from error
     if not payload:
-        return False        # 空的，或剪貼簿裡是「檔案」而不是圖片本身
+        return False        # empty, or the clipboard holds "files" rather than the image itself
     try:
         dest.write_bytes(payload)
     except OSError as error:
-        raise GuiError("剪貼簿圖片存檔失敗。") from error
+        raise GuiError("Failed to save the clipboard image.") from error
     return True
 
 
 def set_clipboard_image(source: Path) -> None:
-    """把一張圖放進剪貼簿，之後就能在任何程式裡直接貼上。
+    """Put an image on the clipboard so it can then be pasted directly into any
+    program.
 
-    函式庫的 `set_clipboard_image` 同時吃 PNG 位元組與檔案路徑，這裡給路徑。
+    The library's `set_clipboard_image` accepts both PNG bytes and a file path;
+    this passes a path.
     """
     try:
         load_ac().set_clipboard_image(str(source))
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("寫入剪貼簿圖片失敗。") from error
+        raise GuiError("Failed to put the image on the clipboard.") from error
 
 
 def clipboard_file_list() -> list[str]:
-    """在檔案總管按了「複製」之後，剪貼簿裡的檔案路徑清單。
+    """The list of file paths on the clipboard after pressing "Copy" in File
+    Explorer.
 
-    第三種剪貼簿內容。文字看不到它、圖片也看不到它——複製了一批檔案再打
-    `!clip` 會得到「空的」，跟當初圖片那個誤導完全同一類。
+    The third kind of clipboard content. Text cannot see it and neither can the
+    image path—copying a batch of files and then typing `!clip` would report
+    "empty", exactly the same kind of misdirection the image case once was.
 
-    **回的是主機上的完整路徑**，呼叫端只能拿它算數量與副檔名，不可以整串送出去
-    （Secrecy Layer 1）。
+    **It returns full paths on the host**; the caller may only use it to count
+    items and read extensions, and must never send the list out whole
+    (Secrecy Layer 1).
     """
     try:
         return list(load_ac().get_clipboard_files() or [])
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("讀取剪貼簿檔案清單失敗。") from error
+        raise GuiError("Failed to read the clipboard file list.") from error
 
 
 def clipboard_kinds() -> dict[str, Any]:
-    """剪貼簿目前**有哪幾種**內容：`{categories, has_text, has_image, has_files}`。
+    """**Which kinds** of content the clipboard currently holds:
+    `{categories, has_text, has_image, has_files}`.
 
-    格式清單（`formats`）刻意不往外傳：那是 Win32 的格式名稱，對使用者沒有意義，
-    而且有些程式會把自訂格式名取成含路徑或產品內部代號的字串。
+    The format list (`formats`) is deliberately not passed on: those are Win32
+    format names, meaningless to the user, and some programs name their custom
+    formats with strings containing paths or internal product code names.
     """
     try:
         summary = load_ac().clipboard_formats() or {}
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("讀取剪貼簿格式失敗。") from error
+        raise GuiError("Failed to read the clipboard formats.") from error
     return {
         "categories": list(summary.get("categories") or []),
         "has_text": bool(summary.get("has_text")),
@@ -1135,26 +1309,27 @@ def clipboard_kinds() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# 視窗
+# Windows
 # --------------------------------------------------------------------------
 def list_windows() -> list[tuple[int, str]]:
-    """所有可見、有標題的最上層視窗，依 z-order（最前面的在最前）。"""
+    """All visible, titled top-level windows, in z-order (frontmost first)."""
     api = _window_api()
     try:
         return api.list_windows(titled_only=True)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("列舉視窗失敗。") from error
+        raise GuiError("Failed to enumerate windows.") from error
 
 
 def match_windows(needle: str) -> list[tuple[int, str]]:
-    """標題含 `needle` 的視窗（不分大小寫）。"""
+    """Windows whose title contains `needle` (case-insensitive)."""
     key = (needle or "").strip().lower()
     if not key:
-        raise GuiError("請給視窗標題的一段文字。")
+        raise GuiError("Give part of the window title.")
     return [(hwnd, title) for hwnd, title in list_windows() if key in title.lower()]
 
 
-# `!win <動作>` → Win32 `ShowWindow` 的 cmd 值。`close` 不在這裡，它走 WM_CLOSE。
+# `!win <action>` → the cmd value for Win32 `ShowWindow`. `close` is not here; it
+# goes through WM_CLOSE.
 WINDOW_SHOW_ACTIONS = {
     "min": 6,        # SW_MINIMIZE
     "minimize": 6,
@@ -1167,62 +1342,67 @@ WINDOW_SHOW_ACTIONS = {
 
 
 def window_show(needle: str, action: str) -> tuple[int, str, int]:
-    """對第一個命中的視窗做 min / max / restore / hide / show。
+    """Apply min / max / restore / hide / show to the first matching window.
 
-    回 `(hwnd, title, 命中數)`；呼叫端只該把命中數回給使用者，**標題不可外送**
-    （IDE / 編輯器慣例會把絕對主機路徑寫在標題列）。
+    Returns `(hwnd, title, match count)`; the caller should only report the match
+    count to the user, and **the title must not be sent out** (IDEs / editors
+    conventionally put an absolute host path in the title bar).
     """
     api = _window_api()
     cmd_show = WINDOW_SHOW_ACTIONS.get((action or "").strip().lower())
     if cmd_show is None:
-        raise GuiError("視窗動作只能是 `min` / `max` / `restore` / `show` / `hide` / `close`。")
+        raise GuiError("The window action must be `min` / `max` / `restore` / `show` / `hide` / `close`.")
     matched = match_windows(needle)
     if not matched:
-        raise GuiError("找不到符合的視窗。")
+        raise GuiError("No matching window was found.")
     hwnd, title = matched[0]
     try:
         api.show_window_by_title(needle, cmd_show)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("切換視窗狀態失敗。") from error
+        raise GuiError("Failed to change the window state.") from error
     return hwnd, title, len(matched)
 
 
 def window_close(needle: str) -> tuple[int, str, int]:
-    """送 `WM_CLOSE` 給第一個命中的視窗（等同按右上角的關閉鈕）。
+    """Send `WM_CLOSE` to the first matching window (the same as clicking the
+    close button in the top-right corner).
 
-    刻意不用 `TerminateProcess`：`WM_CLOSE` 讓程式跑自己的收尾（存檔提示、
-    設定寫回），要硬殺行程使用者本來就有 `!kill`。
+    `TerminateProcess` is deliberately not used: `WM_CLOSE` lets the program run
+    its own wrap-up (save prompts, writing settings back), and a user who wants to
+    kill the process outright already has `!kill`.
     """
     api = _window_api()
     matched = match_windows(needle)
     if not matched:
-        raise GuiError("找不到符合的視窗。")
+        raise GuiError("No matching window was found.")
     hwnd, title = matched[0]
     try:
         api.close_window_by_title(needle)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("關閉視窗失敗。") from error
+        raise GuiError("Failed to close the window.") from error
     return hwnd, title, len(matched)
 
 
 def window_focus(needle: str) -> tuple[int, str, int]:
-    """還原（如果被最小化）再拉到前景。"""
+    """Restore it (if minimised) and bring it to the foreground."""
     api = _window_api()
     matched = match_windows(needle)
     if not matched:
-        raise GuiError("找不到符合的視窗。")
+        raise GuiError("No matching window was found.")
     hwnd, title = matched[0]
     try:
-        # 套件的 focus_window 會在視窗被最小化時先還原再拉到前景。
+        # The library's focus_window restores a minimised window first and then
+        # brings it to the foreground.
         api.focus_window(needle)
     except Exception as error:  # pylint: disable=broad-except
-        # SetForegroundWindow 在 alt-tab 鎖 / 前景鎖定的情況會 access denied。
-        raise GuiError("找到視窗了，但系統不允許把它拉到前景。") from error
+        # SetForegroundWindow is access-denied under the alt-tab lock /
+        # foreground lock.
+        raise GuiError("The window was found, but the system does not allow bringing it to the foreground.") from error
     return hwnd, title, len(matched)
 
 
 def foreground_window() -> tuple[int, str] | None:
-    """目前最前面的視窗 `(hwnd, 標題)`；取不到回 None。"""
+    """The current frontmost window `(hwnd, title)`; None if unavailable."""
     try:
         return _window_api().foreground_window()
     except Exception:  # pylint: disable=broad-except
@@ -1230,52 +1410,60 @@ def foreground_window() -> tuple[int, str] | None:
 
 
 def window_rect(needle: str) -> tuple[int, str, tuple[int, int, int, int], int]:
-    """第一個命中視窗的 `(hwnd, 標題, (x, y, 寬, 高), 命中數)`。
+    """The first matching window's `(hwnd, title, (x, y, width, height), match
+    count)`.
 
-    座標跟滑鼠是**同一個空間**（本行程 DPI-unaware，`GetWindowRect` 回的是虛擬化
-    後的邏輯座標），所以量到什麼就能直接拿去 `!click`。
+    The coordinates are in **the same space** as the mouse (this process is
+    DPI-unaware, and `GetWindowRect` returns virtualised logical coordinates), so
+    whatever is measured can go straight into `!click`.
 
-    這個原語是「可靠地點到某個視窗裡面」的前提：沒有它，使用者只能截圖數像素，
-    而視窗一移動座標就全錯。
+    This primitive is the precondition for "reliably clicking inside a given
+    window": without it, the user can only count pixels on a screenshot, and every
+    coordinate goes wrong as soon as the window moves.
     """
     api = _window_api()
     matched = match_windows(needle)
     if not matched:
-        raise GuiError("找不到符合的視窗。")
+        raise GuiError("No matching window was found.")
     hwnd, title = matched[0]
     rect = api.window_rect(needle)
     if rect is None:
-        raise GuiError("讀取視窗位置失敗。")
+        raise GuiError("Failed to read the window position.")
     left, top, right, bottom = rect
     return hwnd, title, (left, top, right - left, bottom - top), len(matched)
 
 
 def window_move(needle: str, x: int, y: int, width: int | None = None,
                 height: int | None = None) -> tuple[int, str, int]:
-    """把第一個命中的視窗搬到 `(x, y)`，可選同時改成 `width × height`。
+    """Move the first matching window to `(x, y)`, optionally also resizing it to
+    `width × height`.
 
-    底層走 `MoveWindow`，它只改位置與大小，不動 z-order 也不搶焦點——只想擺位置
-    的時候把視窗拉到最上面又搶走焦點，會打斷使用者正在做的事，也會讓接下來的鍵盤
-    操作打錯地方。省略寬高時由套件讀出目前大小沿用，不會把視窗縮成 0。
+    The low level uses `MoveWindow`, which only changes position and size, without
+    touching the z-order or stealing focus—raising the window to the top and
+    stealing focus when all you want is to position it would interrupt what the
+    user is doing, and send the following keyboard actions to the wrong place.
+    When width and height are omitted, the library reads the current size and keeps
+    it, so the window is never shrunk to 0.
     """
     api = _window_api()
     matched = match_windows(needle)
     if not matched:
-        raise GuiError("找不到符合的視窗。")
+        raise GuiError("No matching window was found.")
     hwnd, title = matched[0]
     try:
         moved = api.move_window_by_title(needle, x, y, width, height)
     except Exception as error:  # pylint: disable=broad-except
-        raise GuiError("搬移視窗失敗。") from error
+        raise GuiError("Failed to move the window.") from error
     if not moved:
-        raise GuiError("搬移視窗失敗。")
+        raise GuiError("Failed to move the window.")
     return hwnd, title, len(matched)
 
 
 def wait_window(needle: str, timeout: float, poll: float = 0.5, *,
                 should_abort: Callable[[], bool] | None = None
                 ) -> tuple[int, str]:
-    """輪詢等視窗出現。逾時丟 `GuiError`，被中止丟 `GuiAborted`。"""
+    """Poll until the window appears. Raises `GuiError` on timeout and
+    `GuiAborted` when aborted."""
     deadline = time.monotonic() + timeout
     while True:
         _check_abort(should_abort)
@@ -1283,30 +1471,35 @@ def wait_window(needle: str, timeout: float, poll: float = 0.5, *,
         if matched:
             return matched[0]
         if time.monotonic() >= deadline:
-            raise GuiError("等到逾時仍沒有出現符合的視窗。")
+            raise GuiError("Timed out and no matching window appeared.")
         _sleep_abortable(poll, should_abort)
 
 
 # --------------------------------------------------------------------------
-# 視窗版面（存 / 還原 / 靠邊 / 排格）
+# Window layouts (save / restore / snap / grid)
 # --------------------------------------------------------------------------
-# 遠端操作時最花時間的往往不是「點哪裡」，而是把畫面重新排成看得懂的樣子。實作
-# 全部在函式庫（`window_capture` 的 `save_window_layout` / `restore_window_layout`
-# / `snap_window` / `arrange_grid`），這裡只做名稱驗證、落地位置與錯誤訊息。
+# In remote operation, what takes the most time is often not "where to click" but
+# rearranging the screen into something readable. The implementation is entirely
+# in the library (`window_capture`'s `save_window_layout` / `restore_window_layout`
+# / `snap_window` / `arrange_grid`); this only does name validation, the on-disk
+# location and the error messages.
 LAYOUT_DIR = PROJECT_ROOT / "window_layouts"
 LAYOUT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 
 def layout_path(name: str) -> Path:
-    """版面檔路徑。名稱限英數 / `_` / `-`，擋掉 `../` 之類的路徑穿越。"""
+    """The layout file path. Names are limited to letters, digits / `_` / `-`,
+    blocking path traversal such as `../`."""
     key = (name or "").strip()
     if not LAYOUT_NAME_RE.match(key):
-        raise GuiError("版面名稱只能是英數字、底線與連字號，長度 1..40。")
+        raise GuiError("A layout name may only contain letters, digits, underscores and hyphens, "
+                       "length 1..40.")
     return LAYOUT_DIR / f"{key}.json"
 
 
 def save_window_layout(name: str) -> int:
-    """把目前每個有標題的視窗的位置與大小存起來，回存了幾個。"""
+    """Save the position and size of every titled window right now; return how
+    many were saved."""
     path = layout_path(name)
     ac = load_ac()
     try:
@@ -1314,29 +1507,31 @@ def save_window_layout(name: str) -> int:
         entries = ac.save_window_layout(str(path))
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] save_window_layout failed: {error!r}", file=sys.stderr)
-        raise GuiError("儲存視窗版面失敗。") from error
+        raise GuiError("Failed to save the window layout.") from error
     return len(entries or [])
 
 
 def restore_window_layout(name: str) -> int:
-    """把視窗擺回存檔時的位置，回實際搬動了幾個。
+    """Put windows back where they were when saved; return how many were actually
+    moved.
 
-    存檔之後關掉的視窗不會被重開——套件對找不到的標題就跳過，所以回傳值比存檔
-    時少是正常的，呼叫端要照實講而不是報成功。
+    Windows closed after saving are not reopened—the library skips titles it
+    cannot find, so a return value smaller than at save time is normal, and the
+    caller must say so plainly rather than report success.
     """
     path = layout_path(name)
     if not path.is_file():
-        raise GuiError("找不到這個版面。")
+        raise GuiError("No layout with that name was found.")
     ac = load_ac()
     try:
         return int(ac.restore_window_layout(str(path)))
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] restore_window_layout failed: {error!r}", file=sys.stderr)
-        raise GuiError("還原視窗版面失敗。") from error
+        raise GuiError("Failed to restore the window layout.") from error
 
 
 def list_window_layouts() -> list[tuple[str, int, float]]:
-    """`[(名稱, 視窗數, 修改時間), …]`，新的在前。"""
+    """`[(name, window count, modified time), …]`, newest first."""
     out: list[tuple[str, int, float]] = []
     try:
         paths = sorted(LAYOUT_DIR.glob("*.json"))
@@ -1356,16 +1551,17 @@ def list_window_layouts() -> list[tuple[str, int, float]]:
 def delete_window_layout(name: str) -> None:
     path = layout_path(name)
     if not path.is_file():
-        raise GuiError("找不到這個版面。")
+        raise GuiError("No layout with that name was found.")
     try:
         path.unlink()
     except OSError as error:
-        raise GuiError("刪除版面失敗。") from error
+        raise GuiError("Failed to delete the layout.") from error
 
 
-# 位置名稱必須跟函式庫的 `_snap_rect` 對得上——實測 `maximize` 不是它的合法值
-# （它叫 `max`），送過去只會丟 ValueError 然後被折成一句泛用失敗。這裡的清單就是
-# 它支援的九種，另外把好記的 `maximize` 收成 `max` 的別名。
+# Position names must match the library's `_snap_rect`—measured, `maximize` is not
+# a legal value for it (it is called `max`), and sending it only raises ValueError,
+# which is then folded into a generic failure. This list is exactly the nine it
+# supports, with the memorable `maximize` taken in as an alias for `max`.
 SNAP_POSITIONS = ("left", "right", "top", "bottom", "top-left", "top-right",
                   "bottom-left", "bottom-right", "max")
 SNAP_ALIASES = {"maximize": "max", "full": "max", "tl": "top-left",
@@ -1373,109 +1569,121 @@ SNAP_ALIASES = {"maximize": "max", "full": "max", "tl": "top-left",
 
 
 def snap_window(needle: str, position: str) -> tuple[int, str]:
-    """把第一個命中的視窗靠到螢幕的某一半／某一角。回 `(hwnd, 標題)`。"""
+    """Snap the first matching window to one half / one corner of the screen.
+    Returns `(hwnd, title)`."""
     key = (position or "left").strip().lower()
     key = SNAP_ALIASES.get(key, key)
     if key not in SNAP_POSITIONS:
         raise GuiError(
-            "位置只能是 `left` / `right` / `top` / `bottom` / `top-left` / "
-            "`top-right` / `bottom-left` / `bottom-right` / `max`。")
+            "The position must be `left` / `right` / `top` / `bottom` / `top-left` / "
+            "`top-right` / `bottom-left` / `bottom-right` / `max`.")
     matched = match_windows(needle)
     if not matched:
-        raise GuiError("找不到符合的視窗。")
+        raise GuiError("No matching window was found.")
     hwnd, title = matched[0]
     ac = load_ac()
     try:
         ok = ac.snap_window(title, key)
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] snap_window failed: {error!r}", file=sys.stderr)
-        raise GuiError("靠邊排列失敗。") from error
+        raise GuiError("Failed to snap the window.") from error
     if not ok:
-        raise GuiError("靠邊排列失敗。")
+        raise GuiError("Failed to snap the window.")
     return hwnd, title
 
 
 def grid_windows(needles: list[str], *, gap: int = 0) -> int:
-    """把幾個視窗排成方格，回實際排了幾個。"""
+    """Arrange several windows in a grid; return how many were actually
+    arranged."""
     titles: list[str] = []
     for needle in needles:
         matched = match_windows(needle)
         if not matched:
-            raise GuiError(f"找不到符合「{needle}」的視窗。")
+            raise GuiError(f"No window matching \"{needle}\" was found.")
         titles.append(matched[0][1])
     ac = load_ac()
     try:
         return int(ac.arrange_grid(titles, gap=max(0, int(gap))))
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] arrange_grid failed: {error!r}", file=sys.stderr)
-        raise GuiError("排列視窗失敗。") from error
+        raise GuiError("Failed to arrange the windows.") from error
 
 
 # --------------------------------------------------------------------------
-# 背景視窗輸入（不搶焦點）
+# Background window input (without stealing focus)
 # --------------------------------------------------------------------------
-# 一般的 `!click` / `!key` 走系統層輸入，一定作用在**前景**視窗，所以遠端操作會
-# 打斷使用者當下在做的事。這條路徑改用 `PostMessage` 把訊息直接投遞給目標視窗。
+# The ordinary `!click` / `!key` use system-level input, which always acts on the
+# **foreground** window, so remote operation interrupts whatever the user is doing
+# at that moment. This path instead uses `PostMessage` to deliver messages
+# straight to the target window.
 #
-# **代價要講清楚**：投遞訊息不是真的輸入。很多程式（遊戲、要求 raw input 的程式、
-# 自己檢查前景狀態的程式）會直接忽略，而 `PostMessage` 成功只代表「訊息排進佇列
-# 了」，不代表對方處理了——這正是本專案最在意的「靜默成功」形態，所以呼叫端**必須**
-# 告訴使用者這條路是盡力而為，沒反應就改用前景操作。
+# **The cost must be stated clearly**: a posted message is not real input. Many
+# programs (games, programs that require raw input, programs that check the
+# foreground state themselves) simply ignore it, and a successful `PostMessage`
+# only means "the message was queued", not that the other side handled it—this is
+# exactly the "silent success" shape this project cares about most, so the caller
+# **must** tell the user this path is best-effort and to switch to foreground
+# operation if nothing happens.
 #
-# 走套件的 `post_key_to_window` / `post_click_to_window`，**不是**較舊的
-# `send_key_event_to_window`：後者投遞給頂層視窗，而鍵盤訊息是送給**有焦點的子
-# 控制項**的。實測（字元對應表）投遞給外框什麼都沒發生、投遞給焦點控制項字才進得
-# 去，所以舊路徑對任何有子控制項的程式都等於沒作用——又是一種靜默成功。
+# It uses the library's `post_key_to_window` / `post_click_to_window`, **not** the
+# older `send_key_event_to_window`: the latter posts to the top-level window, while
+# keyboard messages go to **the focused child control**. Measured (with Character
+# Map): posting to the frame did nothing, and only posting to the focused control
+# got the character in, so the old path is effectively a no-op for any program
+# with child controls—yet another kind of silent success.
 def send_key_to_window(needle: str, key: str) -> tuple[int, str, str]:
-    """把一次按鍵（按下＋放開）投遞給命中的視窗，不搶焦點。
+    """Post one key stroke (press + release) to the matching window, without
+    stealing focus.
 
-    回 `(hwnd, 標題, 正規化後的鍵名)`。
+    Returns `(hwnd, title, normalised key name)`.
     """
     name = parse_key_name(key)
     matched = match_windows(needle)
     if not matched:
-        raise GuiError("找不到符合的視窗。")
+        raise GuiError("No matching window was found.")
     hwnd, title = matched[0]
     ac = load_ac()
     try:
         posted = ac.post_key_to_window(title, _library_key(name))
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] post_key_to_window failed: {error!r}", file=sys.stderr)
-        raise GuiError("送出背景按鍵失敗。") from error
+        raise GuiError("Failed to send the background key press.") from error
     if not posted:
-        raise GuiError("送出背景按鍵失敗。")
+        raise GuiError("Failed to send the background key press.")
     return hwnd, title, name
 
 
 def send_click_to_window(needle: str, button: str, x: int, y: int
                          ) -> tuple[int, str]:
-    """把一次點選投遞給命中的視窗，不搶焦點。座標是**視窗內相對座標**。"""
+    """Post one click to the matching window, without stealing focus. The
+    coordinates are **relative to the window**."""
     key = parse_button(button)
     matched = match_windows(needle)
     if not matched:
-        raise GuiError("找不到符合的視窗。")
+        raise GuiError("No matching window was found.")
     hwnd, title = matched[0]
     ac = load_ac()
     try:
         posted = ac.post_click_to_window(title, key, int(x), int(y))
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] post_click_to_window failed: {error!r}", file=sys.stderr)
-        raise GuiError("送出背景點選失敗。") from error
+        raise GuiError("Failed to send the background click.") from error
     if not posted:
-        raise GuiError("送出背景點選失敗。")
+        raise GuiError("Failed to send the background click.")
     return hwnd, title
 
 
 # --------------------------------------------------------------------------
-# 等待條件：連接埠 / 行程 / 剪貼簿
+# Wait conditions: port / process / clipboard
 # --------------------------------------------------------------------------
-# 這三個都轉呼叫函式庫的 `smart_waits`：它同時擁有探測與輪詢，這裡只把「等一小段
-# 時間」的結果折成一個 bool，讓 bot 的監看迴圈照自己的節奏問。
+# All three delegate to the library's `smart_waits`: it owns both the probing and
+# the polling, and this only folds the result of "wait a short while" into a
+# bool, so the bot's watch loop can ask at its own pace.
 def parse_host_port(raw: str) -> tuple[str, int]:
-    """`8080` / `127.0.0.1:8080` / `example.com:443` → `(host, port)`。"""
+    """`8080` / `127.0.0.1:8080` / `example.com:443` → `(host, port)`."""
     text = (raw or "").strip()
     if not text:
-        raise GuiError("需要連接埠，例如 `8080` 或 `127.0.0.1:8080`。")
+        raise GuiError("A port is required, e.g. `8080` or `127.0.0.1:8080`.")
     host = "127.0.0.1"
     port_text = text
     if ":" in text:
@@ -1484,14 +1692,14 @@ def parse_host_port(raw: str) -> tuple[str, int]:
     try:
         port = int(port_text)
     except ValueError as error:
-        raise GuiError("連接埠必須是整數。") from error
+        raise GuiError("The port must be an integer.") from error
     if not 0 < port <= 65535:
-        raise GuiError("連接埠必須介於 1 到 65535。")
+        raise GuiError("The port must be between 1 and 65535.")
     return host, port
 
 
 def port_open(host: str, port: int, *, timeout: float = 1.5) -> bool:
-    """那個連接埠現在接不接得上。"""
+    """Whether that port accepts connections right now."""
     ac = load_ac()
     try:
         outcome = ac.wait_until_port(
@@ -1504,10 +1712,11 @@ def port_open(host: str, port: int, *, timeout: float = 1.5) -> bool:
 
 
 def process_running(name: str, *, timeout: float = 1.0) -> bool:
-    """有沒有這個名字的行程在跑（比對是套件那邊做的，不分大小寫的包含比對）。"""
+    """Whether a process with this name is running (the matching is done by the
+    library, as a case-insensitive substring match)."""
     target = (name or "").strip()
     if not target:
-        raise GuiError("需要行程名稱，例如 `notepad.exe`。")
+        raise GuiError("A process name is required, e.g. `notepad.exe`.")
     ac = load_ac()
     try:
         outcome = ac.wait_until_process(
@@ -1521,7 +1730,8 @@ def process_running(name: str, *, timeout: float = 1.0) -> bool:
 
 def clipboard_changed(baseline: str, *, contains: str = "",
                       timeout: float = 1.0) -> bool:
-    """剪貼簿變了沒；給了 `contains` 就改判「內容是否含那段字」。"""
+    """Whether the clipboard has changed; given `contains`, it instead checks
+    "whether the content contains that text"."""
     ac = load_ac()
     try:
         outcome = ac.wait_until_clipboard_changes(
@@ -1536,47 +1746,58 @@ def clipboard_changed(baseline: str, *, contains: str = "",
 
 
 # --------------------------------------------------------------------------
-# 文字辨識（OCR）
+# Text recognition (OCR)
 # --------------------------------------------------------------------------
-# **辨識與定位本身交給桌面自動化函式庫**（`find_text_matches` /
-# `read_text_in_region` / `group_lines`）。這裡曾經自己實作過一份，因為當時函式庫
-# 回的座標在這台主機上是錯的，而且錯得看不出來（點下去偏一點點，像是「有時候會
-# 失敗」而不是「壞了」）：全桌面截圖是**實體像素**（本機 3840×1244）而滑鼠座標是
-# 邏輯像素（3456×1244，副螢幕 125% 縮放），而且圖內座標被直接當成螢幕座標回傳，
-# 忽略了虛擬桌面原點（本機 y 從 −164 起算）。這兩個缺陷連同「只比對單一辨識詞、
-# 跨詞的目標永遠找不到」都已經在函式庫那邊修掉，所以本專案不再留第二份實作。
+# **Recognition and location themselves are handed to the desktop-automation
+# library** (`find_text_matches` / `read_text_in_region` / `group_lines`). This
+# module once had its own implementation, because back then the coordinates the
+# library returned were wrong on this host, and wrong in a way that did not show
+# (the click landed slightly off, looking like "sometimes fails" rather than
+# "broken"): a whole-desktop screenshot is in **physical pixels** (3840×1244
+# locally) while mouse coordinates are logical pixels (3456×1244, secondary
+# monitor at 125% scaling), and in-image coordinates were returned directly as
+# screen coordinates, ignoring the virtual-desktop origin (locally y starts at
+# −164). Both defects, together with "only single recognised words are matched,
+# so a target spanning words is never found", have been fixed on the library
+# side, so this project no longer keeps a second implementation.
 #
-# 這一段剩下的是**本機環境政策**，那本來就不屬於函式庫：
+# What remains in this section is **local environment policy**, which never
+# belonged to the library:
 #
-# * 引擎執行檔的位置（安裝檔不會把自己加進 PATH）；
-# * 語言資料放在專案內的 `ocr_tessdata/`（`TESSDATA_PREFIX` 指過去）而不是引擎的
-#   安裝目錄——安裝目錄在 `Program Files` 底下，沒有系統管理員權限寫不進去，要求
-#   使用者提權只為了補一個語言檔並不合理；
-# * 依目標字串自動選辨識語言（見 `ocr_lang_for`）。
+# * the location of the engine executable (the installer does not add itself to
+#   PATH);
+# * language data lives in the project's `ocr_tessdata/` (`TESSDATA_PREFIX`
+#   points there) rather than the engine's install directory—that directory is
+#   under `Program Files` and cannot be written without administrator rights, and
+#   asking the user to elevate just to add one language file is unreasonable;
+# * picking the recognition language automatically from the target string (see
+#   `ocr_lang_for`).
 LOCAL_TESSDATA = PROJECT_ROOT / "ocr_tessdata"
 
-# 安裝檔預設**不會**把自己加進 PATH（本機實測：裝完 `where tesseract` 仍然找不
-# 到）。只查 PATH 會讓這個功能在多數主機上默默不能用，所以補上慣例安裝位置。
+# By default the installer does **not** add itself to PATH (measured locally:
+# after installing, `where tesseract` still finds nothing). Checking only PATH
+# would leave this feature silently unusable on most hosts, so the conventional
+# install locations are added.
 TESSERACT_CANDIDATES = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
 )
 
-# 中日韓字元；用來決定預設辨識語言。
+# CJK characters; used to decide the default recognition language.
 _CJK_RE = re.compile(
     r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]")
 
 _OCR: Any = None
 _OCR_TRIED = False
 _OCR_CONFIGURED = False
-_OCR_REASON = "文字辨識未啟用：辨識引擎無法使用。"
+_OCR_REASON = "Text recognition is disabled: the recognition engine is unavailable."
 _OCR_PROBED_CMD: str | None = None
 
 
 def tesseract_cmd() -> str | None:
-    """辨識引擎執行檔的絕對路徑；找不到回 None。
+    """The absolute path of the recognition engine executable; None if not found.
 
-    順序：環境變數覆寫 → PATH → 慣例安裝位置。
+    Order: environment-variable override → PATH → conventional install locations.
     """
     override = (os.environ.get("TESSERACT_CMD") or "").strip()
     if override and Path(override).exists():
@@ -1592,25 +1813,32 @@ def tesseract_cmd() -> str | None:
 
 
 def _configure_ocr() -> None:
-    """把本機的引擎路徑與語言資料位置告訴桌面自動化函式庫（成功之後只做一次）。
+    """Tell the desktop-automation library the local engine path and
+    language-data location (only once, after it succeeds).
 
-    這兩件事是**本機環境政策**，不是辨識邏輯：引擎安裝檔不會把自己加進 PATH，
-    而語言資料放在專案內是因為引擎安裝目錄需要系統管理員權限。辨識本身交給函式
-    庫，本模組不再自己跑一份。
+    These two are **local environment policy**, not recognition logic: the engine
+    installer does not add itself to PATH, and the language data lives in the
+    project because the engine's install directory needs administrator rights.
+    Recognition itself is handed to the library; this module no longer runs its
+    own.
 
-    ⚠️ **沒找到執行檔時不要把「已設定過」記下來。** 這個旗標原本無條件設在函式
-    開頭，所以在一台還沒裝引擎的主機上，第一次呼叫就記成「設定過了」卻什麼都沒
-    設定；使用者之後把引擎裝好（bot 是被監督者長期執行的行程，不會自己重啟），
-    函式庫就**永遠**拿不到那個路徑——而實際的辨識是走函式庫，不是走本模組的
-    `_OCR`。失敗形態是安靜的：`ocr_status()` 說可用，每個辨識指令卻回泛用的
-    「文字辨識失敗。」。實測（2026-09-11）：晚裝引擎的情形下
-    `set_tesseract_cmd` 被呼叫 **0** 次，而乾淨啟動的對照組是 1 次。
+    ⚠️ **Do not record "already configured" when no executable was found.** This
+    flag used to be set unconditionally at the top of the function, so on a host
+    without the engine installed yet, the first call recorded "configured" while
+    configuring nothing; once the user later installed the engine (the bot is a
+    long-running process under a supervisor and does not restart by itself), the
+    library would **never** get that path—and actual recognition goes through the
+    library, not through this module's `_OCR`. The failure is quiet:
+    `ocr_status()` says it is available, while every recognition command returns
+    the generic "Text recognition failed.". Measured (2026-09-11): with the engine
+    installed late, `set_tesseract_cmd` was called **0** times, versus once in the
+    clean-start control.
     """
     global _OCR_CONFIGURED  # pylint: disable=global-statement
     if _OCR_CONFIGURED:
         return
     if LOCAL_TESSDATA.is_dir() and any(LOCAL_TESSDATA.glob("*.traineddata")):
-        # setdefault：使用者已經自己指定過就尊重他的設定。
+        # setdefault: if the user already set it themselves, respect their setting.
         os.environ.setdefault("TESSDATA_PREFIX", str(LOCAL_TESSDATA))
     command = tesseract_cmd()
     if not command:
@@ -1624,32 +1852,44 @@ def _configure_ocr() -> None:
 
 
 def _load_ocr() -> Any:
-    """回傳設定好的 `pytesseract` 模組；不可用就丟 `GuiError`。
+    """Return the configured `pytesseract` module; raise `GuiError` if it is
+    unavailable.
 
-    只剩**語言清單查詢**還需要它（函式庫的門面沒有這個入口）。實際的辨識與定位
-    走 `_ocr_call`，那是轉呼叫函式庫。
+    Only the **language-list query** still needs it (the library's facade has no
+    entry point for that). Actual recognition and location go through
+    `_ocr_call`, which delegates to the library.
 
-    ⚠️ **失敗的原因記在 `_OCR_REASON`，不要回頭呼叫 `ocr_status()` 去要那句話。**
-    這裡原本寫 `raise GuiError(ocr_status()[1])`，而 `ocr_status()` 當時的第三道
-    檢查就是呼叫 `_load_ocr()`——**例外的引數在 raise 之前就會被求值**，所以那個
-    `except GuiError` 永遠等不到，先撞的是 `RecursionError`（實測 1000 層）。順帶
-    把「辨識引擎執行檔無法執行。」那句話變成一次都沒回出去過的死碼。呼叫方向現在
-    是單向的：`ocr_status()`（回報）→ `_load_ocr()`（探測），而探測自己說得出理由。
-    `test_bot_helpers.py` 有一支跨專案的 AST 守門（`raise` 的引數不得走得回 raise
-    所在的函式）盯著這條邊不得反向——**行為測試抓不到**「只把其中一個 raise 改回
-    去」的回歸，因為下面的重探會讓那個環在第二層自己收斂，變異實測驗證過。
+    ⚠️ **The reason for a failure is recorded in `_OCR_REASON`; do not call back
+    into `ocr_status()` to ask for that sentence.** This used to read
+    `raise GuiError(ocr_status()[1])`, and the third check in `ocr_status()` back
+    then was a call to `_load_ocr()`—**the exception's argument is evaluated
+    before the raise**, so that `except GuiError` was never reached; what hit first
+    was a `RecursionError` (measured at 1000 levels). Along the way it turned the
+    sentence "the recognition engine executable cannot run." into dead code that was
+    never sent even once. The call direction is now one-way: `ocr_status()`
+    (reporting) → `_load_ocr()` (probing), and the probe can state the reason
+    itself. `test_bot_helpers.py` has a cross-project AST guard (a `raise`'s
+    argument must not lead back to the function containing the raise) watching
+    that this edge never reverses—**behaviour tests cannot catch** a regression
+    that "reverts just one of the raises", because the re-probe below makes that
+    cycle converge on its own at the second level, as verified by a mutation run.
 
-    ⚠️ **失敗的結果只快取到「探測當下看到的執行檔路徑」為止。** 只記一個
-    `_OCR_TRIED` 的話，一台還沒裝引擎的主機上，第一個辨識指令就把 `_OCR=None` 記
-    死；使用者之後把引擎裝好，這裡永遠不重試。而那正是上面那個遞迴最容易被觸發的
-    路徑：實測「沒裝引擎 → 下過一次文字指令 → 把引擎裝好」之後，這個長命行程的
-    `ocr_status()` 與 `_load_ocr()` 就永久 `RecursionError`，不需要壞掉的安裝、
-    不需要架構不符、也不需要錯的 `TESSERACT_CMD`。成功的結果**永久快取**，而且在
-    `tesseract_cmd()`（會掃 PATH，本機實測 4.0 ms）之前就早退——`wait_text` 每
-    0.5 秒輪詢一次 `find_text`，那條路不能有多餘的成本（實測早退 0.0001 ms/次）。
+    ⚠️ **A failed result is only cached for as long as "the executable path seen
+    at probe time" stays the same.** Recording only `_OCR_TRIED` would, on a host
+    without the engine installed yet, pin `_OCR=None` on the first recognition
+    command; once the user later installed the engine, this would never retry. And
+    that is exactly the path most likely to trigger the recursion above: measured,
+    after "no engine installed → one text command issued → engine installed", this
+    long-lived process's `ocr_status()` and `_load_ocr()` hit `RecursionError`
+    permanently, with no broken install, no architecture mismatch and no wrong
+    `TESSERACT_CMD` needed. A successful result is **cached permanently**, and
+    returns early before `tesseract_cmd()` (which scans PATH, measured locally at
+    4.0 ms)—`wait_text` polls `find_text` every 0.5 seconds, and that path cannot
+    afford any extra cost (the early return measured 0.0001 ms per call).
 
-    殘留（兩者都要重啟 bot，而且都比原本的 `RecursionError` 好）：在**同一個路徑**
-    上把壞掉的引擎原地修好、以及行程跑起來之後才 pip 裝上那個 Python 套件。
+    Remaining gaps (both need a bot restart, and both are better than the original
+    `RecursionError`): repairing a broken engine in place at **the same path**, and
+    pip-installing that Python package after the process has started.
     """
     global _OCR, _OCR_TRIED, _OCR_REASON, _OCR_PROBED_CMD  # pylint: disable=global-statement
     if _OCR is not None:
@@ -1663,13 +1903,14 @@ def _load_ocr() -> Any:
         import pytesseract  # type: ignore
     except ImportError as error:
         print(f"[gui] pytesseract unavailable: {error!r}", file=sys.stderr)
-        _OCR_REASON = "文字辨識未啟用：缺少辨識用的 Python 套件。"
+        _OCR_REASON = "Text recognition is disabled: the Python package used for recognition is missing."
     else:
         _configure_ocr()
         if not command:
-            # 沒有執行檔就不要去問版本——問了也只會失敗，然後把「沒裝」報成
-            # 「無法執行」，指向錯誤的那一半。
-            _OCR_REASON = "文字辨識未啟用：辨識引擎執行檔未安裝。"
+            # With no executable, do not ask for the version—asking would only
+            # fail and then report "not installed" as "cannot run", pointing at
+            # the wrong half.
+            _OCR_REASON = "Text recognition is disabled: the recognition engine executable is not installed."
         else:
             pytesseract.pytesseract.tesseract_cmd = command
             try:
@@ -1678,81 +1919,107 @@ def _load_ocr() -> Any:
             except Exception as error:  # pylint: disable=broad-except
                 print(f"[gui] tesseract binary unusable: {error!r}",
                       file=sys.stderr)
-                _OCR_REASON = "文字辨識未啟用：辨識引擎執行檔無法執行。"
+                _OCR_REASON = "Text recognition is disabled: the recognition engine executable cannot run."
     if _OCR is None:
         raise GuiError(_OCR_REASON)
     return _OCR
 
 
 def _ocr_no_language_data(langs: list[str], known: bool) -> bool:
-    """「引擎答得出語言清單，而且清單真的是空的」。
+    """True when "the engine can answer with a language list, and the list
+    really is empty".
 
-    ⚠️ **這條判準有兩個地方在用，但只有一個真的呼叫本函式。** `ocr_status` 直接
-    呼叫它（回報整個功能不可用）；`ocr_lang_for` 表達的是同一個退化情形，但**不能**
-    改寫成呼叫本函式——它的白名單還要擋「清單非空、但這個代碼不在裡面」，那是更寬
-    的一條規則，`known and not langs` 只是它的一個特例。所以兩邊是**語意耦合、不是
-    程式碼共用**：其中一邊改掉不會有任何症狀（`/sys doctor` 說可用而每個辨識指令都
-    硬失敗，正好是這條判準要消滅的不一致），只有對帳測試會事後變紅。因此兩邊都留
-    了指向對方的註解——那是唯一在**事前**提醒的東西。
-    `test_gui_control.py` 餵同一份 `(langs, known)` 語料給兩個呼叫端比答案。
+    ⚠️ **This criterion is used in two places, but only one actually calls this
+    function.** `ocr_status` calls it directly (to report the whole feature as
+    unavailable); `ocr_lang_for` expresses the same degenerate case but **must
+    not** be rewritten to call this function—its whitelist must also block "the
+    list is non-empty but this code is not in it", which is a wider rule, and
+    `known and not langs` is only one special case of it. So the two sides are
+    **semantically coupled, not sharing code**: changing one side produces no
+    symptom at all (`/sys doctor` says available while every recognition command
+    fails hard, which is exactly the inconsistency this criterion exists to
+    eliminate), and only the reconciliation test turns red after the fact. That is
+    why both sides carry a comment pointing at the other—the only thing that warns
+    **beforehand**. `test_gui_control.py` feeds the same `(langs, known)` corpus
+    to both callers and compares the answers.
 
-    `known is False`（問不到）**不算**沒有語言資料：那半的成因幾乎都是引擎本身載
-    不起來，而那件事由前面的探測報得更準；為一次列舉打嗝就宣告整個功能不可用，
-    正是 `ocr_lang_for` 的白名單刻意不做的事（見那裡的兩個 ⚠️）。
+    `known is False` (could not ask) **does not count** as having no language data:
+    that half is almost always caused by the engine itself failing to load, which
+    the earlier probe reports more precisely; declaring the whole feature
+    unavailable because one enumeration hiccuped is exactly what `ocr_lang_for`'s
+    whitelist deliberately does not do (see the two ⚠️ there).
     """
     return known and not langs
 
 
 def ocr_status() -> tuple[bool, str]:
-    """`(可用嗎, 說明)`。說明是寫死的泛用字串，可直接回給使用者。
+    """`(available?, explanation)`. The explanation is a hardcoded generic string
+    that can be sent straight to the user.
 
-    文字辨識需要**三**件東西，所以分開回報，使用者才知道要補哪一塊：Python 套件、
-    **另外安裝**的辨識引擎執行檔、以及至少一個語言資料檔。前兩塊由 `_load_ocr()`
-    探測、而且由它自己說出理由（見那裡的兩個 ⚠️；`ocr_status` 不得再自己複製一份
-    判斷，否則兩邊會各說各話——原本那三道重複的檢查就是遞迴的來源）。
+    Text recognition needs **three** things, so they are reported separately and
+    the user knows which piece to supply: the Python package, the **separately
+    installed** recognition engine executable, and at least one language data
+    file. The first two are probed by `_load_ocr()`, which also states the reason
+    itself (see the two ⚠️ there; `ocr_status` must not keep its own copy of that
+    judgement, or the two would each tell a different story—the original three
+    duplicated checks were the source of the recursion).
 
-    第三塊是 2026-09-11 補的：`ocr_lang_for` 從那天起會在「引擎答了、語言清單是空
-    的」時擋下 `--lang`，而沒有 `--lang` 的那條路會回 `eng`（同樣沒安裝）讓引擎自
-    己丟錯，所以那種機器上 `/locate text find` / `/locate text click` /
-    `/locate text wait` 三個指令**都不可能成功**——而 `/sys doctor` 當時還是報綠燈。
-    doctor 對這一格的建議句本來就寫「那三個指令都關了，圖片定位仍然可用」，在零語
-    言的機器上那句話是誠實的，所以 doctor 那一側不需要改。
+    The third was added on 2026-09-11: from that day `ocr_lang_for` blocks
+    `--lang` when "the engine answered and the language list is empty", and the
+    path without `--lang` returns `eng` (also not installed) and lets the engine
+    raise, so on such a machine the three commands `/locate text find` /
+    `/locate text click` / `/locate text wait` **cannot possibly succeed**—while
+    `/sys doctor` still showed green at the time. Doctor's advice for this item
+    already says "those three commands are all off, image location still works",
+    which is honest on a machine with zero languages, so the doctor side needs no
+    change.
 
-    **刻意接受的取捨**：原本第一道 `import pytesseract` 是每次重算的，現在跟著
-    `_load_ocr` 的 `_OCR_PROBED_CMD` 走，所以「行程跑起來之後才 pip 裝上套件」要
-    重啟 bot 才會被看見。換到的是「晚裝引擎會自動被重探」，那個情境常見得多。
+    **A deliberately accepted trade-off**: the first check, `import pytesseract`,
+    used to be re-evaluated every time; it now follows `_load_ocr`'s
+    `_OCR_PROBED_CMD`, so "pip-installing the package after the process has
+    started" is only noticed after a bot restart. What we get in exchange is "an
+    engine installed late is re-probed automatically", which is a far more common
+    situation.
     """
     try:
         _load_ocr()
     except GuiError as error:
-        # `_load_ocr` 只會丟本模組寫死的三個字串之一（`_OCR_REASON`），所以直接
-        # 轉述不會踩 Secrecy Layer 1；原始例外只進 stderr。
+        # `_load_ocr` only raises one of this module's hardcoded strings
+        # (`_OCR_REASON`), so relaying it directly does not violate Secrecy
+        # Layer 1; the raw exception only goes to stderr.
         return False, str(error)
     langs, known = ocr_languages()
     if _ocr_no_language_data(langs, known):
-        return False, "文字辨識未啟用：缺少語言辨識資料。"
-    return True, "文字辨識可用。"
+        return False, "Text recognition is disabled: language recognition data is missing."
+    return True, "Text recognition is available."
 
 
 def ocr_languages() -> tuple[list[str], bool]:
-    """`(已安裝的語言, 問得到嗎)`。
+    """`(installed languages, could we ask?)`.
 
-    ⚠️ **兩個值不能合成一個。** `([], True)` ＝ 引擎答了、**真的一個語言都沒有**；
-    `([], False)` ＝ **問不到**（引擎沒裝／列舉本身失敗）。合成之後這兩件事在呼叫端
-    長得一模一樣，而它們該有**相反**的處置——`ocr_lang_for` 的白名單就是這樣安靜
-    失效的：`t for t in wanted if available and t not in available`，空清單讓
-    `available and …` 短路掉，整道檢查消失而沒有任何症狀。
-    同型別的做法本專案已經有三處：`_process_control._find_all_webrunner_pids`、
-    `discord_bot._load_pid`、`discord_bot._webrunner_liveness`。
+    ⚠️ **The two values must not be merged into one.** `([], True)` = the engine
+    answered and **there really are no languages**; `([], False)` = **could not
+    ask** (engine not installed / the enumeration itself failed). Merged, these two
+    look identical to the caller, while they need **opposite** handling—that is how
+    `ocr_lang_for`'s whitelist silently stopped working:
+    `t for t in wanted if available and t not in available`, where an empty list
+    short-circuits `available and …` and the whole check disappears without any
+    symptom. This project already does the same kind of thing in three places:
+    `_process_control._find_all_webrunner_pids`, `discord_bot._load_pid`,
+    `discord_bot._webrunner_liveness`.
 
-    `([], True)` 是**真的到得了**，不是理論上的：實測把 `TESSDATA_PREFIX` 指到一個
-    空目錄或不存在的目錄，引擎 rc=0、`get_languages(config="")` 回 `[]`，不丟例外。
+    `([], True)` is **really reachable**, not theoretical: measured, pointing
+    `TESSDATA_PREFIX` at an empty or nonexistent directory gives engine rc=0 and
+    `get_languages(config="")` returns `[]` without raising.
 
-    ⚠️ **不要傳 `cached=True` 給 `get_languages`。** 底層是 `@run_once`，而它只在
-    收到那個旗標時才快取（`pytesseract.py:162`：
-    `if not kwargs.pop('cached', False) or wrapper._result is wrapper`）。現在每次
-    都是真的重問，所以使用者補上語言檔之後不必重啟 bot；加上快取的話，一次早期的
-    `[]` 會凍結整個行程的壽命，而在下面那條新規則底下那等於永久硬擋。
+    ⚠️ **Do not pass `cached=True` to `get_languages`.** The low level is
+    `@run_once`, and it only caches when it receives that flag
+    (`pytesseract.py:162`:
+    `if not kwargs.pop('cached', False) or wrapper._result is wrapper`). Right now
+    it really asks again every time, so after the user adds a language file there is
+    no need to restart the bot; with caching, one early `[]` would be frozen for the
+    whole lifetime of the process, which under the new rule below amounts to a
+    permanent hard block.
     """
     try:
         return sorted(_load_ocr().get_languages(config="")), True
@@ -1761,53 +2028,69 @@ def ocr_languages() -> tuple[list[str], bool]:
 
 
 def ocr_lang_for(target: str, explicit: str | None = None) -> str:
-    """決定辨識語言。
+    """Decide the recognition language.
 
-    預設會**看目標字串自動選**：使用者要找「確定」卻用英文模型辨識，結果是永遠
-    找不到而且沒有任何線索說明為什麼。要求每次都打 `--lang chi_tra` 才是真正的
-    陷阱，所以含中日韓字元就自動掛上中文模型。
+    By default it is **chosen automatically from the target string**: a user
+    looking for a Chinese label (say, the "OK" button) with an English model will
+    never find it and gets no clue why. Requiring `--lang chi_tra` every time is the real trap, so a target
+    containing CJK characters automatically gets the Chinese model.
 
-    目標是空的（`read_text` 那種「畫面上寫了什麼」的用法）時同樣掛上中文模型：
-    不知道要讀到什麼，就用涵蓋最廣的那組。
+    An empty target (the "what does the screen say" use of `read_text`) also gets
+    the Chinese model: when you do not know what you will read, use the set with
+    the widest coverage.
 
-    `--lang` 的白名單**問不到清單時放行、清單真的是空的時擋下**。這兩種以前都是
-    空清單、走同一條路（都放行），而它們該有相反的處置：
+    The `--lang` whitelist **lets it through when the list cannot be asked for,
+    and blocks it when the list really is empty**. Both used to be an empty list
+    and took the same path (both let through), while they need opposite handling:
 
-    * **問不到（`known is False`）→ 放行。** 最常見的成因就是引擎根本沒裝，而那件事
-      由下游的 `_ocr_call` 報成「文字辨識未啟用：…」——一句使用者補得了的話。在這裡
-      擋下只會把它換成「沒有安裝這個語言的辨識資料」，指向錯誤的那一半。代價也完全
-      不對稱：列舉打個嗝就讓整個文字辨識不能用，而放行的下場只是引擎自己丟一個明確
-      的錯（實測給沒安裝的語言 → `TesseractError`，已由 `_ocr_call` 折成泛用訊息，
-      所以也不會把 tessdata 路徑洩到聊天室）。
-    * **引擎答了、清單是空的（`known and not langs`）→ 擋。** 這種機器上任何辨識都
-      不會成功，明講「已安裝：（無）」比讓引擎丟一個泛用的「文字辨識失敗」好。
-      這條在修好之前是**死碼**：空清單時 `missing` 也一定是空的，`or "（無）"` 那一
-      支永遠走不到。
-      ⚠️ 已知的近似案例，是**選定的取捨不是漏看**：底層用 `LANG_PATTERN`
-      （`^[a-z_]+$`，`pytesseract.py:51`）過濾語言名，所以只裝了大寫 script 模型
-      （`Latin` / `script/Han`）的機器也會回空清單，於是連 `--lang Latin` 一起擋掉。
-      那種機器本來就只剩這一條路能用——自動選語言那一段會回 `eng`，而 `eng` 沒裝。
+    * **Could not ask (`known is False`) → let through.** The most common cause is
+      that the engine is not installed at all, which the downstream `_ocr_call`
+      reports as "Text recognition is disabled: …"—a sentence the user can act on.
+      Blocking here would only replace it with "No recognition data is installed
+      for this language", pointing at the wrong half. The costs are also completely
+      asymmetric: one hiccup in the enumeration would make all text recognition
+      unusable, whereas letting it through only ends with the engine raising a clear
+      error itself (measured, an uninstalled language → `TesseractError`, already
+      folded by `_ocr_call` into a generic message, so the tessdata path does not
+      leak into the chat either).
+    * **The engine answered and the list is empty (`known and not langs`) →
+      block.** No recognition can succeed on such a machine, and saying
+      "Installed: (none)" outright is better than letting the engine raise a
+      generic "Text recognition failed". Before the fix this was **dead code**:
+      with an empty list `missing` is always empty too, so the `or "(none)"`
+      branch was never reached.
+      ⚠️ A known near-miss that is **a chosen trade-off, not an oversight**: the
+      low level filters language names with `LANG_PATTERN` (`^[a-z_]+$`,
+      `pytesseract.py:51`), so a machine with only capitalised script models
+      (`Latin` / `script/Han`) also returns an empty list, and `--lang Latin` is
+      blocked along with it. On such a machine this is the only path that could
+      work anyway—the automatic language choice would return `eng`, and `eng` is
+      not installed.
 
-    自動選語言那一段直接用 `langs`：它在上面兩種情況下都是 `[]`，而「不知道有什麼就
-    退回 eng」本來就是它的政策，不是被跳過的檢查。
+    The automatic language choice uses `langs` directly: it is `[]` in both cases
+    above, and "fall back to eng when you do not know what is there" is its policy
+    anyway, not a skipped check.
     """
     langs, known = ocr_languages()
     if explicit:
         wanted = [t.strip() for t in explicit.split("+") if t.strip()]
         if not wanted or any(not HOTKEY_TOKEN_RE.match(t) for t in wanted):
-            raise GuiError("語言代碼只能是英數字，用 `+` 分隔。")
-        # ⚠️ `langs` 是空的時候每個代碼都會落進 `missing`——那個退化情形就是
-        # `_ocr_no_language_data`，`ocr_status` 用它回報整個功能不可用。這裡
-        # **不能**改成呼叫它（白名單還要擋「清單非空但代碼不在裡面」，那是更寬
-        # 的一條規則），所以兩邊是語意耦合、不是程式碼共用；有對帳測試盯著。
-        # `if known:` 刻意單獨一行：跳過白名單是一個**看得見的決定**。寫成
-        # `if known and any(...)` 會重現這個缺陷原本的形狀（一行 `X and Y`，
-        # 其中一個運算元為假就把整道檢查靜靜關掉）。
+            raise GuiError("Language codes may only contain letters and digits, separated by `+`.")
+        # ⚠️ When `langs` is empty, every code lands in `missing`—that degenerate
+        # case is `_ocr_no_language_data`, which `ocr_status` uses to report the
+        # whole feature as unavailable. This **must not** be changed to call it
+        # (the whitelist must also block "the list is non-empty but the code is
+        # not in it", a wider rule), so the two sides are semantically coupled,
+        # not sharing code; a reconciliation test watches them.
+        # `if known:` is deliberately on its own line: skipping the whitelist is a
+        # **visible decision**. Writing `if known and any(...)` would recreate the
+        # original shape of this defect (a single `X and Y` line, where one false
+        # operand quietly switches off the whole check).
         if known:
             missing = [t for t in wanted if t not in langs]
             if missing:
-                listed = " / ".join(langs) or "（無）"
-                raise GuiError(f"沒有安裝這個語言的辨識資料。已安裝：{listed}")
+                listed = " / ".join(langs) or "(none)"
+                raise GuiError(f"No recognition data is installed for this language. Installed: {listed}")
         return "+".join(wanted)
     if not (target or "").strip() or _CJK_RE.search(target or ""):
         for chinese in ("chi_tra", "chi_sim", "jpn"):
@@ -1817,10 +2100,13 @@ def ocr_lang_for(target: str, explicit: str | None = None) -> str:
 
 
 def _logical_frame(region: list[int] | None):
-    """`(圖, 原點x, 原點y)`——圖上的一個像素 = 一個點選座標。
+    """`(image, origin x, origin y)`—one pixel in the image = one click
+    coordinate.
 
-    轉呼叫函式庫的 `grab_logical`。限定區域**不只是過濾結果**，是真的只截那一
-    塊：辨識與比對的成本跟像素數成正比，實測 600×400 的區域比整個桌面快 4 倍。
+    Delegates to the library's `grab_logical`. Limiting to a region **is not just
+    filtering the results**; it really captures only that area: the cost of
+    recognition and matching is proportional to the pixel count, and a 600×400
+    region measured 4 times faster than the whole desktop.
     """
     try:
         return load_ac().grab_logical(_region_xywh(region))
@@ -1828,11 +2114,12 @@ def _logical_frame(region: list[int] | None):
         raise
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] grab_logical failed: {error!r}", file=sys.stderr)
-        raise GuiError("截圖失敗。") from error
+        raise GuiError("Screenshot failed.") from error
 
 
 def _region_xywh(region: list[int] | None) -> tuple[int, int, int, int] | None:
-    """本模組用 bbox `[左, 上, 右, 下]`，函式庫要 `(x, y, 寬, 高)`。"""
+    """This module uses the bbox `[left, top, right, bottom]`; the library wants
+    `(x, y, width, height)`."""
     if region is None:
         return None
     left, top, right, bottom = region
@@ -1840,11 +2127,14 @@ def _region_xywh(region: list[int] | None) -> tuple[int, int, int, int] | None:
 
 
 def _ocr_call(name: str, *args, **kwargs) -> Any:
-    """呼叫函式庫的辨識入口，並把它的例外折成本模組的泛用 `GuiError`。
+    """Call the library's recognition entry point, folding its exceptions into
+    this module's generic `GuiError`.
 
-    「引擎沒裝」與「辨識失敗」分開回報：前者使用者補得了（去裝引擎），後者只能
-    看 log。型別用名字比對而不是 import，避免為了一個例外型別把辨識後端的模組
-    在 import 時就拉進來。
+    "Engine not installed" and "recognition failed" are reported separately: the
+    user can fix the former (install the engine), while the latter can only be
+    investigated in the log. The type is matched by name rather than imported, to
+    avoid pulling in the recognition backend's module at import time just for one
+    exception type.
     """
     ac = load_ac()
     _configure_ocr()
@@ -1854,16 +2144,18 @@ def _ocr_call(name: str, *args, **kwargs) -> Any:
         print(f"[gui] ocr {name} failed: {error!r}", file=sys.stderr)
         if type(error).__name__ == "OCRBackendNotAvailableError":
             raise GuiError(ocr_status()[1]) from error
-        raise GuiError("文字辨識失敗。") from error
+        raise GuiError("Text recognition failed.") from error
 
 
 def read_text(*, region: list[int] | None = None, lang: str | None = None,
               min_confidence: float = 60.0) -> list[dict[str, Any]]:
-    """把畫面（或指定區域）上的文字整段讀出來，一行一筆。
+    """Read out all the text on the screen (or a given region), one entry per
+    line.
 
-    辨識與座標換算都在函式庫裡；這裡只做「把詞併成行」的呈現。行的判定用函式庫
-    的 `group_lines`（依垂直重疊分組），而不是引擎自己的行編號——不是每個辨識後端
-    都會回報行編號。
+    Recognition and coordinate conversion are both in the library; this only
+    handles the presentation of "joining words into lines". Lines are decided by
+    the library's `group_lines` (grouping by vertical overlap) rather than the
+    engine's own line numbers—not every recognition backend reports line numbers.
     """
     ac = load_ac()
     words = _ocr_call("read_text_in_region", region=_region_xywh(region),
@@ -1884,15 +2176,19 @@ def read_text(*, region: list[int] | None = None, lang: str | None = None,
 def find_text(target: str, *, region: list[int] | None = None,
               min_confidence: float = 60.0, lang: str | None = None,
               case_sensitive: bool = False) -> list[dict[str, Any]]:
-    """在螢幕上找文字，回 `[{text, x, y, confidence}, …]`（點選座標）。
+    """Find text on the screen, returning `[{text, x, y, confidence}, …]` (click
+    coordinates).
 
-    比對與座標換算都在函式庫裡：它會在同一行內找「最短的一段連續詞，串起來之後
-    包含目標」——辨識引擎把一行切成很多塊，只比對單一塊會讓「另存新檔」這種很
-    正常的目標永遠找不到。本模組只保留**選語言**這層政策（見 `ocr_lang_for`），
-    以及把結果轉成呼叫端用的欄位名。
+    Matching and coordinate conversion are both in the library: within one line
+    it finds "the shortest run of consecutive words that, joined together,
+    contains the target"—the recognition engine cuts a line into many pieces, and
+    matching only single pieces would mean a perfectly ordinary target like
+    "Save As" is never found. This module keeps only the **language choice**
+    policy (see `ocr_lang_for`) and the conversion of results into the field names
+    the caller uses.
     """
     if not (target or "").strip():
-        raise GuiError("請給要尋找的文字。")
+        raise GuiError("Give the text to look for.")
     resolved = ocr_lang_for(target, lang)
     matches = _ocr_call("find_text_matches", target, resolved,
                         _region_xywh(region), min_confidence, case_sensitive)
@@ -1905,11 +2201,12 @@ def click_text(target: str, *, button: str = "mouse_left",
                region: list[int] | None = None,
                min_confidence: float = 60.0,
                lang: str | None = None) -> tuple[int, int]:
-    """找到文字就點下去，回實際點選的座標。命中多處時點畫面上最前面那一處。"""
+    """Click the text once found, returning the coordinates actually clicked.
+    With several matches, click the first one on screen."""
     matches = find_text(target, region=region, min_confidence=min_confidence,
                         lang=lang)
     if not matches:
-        raise GuiError("畫面上找不到那段文字。")
+        raise GuiError("That text was not found on the screen.")
     x, y = matches[0]["x"], matches[0]["y"]
     mouse_click(button, x, y)
     return x, y
@@ -1919,7 +2216,8 @@ def wait_text(target: str, timeout: float, *, region: list[int] | None = None,
               poll: float = 0.5, min_confidence: float = 60.0,
               lang: str | None = None,
               should_abort: Callable[[], bool] | None = None) -> tuple[int, int]:
-    """等文字出現在螢幕上，回它的中心座標。逾時丟 `GuiError`。"""
+    """Wait for text to appear on the screen, returning its centre coordinates.
+    Raises `GuiError` on timeout."""
     deadline = time.monotonic() + timeout
     while True:
         _check_abort(should_abort)
@@ -1928,26 +2226,30 @@ def wait_text(target: str, timeout: float, *, region: list[int] | None = None,
         if matches:
             return matches[0]["x"], matches[0]["y"]
         if time.monotonic() >= deadline:
-            raise GuiError("等到逾時仍沒有在畫面上看到那段文字。")
+            raise GuiError("Timed out and that text still did not appear on the screen.")
         _sleep_abortable(poll, should_abort)
 
 
 # --------------------------------------------------------------------------
-# 圖片定位
+# Image location
 # --------------------------------------------------------------------------
-# 比對本身交給桌面自動化函式庫的 `match_template_all`：它會回**相似度分數**、
-# 用 NMS 併掉同一個目標周圍那一整片高分點、擋掉單色樣板，而且擷取走
-# `grab_logical`（涵蓋所有螢幕、換算回點選座標空間）。這幾件事本專案曾經各寫過
-# 一份，現在單一來源在函式庫那邊。
+# The matching itself is handed to the desktop-automation library's
+# `match_template_all`: it returns a **similarity score**, uses NMS to merge the
+# whole patch of high-scoring points around one target, rejects flat single-colour
+# templates, and captures through `grab_logical` (covering every monitor,
+# converting back into the click coordinate space). This project once had its own
+# copy of each of these; the single source is now on the library side.
 #
-# 這裡剩下的是**錯誤訊息的去識別化**：函式庫的訊息是英文、而且會帶樣板圖的路徑，
-# 兩者都不能直接送進對話平台。
+# What remains here is **de-identifying the error messages**: the library's
+# messages are in English and carry the template image's path, and neither may be
+# sent straight into the chat platform.
 LOCATE_MAX_HITS = 20
 
 
 def _locate_all(image_path: str, threshold: float,
                 region: list[int] | None = None) -> list[tuple[int, int, float]]:
-    """樣板比對，回 `[(中心x, 中心y, 相似度), …]`，相似度高的在前。"""
+    """Template matching, returning `[(centre x, centre y, similarity), …]`,
+    highest similarity first."""
     ac = load_ac()
     try:
         matches = ac.match_template_all(
@@ -1955,38 +2257,43 @@ def _locate_all(image_path: str, threshold: float,
             min_score=float(threshold), max_results=LOCATE_MAX_HITS)
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] match_template_all failed: {error!r}", file=sys.stderr)
-        # 單色樣板是使用者改得了的（重截一塊有圖案的），值得講清楚；其餘只回
-        # 泛用句。用型別名稱比對，避免為了一個例外型別多一個 import。
+        # A flat single-colour template is something the user can fix (capture an
+        # area with a pattern instead), so it is worth spelling out; everything
+        # else gets only a generic sentence. Match on the type name to avoid an
+        # extra import just for one exception type.
         if type(error).__name__ == "AutoControlFlatTemplateException":
             raise GuiError(
-                "樣板圖幾乎是單一顏色，無法定位；請截一塊有圖案或文字的區域。"
+                "The template image is almost a single colour and cannot be located; "
+                "please capture an area with a pattern or text."
             ) from error
         if isinstance(error, (OSError, ValueError)):
-            raise GuiError("樣板圖讀取失敗（格式不支援？）。") from error
-        raise GuiError("圖片比對失敗。") from error
+            raise GuiError("Failed to read the template image (unsupported format?).") from error
+        raise GuiError("Image matching failed.") from error
     return [(match.center[0], match.center[1], match.score) for match in matches]
 
 
 def locate_image(image_path: str, *, threshold: float = 0.9,
                  region: list[int] | None = None) -> tuple[int, int]:
-    """在螢幕上找一張樣板圖，回最相似那一處的中心座標。"""
+    """Find a template image on the screen, returning the centre coordinates of
+    the most similar spot."""
     hits = _locate_all(image_path, threshold, region)
     if not hits:
-        raise GuiError("畫面上找不到這張圖。")
+        raise GuiError("This image was not found on the screen.")
     return hits[0][0], hits[0][1]
 
 
 def locate_image_all(image_path: str, *, threshold: float = 0.9,
                      region: list[int] | None = None
                      ) -> list[tuple[int, int, float]]:
-    """找出所有命中處。"""
+    """Find every match."""
     return _locate_all(image_path, threshold, region)
 
 
 def click_image(image_path: str, *, button: str = "mouse_left",
                 threshold: float = 0.9,
                 region: list[int] | None = None) -> tuple[int, int]:
-    """找到樣板圖就點它的中心，回座標。"""
+    """Click the centre of the template image once found; return the
+    coordinates."""
     x, y = locate_image(image_path, threshold=threshold, region=region)
     mouse_click(button, x, y)
     return x, y
@@ -1996,9 +2303,11 @@ def wait_image(image_path: str, timeout: float, *, poll: float = 0.6,
                threshold: float = 0.9, region: list[int] | None = None,
                should_abort: Callable[[], bool] | None = None
                ) -> tuple[int, int]:
-    """等一張圖出現在畫面上，回它的中心座標。逾時丟 `GuiError`。
+    """Wait for an image to appear on the screen, returning its centre
+    coordinates. Raises `GuiError` on timeout.
 
-    辨識引擎沒裝時，這是唯一能用畫面內容做同步點的方法（`wait_text` 不可用）。
+    When the recognition engine is not installed, this is the only way to use
+    screen content as a synchronisation point (`wait_text` is unavailable).
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -2007,21 +2316,24 @@ def wait_image(image_path: str, timeout: float, *, poll: float = 0.6,
         if hits:
             return hits[0][0], hits[0][1]
         if time.monotonic() >= deadline:
-            raise GuiError("等到逾時仍沒有在畫面上看到這張圖。")
+            raise GuiError("Timed out and this image still did not appear on the screen.")
         _sleep_abortable(poll, should_abort)
 
 
 # --------------------------------------------------------------------------
-# 等待「消失」與等待顏色
+# Waiting for "gone" and waiting for a colour
 # --------------------------------------------------------------------------
-# 等東西**出現**只解決一半的同步問題。另一半更常見：等載入轉圈圈消失、等對話框
-# 關掉、等「處理中」變成別的東西。沒有這一組的話，那些情況只能盲等一個猜出來的
-# 秒數，而猜太短就在畫面還沒好的時候亂點。
+# Waiting for something to **appear** solves only half of the synchronisation
+# problem. The other half is more common: waiting for a loading spinner to
+# disappear, for a dialog to close, for "Processing" to turn into something else.
+# Without this set, those cases can only blindly wait a guessed number of seconds,
+# and guessing too short means clicking about before the screen is ready.
 def wait_text_gone(target: str, timeout: float, *,
                    region: list[int] | None = None, poll: float = 0.5,
                    min_confidence: float = 60.0, lang: str | None = None,
                    should_abort: Callable[[], bool] | None = None) -> None:
-    """等某段文字從畫面上消失。逾時丟 `GuiError`。"""
+    """Wait for some text to disappear from the screen. Raises `GuiError` on
+    timeout."""
     deadline = time.monotonic() + timeout
     while True:
         _check_abort(should_abort)
@@ -2029,34 +2341,36 @@ def wait_text_gone(target: str, timeout: float, *,
                          lang=lang):
             return
         if time.monotonic() >= deadline:
-            raise GuiError("等到逾時，那段文字還在畫面上。")
+            raise GuiError("Timed out and that text is still on the screen.")
         _sleep_abortable(poll, should_abort)
 
 
 def wait_window_gone(needle: str, timeout: float, poll: float = 0.5, *,
                      should_abort: Callable[[], bool] | None = None) -> None:
-    """等符合的視窗消失（關掉）。逾時丟 `GuiError`。"""
+    """Wait for the matching window to disappear (close). Raises `GuiError` on
+    timeout."""
     deadline = time.monotonic() + timeout
     while True:
         _check_abort(should_abort)
         if not match_windows(needle):
             return
         if time.monotonic() >= deadline:
-            raise GuiError("等到逾時，那個視窗還在。")
+            raise GuiError("Timed out and that window is still there.")
         _sleep_abortable(poll, should_abort)
 
 
 def wait_image_gone(image_path: str, timeout: float, *, poll: float = 0.6,
                     threshold: float = 0.9, region: list[int] | None = None,
                     should_abort: Callable[[], bool] | None = None) -> None:
-    """等一張圖從畫面上消失。逾時丟 `GuiError`。"""
+    """Wait for an image to disappear from the screen. Raises `GuiError` on
+    timeout."""
     deadline = time.monotonic() + timeout
     while True:
         _check_abort(should_abort)
         if not _locate_all(image_path, threshold, region):
             return
         if time.monotonic() >= deadline:
-            raise GuiError("等到逾時，那張圖還在畫面上。")
+            raise GuiError("Timed out and that image is still on the screen.")
         _sleep_abortable(poll, should_abort)
 
 
@@ -2064,7 +2378,7 @@ COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
 
 
 def parse_color(raw: str) -> tuple[int, int, int]:
-    """`"#1E90FF"` / `"1e90ff"` / `"30,144,255"` → `(30, 144, 255)`。"""
+    """`"#1E90FF"` / `"1e90ff"` / `"30,144,255"` → `(30, 144, 255)`."""
     text = (raw or "").strip()
     match = COLOR_RE.match(text)
     if match:
@@ -2075,30 +2389,34 @@ def parse_color(raw: str) -> tuple[int, int, int]:
         try:
             channels = [int(p) for p in parts]
         except ValueError as error:
-            raise GuiError("顏色格式不對；用 `#RRGGBB` 或 `r,g,b`。") from error
+            raise GuiError("Invalid colour format; use `#RRGGBB` or `r,g,b`.") from error
         if all(0 <= c <= 255 for c in channels):
             return channels[0], channels[1], channels[2]
-    raise GuiError("顏色格式不對；用 `#RRGGBB` 或 `r,g,b`。")
+    raise GuiError("Invalid colour format; use `#RRGGBB` or `r,g,b`.")
 
 
 PIXEL_TOLERANCE_MAX = 255
 
 
 def parse_tolerance(raw: str) -> int:
-    """顏色容差字串 → `0..PIXEL_TOLERANCE_MAX` 的整數（每個色版允許的誤差）。
+    """Colour tolerance string → an integer in `0..PIXEL_TOLERANCE_MAX` (the error
+    allowed per colour channel).
 
-    **巨集的存檔驗證與 `if_pixel` 的執行必須共用這一支。** 2026-09-21 實測到的
-    缺陷：驗證端把 `if_pixel` 的第四個參數當秒數（跟 `wait_pixel` 共用一個分支），
-    執行端卻當整數容差讀——於是 `if_pixel 10 10 #ffffff 2.5` 存得起來、重播到那一行
-    才丟出沒有理由的錯誤，而 `… 150` 這種合法容差反而在存檔時被「秒數上限」擋掉。
-    兩邊各寫一份解析就一定會再漂開，所以只留這一份。
+    **The macro's save-time validation and `if_pixel`'s execution must share this
+    one function.** The defect measured on 2026-09-21: the validation side read
+    `if_pixel`'s fourth argument as seconds (sharing a branch with `wait_pixel`),
+    while the execution side read it as an integer tolerance—so
+    `if_pixel 10 10 #ffffff 2.5` could be saved and only raised an unexplained
+    error when replay reached that line, while a legal tolerance like `… 150` was
+    instead blocked at save time by the "seconds cap". Two separate parsers will
+    always drift apart again, so only this one is kept.
     """
     try:
         value = int(str(raw).strip())
     except (TypeError, ValueError) as error:
-        raise GuiError("顏色容差必須是整數。") from error
+        raise GuiError("The colour tolerance must be an integer.") from error
     if not 0 <= value <= PIXEL_TOLERANCE_MAX:
-        raise GuiError(f"顏色容差必須介於 0 到 {PIXEL_TOLERANCE_MAX}。")
+        raise GuiError(f"The colour tolerance must be between 0 and {PIXEL_TOLERANCE_MAX}.")
     return value
 
 
@@ -2106,13 +2424,16 @@ def wait_pixel(x: int, y: int, color: tuple[int, int, int], timeout: float, *,
                poll: float = 0.3, tolerance: int = 12, match: bool = True,
                should_abort: Callable[[], bool] | None = None
                ) -> tuple[int, int, int]:
-    """等某一點的顏色變成（或不再是）指定的顏色，回最後看到的顏色。
+    """Wait for a point's colour to become (or stop being) the given colour,
+    returning the last colour seen.
 
-    `tolerance` 是每個色版允許的誤差——抗鋸齒、色彩管理與影片壓縮都會讓「同一個
-    顏色」差個幾階，要求完全相等的話這個功能在真實畫面上幾乎不會成立。
+    `tolerance` is the error allowed per colour channel—anti-aliasing, colour
+    management and video compression all make "the same colour" differ by a few
+    steps, and demanding exact equality would make this feature almost never hold
+    on a real screen.
 
-    比截圖便宜非常多：一個像素 vs 一張圖 ＋ 一次辨識，所以適合放在密集輪詢的
-    同步點上。
+    Far cheaper than a screenshot: one pixel vs an image + a recognition pass, so
+    it suits synchronisation points polled at a high rate.
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -2122,39 +2443,51 @@ def wait_pixel(x: int, y: int, color: tuple[int, int, int], timeout: float, *,
         if close == match:
             return current
         if time.monotonic() >= deadline:
-            raise GuiError("等到逾時，那個點的顏色沒有變成預期的樣子。"
-                           if match else "等到逾時，那個點的顏色還是原來那個。")
+            raise GuiError("Timed out and the colour at that point did not become the expected one."
+                           if match else "Timed out and the colour at that point is still the original one.")
         _sleep_abortable(poll, should_abort)
 
 
 # --------------------------------------------------------------------------
-# UI 元素樹（無障礙介面 / UI Automation）
+# UI element tree (accessibility interface / UI Automation)
 # --------------------------------------------------------------------------
-# 到這裡為止的三種定位方式——座標、文字辨識、樣板比對——**全都是像素層的猜測**：
-# 座標怕視窗移動，辨識怕字型與縮放，樣板圖怕主題換色。作業系統其實知道畫面上有
-# 哪些按鈕、叫什麼名字、在哪個矩形，那是無障礙介面的資料。
+# The three location methods so far—coordinates, text recognition, template
+# matching—are **all pixel-level guesses**: coordinates break when a window moves,
+# recognition breaks with fonts and scaling, template images break when the theme
+# changes colour. The OS actually knows which buttons are on the screen, what they
+# are called and which rectangle they occupy—that is the accessibility interface's
+# data.
 #
-# 所以這一層是**首選**，不是替代：問得到就用它（精確矩形、被遮住也找得到、不受
-# 縮放影響），問不到再退回原本那三種。不是每個程式都支援得一樣好——老式視窗程式、
-# 遊戲、部分跨平台框架的樹可能很稀疏甚至空的，那是常態不是錯誤。
+# So this layer is the **first choice**, not a fallback: use it when it can answer
+# (exact rectangles, found even when covered, unaffected by scaling), and only fall
+# back to the other three when it cannot. Not every program supports it equally
+# well—the trees of old-style window programs, games and some cross-platform
+# frameworks may be sparse or even empty, which is normal, not an error.
 #
-# 走訪與比對都在函式庫裡（`list_accessibility_elements` / `find_accessibility_
-# elements` / `control_get_state`）。本模組只留三件事：型別名稱的驗證與提示、
-# 把函式庫的欄位轉成呼叫端用的名字，以及**點選仍走滑鼠座標**。
+# Traversal and matching are both in the library (`list_accessibility_elements` /
+# `find_accessibility_elements` / `control_get_state`). This module keeps only
+# three things: validating and hinting type names, converting the library's
+# fields into the names the caller uses, and **clicking still through mouse
+# coordinates**.
 #
-# **限定視窗（`window`）不是過濾，是換一個搜尋起點。** 不指定視窗現在也只要約
-# 2 秒（曾經是 61 秒），但限定單一視窗是 0.03 秒——而且不會漏掉排在後面的視窗。
-# 那三個 60 秒的成因都在函式庫那邊修掉了：桌面全樹是一次不能中斷的呼叫、單一視窗
-# 的走訪也是原子的、以及作業系統會等應用程式回應（一個全螢幕遊戲從不回應，讓單一
-# 次查詢卡了 60 秒）。
-# 回給使用者的命中數上限，以及「為了找它們最多看幾個元素」。這兩個是**不同的
-# 數字**：把命中上限拿去當掃描上限，等於「只看畫面上前 40 個元素」，那幾乎什麼
-# 都找不到。
+# **Limiting to a window (`window`) is not a filter; it changes the search
+# starting point.** Without a window it now takes only about 2 seconds (it was
+# once 61 seconds), but limiting to a single window takes 0.03 seconds—and does
+# not miss windows further down the order. The causes of those three 60-second
+# delays were all fixed on the library side: the whole desktop tree was one
+# uninterruptible call, a single window's traversal was atomic too, and the OS
+# waits for the application to respond (a full-screen game never responds, which
+# stalled a single query for 60 seconds).
+# The cap on matches returned to the user, and "at most how many elements to look
+# at to find them". These are **different numbers**: using the match cap as the
+# scan cap amounts to "only look at the first 40 elements on the screen", which
+# finds almost nothing.
 UI_MAX_RESULTS = 40
 UI_SCAN_LIMIT = 1500
 
-# 型別名稱只用來驗證與給提示；真正的比對由函式庫做（它同時吃 `button` 與底層的
-# `ControlType_50000` 兩種寫法）。
+# Type names are only used for validation and hints; the actual matching is done
+# by the library (it accepts both `button` and the low-level `ControlType_50000`
+# spelling).
 UI_CONTROL_TYPES = {
     50000: "button", 50001: "calendar", 50002: "checkbox", 50003: "combobox",
     50004: "edit", 50005: "hyperlink", 50006: "image", 50007: "listitem",
@@ -2172,9 +2505,9 @@ _UI_TYPE_CODES = {name: code for code, name in UI_CONTROL_TYPES.items()}
 
 
 def ui_status() -> tuple[bool, str]:
-    """`(可用嗎, 說明)`；說明是寫死的泛用字串。"""
+    """`(available?, explanation)`; the explanation is a hardcoded generic string."""
     if os.name != "nt":
-        return False, "UI 元素定位僅 Windows 可用。"
+        return False, "UI element location is only available on Windows."
     try:
         ok, reason = load_ac().accessibility_status()
     except GuiError as error:
@@ -2182,29 +2515,33 @@ def ui_status() -> tuple[bool, str]:
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] accessibility status probe failed: {error!r}",
               file=sys.stderr)
-        return False, "UI 元素定位功能無法在此環境使用。"
-    # 原因字串來自函式庫（英文、可能含安裝指示），不外送；只記進 stderr。
+        return False, "UI element location is unavailable in this environment."
+    # The reason string comes from the library (English, possibly with install
+    # instructions) and is not sent out; it only goes to stderr.
     if not ok:
         print(f"[gui] accessibility unavailable: {reason}", file=sys.stderr)
-        return False, "UI 元素定位功能無法在此環境使用。"
-    return True, "UI 元素定位可用。"
+        return False, "UI element location is unavailable in this environment."
+    return True, "UI element location is available."
 
 
 def parse_ui_type(raw: str) -> str:
-    """`"button"` → 驗證過的型別名稱；空字串回 `""`（不限型別）。"""
+    """`"button"` → a validated type name; an empty string returns `""` (any
+    type)."""
     key = (raw or "").strip().lower()
     if not key:
         return ""
     if key in _UI_TYPE_CODES:
         return key
     listed = " / ".join(sorted(_UI_TYPE_CODES)[:12])
-    raise GuiError(f"不認得的元素型別。常用的有：{listed} …")
+    raise GuiError(f"Unknown element type. Common ones are: {listed} …")
 
 
 def _ui_call(func: str, *args, **kwargs) -> Any:
-    """呼叫函式庫的無障礙介面入口，把它的例外折成泛用的 `GuiError`。
+    """Call the library's accessibility entry point, folding its exceptions into
+    a generic `GuiError`.
 
-    第一個參數叫 `func` 不叫 `name`：這些入口本身就有一個 `name=` 關鍵字參數。
+    The first parameter is called `func`, not `name`: these entry points have a
+    `name=` keyword argument of their own.
     """
     ac = load_ac()
     try:
@@ -2212,16 +2549,17 @@ def _ui_call(func: str, *args, **kwargs) -> Any:
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] accessibility {func} failed: {error!r}", file=sys.stderr)
         if type(error).__name__ == "AccessibilityNotAvailableError":
-            # 「找不到那個視窗」與「這台機器沒有這個功能」都走這個型別，但對使用者
-            # 是兩件事——前者他改得了。
+            # "That window cannot be found" and "this machine lacks the feature"
+            # both come as this type, but to the user they are two different
+            # things—the former is something they can fix.
             if "window title" in str(error):
-                raise GuiError("找不到符合的視窗。") from error
-            raise GuiError("UI 元素定位功能無法在此環境使用。") from error
-        raise GuiError("讀取 UI 元素失敗。") from error
+                raise GuiError("No matching window was found.") from error
+            raise GuiError("UI element location is unavailable in this environment.") from error
+        raise GuiError("Failed to read the UI elements.") from error
 
 
 def _ui_row(element: Any) -> dict[str, Any]:
-    """函式庫的元素 → 呼叫端用的欄位名。"""
+    """A library element → the field names the caller uses."""
     left, top, width, height = element.bounds
     return {
         "name": element.name,
@@ -2237,9 +2575,11 @@ def _ui_row(element: Any) -> dict[str, Any]:
 
 
 def _ui_type_name(role: str) -> str:
-    """底層型別代碼 → 本模組用的小寫短名（`ControlType_50000` → `button`）。
+    """Low-level type code → the short lowercase name this module uses
+    (`ControlType_50000` → `button`).
 
-    函式庫刻意保留原始代碼（翻譯是獨立的一步），但回給使用者的必須是看得懂的字。
+    The library deliberately keeps the raw code (translating it is a separate
+    step), but what goes back to the user must be a readable word.
     """
     try:
         return str(load_ac().humanize_role(role) or "").lower()
@@ -2248,21 +2588,24 @@ def _ui_type_name(role: str) -> str:
 
 
 def _ui_visible(element: Any) -> bool:
-    """有實際版面嗎。零面積的元素點不到，列出來只會誤導人。"""
+    """Does it have an actual layout. A zero-area element cannot be clicked, and
+    listing it would only mislead."""
     _left, _top, width, height = element.bounds
     return width > 0 and height > 0
 
 
 def ui_find(name: str, *, control_type: str = "", window: str = "",
             exact: bool = False) -> list[dict[str, Any]]:
-    """找名稱含 `name` 的 UI 元素，回 `[{name, type, x, y, …}, …]`。
+    """Find UI elements whose name contains `name`, returning
+    `[{name, type, x, y, …}, …]`.
 
-    比對預設用「包含」而不是「完全相等」：真實介面的名稱常常帶快捷鍵標記或後綴
-    （`儲存(&S)`、`確定 `），要求完全相等會讓一半的目標找不到。函式庫會把完全
-    相等的排在最前面。
+    Matching defaults to "contains" rather than "exactly equal": names in real
+    interfaces often carry accelerator markers or suffixes (`Save(&S)`, `OK `),
+    and demanding exact equality would leave half the targets unfound. The library
+    sorts exact matches first.
     """
     if not (name or "").strip():
-        raise GuiError("請給要尋找的元素名稱。")
+        raise GuiError("Give the name of the element to look for.")
     found = _ui_call(
         "find_accessibility_elements", name=name,
         role=parse_ui_type(control_type) or None,
@@ -2273,19 +2616,23 @@ def ui_find(name: str, *, control_type: str = "", window: str = "",
 
 def ui_value(name: str, *, control_type: str = "", window: str = "",
              exact: bool = False, limit: int = 5) -> list[dict[str, Any]]:
-    """找元素並附上它現在的值，回 `[{name, type, x, y, value?, toggle?, …}, …]`。
+    """Find elements and attach their current value, returning
+    `[{name, type, x, y, value?, toggle?, …}, …]`.
 
-    **不提供設值。** 寫入跟無障礙介面的 Invoke 是同一個問題：程式收得到新值，但
-    收不到「有人真的在這裡打了字」的那串事件（焦點、逐字變更、離開焦點），所以
-    驗證與連動邏輯不會跑。要填輸入框就照人的方式做——點進去再 `!type` /
-    `!clip paste`。
+    **Setting a value is not offered.** Writing has the same problem as the
+    accessibility interface's Invoke: the program receives the new value but not
+    the chain of events for "someone really typed here" (focus, per-character
+    changes, losing focus), so validation and dependent logic do not run. To fill
+    in an input box, do it the way a person would—click into it, then `!type` /
+    `!clip paste`.
     """
     rows = ui_find(name, control_type=control_type, window=window, exact=exact)
     out: list[dict[str, Any]] = []
     for row in rows[:max(1, limit)]:
         merged = dict(row)
-        # 帶著 `window` 一起問：讀值要再走一次樹，沒有限定視窗的話那一步是整個
-        # 桌面（本機實測數十秒）。
+        # Ask with `window` included: reading the value walks the tree again, and
+        # without a window limit that step covers the whole desktop (measured
+        # locally at tens of seconds).
         state = _ui_call("control_get_state", name=row["name"],
                          window_title=window or None)
         merged.update(state or {})
@@ -2294,7 +2641,8 @@ def ui_value(name: str, *, control_type: str = "", window: str = "",
 
 
 def ui_tree(window: str = "", limit: int = 60) -> list[dict[str, Any]]:
-    """列出（某個視窗底下的）UI 元素，給人看清楚有哪些東西可以點。"""
+    """List the UI elements (under a given window), so a person can see clearly
+    what there is to click."""
     found = _ui_call("list_accessibility_elements",
                      window_title=window or None, max_results=max(1, limit))
     return [_ui_row(element) for element in found
@@ -2303,15 +2651,18 @@ def ui_tree(window: str = "", limit: int = 60) -> list[dict[str, Any]]:
 
 def ui_click(name: str, *, button: str = "mouse_left", control_type: str = "",
              window: str = "") -> tuple[int, int]:
-    """找到元素就點它的中心，回座標。
+    """Click the element's centre once found; return the coordinates.
 
-    刻意**用滑鼠點座標**而不是呼叫無障礙介面的 Invoke：Invoke 不需要元素在畫面
-    上，但也因此繞過了程式對「真的有人點了這裡」的判斷（hover 狀態、焦點、拖放）。
-    這個專案要模擬的是人的操作，所以只用它拿精確位置，動作還是走滑鼠。
+    It deliberately **clicks the coordinates with the mouse** rather than calling
+    the accessibility interface's Invoke: Invoke does not need the element to be on
+    screen, but for that very reason it bypasses the program's judgement of
+    "someone really clicked here" (hover state, focus, drag and drop). This project
+    simulates a person's actions, so it only uses the interface to get the exact
+    position, and the action still goes through the mouse.
     """
     matches = ui_find(name, control_type=control_type, window=window)
     if not matches:
-        raise GuiError("找不到這個名稱的 UI 元素。")
+        raise GuiError("No UI element with that name was found.")
     target = matches[0]
     mouse_click(button, target["x"], target["y"])
     return target["x"], target["y"]
@@ -2321,7 +2672,8 @@ def ui_wait(name: str, timeout: float, *, control_type: str = "",
             window: str = "", poll: float = 0.5, gone: bool = False,
             should_abort: Callable[[], bool] | None = None
             ) -> dict[str, Any] | None:
-    """等某個 UI 元素出現（或消失）。逾時丟 `GuiError`。"""
+    """Wait for a UI element to appear (or disappear). Raises `GuiError` on
+    timeout."""
     deadline = time.monotonic() + timeout
     while True:
         _check_abort(should_abort)
@@ -2331,38 +2683,46 @@ def ui_wait(name: str, timeout: float, *, control_type: str = "",
         if not gone and matches:
             return matches[0]
         if time.monotonic() >= deadline:
-            raise GuiError("等到逾時，那個 UI 元素還在。" if gone
-                           else "等到逾時仍沒有出現這個 UI 元素。")
+            raise GuiError("Timed out and that UI element is still there." if gone
+                           else "Timed out and this UI element still did not appear.")
         _sleep_abortable(poll, should_abort)
 
 
 # --------------------------------------------------------------------------
-# 檔案進出主機
+# Files in and out of the host
 # --------------------------------------------------------------------------
-# 沒有這一段，「用對話完成任何操作」就少一塊：指令執行做得到「動」，但**把一個
-# 檔案拿回來看**或**把一個檔案放上去**做不到。`!sh` 的輸出會被去識別化又有長度
-# 上限，拿它當檔案傳輸管道並不可行。
+# Without this section, "do anything through chat" is missing a piece: command
+# execution can "act", but cannot **fetch a file back to look at** or **put a file
+# up**. `!sh` output is de-identified and length-capped, so using it as a file
+# transfer channel is not workable.
 #
-# 上限分開設：拿回來受對話平台的附件大小限制，放上去只受磁碟限制。
+# The caps are set separately: fetching is limited by the chat platform's
+# attachment size, uploading only by the disk.
 GET_MAX_BYTES = 20 * 1024 * 1024
 PUT_MAX_BYTES = 64 * 1024 * 1024
 
 
 def unquote_path(raw: str | None) -> str:
-    """把使用者貼進來的路徑字串正規化：去前後空白，再脫掉**成對**的引號一層。
+    """Normalise a path string the user pasted in: strip surrounding whitespace,
+    then peel off one layer of **paired** quotes.
 
-    存在的理由是檔案總管的「複製路徑」（Shift ＋右鍵）自帶雙引號，貼進來就是
-    `"D:\\Work\\Foo"`——那不是任何一個存在的路徑。
+    It exists because File Explorer's "Copy as path" (Shift + right-click) comes
+    with double quotes, so what gets pasted is `"D:\\Work\\Foo"`—which is not any
+    path that exists.
 
-    只脫**成對**的一層。原本這裡（以及另外兩處）寫的是
-    `.strip('"').strip("'")`，那會把頭尾**所有**引號字元一路刮掉：真的叫 `'foo'`
-    的目錄（`'` 在 Windows 檔名裡是合法的）會被悄悄改成 `foo`，於是
-    `/host put`、`/host cd` 指向另一個地方——**安靜地指錯位置比乾脆被拒更糟**，
-    因為這條路是限擁有者的「用對話操作整台電腦」，寫錯地方就是真的寫錯地方。
-    引號沒配對時原樣留著、讓它自然解析失敗，也不要猜使用者的意思。
+    Only one **paired** layer is peeled. This (and two other places) used to read
+    `.strip('"').strip("'")`, which scrapes off **every** quote character at both
+    ends: a directory really named `'foo'` (`'` is legal in Windows file names)
+    would silently become `foo`, so `/host put` and `/host cd` point somewhere
+    else—**silently pointing at the wrong place is worse than an outright
+    rejection**, because this path is the owner-only "operate the whole computer
+    through chat", and writing to the wrong place really is writing to the wrong
+    place. When the quotes are not paired, leave it as-is and let it fail to parse
+    naturally, rather than guessing what the user meant.
 
-    與 `dorossi_backend._dorossi_unquote_dir` 是同一條判準的兩份實作（模組邊界
-    不同，不互相 import）。改其中一份時記得看另一份。
+    This and `dorossi_backend._dorossi_unquote_dir` are two implementations of the
+    same criterion (different module boundaries, no mutual import). When changing
+    one, remember to look at the other.
     """
     text = (raw or "").strip()
     for quote in ('"', "'"):
@@ -2372,14 +2732,17 @@ def unquote_path(raw: str | None) -> str:
 
 
 def resolve_host_path(raw: str) -> Path:
-    """把使用者打的路徑轉成絕對路徑。相對路徑以專案根目錄為基準。
+    """Turn the path the user typed into an absolute path. Relative paths are
+    based on the project root.
 
-    刻意**不做沙箱**：這個能力的呼叫端限擁有者，而限制在專案目錄內等於讓「用
-    對話操作整台電腦」這件事名不副實。真正的閘門在呼叫端的身分檢查。
+    It deliberately **does no sandboxing**: the callers of this capability are
+    owner-only, and restricting it to the project directory would make "operate
+    the whole computer through chat" a misnomer. The real gate is the caller's
+    identity check.
     """
     text = unquote_path(raw)
     if not text:
-        raise GuiError("請給檔案路徑。")
+        raise GuiError("Give a file path.")
     expanded = os.path.expandvars(os.path.expanduser(text))
     path = Path(expanded)
     if not path.is_absolute():
@@ -2387,117 +2750,140 @@ def resolve_host_path(raw: str) -> Path:
     return Path(os.path.normpath(str(path)))
 
 
-# Windows 保留名稱的判準**單一來源在標準函式庫**（`ntpath.isreserved`，3.13+）。
-# 刻意不自己抄那 30 個裝置名：那份資料會隨 Windows 版本長大（`COM¹`／`COM²`／
-# `COM³` 是 Windows 11 才加的），抄本不會——本 repo 已經有三份 `_pid_alive` 的前例。
-# 用 `ntpath` 而不是 `os.path`：`os.path.isreserved` 只在 Windows 上存在，而寫入
-# 目標永遠是 Windows 主機，判準不該跟著「跑測試的平台」走。
+# The **single source** for the Windows reserved-name criterion **is the standard
+# library** (`ntpath.isreserved`, 3.13+). The 30 device names are deliberately not
+# copied here: that data grows with Windows versions (`COM¹` / `COM²` / `COM³`
+# were only added in Windows 11), while a copy would not—this repo already has the
+# precedent of three copies of `_pid_alive`. `ntpath` rather than `os.path`:
+# `os.path.isreserved` only exists on Windows, while the write target is always a
+# Windows host, so the criterion must not depend on "the platform running the
+# tests".
 #
-# 取成模組層別名是為了讓缺少它的直譯器**在匯入時**就炸掉。寫在函式裡的話，
-# `AttributeError` 會被 `cmd_put` 的 broad except 折成一句「檔案寫入失敗」——守衛
-# 安靜消失，而那正是這道守衛存在的理由。
+# It is taken as a module-level alias so that an interpreter lacking it blows up
+# **at import time**. Written inside the function, the `AttributeError` would be
+# folded by `cmd_put`'s broad except into a "file write failed"—the guard would
+# silently vanish, which is exactly why this guard exists.
 _isreserved_name = ntpath.isreserved
 
 
 def _reject_reserved_filename(name: str) -> None:
-    """`name` 會被 Windows 特殊對待的話就丟 `GuiError`。
+    """Raise `GuiError` if Windows would treat `name` specially.
 
-    `ntpath.isreserved` 一次回答三件事，這三件的共同點是**寫下去不會得到使用者
-    要的那個檔案**：
+    `ntpath.isreserved` answers three things at once, and what they have in common
+    is that **writing to it will not produce the file the user wanted**:
 
-    1. DOS 裝置名（`NUL`／`CON`／`COM1`…，不分大小寫，`NUL.md` 一樣算中）；
-    2. 保留字元 `*?"<>/\\:|` 與 ASCII 控制字元；
-    3. 結尾的點與空白。
+    1. DOS device names (`NUL` / `CON` / `COM1`…, case-insensitive; `NUL.md`
+       counts too);
+    2. the reserved characters `*?"<>/\\:|` and ASCII control characters;
+    3. trailing dots and spaces.
 
-    **只剝掉結尾的點與空白再問**，不是取「第一個點之前的字段」。兩種寫法都能繞開
-    第 3 條（本專案已裁定全點名字要原樣通過，見下），但取字段會讓第 2 條**只看得到
-    第一個點之前**。實測差 8 筆，而且差的那些正是最該擋的：`report.txt:secret`
-    寫下去會產生一個 NTFS 替代資料流——`os.listdir` 看不到它，`report.txt` 本身是
-    **0 位元組**，而呼叫端回報成功。回報成功、資料看不見，是本專案最在意的那種
-    無聲錯誤。同族的還有 `a.txt\\tb`、`a.b<c`、`a.b|c`。
+    **Only trailing dots and spaces are stripped before asking**, rather than
+    taking "the segment before the first dot". Both approaches get around rule 3
+    (this project has already ruled that all-dot names pass through as-is, see
+    below), but taking the segment would let rule 2 **only see what is before the
+    first dot**. Measured, that differs by 8 cases, and the ones that differ are
+    exactly the ones most worth blocking: writing `report.txt:secret` creates an
+    NTFS alternate data stream—`os.listdir` cannot see it, `report.txt` itself is
+    **0 bytes**, and the caller reports success. Reporting success while the data
+    is invisible is the kind of silent error this project cares about most. In the
+    same family are `a.txt\\tb`, `a.b<c`, `a.b|c`.
 
-    剝掉結尾點空白之後，`...` / `....` / `x.` 會變成 `` / `x`，兩者都不保留，所以
-    原樣通過——那是既有裁定，不是疏漏：
-    `test_bot_helpers.test_the_attachment_name_guard_lets_nothing_escape` 釘著全點
-    名字要通過，理由是它寫檔時 `os.replace` 丟 errno 13 **大聲**失敗，不會靜靜寫錯
-    地方。要改那個決定請去改那一支。
+    After stripping trailing dots and spaces, `...` / `....` / `x.` become `` /
+    `x`, neither of which is reserved, so they pass through as-is—that is an
+    existing ruling, not an oversight:
+    `test_bot_helpers.test_the_attachment_name_guard_lets_nothing_escape` pins
+    all-dot names as passing, because writing them makes `os.replace` raise errno
+    13 and fail **loudly**, rather than silently writing to the wrong place. To
+    change that decision, change that test.
 
-    ⚠️ **這道守衛刻意比「這台機器上真的會出事的名字」寬，不要照著實測收窄。**
-    2026-09-11 以 `CreateFileW` ＋ `GetFileType` 量過（Windows 11 build 26200）：
-    只有 `NUL` 家族真的被路徑剖析器改寫成 `\\\\.\\NUL`，`CON`／`PRN`／`AUX`／
-    `COM1`／`LPT1`／`CONIN$` 全部產生 `type=DISK` 的**普通檔案**。舊版 Windows 不是
-    這樣，而標準函式庫自己的註解就寫著「規則複雜且隨版本不同，保守起見一律回
-    True」。在這台機器上試出 `CON` 沒事就把它拿掉，等於讓 `write_host_file` 的行為
-    跟著主機的 Windows 版本跑——那是 fresh clone 會踩到而本機永遠看不到的坑。
+    ⚠️ **This guard is deliberately wider than "the names that really cause
+    trouble on this machine"; do not narrow it to match measurements.** Measured on
+    2026-09-11 with `CreateFileW` + `GetFileType` (Windows 11 build 26200): only
+    the `NUL` family is really rewritten by the path parser to `\\\\.\\NUL`, while
+    `CON` / `PRN` / `AUX` / `COM1` / `LPT1` / `CONIN$` all produce an **ordinary
+    file** of `type=DISK`. Older Windows versions were not like this, and the
+    standard library's own comment says "the rules are complex and vary by version,
+    so to be safe always return True". Dropping `CON` because it turned out fine on
+    this machine would make `write_host_file`'s behaviour follow the host's Windows
+    version—a pit a fresh clone would fall into while this machine never sees it.
     """
     if _isreserved_name(name.rstrip(". ")):
         raise GuiError(
-            "這個檔名 Windows 會特殊對待（`NUL`／`CON`／`COM1` 這類裝置名，或含有 "
-            "`: * ? \" < > |` 與控制字元），寫下去不會得到你要的那個檔案——"
-            "資料可能消失或跑進一個看不見的資料流。請換一個檔名。")
+            "Windows treats this file name specially (a device name like `NUL` / `CON` / `COM1`, "
+            "or it contains `: * ? \" < > |` or control characters), so writing it will not produce "
+            "the file you want—the data may vanish or go into an invisible data stream. "
+            "Please use a different file name.")
 
 
 def safe_basename(name: str) -> str:
-    """從使用者 / 附件給的名稱取出乾淨的檔名，擋掉路徑穿越與保留名稱。"""
+    """Extract a clean file name from a name given by the user / an attachment,
+    blocking path traversal and reserved names."""
     base = os.path.basename(str(name or "").replace("\\", "/")).strip()
     if not base or base in (".", ".."):
-        raise GuiError("檔名不合法。")
+        raise GuiError("Invalid file name.")
     _reject_reserved_filename(base)
     return base
 
 
 def read_host_file(raw: str) -> tuple[Path, bytes]:
-    """讀主機上的檔案，回 `(路徑, 內容)`。"""
+    """Read a file on the host, returning `(path, content)`."""
     path = resolve_host_path(raw)
     if path.is_dir():
-        raise GuiError("那是一個資料夾，不是檔案。")
+        raise GuiError("That is a folder, not a file.")
     if not path.exists():
-        raise GuiError("找不到這個檔案。")
+        raise GuiError("File not found.")
     try:
         size = path.stat().st_size
     except OSError as error:
-        raise GuiError("檔案讀取失敗。") from error
+        raise GuiError("Failed to read the file.") from error
     if size > GET_MAX_BYTES:
-        raise GuiError(f"檔案太大（上限 {GET_MAX_BYTES // (1024 * 1024)} MB）。")
+        raise GuiError(f"The file is too large (limit {GET_MAX_BYTES // (1024 * 1024)} MB).")
     try:
         return path, path.read_bytes()
     except OSError as error:
-        raise GuiError("檔案讀取失敗。") from error
+        raise GuiError("Failed to read the file.") from error
 
 
 def write_host_file(raw: str, data: bytes, *, default_name: str = "",
                     overwrite: bool = False) -> tuple[Path, int]:
-    """把內容寫到主機上，回 `(路徑, 位元組數)`。
+    """Write content to the host, returning `(path, byte count)`.
 
-    * 目的地是既有資料夾（或以斜線結尾）時，用 `default_name` 當檔名；
-    * 上層資料夾不存在就直接失敗，**不自動建立整棵樹**——打錯一個字就多出一串
-      空目錄，而下指令的人不在電腦前面看不到；
-    * 已存在的檔案要 `overwrite` 才蓋掉；
-    * 寫入走同目錄 temp ＋ `os.replace`（跨行程檔案一律原子寫入，見 CLAUDE.md）。
+    * When the destination is an existing folder (or ends with a slash),
+      `default_name` is used as the file name;
+    * if the parent folder does not exist it fails outright, **without creating
+      the whole tree**—one typo would leave a string of empty directories, and the
+      person who issued the command is not at the computer to see them;
+    * an existing file is only replaced with `overwrite`;
+    * writing goes through a same-directory temp + `os.replace` (cross-process
+      files are always written atomically, see CLAUDE.md).
     """
     if len(data) > PUT_MAX_BYTES:
-        raise GuiError(f"檔案太大（上限 {PUT_MAX_BYTES // (1024 * 1024)} MB）。")
-    # 正規化只有一份（`unquote_path`）。`resolve_host_path` 自己也會叫它——
-    # 冪等，所以叫兩次無害；這裡需要正規化後的字串是為了下一行的 `endswith`。
+        raise GuiError(f"The file is too large (limit {PUT_MAX_BYTES // (1024 * 1024)} MB).")
+    # There is only one normalisation (`unquote_path`). `resolve_host_path` calls
+    # it too—it is idempotent, so calling it twice is harmless; the normalised
+    # string is needed here for the `endswith` on the next line.
     text = unquote_path(raw)
     path = resolve_host_path(text)
     if path.is_dir() or text.endswith(("/", "\\")):
         if not default_name:
-            raise GuiError("目的地是資料夾，請給完整檔名。")
+            raise GuiError("The destination is a folder; please give a full file name.")
         path = path / safe_basename(default_name)
-    # 明寫路徑那條（`/host put D:\x\NUL`）**不經過** `safe_basename`，所以這裡再問
-    # 一次——冪等，跟上面 `unquote_path` 叫兩次同一個理由。
+    # The explicit-path route (`/host put D:\x\NUL`) **does not go through**
+    # `safe_basename`, so ask again here—idempotent, for the same reason as calling
+    # `unquote_path` twice above.
     #
-    # ⚠️ 順序是承重的：要擋在 `path.exists()` **前面**。`Path(r"…\NUL").exists()`
-    # 是 True，所以擋晚了的話使用者先拿到「目的檔已經存在；要覆寫請加上 `--force`」
-    # ——一句把他導向 `--force`、而 `--force` 之後只會拿到「檔案寫入失敗。」
-    # （2026-09-11 實測的實際下場：兩句都是錯的答案，而這是一個擁有者拿來操作一台
-    # 他不在現場的機器的指令）。
+    # ⚠️ The order is load-bearing: this must block **before** `path.exists()`.
+    # `Path(r"…\NUL").exists()` is True, so blocking late would first give the user
+    # "The destination file already exists; add `--force` to overwrite it."—a
+    # sentence steering them to `--force`, after which `--force` would only get
+    # "Failed to write the file." (the actual outcome measured on 2026-09-11: both
+    # sentences are wrong answers, and this is a command an owner uses to operate a
+    # machine they are not physically at).
     _reject_reserved_filename(path.name)
     if not path.parent.is_dir():
-        raise GuiError("目的資料夾不存在。")
+        raise GuiError("The destination folder does not exist.")
     if path.exists() and not overwrite:
-        raise GuiError("目的檔已經存在；要覆寫請加上 `--force`。")
+        raise GuiError("The destination file already exists; add `--force` to overwrite it.")
     tmp = path.with_name(path.name + ".tmp")
     try:
         tmp.write_bytes(data)
@@ -2507,25 +2893,28 @@ def write_host_file(raw: str, data: bytes, *, default_name: str = "",
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
-        raise GuiError("檔案寫入失敗。") from error
+        raise GuiError("Failed to write the file.") from error
     return path, len(data)
 
 
 # --------------------------------------------------------------------------
-# 巨集
+# Macros
 # --------------------------------------------------------------------------
 MACRO_MAX_STEPS = 200
 MACRO_MAX_WAIT_SEC = 120.0
 MACRO_SCHEMA_VERSION = 1
 
-# 每個動詞 → 需要的參數個數 `(最少, 最多)`；`None` 代表不限。
-# `sh` 刻意**不在**這張表裡：巨集是存在磁碟上、任何有權下指令的人都能重播的
-# 東西，把任意指令執行藏在巨集裡等於做出一個「存起來的遠端執行後門」，繞過
-# `!sh` 的擁有者閘門。要跑指令就自己打 `!sh`。
-# 條件動詞 → `(判斷函式, 是否取反)`。八個是機械式的兩兩成對，實作走同一條路。
-# **成本差很多**，說明文件要講清楚：`if_pixel` 幾乎免費、`if_window` / `if_ui`
-# 是毫秒到一秒、`if_text` 要跑一次辨識（全桌面 3 秒起跳）。放在 `repeat` 裡面的
-# 條件用錯一個，整個巨集會從幾秒變成幾分鐘。
+# Each verb → the number of arguments it needs `(min, max)`; `None` means no limit.
+# `sh` is deliberately **not** in this table: a macro is stored on disk and can be
+# replayed by anyone entitled to issue commands, so hiding arbitrary command
+# execution in a macro amounts to building a "stored remote-execution backdoor"
+# that bypasses `!sh`'s owner gate. To run a command, type `!sh` yourself.
+# Condition verb → `(predicate, negated?)`. The eight form mechanical pairs, and
+# the implementation takes one path for all of them. **Their costs differ a lot**,
+# and the docs must say so clearly: `if_pixel` is almost free, `if_window` /
+# `if_ui` take milliseconds to a second, `if_text` runs a recognition pass (3
+# seconds and up for the whole desktop). One wrong condition inside a `repeat`
+# turns the whole macro from seconds into minutes.
 MACRO_CONDITIONS: dict[str, tuple[str, bool]] = {
     "if_text": ("text", False), "if_no_text": ("text", True),
     "if_window": ("window", False), "if_no_window": ("window", True),
@@ -2534,15 +2923,15 @@ MACRO_CONDITIONS: dict[str, tuple[str, bool]] = {
 }
 
 MACRO_VERBS: dict[str, tuple[int, int | None]] = {
-    # --- 控制流 ---
-    "repeat": (1, 1),       # 次數
+    # --- control flow ---
+    "repeat": (1, 1),       # count
     "else": (0, 0),
     "end": (0, 0),
-    "stop": (0, 0),         # 提早結束整個巨集（不算失敗）
-    "call": (1, None),      # 巨集名稱 [參數…]
+    "stop": (0, 0),         # end the whole macro early (not a failure)
+    "call": (1, None),      # macro name [args…]
     **{verb: ((3, 4) if verb.endswith("pixel") else (1, None))
        for verb in MACRO_CONDITIONS},
-    # --- 動作 ---
+    # --- actions ---
     "click": (2, 3),        # x y [button]
     "move": (2, 2),         # x y
     "drag": (4, 5),         # x1 y1 x2 y2 [button]
@@ -2551,48 +2940,60 @@ MACRO_VERBS: dict[str, tuple[int, int | None]] = {
     "type": (1, None),      # text…
     "paste": (1, None),     # text…
     "hotkey": (1, 1),       # combo
-    "keydown": (1, 1),      # 鍵名（按住不放）
-    "keyup": (1, 1),        # 鍵名
-    "release_keys": (0, 0),  # 全部放開
-    "focus": (1, None),     # 視窗標題片段
-    "win": (2, None),       # action 視窗標題片段
-    "wait": (1, 1),         # 秒
-    "wait_window": (1, None),   # [timeout] 標題片段 —— 見 parse 說明
+    "keydown": (1, 1),      # key name (held down)
+    "keyup": (1, 1),        # key name
+    "release_keys": (0, 0),  # release everything
+    "focus": (1, None),     # window title fragment
+    "win": (2, None),       # action window-title fragment
+    "wait": (1, 1),         # seconds
+    "wait_window": (1, None),   # [timeout] title fragment — see the parse notes
     "wait_text": (1, None),
     "click_text": (1, None),
     "clip": (1, None),      # set <text>
-    "ui_click": (1, None),      # 元素名稱
-    "wait_ui": (1, None),       # [秒] 元素名稱
+    "ui_click": (1, None),      # element name
+    "wait_ui": (1, None),       # [seconds] element name
     "wait_gone_text": (1, None),
     "wait_gone_window": (1, None),
-    "wait_pixel": (3, 4),       # x y 顏色 [秒]
+    "wait_pixel": (3, 4),       # x y colour [seconds]
 }
 
-# 一次執行最多跑幾步。`repeat` 可以巢狀，光靠來源行數上限擋不住無窮迴圈——
-# 一個 `repeat 1000` 裡面包 `repeat 1000` 只有四行卻要跑一百萬步。
+# The most steps one run may execute. `repeat` can nest, so a cap on source lines
+# alone cannot stop an endless loop—a `repeat 1000` wrapping a `repeat 1000` is
+# only four lines but runs a million steps.
 MACRO_MAX_EXECUTED = 5000
 MACRO_MAX_REPEAT = 1000
 MACRO_MAX_CALL_DEPTH = 3
-# `$1`..`$9` 是參數，`$$` 是一個字面的 `$`；語法全文見 `substitute_macro_args`。
+# `$1`..`$9` are arguments, `$$` is a literal `$`; the full syntax is in
+# `substitute_macro_args`.
 MACRO_ARG_RE = re.compile(r"\$(\$|[1-9])")
 
-# 事前檢查（`check_macro_program`）最多驗幾步。以 `(巨集名, 參數)` 做記憶化之後，
-# 「參數原樣往下傳」這種常見寫法的工作量是「不同巨集數 × 步數」；但記憶化**不是**
-# 上界：每一層都能用字面參數分出不同的鍵（`call b 1` … `call b 200`，`b` 裡再
-# `call c $1 1` … `call c $1 200`），三層就是八百萬個不同的鍵、十幾億次驗證。執行
-# 端有 `MACRO_MAX_EXECUTED` 擋著，事前檢查要有自己的上限，否則檢查會比執行還久，
-# 而且卡在工作執行緒裡沒人收得回來。兩萬步 ＝ 一百個不同的滿載巨集，正常用法碰
-# 不到。2026-09-21 實測：四層各 200 行、參數原樣往下傳的扇出，記憶化後驗 1,400 次
-# （不記憶化是十六億次）、0.03 秒；三層字面參數的扇出撞到這個上限，0.07 秒結束。
+# The most steps the up-front check (`check_macro_program`) validates. With
+# memoisation on `(macro name, args)`, the workload for the common style of
+# "passing the arguments down unchanged" is "number of distinct macros × steps";
+# but memoisation is **not** a bound: every level can split off distinct keys with
+# literal arguments (`call b 1` … `call b 200`, and inside `b`,
+# `call c $1 1` … `call c $1 200`), so three levels make eight million distinct
+# keys and over a billion validations. The execution side is guarded by
+# `MACRO_MAX_EXECUTED`; the up-front check needs a cap of its own, or checking
+# would take longer than running, stuck in a worker thread nobody can reclaim.
+# Twenty thousand steps = a hundred distinct fully loaded macros, which normal use
+# never reaches. Measured 2026-09-21: a fan-out of four levels of 200 lines each,
+# passing arguments down unchanged, validates 1,400 times with memoisation (1.6
+# billion without) in 0.03 seconds; a three-level fan-out with literal arguments
+# hits this cap and finishes in 0.07 seconds.
 MACRO_MAX_CHECKED = 20000
 
-# 開頭可以帶一個逾時秒數的動詞 → 沒給時的預設秒數。**存檔驗證與執行共用這張表**：
-# `run_macro_step` 從這裡拿預設值交給 `split_timeout`，`validate_macro_step` 對同一
-# 批動詞用同一支 `split_timeout` 先解析一次。兩邊各列一份名單的時候，驗證端只記得
-# `wait_window` / `wait_text`，於是 `wait_ui 150 確定`、`wait_gone_text -1 x`、
-# `click_text nan x` 都存得起來、重播到那一行才炸（2026-09-21 實測）。
-# `click_text` 的秒數會被丟掉（一次性辨識沒有等待迴圈），但它照樣經過解析，所以
-# 一樣要在存檔時擋掉壞值。
+# Verbs that may lead with a timeout in seconds → the default seconds when none is
+# given. **Save-time validation and execution share this table**: `run_macro_step`
+# takes the default from here and hands it to `split_timeout`, and
+# `validate_macro_step` parses the same set of verbs once up front with the same
+# `split_timeout`. When the two sides each kept their own list, the validation side
+# only remembered `wait_window` / `wait_text`, so `wait_ui 150 OK`,
+# `wait_gone_text -1 x` and `click_text nan x` could all be saved and only blew up
+# when replay reached that line (measured 2026-09-21).
+# `click_text`'s seconds are discarded (a one-shot recognition has no wait loop),
+# but it still goes through parsing, so bad values must be blocked at save time
+# just the same.
 MACRO_TIMEOUT_DEFAULTS: dict[str, float] = {
     "wait_window": 15.0,
     "wait_text": 15.0,
@@ -2604,40 +3005,45 @@ MACRO_TIMEOUT_DEFAULTS: dict[str, float] = {
 
 
 def parse_macro_steps(raw: str) -> list[str]:
-    """把使用者貼的多行文字轉成正規化後的步驟清單，順便驗證。
+    """Turn the multi-line text the user pasted into a normalised list of steps,
+    validating it along the way.
 
-    每行一步，`#` 開頭與空行忽略。驗證在**存檔時**就做一次，這樣壞掉的巨集
-    不會等到重播到一半才炸；`load_macro` 會再驗一次，因為檔案在磁碟上是可以
-    被手動編輯的。
+    One step per line; lines starting with `#` and blank lines are ignored.
+    Validation is done once **at save time**, so a broken macro does not blow up
+    halfway through a replay; `load_macro` validates again, because the file on
+    disk can be edited by hand.
     """
     steps: list[str] = []
     for line_no, line in enumerate((raw or "").splitlines(), start=1):
         text = line.strip()
         if not text or text.startswith("#"):
             continue
-        # 讓使用者可以直接把 `!` 指令貼進來，不用逐行去掉驚嘆號
+        # Let the user paste `!` commands straight in without stripping the
+        # exclamation mark line by line
         if text.startswith("!"):
             text = text[1:].strip()
         try:
             validate_macro_step(text)
         except GuiError as error:
-            raise GuiError(f"第 {line_no} 行：{error}") from error
+            raise GuiError(f"Line {line_no}: {error}") from error
         steps.append(text)
         if len(steps) > MACRO_MAX_STEPS:
-            raise GuiError(f"一個巨集最多 {MACRO_MAX_STEPS} 步。")
+            raise GuiError(f"A macro may have at most {MACRO_MAX_STEPS} steps.")
     if not steps:
-        raise GuiError("巨集內容是空的。")
-    macro_block_map(steps)   # 區塊平衡在存檔時就驗，不要留到重播到一半才爆
+        raise GuiError("The macro is empty.")
+    macro_block_map(steps)   # check block balance at save time, not halfway through a replay
     return steps
 
 
 def macro_block_map(steps: list[str]) -> dict[int, tuple[int | None, int]]:
-    """把每個 `repeat` / `if_*` 對到它的 `else`（若有）與 `end`。
+    """Map each `repeat` / `if_*` to its `else` (if any) and `end`.
 
-    區塊結構在**存檔時**就驗一次：少一個 `end` 是很容易犯的錯，而等到重播跑到
-    一半才發現，前面那些步驟已經在真實桌面上做過了，收不回來。
+    The block structure is validated once **at save time**: a missing `end` is an
+    easy mistake to make, and if it is only discovered halfway through a replay,
+    the steps before it have already been done on the real desktop and cannot be
+    taken back.
 
-    回 `{開頭行號: (else 行號 或 None, end 行號)}`。
+    Returns `{opening line index: (else line index or None, end line index)}`.
     """
     stack: list[tuple[int, str]] = []
     blocks: dict[int, tuple[int | None, int]] = {}
@@ -2648,35 +3054,36 @@ def macro_block_map(steps: list[str]) -> dict[int, tuple[int | None, int]]:
             stack.append((index, verb))
         elif verb == "else":
             if not stack or stack[-1][1] not in MACRO_CONDITIONS:
-                raise GuiError(f"第 {index + 1} 行：`else` 必須在 `if_…` 區塊裡。")
+                raise GuiError(f"Line {index + 1}: `else` must be inside an `if_…` block.")
             if stack[-1][0] in elses:
-                raise GuiError(f"第 {index + 1} 行：同一個 `if_…` 只能有一個 `else`。")
+                raise GuiError(f"Line {index + 1}: an `if_…` may have only one `else`.")
             elses[stack[-1][0]] = index
         elif verb == "end":
             if not stack:
-                raise GuiError(f"第 {index + 1} 行：多出來的 `end`。")
+                raise GuiError(f"Line {index + 1}: an extra `end`.")
             opener, _kind = stack.pop()
             blocks[opener] = (elses.get(opener), index)
     if stack:
         line = stack[-1][0] + 1
-        raise GuiError(f"第 {line} 行的區塊沒有對應的 `end`。")
+        raise GuiError(f"The block on line {line} has no matching `end`.")
     return blocks
 
 
 def validate_macro_step(step: str) -> tuple[str, list[str]]:
-    """驗證單一步驟，回 `(動詞, 參數)`。不合法就丟 `GuiError`。"""
+    """Validate a single step, returning `(verb, args)`. Raise `GuiError` if it
+    is invalid."""
     parts = (step or "").split()
     if not parts:
-        raise GuiError("空的步驟。")
+        raise GuiError("Empty step.")
     verb = parts[0].lower()
     args = parts[1:]
     if verb not in MACRO_VERBS:
         allowed = " / ".join(sorted(MACRO_VERBS))
-        raise GuiError(f"不認得的動作 `{verb}`。可用：{allowed}")
+        raise GuiError(f"Unknown action `{verb}`. Available: {allowed}")
     low, high = MACRO_VERBS[verb]
     if len(args) < low or (high is not None and len(args) > high):
-        raise GuiError(f"`{verb}` 的參數個數不對。")
-    # 逐動詞的細部檢查——存檔時就擋掉，不要留到重播才失敗
+        raise GuiError(f"Wrong number of arguments for `{verb}`.")
+    # Per-verb detailed checks—block at save time rather than failing on replay
     if verb in ("click", "move", "dclick"):
         parse_xy(args[:2])
         if len(args) > 2:
@@ -2690,11 +3097,11 @@ def validate_macro_step(step: str) -> tuple[str, list[str]]:
         try:
             int(args[0])
         except ValueError as error:
-            raise GuiError("`scroll` 的第一個參數必須是整數。") from error
+            raise GuiError("The first argument of `scroll` must be an integer.") from error
         if len(args) == 3:
             parse_xy(args[1:3])
         elif len(args) == 2:
-            raise GuiError("`scroll` 的座標要嘛不給、要嘛給兩個。")
+            raise GuiError("`scroll` takes either no coordinates or two.")
     elif verb == "hotkey":
         parse_hotkey_tokens(args[0])
     elif verb in ("keydown", "keyup"):
@@ -2703,20 +3110,23 @@ def validate_macro_step(step: str) -> tuple[str, list[str]]:
         try:
             count = int(args[0])
         except ValueError as error:
-            raise GuiError("`repeat` 的次數必須是整數。") from error
+            raise GuiError("The `repeat` count must be an integer.") from error
         if not 0 <= count <= MACRO_MAX_REPEAT:
-            raise GuiError(f"`repeat` 的次數必須介於 0 到 {MACRO_MAX_REPEAT}。")
+            raise GuiError(f"The `repeat` count must be between 0 and {MACRO_MAX_REPEAT}.")
     elif verb == "call":
-        macro_path(args[0])          # 名稱合法性（也擋路徑穿越）
+        macro_path(args[0])          # name validity (also blocks path traversal)
     elif verb in ("if_pixel", "if_no_pixel"):
-        # 第四個參數是**顏色容差**（整數），不是秒數——跟 `eval_macro_condition`
-        # 走同一支 `parse_tolerance`，不要併回下面 `wait_pixel` 那一支。
+        # The fourth argument is the **colour tolerance** (an integer), not
+        # seconds—it goes through the same `parse_tolerance` as
+        # `eval_macro_condition`; do not merge it back into the `wait_pixel`
+        # branch below.
         parse_xy(args[:2])
         parse_color(args[2])
         if len(args) > 3:
             parse_tolerance(args[3])
     elif verb == "wait_pixel":
-        # 這裡的第四個參數才是逾時秒數（見 `run_macro_step`）
+        # Here the fourth argument really is the timeout in seconds (see
+        # `run_macro_step`)
         parse_xy(args[:2])
         parse_color(args[2])
         if len(args) > 3:
@@ -2726,14 +3136,15 @@ def validate_macro_step(step: str) -> tuple[str, list[str]]:
     elif verb == "win":
         action = args[0].lower()
         if action != "close" and action not in WINDOW_SHOW_ACTIONS:
-            raise GuiError("`win` 的動作只能是 `min` / `max` / `restore` / `show` / `hide` / `close`。")
+            raise GuiError("The `win` action must be `min` / `max` / `restore` / `show` / `hide` / `close`.")
     elif verb in MACRO_TIMEOUT_DEFAULTS:
-        # 第一個參數如果是數字就當逾時秒數，剩下的是目標。直接呼叫執行端用的
-        # 那一支 `split_timeout`，不要在這裡再寫一次「像不像數字」的判斷。
+        # If the first argument is a number it is the timeout in seconds, and the
+        # rest is the target. Call the same `split_timeout` the execution side
+        # uses; do not write a second "does it look like a number" check here.
         split_timeout(args, default=MACRO_TIMEOUT_DEFAULTS[verb])
     elif verb == "clip":
         if args[0].lower() != "set" or len(args) < 2:
-            raise GuiError("巨集裡的 `clip` 只能是 `clip set <文字>`。")
+            raise GuiError("In a macro, `clip` can only be `clip set <text>`.")
     return verb, args
 
 
@@ -2747,33 +3158,35 @@ def _looks_numeric(text: str) -> bool:
 
 def run_macro_step(step: str, *,
                    should_abort: Callable[[], bool] | None = None) -> str:
-    """執行單一步驟，回一句可以直接顯示給使用者的敘述（**同步阻塞**）。
+    """Run a single step, returning a sentence that can be shown to the user
+    directly (**synchronous, blocking**).
 
-    `should_abort` 會往下傳給所有會等待的動作。沒有它的話「中止在步驟之間生效」
-    等於「最久要等 `MACRO_MAX_WAIT_SEC` 才生效」——單一 `wait_text 120 …` 就能讓
-    `!macro stop` 兩分鐘沒有反應。
+    `should_abort` is passed down to every action that waits. Without it, "the
+    abort takes effect between steps" would mean "the abort takes effect after at
+    most `MACRO_MAX_WAIT_SEC`"—a single `wait_text 120 …` could leave `!macro stop`
+    unresponsive for two minutes.
     """
     verb, args = validate_macro_step(step)
     if verb == "click":
         x, y = parse_xy(args[:2])
         button = parse_button(args[2]) if len(args) > 2 else "mouse_left"
         mouse_click(button, x, y)
-        return f"點選 ({x}, {y})"
+        return f"clicked ({x}, {y})"
     if verb == "dclick":
         x, y = parse_xy(args[:2])
         button = parse_button(args[2]) if len(args) > 2 else "mouse_left"
         mouse_click(button, x, y, times=2)
-        return f"雙擊 ({x}, {y})"
+        return f"double-clicked ({x}, {y})"
     if verb == "move":
         x, y = parse_xy(args[:2])
         mouse_move(x, y)
-        return f"移動到 ({x}, {y})"
+        return f"moved to ({x}, {y})"
     if verb == "drag":
         x1, y1 = parse_xy(args[:2])
         x2, y2 = parse_xy(args[2:4])
         button = parse_button(args[4]) if len(args) > 4 else "mouse_left"
         mouse_drag(x1, y1, x2, y2, button)
-        return f"拖曳 ({x1}, {y1}) → ({x2}, {y2})"
+        return f"dragged ({x1}, {y1}) → ({x2}, {y2})"
     if verb == "scroll":
         amount = int(args[0])
         if len(args) == 3:
@@ -2781,34 +3194,36 @@ def run_macro_step(step: str, *,
             mouse_scroll(amount, x, y)
         else:
             mouse_scroll(amount)
-        return f"捲動 {amount}"
+        return f"scrolled {amount}"
     if verb == "type":
         text = " ".join(args)
         type_text(text)
-        return f"輸入 {len(text)} 字"
+        return f"typed {len(text)} characters"
     if verb == "paste":
         text = " ".join(args)
         paste_text(text)
-        return f"貼上 {len(text)} 字"
+        return f"pasted {len(text)} characters"
     if verb == "hotkey":
         tokens = parse_hotkey_tokens(args[0])
         press_hotkey(tokens)
-        return f"按鍵 {' + '.join(tokens)}"
+        return f"pressed {' + '.join(tokens)}"
     if verb == "keydown":
-        return f"按住 {key_down(args[0])}"
+        return f"holding {key_down(args[0])}"
     if verb == "keyup":
-        return f"放開 {key_up(args[0])}"
+        return f"released {key_up(args[0])}"
     if verb == "release_keys":
-        # 要回報人看的步驟敘述，所以走 `_report`：放不掉的鍵不算進「放開」，也不能就此
-        # 不提——它們還列在 `/input key status`、巨集結束時會再試一次。
+        # This is a step description for a person to read, so it goes through
+        # `_report`: keys that could not be released are not counted as
+        # "released", nor can they go unmentioned—they are still listed in
+        # `/input key status`, and the end of the macro will try again.
         released, stuck = release_all_inputs_report()
-        detail = f"{len(released)} 個"
+        detail = f"{len(released)} released"
         if stuck:
-            detail += f"；另有 {len(stuck)} 個放不掉"
-        return f"放開全部按鍵（{detail}）"
+            detail += f"; {len(stuck)} could not be released"
+        return f"released all keys ({detail})"
     if verb == "focus":
         _hwnd, _title, count = window_focus(" ".join(args))
-        return f"聚焦視窗（命中 {count} 個）"
+        return f"focused window ({count} matched)"
     if verb == "win":
         action = args[0].lower()
         needle = " ".join(args[1:])
@@ -2816,55 +3231,55 @@ def run_macro_step(step: str, *,
             _hwnd, _title, count = window_close(needle)
         else:
             _hwnd, _title, count = window_show(needle, action)
-        return f"視窗 {action}（命中 {count} 個）"
+        return f"window {action} ({count} matched)"
     if verb == "wait":
         seconds = parse_duration(args[0], maximum=MACRO_MAX_WAIT_SEC)
         _sleep_abortable(seconds, should_abort)
-        return f"等待 {seconds:g} 秒"
+        return f"waited {seconds:g} seconds"
     if verb == "wait_window":
         timeout, needle = split_timeout(args, default=MACRO_TIMEOUT_DEFAULTS[verb])
         wait_window(needle, timeout, should_abort=should_abort)
-        return "視窗已出現"
+        return "window appeared"
     if verb == "wait_text":
         timeout, target = split_timeout(args, default=MACRO_TIMEOUT_DEFAULTS[verb])
         x, y = wait_text(target, timeout, should_abort=should_abort)
-        return f"文字已出現於 ({x}, {y})"
+        return f"text appeared at ({x}, {y})"
     if verb == "click_text":
         timeout, target = split_timeout(args, default=MACRO_TIMEOUT_DEFAULTS[verb])
         del timeout
         x, y = click_text(target)
-        return f"點選文字於 ({x}, {y})"
+        return f"clicked text at ({x}, {y})"
     if verb == "clip":
         text = " ".join(args[1:])
         set_clipboard(text)
-        return f"寫入剪貼簿 {len(text)} 字"
+        return f"wrote {len(text)} characters to the clipboard"
     if verb == "ui_click":
         x, y = ui_click(" ".join(args))
-        return f"點選 UI 元素於 ({x}, {y})"
+        return f"clicked UI element at ({x}, {y})"
     if verb == "wait_ui":
         timeout, target = split_timeout(args, default=MACRO_TIMEOUT_DEFAULTS[verb])
         found = ui_wait(target, timeout, should_abort=should_abort)
-        return f"UI 元素已出現於 ({found['x']}, {found['y']})"
+        return f"UI element appeared at ({found['x']}, {found['y']})"
     if verb == "wait_gone_text":
         timeout, target = split_timeout(args, default=MACRO_TIMEOUT_DEFAULTS[verb])
         wait_text_gone(target, timeout, should_abort=should_abort)
-        return "文字已消失"
+        return "text disappeared"
     if verb == "wait_gone_window":
         timeout, needle = split_timeout(args, default=MACRO_TIMEOUT_DEFAULTS[verb])
         wait_window_gone(needle, timeout, should_abort=should_abort)
-        return "視窗已關閉"
+        return "window closed"
     if verb == "wait_pixel":
         x, y = parse_xy(args[:2])
         color = parse_color(args[2])
         timeout = (parse_duration(args[3], maximum=MACRO_MAX_WAIT_SEC)
                    if len(args) > 3 else 15.0)
         wait_pixel(x, y, color, timeout, should_abort=should_abort)
-        return f"({x}, {y}) 已變成指定顏色"
-    raise GuiError(f"不認得的動作 `{verb}`。")
+        return f"({x}, {y}) turned the specified colour"
+    raise GuiError(f"Unknown action `{verb}`.")
 
 
 def eval_macro_condition(verb: str, args: list[str]) -> bool:
-    """判斷一個 `if_…` 條件。"""
+    """Evaluate an `if_…` condition."""
     kind, negate = MACRO_CONDITIONS[verb]
     if kind == "text":
         result = bool(find_text(" ".join(args)))
@@ -2875,7 +3290,8 @@ def eval_macro_condition(verb: str, args: list[str]) -> bool:
     else:
         x, y = parse_xy(args[:2])
         color = parse_color(args[2])
-        # 與 `validate_macro_step` 同一支解析；存檔時放行的值這裡一定讀得懂
+        # The same parser as `validate_macro_step`; any value allowed at save time
+        # is guaranteed to be understood here
         tolerance = parse_tolerance(args[3]) if len(args) > 3 else 12
         current = pixel_color(x, y)
         result = all(abs(a - b) <= tolerance for a, b in zip(current, color))
@@ -2883,22 +3299,25 @@ def eval_macro_condition(verb: str, args: list[str]) -> bool:
 
 
 def split_timeout(args: list[str], *, default: float) -> tuple[float, str]:
-    """`["10", "存檔"]` → `(10.0, "存檔")`；`["存檔"]` → `(default, "存檔")`。"""
+    """`["10", "Save"]` → `(10.0, "Save")`; `["Save"]` → `(default, "Save")`."""
     if len(args) > 1 and _looks_numeric(args[0]):
         return parse_duration(args[0], maximum=MACRO_MAX_WAIT_SEC), " ".join(args[1:])
     return default, " ".join(args)
 
 
 def macro_path(name: str) -> Path:
-    """巨集檔路徑。名稱限英數 / `_` / `-`，擋掉 `../` 之類的路徑穿越。"""
+    """The macro file path. Names are limited to letters, digits / `_` / `-`,
+    blocking path traversal such as `../`."""
     key = (name or "").strip()
     if not MACRO_NAME_RE.match(key):
-        raise GuiError("巨集名稱只能是英數字、底線與連字號，長度 1..40。")
+        raise GuiError("A macro name may only contain letters, digits, underscores and hyphens, "
+                       "length 1..40.")
     return MACRO_DIR / f"{key}.json"
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """同目錄 temp → `os.replace`（跨行程檔案一律原子寫入，見 CLAUDE.md）。"""
+    """Same-directory temp → `os.replace` (cross-process files are always written
+    atomically, see CLAUDE.md)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     try:
@@ -2913,29 +3332,36 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _macro_author_id(raw: Any) -> int:
-    """把磁碟上的 `author_id` 正規化成一個普通的非負 `int`；壞掉一律回 0。
+    """Normalise the on-disk `author_id` into a plain non-negative `int`; anything
+    broken returns 0.
 
-    `save_macro` 寫出去的是五個欄位，而 `load_macro` 的 docstring 雖然寫著「重新
-    驗證每一步」，實際上只重驗了 `steps`。`author_id` 會被 `edit_macro` 拿去
-    `int(...)`，而巨集檔在磁碟上是可以被手改壞的：`"abc"` → `ValueError`、
-    `[1, 2]` / `{"a": 1}` → `TypeError`、`Infinity` → `OverflowError`、`NaN` →
-    `ValueError`。`/macro` 那一側只 `except GuiError`，所以這些會一路冒到派送層
-    的泛用失敗句，使用者**再也沒辦法用 bot 把那個巨集改回來**——而這整組指令
-    存在的理由正是「下指令的人不在電腦前面」。
+    `save_macro` writes five fields, and although `load_macro`'s docstring says
+    "re-validate every step", it actually only re-validated `steps`. `author_id` is
+    passed to `int(...)` by `edit_macro`, and a macro file on disk can be broken by
+    hand: `"abc"` → `ValueError`, `[1, 2]` / `{"a": 1}` → `TypeError`, `Infinity`
+    → `OverflowError`, `NaN` → `ValueError`. The `/macro` side only does
+    `except GuiError`, so these would bubble all the way up to the dispatch layer's
+    generic failure sentence, and the user **could never again fix that macro
+    through the bot**—while the whole reason this command set exists is that "the
+    person issuing commands is not at the computer".
 
-    `1e400` 那一種甚至不必有人手改檔案：一個夠大的數字 `json.loads` 出來就是
-    `inf`（本專案已經為同一個數值家族寫過一整批守門）。
+    The `1e400` kind does not even need anyone to edit the file by hand: a large
+    enough number comes out of `json.loads` as `inf` (this project has already
+    written a whole batch of guards for the same family of numbers).
 
-    壞掉的值退回 0（＝不知道是誰）而**不是**丟 `GuiError`：`steps` 是行為、壞了
-    不能執行；`author_id` 只是註記——為了一個註記拒收整份巨集，等於把修復路徑跟
-    著關掉，而這正是要修的那個缺陷本身的形狀。
+    A broken value falls back to 0 (= unknown author) rather than raising
+    `GuiError`: `steps` is behaviour and cannot run when broken; `author_id` is only
+    an annotation—rejecting the whole macro over an annotation would close off the
+    repair path too, which is exactly the shape of the defect being fixed.
 
-    `bool` 要單獨排除：`isinstance(True, int)` 是 True，所以 `true` 會穿過一個天
-    真的 `isinstance(x, int)` 閘，然後把作者安靜地記成使用者 1（一個真的存在的 id）。
-    這是本專案同一個陷阱的第四個實例。
+    `bool` has to be excluded separately: `isinstance(True, int)` is True, so
+    `true` would pass a naive `isinstance(x, int)` gate and quietly record the
+    author as user 1 (an id that really exists). This is the fourth instance of the
+    same trap in this project.
 
-    刻意**不設上限**：平台的使用者 id 是 64-bit，`400000000000000001` 是合法值，
-    隨手加一個上限就會把真的作者砍成 0。
+    There is deliberately **no upper bound**: the platform's user ids are 64-bit,
+    `400000000000000001` is a legal value, and adding a casual cap would cut a real
+    author down to 0.
     """
     if isinstance(raw, bool) or not isinstance(raw, int):
         return 0
@@ -2954,57 +3380,62 @@ def save_macro(name: str, steps: list[str], *, author_id: int = 0) -> Path:
     try:
         _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
     except OSError as error:
-        raise GuiError("巨集存檔失敗。") from error
+        raise GuiError("Failed to save the macro.") from error
     return path
 
 
 def load_macro(name: str) -> dict[str, Any]:
-    """讀巨集並**重新驗證**每一步——檔案在磁碟上是可以被手動改壞的。"""
+    """Read a macro and **re-validate** every step—the file on disk can be broken
+    by hand."""
     path = macro_path(name)
     if not path.exists():
-        raise GuiError("找不到這個巨集。")
+        raise GuiError("No macro with that name was found.")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
-        raise GuiError("巨集檔讀取失敗或格式損毀。") from error
+        raise GuiError("Failed to read the macro file, or its format is corrupt.") from error
     steps = data.get("steps") if isinstance(data, dict) else None
     if not isinstance(steps, list) or not steps:
-        raise GuiError("巨集檔內容不合法。")
+        raise GuiError("The macro file's content is invalid.")
     if len(steps) > MACRO_MAX_STEPS:
-        raise GuiError("巨集步驟數超過上限。")
+        raise GuiError("The macro has more steps than the limit.")
     clean: list[str] = []
     for index, step in enumerate(steps, start=1):
         if not isinstance(step, str):
-            raise GuiError(f"巨集第 {index} 步不是文字。")
+            raise GuiError(f"Macro step {index} is not text.")
         try:
             validate_macro_step(step)
         except GuiError as error:
-            raise GuiError(f"巨集第 {index} 步不合法：{error}") from error
+            raise GuiError(f"Macro step {index} is invalid: {error}") from error
         clean.append(step)
     macro_block_map(clean)
     data["steps"] = clean
-    # `steps` 以外的欄位也是手改得了的。`version` / `name` / `created` 每次寫回
-    # 去都由 `save_macro` 重新產生，壞了不會流到下游；`author_id` 不同——它會被
-    # 原值帶回 `save_macro`，所以在**讀取端**就正規化，每一個呼叫端都受惠。
+    # Fields other than `steps` can be edited by hand too. `version` / `name` /
+    # `created` are regenerated by `save_macro` on every write-back, so a broken one
+    # never flows downstream; `author_id` is different—its original value is
+    # carried back into `save_macro`, so it is normalised **on the read side**,
+    # which benefits every caller.
     data["author_id"] = _macro_author_id(data.get("author_id"))
     return data
 
 
 def edit_macro(name: str, line: int, step: str | None, *,
                insert: bool = False) -> list[str]:
-    """改／插入／刪掉巨集的某一行，回改完的步驟清單。
+    """Replace / insert / delete one line of a macro, returning the edited list of
+    steps.
 
-    `step is None` 代表刪除。行號從 1 開始（跟 `/macro show` 顯示的一致）。
-    改完會**整份重驗**（單行合法性 ＋ 區塊平衡）才寫回：只驗那一行的話，一個
-    刪掉的 `end` 會讓整個巨集在下次重播時才爆。
+    `step is None` means delete. Line numbers start at 1 (matching what
+    `/macro show` displays). After the edit, **the whole macro is re-validated**
+    (per-line validity + block balance) before writing back: validating only that
+    line would let a deleted `end` blow up the whole macro on the next replay.
     """
     data = load_macro(name)
     steps = list(data["steps"])
     if insert:
         if not 1 <= line <= len(steps) + 1:
-            raise GuiError(f"行號必須介於 1 到 {len(steps) + 1}。")
+            raise GuiError(f"The line number must be between 1 and {len(steps) + 1}.")
     elif not 1 <= line <= len(steps):
-        raise GuiError(f"行號必須介於 1 到 {len(steps)}。")
+        raise GuiError(f"The line number must be between 1 and {len(steps)}.")
     if step is None:
         steps.pop(line - 1)
     elif insert:
@@ -3012,22 +3443,24 @@ def edit_macro(name: str, line: int, step: str | None, *,
     else:
         steps[line - 1] = step.strip()
     if not steps:
-        raise GuiError("巨集不能變成空的；要整個刪掉請用 `/macro delete`。")
+        raise GuiError("A macro cannot become empty; to delete it entirely, use `/macro delete`.")
     if len(steps) > MACRO_MAX_STEPS:
-        raise GuiError(f"一個巨集最多 {MACRO_MAX_STEPS} 步。")
+        raise GuiError(f"A macro may have at most {MACRO_MAX_STEPS} steps.")
     for index, entry in enumerate(steps, start=1):
         try:
             validate_macro_step(entry)
         except GuiError as error:
-            raise GuiError(f"第 {index} 步不合法：{error}") from error
+            raise GuiError(f"Step {index} is invalid: {error}") from error
     macro_block_map(steps)
-    # `load_macro` 已經把它正規化成非負 `int` 了，這裡不必再 `int(...)` 一次。
+    # `load_macro` has already normalised it into a non-negative `int`, so there is
+    # no need to `int(...)` it again here.
     save_macro(name, steps, author_id=data.get("author_id", 0))
     return steps
 
 
 def list_macros() -> list[tuple[str, int, float]]:
-    """`[(名稱, 步驟數, mtime), …]`，依名稱排序。壞掉的檔跳過不擋列表。"""
+    """`[(name, step count, mtime), …]`, sorted by name. Broken files are skipped
+    without blocking the list."""
     if not MACRO_DIR.exists():
         return []
     out: list[tuple[str, int, float]] = []
@@ -3045,17 +3478,18 @@ def list_macros() -> list[tuple[str, int, float]]:
 def delete_macro(name: str) -> None:
     path = macro_path(name)
     if not path.exists():
-        raise GuiError("找不到這個巨集。")
+        raise GuiError("No macro with that name was found.")
     try:
         path.unlink()
     except OSError as error:
-        raise GuiError("刪除巨集失敗。") from error
+        raise GuiError("Failed to delete the macro.") from error
 
 
 # --------------------------------------------------------------------------
 # Shell
 # --------------------------------------------------------------------------
-# 正在跑的 `run_shell` 子行程。`!sh` 是同步阻塞的，沒有這份名單就沒辦法中止。
+# The `run_shell` child processes currently running. `!sh` is synchronous and
+# blocking, so without this list there is no way to abort one.
 _SHELL_PROCS: set = set()
 
 SHELL_DEFAULT_TIMEOUT_SEC = 60.0
@@ -3063,54 +3497,68 @@ SHELL_MAX_TIMEOUT_SEC = 900.0
 SHELL_MAX_OUTPUT_CHARS = 200_000
 
 # --------------------------------------------------------------------------
-# PowerShell 的編碼：從源頭統一，不要在讀的那一端挑解碼器
+# PowerShell encoding: unify it at the source, rather than picking a decoder at the
+# reading end
 # --------------------------------------------------------------------------
-# 同一次 `/host sh run` 的輸出流裡**可以同時有兩種編碼**，所以「挑一個解碼器」這條
-# 路本來就走不通（實測，不是推論）：
+# One `/host sh run` output stream **can carry two encodings at once**, so "pick a
+# decoder" was never a workable approach (measured, not inferred):
 #
-# * PowerShell **自己**的輸出（`Write-Output '佇列已清空，行程結束'`）走**主控台
-#   代碼頁**，本機是 cp950——`pwsh` 7.6.6 與內建的 `powershell` 5.1 都一樣。照
-#   `encoding="utf-8"` 讀，那 10 個中文字變成 **11 個 U+FFFD**。
-# * **原生命令**的輸出（`git log --format=%s`）是 PowerShell **原樣穿透**的位元組，
-#   git 吐 UTF-8，所以那一半用 utf-8 讀是對的、用 `"oem"` 讀會整個解不開。
+# * PowerShell's **own** output (`Write-Output '佇列已清空，行程結束'`) goes through
+#   the **console code page**, cp950 locally—the same for `pwsh` 7.6.6 and the
+#   built-in `powershell` 5.1. Read with `encoding="utf-8"`, those 10 Chinese
+#   characters become **11 U+FFFD**.
+# * **Native command** output (`git log --format=%s`) is bytes PowerShell **passes
+#   through unchanged**; git emits UTF-8, so reading that half as utf-8 is right,
+#   and reading it as `"oem"` fails to decode entirely.
 #
-# 所以改成叫 PowerShell 兩端都用 UTF-8。`errors="replace"` 保證這個缺陷永遠不會
-# 以例外的形式出現，只會安靜地把中文吃掉——沒有紅字、沒有 traceback。
+# So PowerShell is instead told to use UTF-8 on both ends. `errors="replace"`
+# guarantees this defect never shows up as an exception; it only silently eats the
+# Chinese—no red text, no traceback.
 #
-# ⚠️ **`InputEncoding` 那一句不是順手加的，輸入端本來就是壞的。**
-# `job_start(interactive=True)` 的 stdin 我們用 UTF-8 編碼寫進去，PowerShell 那端
-# 卻用主控台代碼頁解。實測餵 `測試輸入`（4 個字元、UTF-8 是 12 個位元組）進去，
-# `Read-Host` 收到的是 **6 個字元**（U+769C U+7948 U+5CAB U+981B U+8A68 U+F16F）。
-# **而回顯會把這個傷害藏起來**：那串 mojibake 再用同一個代碼頁編碼寫回 stdout，
-# 位元組跟原本的 UTF-8 一模一樣，我們照 utf-8 解就「看起來完全正確」。要量的是
-# `$x.Length`，不是回顯長什麼樣。
+# ⚠️ **The `InputEncoding` line was not added in passing; the input side was
+# broken to begin with.** We write `job_start(interactive=True)`'s stdin encoded as
+# UTF-8, while the PowerShell end decodes it with the console code page. Measured:
+# feeding in `測試輸入` (4 characters, 12 bytes in UTF-8), `Read-Host` received
+# **6 characters** (U+769C U+7948 U+5CAB U+981B U+8A68 U+F16F).
+# **And the echo hides the damage**: that mojibake is encoded back to stdout with
+# the same code page, the bytes are identical to the original UTF-8, and decoding
+# them as utf-8 "looks completely correct". What must be measured is `$x.Length`,
+# not what the echo looks like.
 #
-# ⚠️⚠️ **這兩個 setter 打的是「共用的主控台」，而且不會還原。** 它們底下呼叫
-# `SetConsoleOutputCP` / `SetConsoleCP`，改的是**呼叫者**那個主控台的代碼頁。少了
-# 下面那個 `_SHELL_CREATIONFLAGS`，跑一次 `/host sh run` 就把 bot 主控台的代碼頁從
-# 950 改成 65001（實測：跑前 950、跑後 65001，而且**後續沒有加前綴的呼叫也跟著吐
-# UTF-8**），之後每一個子行程都受影響——包括兩處刻意用 `encoding="oem"` 的
-# `schtasks` 查詢（`_process_control` 與 `install_autostart`）。那種壞法的症狀會
-# 出現在**別的功能**上、完全不會指回這裡。
+# ⚠️⚠️ **These two setters hit "the shared console", and are never restored.**
+# Underneath they call `SetConsoleOutputCP` / `SetConsoleCP`, which change the code
+# page of **the caller's** console. Without the `_SHELL_CREATIONFLAGS` below, one
+# run of `/host sh run` switches the bot console's code page from 950 to 65001
+# (measured: 950 before, 65001 after, and **later calls without the prefix also
+# emit UTF-8**), and every subsequent child process is affected—including the two
+# `schtasks` queries that deliberately use `encoding="oem"` (`_process_control` and
+# `install_autostart`). The symptoms of that breakage show up in **other
+# features** and never point back here.
 #
-# 前綴與旗標是**一組**：只加旗標不加前綴，U+FFFD 仍然是 11（做事的是前綴）；
-# 只加前綴不加旗標，輸出對了但主控台被污染（收住副作用的是旗標）。
+# The prefix and the flag are **a pair**: with only the flag and no prefix, U+FFFD
+# is still 11 (the prefix does the work); with only the prefix and no flag, the
+# output is right but the console gets polluted (the flag contains the side
+# effect).
 _PS_UTF8_PRELUDE = (
     "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
     "[Console]::InputEncoding=[Text.Encoding]::UTF8; "
 )
 
-# 子行程拿到**自己的**隱藏主控台，上面那兩個 setter 就改不到我們這一個。
-# `CREATE_NO_WINDOW` 只存在於 Windows 的 `subprocess`，所以要包起來；傳 0 在其他
-# 平台是合法的（CPython 只在 `creationflags != 0` 時才拒絕）。
-# `DETACHED_PROCESS` 不能拿來代替：實測輸出會變成空字串。
+# The child gets **its own** hidden console, so the two setters above cannot touch
+# ours. `CREATE_NO_WINDOW` only exists in Windows' `subprocess`, hence the guard;
+# passing 0 is legal on other platforms (CPython only refuses when
+# `creationflags != 0`).
+# `DETACHED_PROCESS` cannot be used instead: measured, the output becomes an empty
+# string.
 _SHELL_CREATIONFLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
-# ANSI CSI / OSC 逸出序列。PowerShell 7 的表格輸出會夾雜顏色碼（`Get-ChildItem`
-# 之類的 formatter 一定會），在對話平台上是一堆看不懂的 `[32;1m`。這些純粹是
-# 終端機的呈現指令、不帶內容，所以在 `run_shell` 裡就剝掉——連寫進 log 的那份
-# 也一起乾淨。（不改用 `$PSStyle.OutputRendering`：Windows 內建的 5.1 沒有那個
-# 變數，`powershell` fallback 會直接報錯。）
+# ANSI CSI / OSC escape sequences. PowerShell 7's table output is interspersed with
+# colour codes (formatters like `Get-ChildItem`'s always do this), which on the chat
+# platform are a mess of unreadable `[32;1m`. These are purely terminal
+# presentation commands carrying no content, so `run_shell` strips them—which keeps
+# the copy written to the log clean too. (Not switching to
+# `$PSStyle.OutputRendering`: the built-in Windows 5.1 has no such variable, and
+# the `powershell` fallback would error out.)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
@@ -3118,51 +3566,60 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
 
 
-# 指令執行的「目前工作目錄」。一次 `!sh` 就是一個獨立行程，`cd` 的效果不會留到
-# 下一次，所以工作目錄得由本模組記著。存在**記憶體**裡而不是磁碟：這是對話的
-# 情境狀態，不是跨行程契約，bot 重啟後回到專案根目錄才是預期行為。
+# The "current working directory" for command execution. Each `!sh` is a separate
+# process, and the effect of `cd` does not carry over to the next one, so this
+# module has to remember the working directory. It lives **in memory** rather than
+# on disk: it is conversational context, not a cross-process contract, and going
+# back to the project root after a bot restart is the expected behaviour.
 _SHELL_CWD: Path = PROJECT_ROOT
 
 
 def shell_cwd() -> Path:
-    """`!sh` 目前的工作目錄。"""
+    """The current working directory for `!sh`."""
     return _SHELL_CWD
 
 
 def set_shell_cwd(raw: str | None) -> Path:
-    """切換工作目錄；`None` / 空字串回到專案根目錄。回傳切換後的路徑。"""
+    """Change the working directory; `None` / an empty string goes back to the
+    project root. Returns the path after the change."""
     global _SHELL_CWD  # pylint: disable=global-statement
     text = unquote_path(raw)
     if not text:
         _SHELL_CWD = PROJECT_ROOT
         return _SHELL_CWD
-    # 相對路徑以**目前**工作目錄為基準，這樣連續 `cd a`、`cd b` 才符合直覺
-    # （`resolve_host_path` 是以專案根目錄為基準，那是給絕對定位用的）。
+    # Relative paths are based on the **current** working directory, so that
+    # `cd a` followed by `cd b` behaves intuitively (`resolve_host_path` is based
+    # on the project root, which is meant for absolute positioning).
     expanded = Path(os.path.expandvars(os.path.expanduser(text)))
     candidate = expanded if expanded.is_absolute() else _SHELL_CWD / expanded
     candidate = Path(os.path.normpath(str(candidate)))
     if not candidate.is_dir():
-        raise GuiError("找不到這個資料夾。")
+        raise GuiError("Folder not found.")
     _SHELL_CWD = candidate
     return _SHELL_CWD
 
 
 def shell_argv(command: str, *, interactive: bool = False) -> list[str]:
-    """組出執行指令用的 argv。
+    """Build the argv used to run a command.
 
-    Windows 上優先用 PowerShell 7（`pwsh`）、退回內建的 `powershell`；其他平台
-    走 `/bin/sh -c`。一律加上 `-NoProfile`：載入使用者 profile 會拖慢每次呼叫
-    又可能改動環境。
+    On Windows, PowerShell 7 (`pwsh`) is preferred, falling back to the built-in
+    `powershell`; other platforms use `/bin/sh -c`. `-NoProfile` is always added:
+    loading the user's profile slows down every call and may alter the
+    environment.
 
-    `-NonInteractive` 只在**非**互動模式加。它的用意是「沒有 tty 時不要停在提示
-    那裡等到逾時」，但它同時會讓 `Read-Host` 直接報錯——如果呼叫端根本就打算餵
-    輸入進去（`job_send`），那個旗標會讓整件事做不成。
+    `-NonInteractive` is only added in **non**-interactive mode. Its purpose is
+    "without a tty, do not sit at a prompt until the timeout", but it also makes
+    `Read-Host` error out immediately—if the caller actually intends to feed input
+    in (`job_send`), that flag would make the whole thing impossible.
 
-    Windows 上使用者的指令前面會接上 `_PS_UTF8_PRELUDE`（見那裡的說明）：輸出與
-    輸入兩端都改成 UTF-8，否則 PowerShell 自己的中文走主控台代碼頁、原生命令的
-    輸出原樣穿透，同一次呼叫裡就有兩種編碼。前綴是**兩句**，兩句都要——只設輸出
-    端的話 `job_send` 餵中文仍然壞，而那個壞法沒有任何錯誤訊息。前綴對結束碼是
-    中性的（實測 `exit 3` 加不加前綴都是 rc=3）。
+    On Windows the user's command is prefixed with `_PS_UTF8_PRELUDE` (see the
+    notes there): both output and input are switched to UTF-8, otherwise
+    PowerShell's own Chinese goes through the console code page while native
+    command output passes through unchanged, giving two encodings within one call.
+    The prefix is **two statements**, and both are needed—setting only the output
+    side still breaks Chinese fed in via `job_send`, and that breakage produces no
+    error message at all. The prefix is neutral to the exit code (measured:
+    `exit 3` gives rc=3 with or without the prefix).
     """
     if os.name == "nt":
         import shutil
@@ -3175,11 +3632,13 @@ def shell_argv(command: str, *, interactive: bool = False) -> list[str]:
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """逾時後把整棵子行程樹清掉。
+    """After a timeout, clean up the whole child process tree.
 
-    只 kill 直接子行程是不夠的：`powershell -Command "some.exe"` 之下真正在跑
-    的是孫行程，父死了孫子還在，逾時等於沒有生效。psutil 是必要相依，取不到
-    時退回只殺直接子行程。
+    Killing only the direct child is not enough: under
+    `powershell -Command "some.exe"` what is really running is a grandchild, and
+    when the parent dies the grandchild lives on, so the timeout would effectively
+    not take effect. psutil is a required dependency; when it is unavailable, fall
+    back to killing only the direct child.
     """
     try:
         import psutil  # type: ignore
@@ -3206,24 +3665,28 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 def run_shell(command: str, *, timeout: float = SHELL_DEFAULT_TIMEOUT_SEC,
               cwd: Path | None = None) -> dict[str, Any]:
-    """執行一行指令，回 `{rc, output, elapsed, timed_out}`（**同步阻塞**）。
+    """Run one command line, returning `{rc, output, elapsed, timed_out}`
+    (**synchronous, blocking**).
 
-    `output` 是 stdout ＋ stderr 合併後的原始文字，**沒有做去識別化** —— 呼叫
-    端負責在送進對話平台之前刷過（`_scrub_external_report`）。這裡不做是因為
-    寫 log 的那一份需要原文。
+    `output` is the raw text of stdout + stderr combined, **not de-identified**—the
+    caller is responsible for scrubbing it before it goes into the chat platform
+    (`_scrub_external_report`). It is not done here because the copy written to
+    the log needs the original text.
 
-    呼叫端必須自己確認權限：這個函式本身不認得誰是擁有者。
+    The caller must check permissions itself: this function does not know who the
+    owner is.
     """
     text = (command or "").strip()
     if not text:
-        raise GuiError("請給要執行的指令。")
+        raise GuiError("Give the command to run.")
     limit = max(1.0, min(float(timeout), SHELL_MAX_TIMEOUT_SEC))
     cwd = cwd or shell_cwd()
     argv = shell_argv(text)
     started = time.monotonic()
     try:
-        # nosec B603 — 由設計就是任意指令執行；閘門在呼叫端（限擁有者）。
-        # shell=False：argv 直接交給直譯器，不再多經過一層命令列解析。
+        # nosec B603 — arbitrary command execution by design; the gate is at the
+        # caller (owner-only). shell=False: argv goes straight to the interpreter,
+        # without an extra layer of command-line parsing.
         proc = subprocess.Popen(  # nosec B603
             argv,
             cwd=str(cwd),
@@ -3233,17 +3696,19 @@ def run_shell(command: str, *, timeout: float = SHELL_DEFAULT_TIMEOUT_SEC,
             text=True,
             encoding="utf-8",
             errors="replace",
-            # 子行程拿自己的隱藏主控台，`shell_argv` 那個前綴的
-            # `SetConsoleOutputCP` 才改不到 bot 這一個。少了它，跑一次指令就把
-            # bot 主控台的代碼頁從 950 改成 65001，兩處 `encoding="oem"` 的
-            # `schtasks` 查詢跟著壞掉——而症狀出現在別的功能上。
+            # The child gets its own hidden console, so the `SetConsoleOutputCP`
+            # from `shell_argv`'s prefix cannot touch the bot's. Without it, a
+            # single command run switches the bot console's code page from 950 to
+            # 65001, and the two `encoding="oem"` `schtasks` queries break with
+            # it—with the symptoms showing up in other features.
             creationflags=_SHELL_CREATIONFLAGS,
         )
     except OSError as error:
-        raise GuiError("無法啟動指令直譯器。") from error
+        raise GuiError("Could not start the command interpreter.") from error
     timed_out = False
-    # 登記在案，`shell_stop_all()` 才有東西可以砍。沒有這個的話，一個打錯的
-    # `!sh` 起跑之後只能等到逾時（最長 15 分鐘），中間完全沒有辦法。
+    # Register it so `shell_stop_all()` has something to kill. Without this, a
+    # mistyped `!sh` could only wait out its timeout once started (up to 15
+    # minutes), with no way to intervene in between.
     with _job_lock():
         _SHELL_PROCS.add(proc)
     try:
@@ -3257,13 +3722,13 @@ def run_shell(command: str, *, timeout: float = SHELL_DEFAULT_TIMEOUT_SEC,
             output = ""
     except Exception as error:  # pylint: disable=broad-except
         _kill_tree(proc)
-        raise GuiError("執行指令時發生錯誤。") from error
+        raise GuiError("An error occurred while running the command.") from error
     finally:
         with _job_lock():
             _SHELL_PROCS.discard(proc)
     output = strip_ansi(output or "")
     if len(output) > SHELL_MAX_OUTPUT_CHARS:
-        output = output[:SHELL_MAX_OUTPUT_CHARS] + "\n…（輸出過長，已截斷）"
+        output = output[:SHELL_MAX_OUTPUT_CHARS] + "\n… (output too long, truncated)"
     return {
         "rc": proc.returncode,
         "output": output,
@@ -3273,21 +3738,26 @@ def run_shell(command: str, *, timeout: float = SHELL_DEFAULT_TIMEOUT_SEC,
 
 
 # --------------------------------------------------------------------------
-# 動作錄製
+# Action recording
 # --------------------------------------------------------------------------
-# 掛低階鍵鼠 hook、錄「放開」與滾輪、打時間戳、以及鍵碼→字元的鍵盤配置查詢，
-# 全部在函式庫裡（`record` / `stop_record_timeline` / `char_table`）。這裡只留
-# **把事件轉成本專案的巨集語言**——那是這個 bot 自己的 DSL，不屬於函式庫。
+# Installing the low-level keyboard/mouse hooks, recording "release" and the wheel,
+# timestamping, and looking up key code → character for the keyboard layout are
+# all in the library (`record` / `stop_record_timeline` / `char_table`). All that
+# stays here is **converting events into this project's macro language**—that is
+# this bot's own DSL and does not belong in the library.
 #
-# 為什麼那三樣缺一不可（函式庫原本三樣都沒有，補上去才搬過來的）：沒有「放開」
-# 則拖曳看起來只是一次點選、修飾鍵按住的狀態還原不出來；沒有滾輪則捲動完全錄不
-# 到；沒有時間戳則重播時所有步驟一口氣跑完，真實介面來不及反應。
+# Why none of those three can be dropped (the library originally had none of them;
+# they were added there before this moved over): without "release", a drag looks
+# like just a click and a held modifier cannot be reconstructed; without the wheel,
+# scrolling cannot be recorded at all; without timestamps, replay runs every step
+# in one burst and a real interface cannot keep up.
 #
-# 安全性：鍵盤 hook 會錄到**期間打的每一個字，包含密碼**。所以錄製限擁有者、
-# 有硬性時間上限，而且 `!macro show` 送出前要過去識別化（錄下來的內容不是使用者
-# 寫的，是主機上發生的事）。
+# Security: the keyboard hook records **every character typed during the session,
+# passwords included**. So recording is owner-only, has a hard time limit, and
+# `!macro show` must de-identify before sending (what was recorded was not written
+# by the user; it is what happened on the host).
 RECORD_MAX_SEC = 300.0
-RECORD_MIN_WAIT_SEC = 0.4       # 小於這個間隔就不插 `wait`，免得步驟被切碎
+RECORD_MIN_WAIT_SEC = 0.4       # below this gap no `wait` is inserted, so steps are not chopped up
 RECORD_DOUBLE_CLICK_SEC = 0.4
 RECORD_DRAG_MIN_PX = 6
 
@@ -3295,8 +3765,8 @@ _RECORDING = False
 _RECORD_STARTED = 0.0
 _RECORD_LAYOUT: int | None = None
 
-# 修飾鍵的虛擬鍵碼 → 巨集裡用的名字。這張表是**本專案巨集語言**的字彙，不是
-# 系統知識，所以留在這裡。
+# Modifier virtual-key code → the name used in macros. This table is vocabulary of
+# **this project's macro language**, not system knowledge, so it stays here.
 _MODIFIER_VK = {
     16: "shift", 160: "shift", 161: "shift",
     17: "ctrl", 162: "ctrl", 163: "ctrl",
@@ -3304,27 +3774,30 @@ _MODIFIER_VK = {
     91: "win", 92: "win",
 }
 
-# 函式庫的事件動詞 → 本模組轉步驟時用的短名。
+# The library's event verbs → the short names this module uses when converting to
+# steps.
 _RECORD_OPS = {"key_down": "kdown", "key_up": "kup",
                "mouse_down": "mdown", "mouse_up": "mup", "scroll": "wheel"}
 
 
 def record_start() -> None:
-    """開始錄製。已經在錄就丟 `GuiError`。"""
+    """Start recording. Raise `GuiError` if already recording."""
     global _RECORDING, _RECORD_STARTED, _RECORD_LAYOUT  # pylint: disable=global-statement
     if os.name != "nt":
-        raise GuiError("錄製功能僅 Windows 可用。")
+        raise GuiError("Recording is only available on Windows.")
     if _RECORDING:
-        raise GuiError("已經在錄製中。")
+        raise GuiError("Already recording.")
     ac = load_ac()
-    # 鍵盤配置在**開始錄的時候**就問：那是使用者接下來打字用的那一個。等到停止
-    # 才問就晚了——那時候他人已經回到對話平台，前景視窗換了，配置也可能跟著換。
+    # Ask for the keyboard layout **when recording starts**: that is the one the
+    # user is about to type with. Asking at stop time is too late—by then they are
+    # back on the chat platform, the foreground window has changed, and the layout
+    # may have changed with it.
     _RECORD_LAYOUT = ac.foreground_keyboard_layout()
     try:
         ac.record()
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] record start failed: {error!r}", file=sys.stderr)
-        raise GuiError("無法開始錄製（掛不上鍵鼠監聽）。") from error
+        raise GuiError("Could not start recording (the keyboard/mouse listener could not be attached).") from error
     _RECORDING = True
     _RECORD_STARTED = time.monotonic()
 
@@ -3338,24 +3811,26 @@ def record_elapsed() -> float:
 
 
 def record_stop() -> list[dict[str, Any]]:
-    """停止錄製，回本模組轉步驟用的事件清單。"""
+    """Stop recording, returning the event list this module converts into steps."""
     global _RECORDING  # pylint: disable=global-statement
     if not _RECORDING:
-        raise GuiError("目前沒有在錄製。")
+        raise GuiError("Not currently recording.")
     _RECORDING = False
     try:
         events = load_ac().stop_record_timeline()
     except Exception as error:  # pylint: disable=broad-except
         print(f"[gui] record stop failed: {error!r}", file=sys.stderr)
-        raise GuiError("停止錄製失敗。") from error
+        raise GuiError("Failed to stop recording.") from error
     return _from_timeline(events)
 
 
 def _from_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """函式庫的 `delta_ms` 事件 → 帶絕對時間 `t` 的事件。
+    """The library's `delta_ms` events → events carrying an absolute time `t`.
 
-    轉步驟時要判斷「兩個動作之間停了多久」與「連點算不算雙擊」，用累加出來的
-    絕對時間比逐筆間隔好寫；函式庫回的是間隔，因為那才是重播需要的形式。
+    Converting to steps has to judge "how long the pause between two actions was"
+    and "whether repeated clicks count as a double-click", which is easier to write
+    with accumulated absolute time than with per-event gaps; the library returns
+    gaps because that is the form replay needs.
     """
     out: list[dict[str, Any]] = []
     clock = 0.0
@@ -3372,33 +3847,43 @@ def _from_timeline(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-# 表名 → 好讀的別名（`return` → `enter`）。錄出來的步驟是要給人看、給人改的，
-# 寫成文件裡用的那組名字比寫 Win32 的原始名稱好懂；兩種都能通過驗證。
+# Table name → readable alias (`return` → `enter`). Recorded steps are for people
+# to read and edit, and the names used in the docs are easier to understand than
+# the raw Win32 names; both pass validation.
 _ALIAS_REVERSE: dict[str, str] = {}
 for _friendly, _canonical in KEY_ALIASES.items():
-    # 先宣告的優先（`backspace` 比 `bksp` 好讀），不是最短的優先
+    # The one declared first wins (`backspace` reads better than `bksp`), not the
+    # shortest
     _ALIAS_REVERSE.setdefault(_canonical, _friendly)
 del _friendly, _canonical
 
 
 def _vk_to_name(vk: int) -> str | None:
-    """虛擬鍵碼 → 巨集用的鍵名；表裡查不到就回 None。
+    """Virtual-key code → the key name used in macros; None if the table has no
+    entry.
 
-    反查會撞名（滑鼠事件常數跟鍵盤共用同一張表，例如 vk 32 同時是 `space` 與
-    `middledown`，vk 84 同時是 `t` 與 `T`），所以要有明確的偏好順序，否則同一次
-    錄製在不同機器上會產生不一樣的字面。
+    Reverse lookup hits name collisions (the mouse-event constants share one table
+    with the keyboard: vk 32 is both `space` and `middledown`, and vk 84 is both
+    `t` and `T`), so there has to be an explicit order of preference, otherwise the
+    same recording would produce different text on different machines.
 
-    候選名字同時來自底層表與 `_EXTRA_KEY_CODES`（`parse_key_name` 認得的就是這兩
-    份的聯集），同一個偏好順序一起比——所以 vk 183 的 `LAUNCH_APP2`（大寫，
-    `parse_key_name` 寫不出來）與補充表的 `launch_app2` 同時在場時，一定挑小寫
-    那個。補充表是本專案自己的，底層載不進來也照樣查得到。
+    Candidate names come from both the low-level table and `_EXTRA_KEY_CODES`
+    (what `parse_key_name` recognises is exactly the union of the two), compared
+    with the same order of preference—so when vk 183's `LAUNCH_APP2` (uppercase,
+    which `parse_key_name` cannot write) and the extra table's `launch_app2` are
+    both present, the lowercase one is always picked. The extra table belongs to
+    this project, so it can be looked up even when the low level cannot load.
 
-    `_LIBRARY_NAME_OVERRIDES` 有兩條規則，兩條都跟「底層表那一筆是錯的」有關：
+    `_LIBRARY_NAME_OVERRIDES` has two rules, both about "that entry in the
+    low-level table is wrong":
 
-    * 被覆寫的名字**不拿來反查它在底層表裡的那個錯鍵碼**——vk 0x80（F17）不能錄成
-      `down`，否則重播時 `down` 會被換成 0x28，錄到的 F17 變成方向鍵；
-    * 覆寫的名字**明確勝出**（不靠長短碰巧），所以 vk 0x28 錄成 `down` 而不是底層
-      那個 `vk_down`。覆寫表收的本來就是一般人會打的名字。
+    * an overridden name is **not used for reverse lookup of its wrong key code in
+      the low-level table**—vk 0x80 (F17) must not be recorded as `down`, or on
+      replay `down` would become 0x28 and the recorded F17 would turn into an arrow
+      key;
+    * an overriding name **wins explicitly** (not by luck of length), so vk 0x28 is
+      recorded as `down` rather than the low level's `vk_down`. The override table
+      only holds names an ordinary person would type anyway.
     """
     if vk in _MODIFIER_VK:
         return _MODIFIER_VK[vk]
@@ -3417,16 +3902,19 @@ def _vk_to_name(vk: int) -> str | None:
         names = overriding
     if not names:
         return None
-    # 偏好順序：小寫優先 → 短的優先 → 字典序（保證跨機器一致）
+    # Order of preference: lowercase first → shorter first → lexicographic
+    # (guaranteeing consistency across machines)
     best = min(names, key=lambda n: (n != n.lower(), len(n), n))
     return _ALIAS_REVERSE.get(best, best)
 
 
 def _record_char_table() -> dict[int, tuple[str, str]]:
-    """錄製當下那個鍵盤配置的「按鍵→字元」對照表。
+    """The "key → character" table for the keyboard layout in use while
+    recording.
 
-    標點符號的虛擬鍵碼在不同配置上印出不同的字，寫死一份 US 表會讓非 US 配置錄
-    到的每個標點都是錯的。查詢與退路都在函式庫裡。
+    Punctuation virtual-key codes print different characters on different
+    layouts, and hardcoding a US table would make every punctuation mark recorded
+    on a non-US layout wrong. Both the lookup and the fallback are in the library.
     """
     try:
         return load_ac().char_table(_RECORD_LAYOUT)
@@ -3436,19 +3924,25 @@ def _record_char_table() -> dict[int, tuple[str, str]]:
 
 
 class RecordedMacro(NamedTuple):
-    """錄製轉成步驟的結果，連同**沒存進去的部分有多少**。
+    """The result of converting a recording into steps, together with **how much
+    was not saved**.
 
-    * `steps` —— 可以直接存檔的步驟（`record_to_steps` 回的就是這個）；
-    * `truncated` —— 因為超過 `MACRO_MAX_STEPS` 而沒存到的**動作**數（不含 `wait`：
-      截斷處之後的等待本來就會跟著最後一個動作一起失去意義，算進去只會讓數字看起來
-      比實際損失大）；
-    * `unrecordable` —— 轉出來卻重播不了、被略過的步驟數（叫不出名字的鍵、驗證不過
-      的步驟）。這個數字**與步數上限無關**：截斷處之後的步驟照樣逐一驗過再分類，
-      所以同一段錄製不管上限是多少，略過的數目都一樣。
+    * `steps` — steps that can be saved directly (this is what `record_to_steps`
+      returns);
+    * `truncated` — the number of **actions** not saved because they exceeded
+      `MACRO_MAX_STEPS` (excluding `wait`: waits after the cut-off lose their
+      meaning along with the last action anyway, and counting them would only make
+      the number look bigger than the real loss);
+    * `unrecordable` — the number of steps that were converted but cannot be
+      replayed, and were skipped (keys that cannot be named, steps that fail
+      validation). This number is **independent of the step cap**: steps after the
+      cut-off are still validated one by one and classified, so the same recording
+      skips the same number regardless of the cap.
 
-    兩個數字存在的理由是回報：錄製最長可以跑 `RECORD_MAX_SEC`，一百次點選（停頓
-    之後的每一次都是 `wait` ＋ `click` 兩步）就已經碰到上限，而原本回覆只寫「已存
-    成巨集（200 步）」，後面被丟掉的部分使用者完全不會知道。
+    Both numbers exist for reporting: a recording can run up to `RECORD_MAX_SEC`,
+    and a hundred clicks (each one after a pause is two steps, `wait` + `click`)
+    already reach the cap, while the reply used to say only "saved as a macro (200
+    steps)", so the user would never learn about the part dropped after that.
     """
 
     steps: list[str]
@@ -3460,7 +3954,8 @@ def record_to_steps(events: list[dict[str, Any]], *,
                     min_wait: float = RECORD_MIN_WAIT_SEC,
                     char_table: dict[int, tuple[str, str]] | None = None
                     ) -> list[str]:
-    """把錄到的事件轉成巨集步驟（只要步驟；要知道丟掉多少用 `convert_recording`）。"""
+    """Convert recorded events into macro steps (steps only; to learn how much was
+    dropped, use `convert_recording`)."""
     return convert_recording(events, min_wait=min_wait,
                              char_table=char_table).steps
 
@@ -3469,34 +3964,47 @@ def convert_recording(events: list[dict[str, Any]], *,
                       min_wait: float = RECORD_MIN_WAIT_SEC,
                       char_table: dict[int, tuple[str, str]] | None = None
                       ) -> RecordedMacro:
-    """把錄到的事件轉成巨集步驟，回 `RecordedMacro`。
+    """Convert recorded events into macro steps, returning a `RecordedMacro`.
 
-    轉換規則刻意保守——寧可多出一個看得懂的步驟，也不要猜錯：
+    The conversion rules are deliberately conservative—better an extra step that
+    is easy to understand than a wrong guess:
 
-    * 按下與放開位置差超過 `RECORD_DRAG_MIN_PX` → `drag`，否則 `click`；
-    * 同一點、**同一顆滑鼠鍵**在 `RECORD_DOUBLE_CLICK_SEC` 內連點兩次 → 併成
-      `dclick`（右鍵接著左鍵是兩次不同的點選，不是一次左鍵雙擊）；
-    * 連續滾輪事件併成一個 `scroll`；加總為 0 的一組（往下三格又往上三格）**不出
-      任何步驟**，連它自己的 `wait` 也不出——那段時間併進下一個動作前面的等待；
-    * 可印出字元的按鍵（沒有 ctrl / alt / win 按著）併成一個 `type`，
-      其餘按鍵出成 `hotkey`（帶上當下按著的修飾鍵）；
-    * 事件之間間隔超過 `min_wait` 就補一個 `wait` —— **這是重播能不能成功的關鍵**，
-      沒有它所有步驟會一口氣送出去，畫面根本來不及跟上；
-    * 最多存 `MACRO_MAX_STEPS` 步，後面的動作不存、但**算進 `truncated`**；重播不了
-      的步驟略過、算進 `unrecordable`（兩者都要回報給使用者，見 `RecordedMacro`）。
+    * press and release positions differing by more than `RECORD_DRAG_MIN_PX` →
+      `drag`, otherwise `click`;
+    * two clicks at the same point with **the same mouse button** within
+      `RECORD_DOUBLE_CLICK_SEC` → merged into `dclick` (a right click followed by a
+      left click is two different clicks, not one left double-click);
+    * consecutive wheel events are merged into one `scroll`; a group that sums to 0
+      (three notches down then three up) **produces no step at all**, not even its
+      own `wait`—that time is merged into the wait before the next action;
+    * printable-character keys (with no ctrl / alt / win held) are merged into one
+      `type`, and other keys come out as `hotkey` (with the modifiers held at the
+      time);
+    * a gap between events longer than `min_wait` adds a `wait`—**this is what
+      decides whether replay can succeed**; without it every step is sent in one
+      burst and the screen simply cannot keep up;
+    * at most `MACRO_MAX_STEPS` steps are saved; actions after that are not saved
+      but **are counted in `truncated`**; steps that cannot be replayed are skipped
+      and counted in `unrecordable` (both must be reported to the user, see
+      `RecordedMacro`).
 
-    鍵碼換成字元時用的是**錄製當下那個鍵盤配置**（`record_start` 就記下來了），
-    問不到才退回 US 對照表——標點符號的虛擬鍵碼在不同配置上印出不同的字，寫死一
-    份表會讓非 US 配置錄到的每個標點都是錯的。查表本身在函式庫裡。
+    Key codes are converted into characters using **the keyboard layout in use while
+    recording** (captured by `record_start`), falling back to the US table only when
+    it cannot be asked—punctuation virtual-key codes print different characters on
+    different layouts, and hardcoding one table would make every punctuation mark
+    recorded on a non-US layout wrong. The lookup itself is in the library.
 
-    `type` 的文字經過 `escape_macro_text`（`$` → `$$`），所以錄到的 `$100` 重播
-    出來還是 `$100`，不會被當成參數。這是唯一一種帶著錄到的文字的步驟：`hotkey`
-    的鍵名只能是英數字與底線。
+    `type` text goes through `escape_macro_text` (`$` → `$$`), so a recorded `$100`
+    still replays as `$100` rather than being taken as an argument. This is the only
+    kind of step that carries recorded text: `hotkey` key names can only be letters,
+    digits and underscores.
 
-    **已知、刻意不修的失真：空白。** `type` 的參數是先按空白拆開、重播時再用單一
-    空白接回去，而這裡併字時又 `.strip()` 過，所以連續空白會縮成一個、頭尾的空白
-    會消失。不修是因為要修就得改 `type` 的空白語意，而那會安靜地改變每一個既有的
-    手寫巨集。
+    **A known, deliberately unfixed distortion: whitespace.** `type`'s arguments are
+    split on whitespace and rejoined with single spaces on replay, and the text is
+    also `.strip()`ped here when merging, so runs of whitespace collapse to one and
+    leading/trailing whitespace disappears. It is not fixed because fixing it would
+    mean changing `type`'s whitespace semantics, which would silently change every
+    existing hand-written macro.
     """
     printable = char_table if char_table is not None else _record_char_table()
     steps: list[str] = []
@@ -3505,8 +4013,9 @@ def convert_recording(events: list[dict[str, Any]], *,
     down: dict[str, dict[str, Any]] = {}
     wheel: dict[str, Any] | None = None
     last_t: float | None = None
-    # 上一次點選：`(x, y, 放開時間, 哪一顆鍵)`。鍵要一起比，否則右鍵接著左鍵會被
-    # 併成一次左鍵雙擊（右鍵那一下就這樣不見了）。
+    # The previous click: `(x, y, release time, which button)`. The button has to
+    # be compared too, otherwise a right click followed by a left click would be
+    # merged into one left double-click (and the right click would simply vanish).
     last_click: tuple[int, int, float, str] | None = None
 
     def _flush_text() -> None:
@@ -3514,22 +4023,28 @@ def convert_recording(events: list[dict[str, Any]], *,
             text = "".join(pending_text).strip()
             pending_text.clear()
             if text:
-                # 錄到的是主機上真的打進去的字，裡面的 `$` 要跳脫成 `$$`，否則
-                # 重播時 `$1` 會被當成參數（`$100` → `00`）。
+                # What was recorded is text really typed on the host, so any `$` in
+                # it must be escaped as `$$`, otherwise on replay `$1` would be
+                # taken as an argument (`$100` → `00`).
                 steps.append(f"type {escape_macro_text(text)}")
 
     def _flush_wheel() -> None:
         nonlocal wheel
         if wheel is not None:
-            # 函式庫回的已經是「格數」（原始值除以一格 120），不用再換算。
+            # The library already returns "notches" (the raw value divided by 120
+            # per notch), so no further conversion is needed.
             #
-            # 加總為 0 的一組（往下又往上捲回原處）**什麼都不出**。這裡原本寫
-            # `int(...) or 1`，於是一組互相抵銷的滾動被錄成往上一格——一個從來沒
-            # 發生過的動作。`scroll 0` 本來就驗得過，那個 `or 1` 不是為了驗證。
+            # A group that sums to 0 (scrolling down and back up to where it was)
+            # **produces nothing**. This used to read `int(...) or 1`, so a group of
+            # scrolls that cancelled out was recorded as one notch up—an action that
+            # never happened. `scroll 0` passes validation anyway; that `or 1` was
+            # not there for validation.
             #
-            # 這一組的 `wait` 也是在這裡才補（`_gap` 從開頭延後到這裡），所以丟掉的
-            # 那一組不會留下它自己的等待；`last_t` 也沒動，那段時間自然併進下一個
-            # 動作前面的 `wait`，重播的總時間不會少。
+            # This group's `wait` is also only added here (`_gap` was deferred from
+            # the start to this point), so a dropped group leaves no wait of its
+            # own; `last_t` is untouched too, so that time naturally merges into the
+            # `wait` before the next action and the total replay time is not
+            # shortened.
             notches = int(wheel["delta"])
             if notches:
                 _gap(wheel["start"])
@@ -3547,7 +4062,8 @@ def convert_recording(events: list[dict[str, Any]], *,
         now = float(event.get("t", 0.0))
 
         if kind == "wheel":
-            # 連續滾動併成一步；中斷了才吐出來
+            # Consecutive scrolling merges into one step; it is only emitted once
+            # interrupted
             if wheel is not None and now - wheel["t"] < 0.3:
                 wheel["delta"] += event.get("delta", 0)
                 wheel["t"] = now
@@ -3607,7 +4123,7 @@ def convert_recording(events: list[dict[str, Any]], *,
             _flush_text()
             _gap(now)
             combo = "+".join([*sorted(held), name or str(vk)])
-            steps.append(f"hotkey {combo}" if name else f"# 未知按鍵 vk={vk}")
+            steps.append(f"hotkey {combo}" if name else f"# unknown key vk={vk}")
             last_t = now
             continue
 
@@ -3618,24 +4134,31 @@ def convert_recording(events: list[dict[str, Any]], *,
 
     _flush_wheel()
     _flush_text()
-    # 存進去之前先驗一遍：錄下來的東西是主機上發生的事，不是使用者寫的，
-    # 混進一步不合法的會讓整個巨集在 `load_macro` 時被拒收（而不是跳過那一步）。
+    # Validate once before saving: what was recorded is what happened on the host,
+    # not something the user wrote, and one invalid step mixed in would get the
+    # whole macro rejected by `load_macro` (rather than just that step skipped).
     #
-    # 超過步數上限的部分**不是直接 break**：後面的步驟照樣逐一驗過，重播得了的動作
-    # 算進 `truncated`、重播不了的算進 `unrecordable`。原本是碰到上限就 break，於是
-    # 錄了三百秒、存進去的只有前兩百步，回覆卻只說「已存成巨集（200 步）」。
+    # The part over the step cap **does not simply break**: the remaining steps are
+    # still validated one by one, with replayable actions counted in `truncated`
+    # and unreplayable ones in `unrecordable`. It used to break at the cap, so a
+    # three-hundred-second recording saved only the first two hundred steps while
+    # the reply just said "saved as a macro (200 steps)".
     valid: list[str] = []
     truncated = 0
     unrecordable = 0
     for step in steps:
         if step.startswith("#"):
-            # 叫不出名字的鍵（見 `_EXTRA_KEY_CODES`）。原本這裡是**完全安靜**的，
-            # 錄製回報的步數就這樣少一步，連 log 都查不到；內容只有一個鍵碼數字。
+            # A key that cannot be named (see `_EXTRA_KEY_CODES`). This used to be
+            # **completely silent**: the step count the recording reported was
+            # simply one short, with nothing even in the log; the content is only a
+            # key-code number.
             print(f"[gui] dropped unrecordable step {step!r}", file=sys.stderr)
             unrecordable += 1
             continue
-        # 開頭的 `wait` 一定是多餘的：還沒做任何事，沒有東西好等。錄製一開始的
-        # 那段「把手移到滑鼠上」的空檔會產生它，留著只是讓重播平白慢一拍。
+        # A leading `wait` is always redundant: nothing has been done yet, so there
+        # is nothing to wait for. The "moving your hand to the mouse" gap at the
+        # start of a recording produces it, and keeping it only makes replay a beat
+        # slower for no reason.
         if not valid and step.startswith("wait "):
             continue
         try:
@@ -3650,20 +4173,23 @@ def convert_recording(events: list[dict[str, Any]], *,
             continue
         valid.append(step)
     while valid and valid[-1].startswith("wait "):
-        valid.pop()      # 結尾的 `wait` 同理：後面沒有步驟了
+        valid.pop()      # the same goes for a trailing `wait`: no steps follow it
     return RecordedMacro(valid, truncated, unrecordable)
 
 
 # --------------------------------------------------------------------------
-# 背景作業
+# Background jobs
 # --------------------------------------------------------------------------
-# `run_shell` 會**擋到指令跑完**，上限 900 秒。安裝、建置、下載這類動輒二十分鐘
-# 的事情因此沒辦法用對話做——不是慢，是根本跑不完。
+# `run_shell` **blocks until the command finishes**, capped at 900 seconds. Things
+# like installs, builds and downloads that routinely take twenty minutes therefore
+# cannot be done through chat—not slow, but simply unable to finish.
 #
-# 這裡起一個不等它的行程，輸出由一條讀取執行緒收進記憶體，之後用 `job_log` 取。
-# 輸出**留在記憶體、不落地**：這是對話的暫時狀態，不是跨行程契約，落地反而要多
-# 一套清理與檔名政策。代價是 bot 重啟就沒了（行程本身也會跟著父行程收掉），這在
-# 說明裡講清楚。
+# This starts a process without waiting for it, with a reader thread collecting its
+# output into memory, retrieved later with `job_log`. The output **stays in memory
+# and never touches disk**: it is temporary conversational state, not a
+# cross-process contract, and writing it to disk would need an extra cleanup and
+# file-naming policy. The price is that it is gone after a bot restart (the process
+# itself is also reaped along with its parent), which the docs state clearly.
 JOB_MAX_KEPT = 20
 JOB_LOG_MAX_LINES = 4000
 JOB_LOG_LINE_MAX_CHARS = 2000
@@ -3674,7 +4200,8 @@ _JOB_LOCK: Any = None
 
 
 def _job_lock():
-    """讀取執行緒與呼叫端會同時碰 `_JOBS`，所以要鎖。延遲建立以免 import 就付出成本。"""
+    """The reader threads and callers touch `_JOBS` concurrently, so it needs a
+    lock. Created lazily so importing does not pay the cost."""
     global _JOB_LOCK  # pylint: disable=global-statement
     if _JOB_LOCK is None:
         import threading
@@ -3683,22 +4210,26 @@ def _job_lock():
 
 
 def _close_job_streams(job: dict[str, Any]) -> None:
-    """把作業的管道明確關掉。永不 raise。
+    """Explicitly close the job's pipes. Never raises.
 
-    `Popen` 的 stdout/stdin 是 `TextIOWrapper`，不關的話要等最後一個參照消失才由
-    `__del__` 收——實測（20 個作業，Windows handle 計數）目前確實會在 `_JOBS` 那一筆
-    被丟掉的當下歸零，所以**不是** handle 洩漏；但那是靠 CPython 的參照計數，任何一個
-    參照環（例外的 traceback 抓住 frame 就夠了）就會把釋放推遲到 GC。既然行程要跑好幾
-    天，明確關掉便宜又不用賭。
+    `Popen`'s stdout/stdin are `TextIOWrapper`s; left open, they are only
+    collected by `__del__` once the last reference goes away—measured (20 jobs,
+    Windows handle count), they do currently drop to zero the moment the `_JOBS`
+    entry is discarded, so this is **not** a handle leak; but that relies on
+    CPython's reference counting, and any reference cycle (an exception traceback
+    holding a frame is enough) would defer the release to GC. Since the process
+    runs for days, closing explicitly is cheap and needs no gamble.
 
-    附帶效果是 `-W always::ResourceWarning` 掃全套測試會變乾淨，那條掃描才用得下去
-    ——會叫的守門才有人聽。
+    A side effect is that a `-W always::ResourceWarning` sweep of the whole suite
+    comes out clean, which is what makes that sweep usable—only a guard that barks
+    gets listened to.
     """
     proc = job.get("proc") if isinstance(job, dict) else None
     for name in ("stdout", "stderr", "stdin"):
-        # `getattr` 也在 try 裡面：它的 default 只吃 `AttributeError`，屬性本身
-        # 求值爆炸（任何非 Popen 的替身都可能）會直接穿出去，而這支函式跑在
-        # `finally` 的收尾路徑上，穿出去會蓋掉真正的錯誤。
+        # `getattr` is inside the try too: its default only catches
+        # `AttributeError`, and an attribute whose evaluation blows up (any
+        # non-Popen stand-in might) would escape directly, and since this function
+        # runs on the `finally` wrap-up path, escaping would mask the real error.
         try:
             stream = getattr(proc, name, None)
             if stream is not None:
@@ -3708,7 +4239,8 @@ def _close_job_streams(job: dict[str, Any]) -> None:
 
 
 def _job_reader(job: dict[str, Any]) -> None:
-    """把子行程輸出一行一行收進 job 的環狀緩衝區，直到它結束。"""
+    """Collect the child's output line by line into the job's ring buffer until it
+    ends."""
     proc = job["proc"]
     try:
         for line in proc.stdout:  # type: ignore[union-attr]
@@ -3716,8 +4248,10 @@ def _job_reader(job: dict[str, Any]) -> None:
             with _job_lock():
                 job["lines"].append(clean)
                 job["total_lines"] += 1
-                # 只留最近的一段：一個話多的建置可以吐出幾十萬行，全留會把
-                # bot 的記憶體吃光。丟掉的行數另外記著，才不會讓人以為看到全部。
+                # Keep only the most recent stretch: a chatty build can emit
+                # hundreds of thousands of lines, and keeping them all would eat
+                # the bot's memory. The number of dropped lines is recorded
+                # separately, so nobody mistakes what they see for the whole thing.
                 overflow = len(job["lines"]) - JOB_LOG_MAX_LINES
                 if overflow > 0:
                     del job["lines"][:overflow]
@@ -3732,29 +4266,35 @@ def _job_reader(job: dict[str, Any]) -> None:
         with _job_lock():
             job["rc"] = proc.returncode
             job["finished"] = time.time()
-        # 行程已經結束（`wait` 回來了），管道沒有人會再用——明確關掉，不要留給
-        # 參照計數的時機。`job_send` 會先擋掉已結束的作業，`job_close_input` 對
-        # 已關閉的串流是 no-op，所以兩個使用者面的入口都不受影響。
+        # The process has ended (`wait` returned) and nobody will use the pipes
+        # again—close them explicitly rather than leaving it to the timing of
+        # reference counting. `job_send` blocks finished jobs first, and
+        # `job_close_input` is a no-op on a closed stream, so neither user-facing
+        # entry point is affected.
         _close_job_streams(job)
 
 
 def job_start(command: str, *, cwd: Path | None = None,
               interactive: bool = False) -> int:
-    """起一個背景作業，回作業編號。**不等它跑完。**
+    """Start a background job, returning its job number. **Does not wait for it to
+    finish.**
 
-    `interactive=True` 才把 stdin 接成管道（之後用 `job_send` 餵輸入）。**預設
-    是 `DEVNULL`**，因為那會讓讀 stdin 的程式立刻拿到 EOF 然後照常跑完；接成
-    管道卻沒人寫的話，同一支程式會停在那裡等到逾時。要能回答互動式提示的人自己
-    指定，其餘情況維持「不會莫名卡住」的預設。
+    Only `interactive=True` connects stdin as a pipe (to feed input later with
+    `job_send`). **The default is `DEVNULL`**, because that makes a program reading
+    stdin get EOF immediately and finish normally; with a pipe connected but nobody
+    writing, the same program would sit there until the timeout. Whoever needs to
+    answer interactive prompts asks for it explicitly; everything else keeps the
+    "will not mysteriously hang" default.
     """
     text = (command or "").strip()
     if not text:
-        raise GuiError("請給要執行的指令。")
+        raise GuiError("Give the command to run.")
     global _JOB_NEXT_ID  # pylint: disable=global-statement
     _job_prune()
     argv = shell_argv(text, interactive=interactive)
     try:
-        # nosec B603 — 由設計就是任意指令執行；閘門在呼叫端（限擁有者）。
+        # nosec B603 — arbitrary command execution by design; the gate is at the
+        # caller (owner-only).
         proc = subprocess.Popen(  # nosec B603
             argv,
             cwd=str(cwd or shell_cwd()),
@@ -3765,13 +4305,14 @@ def job_start(command: str, *, cwd: Path | None = None,
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            # 同 `run_shell`：圍堵 `shell_argv` 前綴的主控台副作用。這一站尤其
-            # 不能漏——互動作業是唯一會**寫** stdin 的路徑，前綴的
-            # `InputEncoding` 那一句就是為它加的。
+            # Same as `run_shell`: contain the console side effect of
+            # `shell_argv`'s prefix. This stop in particular must not miss it—an
+            # interactive job is the only path that **writes** stdin, and the
+            # prefix's `InputEncoding` line was added for exactly that.
             creationflags=_SHELL_CREATIONFLAGS,
         )
     except OSError as error:
-        raise GuiError("無法啟動指令直譯器。") from error
+        raise GuiError("Could not start the command interpreter.") from error
     with _job_lock():
         job_id = _JOB_NEXT_ID
         _JOB_NEXT_ID += 1
@@ -3795,7 +4336,8 @@ def job_start(command: str, *, cwd: Path | None = None,
 
 
 def _job_prune() -> None:
-    """作業紀錄留最近 `JOB_MAX_KEPT` 筆，只丟已結束的。"""
+    """Keep the most recent `JOB_MAX_KEPT` job records, discarding only finished
+    ones."""
     with _job_lock():
         done = sorted((j for j in _JOBS.values() if j["finished"] is not None),
                       key=lambda j: j["finished"])
@@ -3804,7 +4346,7 @@ def _job_prune() -> None:
 
 
 def job_list() -> list[dict[str, Any]]:
-    """所有作業的狀態摘要（不含輸出內容），新的在前。"""
+    """A status summary of every job (without output content), newest first."""
     with _job_lock():
         rows = list(_JOBS.values())
     now = time.time()
@@ -3826,12 +4368,13 @@ def _job_get(job_id: int) -> dict[str, Any]:
     with _job_lock():
         job = _JOBS.get(int(job_id))
     if job is None:
-        raise GuiError("找不到這個作業編號。")
+        raise GuiError("No job with that number was found.")
     return job
 
 
 def job_log(job_id: int, lines: int = 40) -> dict[str, Any]:
-    """某個作業最近 `lines` 行輸出。輸出**沒有去識別化**，呼叫端負責。"""
+    """A job's most recent `lines` lines of output. The output is **not
+    de-identified**; that is the caller's job."""
     job = _job_get(job_id)
     count = max(1, min(int(lines), JOB_LOG_MAX_LINES))
     with _job_lock():
@@ -3850,10 +4393,13 @@ def job_log(job_id: int, lines: int = 40) -> dict[str, Any]:
 
 
 def shell_stop_all() -> int:
-    """砍掉所有正在跑的 `run_shell` 子行程樹，回砍了幾個。
+    """Kill every running `run_shell` child process tree, returning how many were
+    killed.
 
-    刻意是「全部」而不是挑一個：`!sh` 是同步阻塞的，實務上不會有一堆同時在跑，
-    而要使用者先查出編號才砍得掉，在「指令跑不完、我想停下來」的當下沒有意義。
+    It is deliberately "all" rather than picking one: `!sh` is synchronous and
+    blocking, so in practice there are never many running at once, and making the
+    user look up a number before they can kill one makes no sense at the moment of
+    "the command will not finish and I want to stop it".
     """
     with _job_lock():
         procs = list(_SHELL_PROCS)
@@ -3863,36 +4409,38 @@ def shell_stop_all() -> int:
 
 
 def job_send(job_id: int, text: str, *, newline: bool = True) -> None:
-    """把一行輸入餵給互動式作業（回答安裝程式的提示那種）。"""
+    """Feed one line of input to an interactive job (the kind that answers an
+    installer's prompts)."""
     job = _job_get(job_id)
     if not job.get("interactive"):
-        raise GuiError("這個作業沒有開互動輸入；請用 `--stdin` 重新啟動它。")
+        raise GuiError("This job was not started with interactive input; restart it with `--stdin`.")
     if job["finished"] is not None:
-        raise GuiError("這個作業已經結束了。")
+        raise GuiError("This job has already finished.")
     stream = job["proc"].stdin
     if stream is None:
-        raise GuiError("這個作業沒有可寫入的輸入。")
+        raise GuiError("This job has no writable input.")
     try:
         stream.write(text + ("\n" if newline else ""))
         stream.flush()
     except (OSError, ValueError) as error:
-        raise GuiError("寫入作業輸入失敗（它可能已經不再讀取了）。") from error
+        raise GuiError("Failed to write to the job's input (it may no longer be reading).") from error
 
 
 def job_close_input(job_id: int) -> None:
-    """關掉作業的輸入端，讓對方讀到 EOF。"""
+    """Close the job's input end, so the other side reads EOF."""
     job = _job_get(job_id)
     stream = job["proc"].stdin
     if stream is None:
-        raise GuiError("這個作業沒有可寫入的輸入。")
+        raise GuiError("This job has no writable input.")
     try:
         stream.close()
     except (OSError, ValueError) as error:
-        raise GuiError("關閉作業輸入失敗。") from error
+        raise GuiError("Failed to close the job's input.") from error
 
 
 def job_stop(job_id: int) -> bool:
-    """砍掉作業的整棵行程樹。已經結束的回 False。"""
+    """Kill the job's whole process tree. Returns False if it has already
+    finished."""
     job = _job_get(job_id)
     if job["finished"] is not None:
         return False
@@ -3902,20 +4450,22 @@ def job_stop(job_id: int) -> bool:
 
 
 def job_clear() -> int:
-    """清掉所有已結束的作業紀錄，回清掉幾筆。"""
+    """Clear every finished job record, returning how many were cleared."""
     with _job_lock():
         done = [k for k, j in _JOBS.items() if j["finished"] is not None]
         for key in done:
             job = _JOBS.pop(key, None)
             if job is not None:
-                # 保險：reader 執行緒正常結束時已經關過了，但如果它根本沒起來
-                # （`Thread.start` 失敗）就沒人關過。關第二次是 no-op。
+                # Insurance: the reader thread already closed them when it ended
+                # normally, but if it never started (`Thread.start` failed) nobody
+                # did. Closing a second time is a no-op.
                 _close_job_streams(job)
     return len(done)
 
 
 def job_stop_all() -> int:
-    """砍掉所有還在跑的作業。bot 關閉時用——否則孤兒行程會留在主機上。"""
+    """Kill every job still running. Used when the bot shuts down—otherwise
+    orphan processes would be left on the host."""
     stopped = 0
     for row in job_list():
         if row["running"]:
@@ -3928,23 +4478,27 @@ def job_stop_all() -> int:
 
 
 # --------------------------------------------------------------------------
-# 巨集重播（同步版，測試與非 async 呼叫端用）
+# Macro replay (synchronous version, for tests and non-async callers)
 # --------------------------------------------------------------------------
 def substitute_macro_args(step: str, args: list[str]) -> str:
-    """把步驟裡的參數記號換成呼叫時給的值。
+    """Replace the argument markers in a step with the values given at call time.
 
-    參數化讓一個巨集能重複用在不同目標上（`/macro run open_url <網址>`），
-    不必為了換一個字複製一份。語法：
+    Parameterisation lets one macro be reused on different targets
+    (`/macro run open_url <url>`), without copying it just to change one word.
+    Syntax:
 
-    * `$1`..`$9` → 第 N 個參數；沒給的換成空字串。只看**一位數**，所以 `$10` 是
-      「第 1 個參數後面接一個 `0`」。
-    * `$$` → 一個字面的 `$`。沒有這條的話，巨集裡根本寫不出「`$` 後面接數字」
-      （`type $100` 會打出 `00`），錄製下來的輸入也會被安靜地改掉。
-    * 其餘的 `$`（結尾的 `$`、`$a`、`$0`）照原樣留著——跟加入 `$$` 之前一樣。
+    * `$1`..`$9` → the Nth argument; missing ones become an empty string. Only
+      **one digit** is read, so `$10` is "the first argument followed by a `0`".
+    * `$$` → a literal `$`. Without this rule, "`$` followed by a digit" could not
+      be written in a macro at all (`type $100` would type `00`), and recorded
+      input would be silently altered too.
+    * Any other `$` (a trailing `$`, `$a`, `$0`) is left as-is—just as before `$$`
+      was added.
 
-    **只掃一遍**：換進去的參數值不會再被掃描，所以參數裡的 `$1` / `$$` 原樣送出，
-    不會變成另一個參數或被折成一個 `$`。由左往右配對，`$$$1` 是「`$` ＋ 第 1 個
-    參數」。反方向是 `escape_macro_text`。
+    **A single pass only**: substituted argument values are not scanned again, so a
+    `$1` / `$$` inside an argument is sent as-is, and does not become another
+    argument or get folded into one `$`. Matching runs left to right, so `$$$1` is
+    "`$` + the first argument". The reverse direction is `escape_macro_text`.
     """
     def _replace(match: re.Match) -> str:
         token = match.group(1)
@@ -3957,36 +4511,47 @@ def substitute_macro_args(step: str, args: list[str]) -> str:
 
 
 def escape_macro_text(text: str) -> str:
-    """把一段要原樣送出的文字寫成巨集步驟：`$` → `$$`。
+    """Write a piece of text that must be sent verbatim as a macro step: `$` →
+    `$$`.
 
-    `substitute_macro_args(escape_macro_text(t), args) == t` 對任何 `t` 都成立——
-    每一個 `$` 都成了一對，由左往右配對時不會有落單的 `$` 去吃後面的數字。錄製
-    （`record_to_steps`）產生 `type` 步驟時走這一支。
+    `substitute_macro_args(escape_macro_text(t), args) == t` holds for any `t`—every
+    `$` becomes a pair, so when matching left to right no lone `$` is left to eat
+    the digit after it. Recording (`record_to_steps`) uses this when it produces
+    `type` steps.
     """
     return text.replace("$", "$$")
 
 
 def check_macro_program(steps: list[str], args: list[str] | None = None, *,
                         name: str | None = None, depth: int = 0) -> None:
-    """重播**之前**把整個程式驗一遍：代入參數後的每一步、區塊平衡、每一個 `call`。
+    """Validate the whole program **before** replay: every step after argument
+    substitution, block balance, and every `call`.
 
-    `run_macro_program` 是一邊跑一邊代入 `$N`、一邊驗證的，所以
-    `['click 10 10', 'type $1']` 沒給參數時，點選已經真的點下去了，才在第二行發現
-    `type` 沒有參數；`call` 到不存在的巨集、遞迴超過 `MACRO_MAX_CALL_DEPTH` 也一樣
-    ——外層那幾步已經在真實桌面上做完，收不回來（`macro_block_map` 講的是同一個
-    原則）。這裡在任何動作之前先把整棵呼叫樹走完。
+    `run_macro_program` substitutes `$N` and validates as it runs, so with
+    `['click 10 10', 'type $1']` and no arguments, the click has already really
+    happened before the second line reveals that `type` has no argument; the same
+    goes for a `call` to a macro that does not exist and recursion beyond
+    `MACRO_MAX_CALL_DEPTH`—the outer steps are already done on the real desktop and
+    cannot be taken back (`macro_block_map` states the same principle). This walks
+    the whole call tree before any action.
 
-    * 每一步都驗，**不管執行時走不走得到**：走到才會壞的步驟就是壞的。
-    * 每一個 `call` 都跟進去：用代入後的參數讀取並檢查被呼叫的巨集，深度上限與
-      執行端丟的是同一句話。所以條件式的自我呼叫（`if_text 錯誤` / `call 自己`）
-      也會被擋：它一路展開一定超過深度上限。
-    * 以 `(巨集名, 參數)` 記憶化，同一個被呼叫者只驗一次；總量另有
-      `MACRO_MAX_CHECKED` 當上界（記憶化本身不是上界，見該常數）。
-    * 失敗丟 `GuiError`，訊息講出是哪個巨集的第幾行，而且整句都是本模組寫的泛用
-      句（巨集名稱已經過 `MACRO_NAME_RE`，參數值不會出現在訊息裡）。
+    * Every step is validated, **whether or not execution would reach it**: a step
+      that breaks when reached is broken.
+    * Every `call` is followed: the called macro is loaded and checked with the
+      substituted arguments, and the depth limit raises the same sentence as the
+      execution side. So a conditional self-call (`if_text Error` / `call` to itself)
+      is blocked too: fully expanded, it always exceeds the depth limit.
+    * Memoised on `(macro name, args)`, so the same callee is validated only once;
+      the total is also bounded by `MACRO_MAX_CHECKED` (memoisation itself is not a
+      bound, see that constant).
+    * A failure raises `GuiError`, whose message says which macro and which line,
+      and the whole sentence is a generic one written by this module (macro names
+      have passed `MACRO_NAME_RE`, and argument values never appear in the
+      message).
 
-    `name` 只用來讓訊息指得出是哪一個巨集；不合 `MACRO_NAME_RE` 的就不印。
-    建立排程／監看時也呼叫這一支，所以壞參數在**建立的時候**就被拒絕。
+    `name` is only used so the message can point at which macro it is; one that
+    does not match `MACRO_NAME_RE` is not printed. Creating a schedule / watch also
+    calls this, so bad arguments are rejected **at creation time**.
     """
     label = name if name and MACRO_NAME_RE.match(name) else None
     _check_macro_level(list(steps), list(args or []), label, depth,
@@ -3998,44 +4563,48 @@ def _check_macro_level(steps: list[str], args: list[str], name: str | None,
                        memo: dict[tuple[str, tuple[str, ...]], int],
                        loaded: dict[str, list[str]],
                        counter: list[int]) -> int:
-    """`check_macro_program` 的一層；回這一層底下還有幾層 `call`（高度）。
+    """One level of `check_macro_program`; returns how many levels of `call` lie
+    below this one (the height).
 
-    記憶化存的是**高度**而不是「驗過了」：同一個 `(巨集, 參數)` 在淺的地方驗得
-    過，在深的地方不一定——深度 1 的呼叫樹高 2 沒事，同一棵樹掛在深度 2 就超過
-    上限。高度跟從哪裡被呼叫無關，所以命中時只要比一次 `depth + 1 + 高度`。
-    只有**成功**的子樹會進記憶，所以循環呼叫一定會一路展開到深度上限然後失敗。
+    Memoisation stores the **height** rather than "validated": the same
+    `(macro, args)` may validate fine at a shallow spot but not at a deep one—a
+    call tree of height 2 at depth 1 is fine, while the same tree hung at depth 2
+    exceeds the limit. The height does not depend on where it is called from, so a
+    hit only needs one comparison of `depth + 1 + height`. Only **successful**
+    subtrees enter the memo, so a call cycle always expands all the way to the
+    depth limit and then fails.
     """
     if depth > MACRO_MAX_CALL_DEPTH:
-        raise GuiError(f"巨集呼叫層數超過上限（{MACRO_MAX_CALL_DEPTH} 層）。")
-    where = f"巨集 `{name}` " if name else ""
+        raise GuiError(f"The macro call depth exceeds the limit ({MACRO_MAX_CALL_DEPTH} levels).")
+    where = f"Macro `{name}`: " if name else ""
     try:
         macro_block_map(steps)
     except GuiError as error:
         if not name:
             raise
-        raise GuiError(f"巨集 `{name}`：{error}") from error
+        raise GuiError(f"Macro `{name}`: {error}") from error
     height = 0
     for index, step in enumerate(steps, start=1):
         counter[0] += 1
         if counter[0] > MACRO_MAX_CHECKED:
             raise GuiError(
-                f"巨集展開之後要檢查的步驟超過上限（{MACRO_MAX_CHECKED} 步）；"
-                "減少 `call` 的層數或分支。")
+                f"After expansion, the macro has more steps to check than the limit ({MACRO_MAX_CHECKED} steps); "
+                "reduce the depth or branching of `call`.")
         raw = substitute_macro_args(step, args)
         try:
             verb, step_args = validate_macro_step(raw)
         except GuiError as error:
-            raise GuiError(f"{where}第 {index} 行：{error}") from error
+            raise GuiError(f"{where}Line {index}: {error}") from error
         if verb != "call":
             continue
-        callee = step_args[0]          # 已經過 `macro_path` 的名稱檢查
+        callee = step_args[0]          # already passed `macro_path`'s name check
         key = (callee, tuple(step_args[1:]))
         below = memo.get(key)
         if below is not None:
             if depth + 1 + below > MACRO_MAX_CALL_DEPTH:
                 raise GuiError(
-                    f"{where}第 {index} 行：巨集呼叫層數超過上限"
-                    f"（{MACRO_MAX_CALL_DEPTH} 層）。")
+                    f"{where}Line {index}: The macro call depth exceeds the limit "
+                    f"({MACRO_MAX_CALL_DEPTH} levels).")
         else:
             callee_steps = loaded.get(callee)
             if callee_steps is None:
@@ -4043,14 +4612,14 @@ def _check_macro_level(steps: list[str], args: list[str], name: str | None,
                     callee_steps = load_macro(callee)["steps"]
                 except GuiError as error:
                     raise GuiError(
-                        f"{where}第 {index} 行：巨集 `{callee}`：{error}") from error
+                        f"{where}Line {index}: Macro `{callee}`: {error}") from error
                 loaded[callee] = callee_steps
             try:
                 below = _check_macro_level(
                     callee_steps, list(step_args[1:]), callee, depth + 1,
                     memo=memo, loaded=loaded, counter=counter)
             except GuiError as error:
-                raise GuiError(f"{where}第 {index} 行：{error}") from error
+                raise GuiError(f"{where}Line {index}: {error}") from error
             memo[key] = below
         height = max(height, below + 1)
     return height
@@ -4061,33 +4630,41 @@ def run_macro_program(steps: list[str], *, args: list[str] | None = None,
                       should_abort: Callable[[], bool] | None = None,
                       depth: int = 0,
                       budget: list[int] | None = None) -> list[str]:
-    """執行一個巨集程式（含 `repeat` / `if_…` / `call`），回每一步的敘述。
+    """Run a macro program (including `repeat` / `if_…` / `call`), returning a
+    description of each step.
 
-    直譯器而不是逐行迴圈：有了區塊就需要程式計數器與控制堆疊。設計上的三個
-    重點——
+    An interpreter rather than a line-by-line loop: once there are blocks, a
+    program counter and a control stack are needed. The key design points—
 
-    * **執行步數有總量上限**（`MACRO_MAX_EXECUTED`）。巢狀 `repeat` 只要四行就能
-      要求跑一百萬步，來源行數上限完全擋不住；沒有這個上限，一個手滑的數字會讓
-      桌面被佔住幾十分鐘而且中止不掉。
-    * **`call` 有深度上限**，兩個巨集互相呼叫是很自然就會寫出來的無窮遞迴。
-    * **`should_abort()` 每一步都檢查**，`!macro stop` 才停得下來。
-    * **第一個動作之前先把整個程式驗完**（`check_macro_program`，只在最外層做
-      一次）：代入參數之後才壞掉的步驟、`call` 到不存在的巨集、遞迴超過深度上限，
-      都要在滑鼠動之前講，不是做到一半才停。迴圈裡逐步的代入與驗證**照樣保留**
-      ——長巨集跑的途中，被呼叫的那個巨集檔還是可能被改掉。
+    * **The number of executed steps has a total cap** (`MACRO_MAX_EXECUTED`).
+      Nested `repeat` can demand a million steps in just four lines, which a cap on
+      source lines cannot stop at all; without this cap, one slip of a number
+      would occupy the desktop for tens of minutes with no way to abort.
+    * **`call` has a depth limit**; two macros calling each other is an endless
+      recursion that is very natural to write.
+    * **`should_abort()` is checked at every step**, which is what lets
+      `!macro stop` stop it.
+    * **The whole program is validated before the first action**
+      (`check_macro_program`, done once at the outermost level only): steps that
+      only break after argument substitution, a `call` to a macro that does not
+      exist, recursion beyond the depth limit—all must be reported before the mouse
+      moves, not by stopping halfway. The per-step substitution and validation in
+      the loop **are kept anyway**—while a long macro is running, the called macro
+      file may still be changed.
 
-    結束時（含失敗 / 中止）放開**這個巨集自己按住**的鍵；使用者跑之前就按著的
-    不動，那是他刻意留的狀態。
+    When it ends (including failure / abort), it releases the keys **this macro
+    itself held down**; keys the user was already holding before the run are left
+    alone, as that is state they left on purpose.
     """
     if depth > MACRO_MAX_CALL_DEPTH:
-        raise GuiError(f"巨集呼叫層數超過上限（{MACRO_MAX_CALL_DEPTH} 層）。")
+        raise GuiError(f"The macro call depth exceeds the limit ({MACRO_MAX_CALL_DEPTH} levels).")
     if depth == 0:
         check_macro_program(steps, args)
     blocks = macro_block_map(steps)
     counters = budget if budget is not None else [0]
     snapshot = held_snapshot() if depth == 0 else None
     done: list[str] = []
-    # 控制堆疊：`("loop", 開頭, end, 剩餘次數)` 或 `("if", end)`
+    # Control stack: `("loop", start, end, remaining count)` or `("if", end)`
     stack: list[tuple] = []
     pointer = 0
     try:
@@ -4097,8 +4674,8 @@ def run_macro_program(steps: list[str], *, args: list[str] | None = None,
             counters[0] += 1
             if counters[0] > MACRO_MAX_EXECUTED:
                 raise GuiError(
-                    f"執行步數超過上限（{MACRO_MAX_EXECUTED} 步），已中止；"
-                    "檢查一下 `repeat` 的次數。")
+                    f"The number of executed steps exceeded the limit ({MACRO_MAX_EXECUTED} steps), so it was aborted; "
+                    "check the `repeat` counts.")
             raw = substitute_macro_args(steps[pointer], args or [])
             verb, step_args = validate_macro_step(raw)
 
@@ -4122,7 +4699,8 @@ def run_macro_program(steps: list[str], *, args: list[str] | None = None,
                     pointer = (else_at + 1) if else_at is not None else end
                 continue
             if verb == "else":
-                # 走到這裡代表 if 的真分支跑完了，跳過 else 分支
+                # Reaching here means the if's true branch has finished; skip the
+                # else branch
                 frame = stack[-1] if stack else None
                 pointer = (frame[1] if frame and frame[0] == "if"
                            else pointer + 1)
@@ -4141,12 +4719,13 @@ def run_macro_program(steps: list[str], *, args: list[str] | None = None,
                     data["steps"], args=step_args[1:], on_step=on_step,
                     should_abort=should_abort, depth=depth + 1, budget=counters)
                 done.extend(nested)
-                detail = f"呼叫巨集 `{step_args[0]}`（{len(nested)} 步）"
+                detail = f"called macro `{step_args[0]}` ({len(nested)} steps)"
             else:
                 try:
                     detail = run_macro_step(raw, should_abort=should_abort)
                 except GuiAborted:
-                    # 等待步驟被中止不是失敗，跟「在步驟之間被停下來」同一件事。
+                    # A wait step being aborted is not a failure; it is the same
+                    # thing as "being stopped between steps".
                     break
 
             done.append(detail)
@@ -4162,5 +4741,6 @@ def run_macro_program(steps: list[str], *, args: list[str] | None = None,
 def run_macro(steps: list[str], *,
               on_step: Callable[[int, str, str], None] | None = None,
               should_abort: Callable[[], bool] | None = None) -> list[str]:
-    """`run_macro_program` 的無參數版（測試與非 async 呼叫端用）。"""
+    """The argument-less version of `run_macro_program` (for tests and non-async
+    callers)."""
     return run_macro_program(steps, on_step=on_step, should_abort=should_abort)

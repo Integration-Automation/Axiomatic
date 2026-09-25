@@ -564,7 +564,7 @@ def test_ui_missing_window_is_reported_as_such(monkeypatch):
     with pytest.raises(GuiError) as caught:
         gui.ui_tree("zzz")
     # 「找不到視窗」是使用者改得了的，不能折成「這台機器沒有這個功能」
-    assert "視窗" in str(caught.value)
+    assert "window" in str(caught.value)
 
 
 def _fake_a11y_error(message):
@@ -637,7 +637,7 @@ def test_run_shell_truncates_huge_output(monkeypatch):
                if sys.platform.startswith("win")
                else "for i in $(seq 500); do echo xxxxxxxxxx; done")
     result = gui.run_shell(command, timeout=60)
-    assert "已截斷" in result["output"]
+    assert "truncated" in result["output"]
     assert len(result["output"]) < 200
 
 
@@ -683,14 +683,14 @@ def test_text_commands_report_unavailable_ocr_instead_of_raising(monkeypatch):
     monkeypatch.setattr(gui, "load_ac", lambda: _Backend)
     monkeypatch.setattr(gui, "ocr_lang_for", lambda target, lang=None: "eng")
     monkeypatch.setattr(gui, "ocr_status",
-                        lambda: (False, "文字辨識未啟用：測試。"))
+                        lambda: (False, "Text recognition is disabled: test."))
     for call in (lambda: gui.find_text("x"),
                  lambda: gui.click_text("x"),
                  lambda: gui.wait_text("x", 1)):
         with pytest.raises(GuiError) as excinfo:
             call()
         # 「引擎沒裝」是使用者補得了的，不能被折成泛用的「辨識失敗」
-        assert "文字辨識未啟用" in str(excinfo.value)
+        assert "Text recognition is disabled" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------
@@ -764,7 +764,7 @@ def test_ocr_status_does_not_recurse_into_load_ocr(monkeypatch):
     _ocr_env(monkeypatch, cmd=_FAKE_TESSERACT,
              pt=_fake_pytesseract(version_error=OSError("bad binary")))
     assert gui.ocr_status() == (
-        False, "文字辨識未啟用：辨識引擎執行檔無法執行。")
+        False, "Text recognition is disabled: the recognition engine executable cannot run.")
 
 
 def test_load_ocr_reports_the_engine_reason_itself(monkeypatch):
@@ -773,7 +773,7 @@ def test_load_ocr_reports_the_engine_reason_itself(monkeypatch):
              pt=_fake_pytesseract(version_error=OSError("bad binary")))
     with pytest.raises(GuiError) as excinfo:
         gui._load_ocr()
-    assert "無法執行" in str(excinfo.value)
+    assert "cannot run" in str(excinfo.value)
 
 
 def test_load_ocr_never_reaches_ocr_status():
@@ -824,7 +824,7 @@ def test_a_cached_failure_is_re_probed_when_the_engine_appears(monkeypatch):
     state = {"cmd": None}
     _ocr_env(monkeypatch, cmd=lambda: state["cmd"], pt=_fake_pytesseract())
     assert gui.ocr_status() == (
-        False, "文字辨識未啟用：辨識引擎執行檔未安裝。")
+        False, "Text recognition is disabled: the recognition engine executable is not installed.")
     # ⚠️ 這一步不能省：`/locate text find` 走的是 `ocr_lang_for`，而**舊碼在沒有
     # 引擎時根本不會呼叫 `_load_ocr`**（`ocr_status` 第二道檢查就 return 了），
     # 所以少了它，`_OCR_TRIED` 從沒被設起來，這支測試在舊碼上照樣是綠的。
@@ -878,7 +878,7 @@ def test_ocr_status_reports_missing_language_data(monkeypatch):
     """引擎答了、清單真的是空的 → 整個功能不可用，而且要指出是缺哪一塊。"""
     _ocr_env(monkeypatch, cmd=_FAKE_TESSERACT,
              pt=_fake_pytesseract(langs=()))
-    assert gui.ocr_status() == (False, "文字辨識未啟用：缺少語言辨識資料。")
+    assert gui.ocr_status() == (False, "Text recognition is disabled: language recognition data is missing.")
 
 
 def test_an_unaskable_language_list_is_not_reported_as_unavailable(monkeypatch):
@@ -889,7 +889,7 @@ def test_an_unaskable_language_list_is_not_reported_as_unavailable(monkeypatch):
     """
     _ocr_env(monkeypatch, cmd=_FAKE_TESSERACT,
              pt=_fake_pytesseract(langs_error=RuntimeError("enumerate blew up")))
-    assert gui.ocr_status() == (True, "文字辨識可用。")
+    assert gui.ocr_status() == (True, "Text recognition is available.")
 
 
 def test_ocr_status_and_ocr_lang_for_agree_about_zero_language_data(monkeypatch):
@@ -906,7 +906,8 @@ def test_ocr_status_and_ocr_lang_for_agree_about_zero_language_data(monkeypatch)
                             lambda _l=langs, _k=known: (_l, _k))
         monkeypatch.setattr(gui, "_load_ocr", lambda: object())
         ok, reason = gui.ocr_status()
-        status_blames = (not ok) and reason == "文字辨識未啟用：缺少語言辨識資料。"
+        status_blames = (not ok) and reason == (
+            "Text recognition is disabled: language recognition data is missing.")
         try:
             gui.ocr_lang_for("x", langs[0] if langs else "eng")
             lang_for_blocks = False
@@ -984,7 +985,7 @@ def test_ocr_lang_for_blocks_when_the_engine_says_zero_languages(monkeypatch):
     monkeypatch.setattr(gui, "_load_ocr", lambda: _FakeOcrLangs([]))
     with pytest.raises(GuiError) as excinfo:
         gui.ocr_lang_for("x", "jpn")
-    assert "（無）" in str(excinfo.value)
+    assert "(none)" in str(excinfo.value)
 
 
 def test_ocr_lang_for_auto_pick_is_unchanged_when_there_is_no_list(monkeypatch):
@@ -1148,7 +1149,7 @@ def test_locate_image_rejects_flat_template(monkeypatch, tmp_path):
     Image.new("RGB", (20, 20), (12, 34, 56)).save(str(template))
     with pytest.raises(GuiError) as excinfo:
         gui.locate_image(str(template))
-    assert "單一顏色" in str(excinfo.value)
+    assert "single colour" in str(excinfo.value)
 
 
 def test_locate_image_reports_missing_template_distinctly(monkeypatch, tmp_path):
@@ -1156,7 +1157,7 @@ def test_locate_image_reports_missing_template_distinctly(monkeypatch, tmp_path)
     _fake_desktop(monkeypatch)
     with pytest.raises(GuiError) as excinfo:
         gui.locate_image(str(tmp_path / "nope.png"))
-    assert "讀取失敗" in str(excinfo.value)
+    assert "Failed to read" in str(excinfo.value)
 
 
 _LEAKY = RuntimeError(r"C:\Users\someone\AppData\engine\core.dll: access violation")
@@ -1193,7 +1194,7 @@ def test_an_unexpected_match_failure_reaches_the_user_as_a_generic_line(
     monkeypatch.setattr(gui, "load_ac", lambda: _FailingBackend())
     with pytest.raises(GuiError) as excinfo:
         gui.locate_image("tpl.png")
-    _generic_only(excinfo, "圖片比對失敗。")
+    _generic_only(excinfo, "Image matching failed.")
 
 
 def test_an_unexpected_ocr_failure_reaches_the_user_as_a_generic_line(
@@ -1203,7 +1204,7 @@ def test_an_unexpected_ocr_failure_reaches_the_user_as_a_generic_line(
     monkeypatch.setattr(gui, "_configure_ocr", lambda: None)
     with pytest.raises(GuiError) as excinfo:
         gui.read_text()
-    _generic_only(excinfo, "文字辨識失敗。")
+    _generic_only(excinfo, "Text recognition failed.")
 
 
 def test_no_match_on_screen_is_its_own_answer(monkeypatch):
@@ -1212,7 +1213,7 @@ def test_no_match_on_screen_is_its_own_answer(monkeypatch):
     monkeypatch.setattr(gui, "load_ac", lambda: _FailingBackend(error=None))
     with pytest.raises(GuiError) as excinfo:
         gui.locate_image("tpl.png")
-    assert str(excinfo.value) == "畫面上找不到這張圖。"
+    assert str(excinfo.value) == "This image was not found on the screen."
 
 
 @pytest.mark.parametrize("parts", [[], ["500"], ["500", "300", "7"]])
@@ -1220,7 +1221,7 @@ def test_a_point_needs_exactly_two_coordinates(parts):
     """多給一個值時照舊取前兩個，會把使用者打錯的指令默默執行在另一個位置。"""
     with pytest.raises(GuiError) as excinfo:
         gui.parse_xy(parts)
-    assert "兩個座標值" in str(excinfo.value)
+    assert "Two coordinate values" in str(excinfo.value)
     assert gui.parse_xy(["500", "300"]) == (500, 300)
 
 
@@ -1567,16 +1568,16 @@ def test_write_host_file_rejects_a_reserved_name_before_the_exists_check(tmp_pat
     """
     with pytest.raises(GuiError) as explicit:
         gui.write_host_file(str(tmp_path / "NUL"), b"payload")
-    assert "保留" in str(explicit.value) or "特殊對待" in str(explicit.value), (
+    assert "reserved" in str(explicit.value) or "specially" in str(explicit.value), (
         "擋在 `path.exists()` 後面了——使用者會先看到「目的檔已經存在」。")
     # `--force` 也要是同一句，不然「加上 --force」就變成一條死路。
     with pytest.raises(GuiError) as forced:
         gui.write_host_file(str(tmp_path / "NUL"), b"payload", overwrite=True)
-    assert "特殊對待" in str(forced.value)
+    assert "specially" in str(forced.value)
     # 附件檔名那條（目的地是資料夾）同樣要擋。
     with pytest.raises(GuiError) as attached:
         gui.write_host_file(str(tmp_path), b"payload", default_name="COM1")
-    assert "特殊對待" in str(attached.value)
+    assert "specially" in str(attached.value)
     # 正面對照組：一般檔名照樣寫得進去，不然「全部拒絕」也會讓上面三句全綠。
     path, written = gui.write_host_file(
         str(tmp_path), b"payload", default_name="NULL.bin")
@@ -1640,16 +1641,16 @@ def test_read_host_file_round_trips_and_reports_size_limit(tmp_path, monkeypatch
     monkeypatch.setattr(gui, "GET_MAX_BYTES", 1)
     with pytest.raises(GuiError) as excinfo:
         gui.read_host_file(str(target))
-    assert "太大" in str(excinfo.value)
+    assert "too large" in str(excinfo.value)
 
 
 def test_read_host_file_distinguishes_missing_from_directory(tmp_path):
     with pytest.raises(GuiError) as missing:
         gui.read_host_file(str(tmp_path / "nope"))
-    assert "找不到" in str(missing.value)
+    assert "not found" in str(missing.value)
     with pytest.raises(GuiError) as folder:
         gui.read_host_file(str(tmp_path))
-    assert "資料夾" in str(folder.value)
+    assert "folder" in str(folder.value)
 
 
 def test_write_host_file_refuses_overwrite_without_flag(tmp_path):
@@ -1658,7 +1659,7 @@ def test_write_host_file_refuses_overwrite_without_flag(tmp_path):
     assert target.read_bytes() == b"one"
     with pytest.raises(GuiError) as excinfo:
         gui.write_host_file(str(target), b"two")
-    assert "已經存在" in str(excinfo.value)
+    assert "already exists" in str(excinfo.value)
     assert gui.write_host_file(str(target), b"two", overwrite=True)[1] == 3
     assert target.read_bytes() == b"two"
 
@@ -1674,7 +1675,7 @@ def test_write_host_file_does_not_create_missing_parents(tmp_path):
     # 打錯一個字就多出一串空目錄，而下指令的人不在電腦前面看不到。
     with pytest.raises(GuiError) as excinfo:
         gui.write_host_file(str(tmp_path / "no" / "such" / "a.txt"), b"x")
-    assert "目的資料夾不存在" in str(excinfo.value)
+    assert "destination folder does not exist" in str(excinfo.value)
     assert not (tmp_path / "no").exists()
 
 
@@ -1994,7 +1995,7 @@ def test_input_primitives_refuse_when_the_machine_is_locked(fake_ac, monkeypatch
                  lambda: gui.key_down("shift")):
         with pytest.raises(GuiError) as excinfo:
             call()
-        assert "鎖定" in str(excinfo.value)
+        assert "locked" in str(excinfo.value)
 
 
 def test_releasing_still_works_when_locked(fake_ac, monkeypatch):
@@ -2060,7 +2061,7 @@ def test_window_rect_and_move_report_no_match_clearly(monkeypatch):
                  lambda: gui.window_move("nope", 0, 0)):
         with pytest.raises(GuiError) as excinfo:
             call()
-        assert "找不到" in str(excinfo.value)
+        assert "No matching window" in str(excinfo.value)
 
 
 def _no_backend():
@@ -2078,7 +2079,7 @@ def test_window_close_and_snap_report_no_match_clearly(monkeypatch):
                  lambda: gui.snap_window("nope", "left")):
         with pytest.raises(GuiError) as excinfo:
             call()
-        assert "找不到" in str(excinfo.value)
+        assert "No matching window" in str(excinfo.value)
 
 
 def test_a_snap_the_library_declined_is_not_reported_as_done(monkeypatch):
@@ -2092,7 +2093,7 @@ def test_a_snap_the_library_declined_is_not_reported_as_done(monkeypatch):
     monkeypatch.setattr(gui, "match_windows", lambda needle: [(7, "Editor")])
     with pytest.raises(GuiError) as excinfo:
         gui.snap_window("Editor", "left")
-    assert "靠邊排列失敗" in str(excinfo.value)
+    assert "Failed to snap the window" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("name", ["", "   ", None])
@@ -2114,9 +2115,9 @@ class _NoWrites:
 
 @pytest.mark.parametrize("job, wording", [
     ({"interactive": True, "finished": 1.0,
-      "proc": types.SimpleNamespace(stdin=_NoWrites())}, "已經結束"),
+      "proc": types.SimpleNamespace(stdin=_NoWrites())}, "already finished"),
     ({"interactive": True, "finished": None,
-      "proc": types.SimpleNamespace(stdin=None)}, "沒有可寫入"),
+      "proc": types.SimpleNamespace(stdin=None)}, "no writable"),
 ], ids=["finished", "no-stdin"])
 def test_job_send_refuses_a_job_that_cannot_take_input(monkeypatch, job, wording):
     monkeypatch.setattr(gui, "_JOBS", {5: job})
@@ -2147,7 +2148,7 @@ def test_window_rect_reports_failure_when_the_package_cannot_read_it(monkeypatch
     monkeypatch.setattr(gui, "match_windows", lambda needle: [(1, "t")])
     with pytest.raises(GuiError) as excinfo:
         gui.window_rect("t")
-    assert "讀取視窗位置失敗" in str(excinfo.value)
+    assert "Failed to read the window position" in str(excinfo.value)
 
 
 def test_window_close_goes_through_the_package_not_a_local_win32_call(monkeypatch):
@@ -2225,10 +2226,10 @@ def test_macro_block_map_rejects_unbalanced_blocks():
     # 少一個 `end` 是很容易犯的錯，而等到重播跑到一半才發現，前面那些步驟已經
     # 在真實桌面上做過了，收不回來。
     for bad, hint in (
-        (["repeat 2", "wait 0"], "沒有對應"),
-        (["end"], "多出來"),
-        (["else"], "`else` 必須"),
-        (["if_text a", "else", "else", "end"], "只能有一個"),
+        (["repeat 2", "wait 0"], "no matching"),
+        (["end"], "extra"),
+        (["else"], "`else` must"),
+        (["if_text a", "else", "else", "end"], "only one"),
     ):
         with pytest.raises(GuiError) as excinfo:
             gui.macro_block_map(bad)
@@ -2282,7 +2283,7 @@ def test_macro_execution_budget_stops_runaway_loops():
     with pytest.raises(GuiError) as excinfo:
         gui.run_macro_program(
             ["repeat 1000", "repeat 1000", "wait 0", "end", "end"])
-    assert "執行步數超過上限" in str(excinfo.value)
+    assert "number of executed steps exceeded the limit" in str(excinfo.value)
 
 
 def test_macro_call_depth_is_capped(tmp_path, monkeypatch):
@@ -2290,7 +2291,7 @@ def test_macro_call_depth_is_capped(tmp_path, monkeypatch):
     gui.save_macro("selfcall", ["call selfcall"])
     with pytest.raises(GuiError) as excinfo:
         gui.run_macro_program(gui.load_macro("selfcall")["steps"])
-    assert "層數超過上限" in str(excinfo.value)
+    assert "call depth exceeds the limit" in str(excinfo.value)
 
 
 def test_macro_call_runs_the_other_macro(tmp_path, monkeypatch):
@@ -2366,7 +2367,7 @@ def test_wait_gone_gives_up_at_its_deadline_when_the_window_stays(monkeypatch):
 
     monkeypatch.setattr(gui, "match_windows", lambda needle: [(1, needle)])
     monkeypatch.setattr(gui, "_sleep_abortable", _nap)
-    with pytest.raises(GuiError, match="等到逾時"):
+    with pytest.raises(GuiError, match="Timed out"):
         gui.wait_window_gone("t", 0.0, poll=0.01)
     assert naps == [], "時限是 0 還睡了一輪"
 
@@ -2965,15 +2966,15 @@ def test_every_nameable_key_survives_record_validate_and_replay(key_library):
 
 def test_a_hotkey_with_an_oem_key_validates_and_sends_its_keycode(key_library):
     gui.validate_macro_step("hotkey ctrl+oem_plus")
-    assert gui.run_macro_step("hotkey ctrl+oem_plus") == "按鍵 control + oem_plus"
-    assert gui.run_macro_step("hotkey ctrl+plus") == "按鍵 control + oem_plus"
+    assert gui.run_macro_step("hotkey ctrl+oem_plus") == "pressed control + oem_plus"
+    assert gui.run_macro_step("hotkey ctrl+plus") == "pressed control + oem_plus"
     assert key_library.sent == [("hotkey", [17, 187]), ("hotkey", [17, 187])]
     # 交給函式庫的是整數，不是名字（函式庫的表查不到 `oem_plus`）。
     assert key_library.raw[0] == ("hotkey", ["control", 187])
 
 
 def test_a_held_oem_key_is_registered_by_name_and_released_by_keycode(key_library):
-    assert gui.run_macro_step("keydown oem_minus") == "按住 oem_minus"
+    assert gui.run_macro_step("keydown oem_minus") == "holding oem_minus"
     assert ("key", "oem_minus") in gui._HELD_INPUTS
     assert [row[1] for row in gui.held_inputs()] == ["oem_minus"]
     assert gui.release_all_inputs() == ["oem_minus"]
@@ -2985,9 +2986,9 @@ def test_a_held_oem_key_is_registered_by_name_and_released_by_keycode(key_librar
 
 def test_down_means_the_arrow_key_not_f17(key_library):
     """底層表的 `down` 是 0x80（＝ F17）；本專案的 `down` 一律送 0x28（方向鍵下）。"""
-    assert gui.run_macro_step("hotkey down") == "按鍵 down"
+    assert gui.run_macro_step("hotkey down") == "pressed down"
     assert key_library.raw == [("hotkey", [0x28])]
-    assert gui.run_macro_step("keydown down") == "按住 down"
+    assert gui.run_macro_step("keydown down") == "holding down"
     assert ("key", "down") in gui._HELD_INPUTS
     assert gui.release_all_inputs() == ["down"]
     assert key_library.raw[1:] == [("press", 0x28), ("release", 0x28)]
@@ -3222,7 +3223,7 @@ def test_the_hotkey_failure_still_surfaces_and_says_the_keys_are_free(
     with pytest.raises(GuiError) as caught:
         gui.press_hotkey(["alt", "f4"])
     text = str(caught.value)
-    assert "放開" in text, (
+    assert "released" in text, (
         f"訊息沒說鍵已經放開了：{text!r}。使用者收到「組合鍵失敗」時最想知道的"
         "就是鍵盤現在是不是卡住的。")
     assert "SendInput" not in text, f"原始例外文字外洩：{text!r}"
@@ -3509,83 +3510,83 @@ def _macro_spy_fixture(monkeypatch):
 # --------------------------------------------------------------------------
 _POINTER_CASES = [
     ("click 100 200",
-     ("mouse_click", ("mouse_left", 100, 200), {}), "點選 (100, 200)"),
+     ("mouse_click", ("mouse_left", 100, 200), {}), "clicked (100, 200)"),
     ("click 100 200 right",
-     ("mouse_click", ("mouse_right", 100, 200), {}), "點選 (100, 200)"),
+     ("mouse_click", ("mouse_right", 100, 200), {}), "clicked (100, 200)"),
     # 虛擬桌面座標可以是負的（本機實測從 y = -164 起算）——翻譯層不能把它擋掉
     ("click -5 -164",
-     ("mouse_click", ("mouse_left", -5, -164), {}), "點選 (-5, -164)"),
+     ("mouse_click", ("mouse_left", -5, -164), {}), "clicked (-5, -164)"),
     # 雙擊沒有底層原語，靠 `times=2` 連點兩次；掉了這個關鍵字就變成單擊
     ("dclick 10 20",
-     ("mouse_click", ("mouse_left", 10, 20), {"times": 2}), "雙擊 (10, 20)"),
+     ("mouse_click", ("mouse_left", 10, 20), {"times": 2}), "double-clicked (10, 20)"),
     ("dclick 10 20 middle",
-     ("mouse_click", ("mouse_middle", 10, 20), {"times": 2}), "雙擊 (10, 20)"),
-    ("move 7 8", ("mouse_move", (7, 8), {}), "移動到 (7, 8)"),
+     ("mouse_click", ("mouse_middle", 10, 20), {"times": 2}), "double-clicked (10, 20)"),
+    ("move 7 8", ("mouse_move", (7, 8), {}), "moved to (7, 8)"),
     ("drag 1 2 3 4",
-     ("mouse_drag", (1, 2, 3, 4, "mouse_left"), {}), "拖曳 (1, 2) → (3, 4)"),
+     ("mouse_drag", (1, 2, 3, 4, "mouse_left"), {}), "dragged (1, 2) → (3, 4)"),
     ("drag 1 2 3 4 back",
-     ("mouse_drag", (1, 2, 3, 4, "mouse_x1"), {}), "拖曳 (1, 2) → (3, 4)"),
-    ("scroll 3", ("mouse_scroll", (3,), {}), "捲動 3"),
-    ("scroll -3 100 200", ("mouse_scroll", (-3, 100, 200), {}), "捲動 -3"),
+     ("mouse_drag", (1, 2, 3, 4, "mouse_x1"), {}), "dragged (1, 2) → (3, 4)"),
+    ("scroll 3", ("mouse_scroll", (3,), {}), "scrolled 3"),
+    ("scroll -3 100 200", ("mouse_scroll", (-3, 100, 200), {}), "scrolled -3"),
 ]
 
 _KEYBOARD_CASES = [
-    ("type hello world", ("type_text", ("hello world",), {}), "輸入 11 字"),
-    ("paste 中文 測試", ("paste_text", ("中文 測試",), {}), "貼上 5 字"),
+    ("type hello world", ("type_text", ("hello world",), {}), "typed 11 characters"),
+    ("paste 中文 測試", ("paste_text", ("中文 測試",), {}), "pasted 5 characters"),
     ("hotkey ctrl+s",
-     ("press_hotkey", (["control", "s"],), {}), "按鍵 control + s"),
-    ("keydown shift", ("key_down", ("shift",), {}), "按住 key:shift"),
-    ("keyup ctrl", ("key_up", ("ctrl",), {}), "放開 key:ctrl"),
-    ("release_keys", ("release_all_inputs_report", (), {}), "放開全部按鍵（2 個）"),
+     ("press_hotkey", (["control", "s"],), {}), "pressed control + s"),
+    ("keydown shift", ("key_down", ("shift",), {}), "holding key:shift"),
+    ("keyup ctrl", ("key_up", ("ctrl",), {}), "released key:ctrl"),
+    ("release_keys", ("release_all_inputs_report", (), {}), "released all keys (2 released)"),
     ("clip set 你好 世界",
-     ("set_clipboard", ("你好 世界",), {}), "寫入剪貼簿 5 字"),
+     ("set_clipboard", ("你好 世界",), {}), "wrote 5 characters to the clipboard"),
 ]
 
 _WINDOW_CASES = [
-    ("focus 記事本", ("window_focus", ("記事本",), {}), "聚焦視窗（命中 2 個）"),
+    ("focus 記事本", ("window_focus", ("記事本",), {}), "focused window (2 matched)"),
     ("win close 記事本",
-     ("window_close", ("記事本",), {}), "視窗 close（命中 2 個）"),
+     ("window_close", ("記事本",), {}), "window close (2 matched)"),
     ("win min 記事本",
-     ("window_show", ("記事本", "min"), {}), "視窗 min（命中 2 個）"),
+     ("window_show", ("記事本", "min"), {}), "window min (2 matched)"),
     # 動作大小寫不敏感，但視窗標題片段要原樣往下傳（含空白）
     ("win MAX 我的 視窗",
-     ("window_show", ("我的 視窗", "max"), {}), "視窗 max（命中 2 個）"),
+     ("window_show", ("我的 視窗", "max"), {}), "window max (2 matched)"),
 ]
 
 _WAIT_CASES = [
-    ("wait 3", ("_sleep_abortable", (3.0, _never_abort), {}), "等待 3 秒"),
-    ("wait 0.5", ("_sleep_abortable", (0.5, _never_abort), {}), "等待 0.5 秒"),
+    ("wait 3", ("_sleep_abortable", (3.0, _never_abort), {}), "waited 3 seconds"),
+    ("wait 0.5", ("_sleep_abortable", (0.5, _never_abort), {}), "waited 0.5 seconds"),
     ("wait_window 儲存",
      ("wait_window", ("儲存", 15.0), {"should_abort": _never_abort}),
-     "視窗已出現"),
+     "window appeared"),
     ("wait_window 30 儲存",
      ("wait_window", ("儲存", 30.0), {"should_abort": _never_abort}),
-     "視窗已出現"),
+     "window appeared"),
     ("wait_text 完成",
      ("wait_text", ("完成", 15.0), {"should_abort": _never_abort}),
-     "文字已出現於 (11, 22)"),
+     "text appeared at (11, 22)"),
     ("wait_text 20 完成",
      ("wait_text", ("完成", 20.0), {"should_abort": _never_abort}),
-     "文字已出現於 (11, 22)"),
-    ("click_text 儲存", ("click_text", ("儲存",), {}), "點選文字於 (33, 44)"),
-    ("ui_click 開始", ("ui_click", ("開始",), {}), "點選 UI 元素於 (55, 66)"),
+     "text appeared at (11, 22)"),
+    ("click_text 儲存", ("click_text", ("儲存",), {}), "clicked text at (33, 44)"),
+    ("ui_click 開始", ("ui_click", ("開始",), {}), "clicked UI element at (55, 66)"),
     ("wait_ui 確定",
      ("ui_wait", ("確定", 15.0), {"should_abort": _never_abort}),
-     "UI 元素已出現於 (77, 88)"),
+     "UI element appeared at (77, 88)"),
     ("wait_gone_text 處理中",
      ("wait_text_gone", ("處理中", 15.0), {"should_abort": _never_abort}),
-     "文字已消失"),
+     "text disappeared"),
     ("wait_gone_window 對話框",
      ("wait_window_gone", ("對話框", 15.0), {"should_abort": _never_abort}),
-     "視窗已關閉"),
+     "window closed"),
     ("wait_pixel 100 200 #ff0000",
      ("wait_pixel", (100, 200, (255, 0, 0), 15.0),
       {"should_abort": _never_abort}),
-     "(100, 200) 已變成指定顏色"),
+     "(100, 200) turned the specified colour"),
     ("wait_pixel 100 200 0,255,0 5",
      ("wait_pixel", (100, 200, (0, 255, 0), 5.0),
       {"should_abort": _never_abort}),
-     "(100, 200) 已變成指定顏色"),
+     "(100, 200) turned the specified colour"),
 ]
 
 _ALL_SPY_CASES = (_POINTER_CASES + _KEYBOARD_CASES
@@ -3661,9 +3662,9 @@ def test_keydown_reports_the_resolved_key_not_the_typed_one(fake_ac):
     別名層把 `ctrl` 換成 `control`；如果敘述回吐使用者打的字，別名壞掉的時候
     報告仍然一片正常，看不出按下去的其實是別的鍵。
     """
-    assert gui.run_macro_step("keydown ctrl") == "按住 control"
+    assert gui.run_macro_step("keydown ctrl") == "holding control"
     assert fake_ac.events == [("down", "control")]
-    assert gui.run_macro_step("keyup ctrl") == "放開 control"
+    assert gui.run_macro_step("keyup ctrl") == "released control"
 
 
 # --------------------------------------------------------------------------
@@ -3868,7 +3869,7 @@ def test_an_aborted_wait_still_releases_what_the_macro_pressed(fake_ac,
         raise gui.GuiAborted("停")
 
     monkeypatch.setattr(gui, "_sleep_abortable", _abort_the_wait)
-    assert gui.run_macro(["keydown shift", "wait 5"]) == ["按住 shift"]
+    assert gui.run_macro(["keydown shift", "wait 5"]) == ["holding shift"]
     assert ("up", "shift") in fake_ac.events
     assert gui.held_inputs() == []
 
@@ -3978,7 +3979,7 @@ def test_a_trailing_plus_in_a_hotkey_is_tolerated_not_treated_as_a_key(
     `parse_hotkey_tokens` 收緊——那會讓「按住單一修飾鍵」這個用法消失。
     """
     assert gui.run_macro_step("hotkey ctrl+",
-                              should_abort=_never_abort) == "按鍵 control"
+                              should_abort=_never_abort) == "pressed control"
     assert macro_spy.calls == [("press_hotkey", (["control"],), {})]
 
 
@@ -4119,7 +4120,7 @@ def test_a_pixel_tolerance_the_evaluator_cannot_read_is_rejected_at_save_time(
     with pytest.raises(GuiError) as excinfo:
         gui.parse_macro_steps(f"wait 0\n{step}\nend")
     message = str(excinfo.value)
-    assert "第 2 行" in message and "容差" in message, message
+    assert "Line 2" in message and "tolerance" in message, message
     # 同一個值交給執行端也必須是 `GuiError`（有理由的拒絕），不是裸的
     # `ValueError`——後者會被 bot 的寬 `except` 折成一句沒有原因的「巨集執行失敗」。
     monkeypatch.setattr(gui, "pixel_color", lambda x, y: (255, 255, 255))
@@ -4170,7 +4171,7 @@ def test_wait_pixel_keeps_its_fourth_argument_as_a_timeout(macro_spy):
     gui.validate_macro_step("wait_pixel 10 10 #ffffff 2.5")
     with pytest.raises(GuiError) as excinfo:
         gui.validate_macro_step("wait_pixel 10 10 #ffffff 150")
-    assert "秒數" in str(excinfo.value)
+    assert "seconds" in str(excinfo.value)
     gui.run_macro_step("wait_pixel 10 10 #ffffff 2.5",
                        should_abort=_never_abort)
     assert macro_spy.calls == [
@@ -4195,7 +4196,7 @@ def test_every_leading_timeout_the_executor_parses_is_rejected_at_save_time(
         gui.validate_macro_step(step)
     with pytest.raises(GuiError) as excinfo:
         gui.parse_macro_steps(f"wait 0\n{step}")
-    assert "第 2 行" in str(excinfo.value)
+    assert "Line 2" in str(excinfo.value)
     # 執行端對同一個值也拒絕，而且拒絕發生在任何真實動作之前
     with pytest.raises(GuiError):
         gui.run_macro_step(step, should_abort=_never_abort)
@@ -4254,11 +4255,11 @@ def test_a_failing_backend_raises_instead_of_returning_a_success_line(
 
 
 @pytest.mark.parametrize("step, expected", [
-    ("wait_text 完成", "文字已出現於 (11, 22)"),
-    ("click_text 儲存", "點選文字於 (33, 44)"),
-    ("ui_click 開始", "點選 UI 元素於 (55, 66)"),
-    ("wait_ui 確定", "UI 元素已出現於 (77, 88)"),
-    ("focus 記事本", "聚焦視窗（命中 2 個）"),
+    ("wait_text 完成", "text appeared at (11, 22)"),
+    ("click_text 儲存", "clicked text at (33, 44)"),
+    ("ui_click 開始", "clicked UI element at (55, 66)"),
+    ("wait_ui 確定", "UI element appeared at (77, 88)"),
+    ("focus 記事本", "focused window (2 matched)"),
 ])
 def test_the_report_describes_the_outcome_not_the_request(macro_spy, step,
                                                           expected):
@@ -4283,7 +4284,7 @@ def test_the_report_says_how_much_was_typed_not_what(macro_spy, step, secret):
     """
     detail = gui.run_macro_step(step, should_abort=_never_abort)
     assert secret not in detail
-    assert "字" in detail
+    assert "characters" in detail
 
 
 def test_the_window_report_says_how_many_matched_not_which(macro_spy):
@@ -4293,7 +4294,7 @@ def test_the_window_report_says_how_many_matched_not_which(macro_spy):
         detail = gui.run_macro_step(step, should_abort=_never_abort)
         assert "某個視窗" not in detail, (
             f"`{step}` 的回報帶出了後端給的視窗標題：{detail}")
-        assert "2 個" in detail
+        assert "2 matched" in detail
 
 
 def test_a_successful_step_always_returns_a_non_empty_description(macro_spy):
@@ -4448,7 +4449,7 @@ def test_a_release_that_also_fails_does_not_mask_the_original_error(monkeypatch)
     monkeypatch.setattr(gui, "time", _FakeClock())
     with pytest.raises(GuiError) as caught:
         gui.mouse_drag(0, 0, 5, 5, steps=4, settle=0.0)
-    assert "拖曳" in str(caught.value)
+    assert "drag" in str(caught.value)
     assert str(caught.value.__cause__) == "backend blew up mid-drag"
 
 
@@ -4599,7 +4600,7 @@ def test_capture_gif_reports_a_missing_imaging_library(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "PIL", None)
     with pytest.raises(GuiError) as caught:
         gui.capture_gif(tmp_path / "x.gif", seconds=1.0, fps=1.0)
-    assert "未安裝" in str(caught.value)
+    assert "not installed" in str(caught.value)
 
 
 def test_capture_gif_reports_a_capture_failure_generically(tmp_path, monkeypatch):
@@ -4607,7 +4608,7 @@ def test_capture_gif_reports_a_capture_failure_generically(tmp_path, monkeypatch
     monkeypatch.setattr(gui, "time", _FakeClock())
     with pytest.raises(GuiError) as caught:
         gui.capture_gif(tmp_path / "x.gif", seconds=1.0, fps=1.0)
-    assert "連拍失敗" in str(caught.value)
+    assert "Continuous capture failed" in str(caught.value)
     assert "grab failed" not in str(caught.value), "原始例外文字外洩了"
 
 
@@ -4617,7 +4618,7 @@ def test_capture_gif_reports_a_save_failure_separately(tmp_path, gif_env):
     missing = tmp_path / "no_such_dir" / "x.gif"
     with pytest.raises(GuiError) as caught:
         gui.capture_gif(missing, seconds=1.0, fps=1.0)
-    assert "存檔" in str(caught.value)
+    assert "save" in str(caught.value)
 
 
 def test_capture_gif_says_so_when_it_caught_nothing(tmp_path, monkeypatch):
@@ -4632,7 +4633,7 @@ def test_capture_gif_says_so_when_it_caught_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(gui, "time", _AlreadyPast())
     with pytest.raises(GuiError) as caught:
         gui.capture_gif(tmp_path / "x.gif", seconds=1.0, fps=1.0)
-    assert "影格" in str(caught.value)
+    assert "frames" in str(caught.value)
 # --------------------------------------------------------------------------
 # 別名表 vs 底層套件的真表
 #
@@ -5153,7 +5154,7 @@ def test_the_control_flow_verbs_the_parity_check_skips_are_really_control_flow(
             verb, low, high, _MACRO_PARITY_POOL, _MACRO_PARITY_TAIL_POOL)
             if _validates(step)]
         assert steps, f"語料生不出 `{verb}` 的合法步驟"
-        with pytest.raises(GuiError, match="不認得的動作"):
+        with pytest.raises(GuiError, match="Unknown action"):
             gui.run_macro_step(steps[0])
     assert not stubbed_desktop.touched, stubbed_desktop.touched
 
@@ -5212,7 +5213,7 @@ def test_a_program_broken_after_substitution_does_nothing_at_all(
     assert macro_spy.calls == [], (
         f"壞掉的程式已經送出 {macro_spy.names}——第 {line} 行的問題必須在第一個"
         "動作之前就被擋下。")
-    assert f"第 {line} 行" in str(excinfo.value), str(excinfo.value)
+    assert f"Line {line}" in str(excinfo.value), str(excinfo.value)
 
 
 def test_a_valid_substituted_program_still_runs_every_step(macro_spy):
@@ -5258,8 +5259,8 @@ def test_a_missing_callee_is_caught_before_the_first_action(macro_spy, macro_dir
                               should_abort=_never_abort)
     assert macro_spy.calls == []
     message = str(excinfo.value)
-    assert "第 2 行" in message and "`ghost`" in message, message
-    assert "找不到這個巨集" in message, message
+    assert "Line 2" in message and "`ghost`" in message, message
+    assert "No macro with that name was found" in message, message
 
 
 def test_a_missing_callee_in_a_branch_that_never_runs_is_still_caught(
@@ -5298,7 +5299,7 @@ def test_a_call_chain_past_the_depth_cap_does_nothing(macro_spy, macro_dir):
                               should_abort=_never_abort)
     assert macro_spy.calls == []
     # 跟執行端丟的是同一句話
-    expected = f"巨集呼叫層數超過上限（{gui.MACRO_MAX_CALL_DEPTH} 層）。"
+    expected = f"The macro call depth exceeds the limit ({gui.MACRO_MAX_CALL_DEPTH} levels)."
     assert str(excinfo.value).endswith(expected), str(excinfo.value)
 
 
@@ -5321,7 +5322,7 @@ def test_a_call_chain_that_deepens_mid_run_is_stopped_by_the_executor(macro_spy,
     with pytest.raises(GuiError) as excinfo:
         gui.run_macro_program(["click 1 1", f"call {head}"], on_step=_deepen,
                               should_abort=_never_abort)
-    expected = f"巨集呼叫層數超過上限（{gui.MACRO_MAX_CALL_DEPTH} 層）。"
+    expected = f"The macro call depth exceeds the limit ({gui.MACRO_MAX_CALL_DEPTH} levels)."
     assert str(excinfo.value).endswith(expected), str(excinfo.value)
     assert macro_spy.names == ["mouse_click"], "多出來的那一層一個動作都不該做"
 
@@ -5335,7 +5336,7 @@ def test_a_conditional_self_call_is_caught_before_the_first_action(
         gui.run_macro_program(gui.load_macro("retry")["steps"],
                               should_abort=_never_abort)
     assert macro_spy.calls == []
-    assert "層數超過上限" in str(excinfo.value)
+    assert "call depth exceeds the limit" in str(excinfo.value)
 
 
 def test_the_memo_does_not_hide_a_depth_overflow_on_a_deeper_path(macro_dir):
@@ -5351,7 +5352,7 @@ def test_the_memo_does_not_hide_a_depth_overflow_on_a_deeper_path(macro_dir):
     gui.save_macro("n", ["call k"])
     with pytest.raises(GuiError) as excinfo:
         gui.check_macro_program(["call k", "call m"])
-    assert "層數超過上限" in str(excinfo.value)
+    assert "call depth exceeds the limit" in str(excinfo.value)
     # 前提：單走淺的那條是合法的，失敗真的來自深的那條
     gui.check_macro_program(["call k"])
 
@@ -5401,17 +5402,17 @@ def test_a_fan_out_with_distinct_arguments_hits_the_check_budget(
     monkeypatch.setattr(gui, "MACRO_MAX_CHECKED", 500)
     with pytest.raises(GuiError) as excinfo:
         gui.check_macro_program(top)
-    assert "超過上限（500 步）" in str(excinfo.value), str(excinfo.value)
+    assert "than the limit (500 steps)" in str(excinfo.value), str(excinfo.value)
 
 
 def test_the_check_rejects_unbalanced_blocks_itself():
     """事前檢查自己就驗區塊平衡——建立排程／監看時只呼叫它，不經過直譯器。"""
     with pytest.raises(GuiError) as excinfo:
         gui.check_macro_program(["repeat 2", "wait 0"])
-    assert "沒有對應" in str(excinfo.value)
+    assert "no matching" in str(excinfo.value)
     with pytest.raises(GuiError) as excinfo:
         gui.check_macro_program(["end"], name="m")
-    assert str(excinfo.value).startswith("巨集 `m`："), str(excinfo.value)
+    assert str(excinfo.value).startswith("Macro `m`: "), str(excinfo.value)
 
 
 def test_the_check_names_the_macro_and_the_line(macro_dir):
@@ -5420,11 +5421,11 @@ def test_the_check_names_the_macro_and_the_line(macro_dir):
     with pytest.raises(GuiError) as excinfo:
         gui.check_macro_program(["wait 0", "call inner a"], name="outer")
     assert str(excinfo.value) == (
-        "巨集 `outer` 第 2 行：巨集 `inner` 第 2 行：`type` 的參數個數不對。")
+        "Macro `outer`: Line 2: Macro `inner`: Line 2: Wrong number of arguments for `type`.")
     # 不合巨集名稱規則的 `name` 不印進訊息（訊息會原樣送給對話平台）
     with pytest.raises(GuiError) as excinfo:
         gui.check_macro_program(["type $1"], name="../evil path")
-    assert str(excinfo.value) == "第 1 行：`type` 的參數個數不對。"
+    assert str(excinfo.value) == "Line 1: Wrong number of arguments for `type`."
 
 
 # --------------------------------------------------------------------------
@@ -5772,9 +5773,9 @@ def test_a_job_reader_that_breaks_midway_still_records_the_exit(monkeypatch, cap
 
 
 def test_write_host_file_to_a_folder_needs_a_file_name(tmp_path):
-    with pytest.raises(GuiError, match="請給完整檔名"):
+    with pytest.raises(GuiError, match="please give a full file name"):
         gui.write_host_file(str(tmp_path), b"x")
-    with pytest.raises(GuiError, match="請給完整檔名"):
+    with pytest.raises(GuiError, match="please give a full file name"):
         gui.write_host_file(str(tmp_path / "not-yet") + "\\", b"x")
     assert list(tmp_path.iterdir()) == []
 
@@ -5802,7 +5803,7 @@ def test_a_failed_host_write_leaves_neither_temp_nor_target(tmp_path, monkeypatc
         monkeypatch.setattr(type(target), "unlink", broken_unlink)
     with pytest.raises(GuiError) as excinfo:
         gui.write_host_file(str(target), b"payload")
-    assert str(excinfo.value) == "檔案寫入失敗。"
+    assert str(excinfo.value) == "Failed to write the file."
     assert not target.exists()
     if not unlink_also_fails:
         assert not (tmp_path / "out.txt.tmp").exists()
@@ -5815,7 +5816,7 @@ def test_run_shell_reports_an_interpreter_that_will_not_start(monkeypatch):
     monkeypatch.setattr(gui.subprocess, "Popen", refuse)
     with pytest.raises(GuiError) as excinfo:
         gui.run_shell("echo hi")
-    assert str(excinfo.value) == "無法啟動指令直譯器。"
+    assert str(excinfo.value) == "Could not start the command interpreter."
 
 
 class _ShellProc:
@@ -5839,7 +5840,7 @@ def test_run_shell_kills_the_tree_when_communicate_fails_unexpectedly(monkeypatc
     monkeypatch.setattr(gui, "_kill_tree", killed.append)
     with pytest.raises(GuiError) as excinfo:
         gui.run_shell("echo hi")
-    assert str(excinfo.value) == "執行指令時發生錯誤。"
+    assert str(excinfo.value) == "An error occurred while running the command."
     assert killed == [proc]
     assert proc not in gui._SHELL_PROCS
 
@@ -6154,8 +6155,9 @@ def test_the_release_keys_step_says_how_many_keys_it_could_not_release(stubborn_
     """
     gui.key_down("ctrl")
     gui.key_down("shift")
-    assert gui.run_macro_step("release_keys") == "放開全部按鍵（1 個；另有 1 個放不掉）"
+    assert gui.run_macro_step("release_keys") == (
+        "released all keys (1 released; 1 could not be released)")
     assert [row[1] for row in gui.held_inputs()] == ["control"], "放不掉的鍵從登記裡消失了"
     stubborn_ac.stuck.clear()
-    assert gui.run_macro_step("release_keys") == "放開全部按鍵（1 個）"
+    assert gui.run_macro_step("release_keys") == "released all keys (1 released)"
     assert gui.held_inputs() == []

@@ -232,7 +232,7 @@ def _raise_runtime(*_a, **_k):
 @pytest.mark.parametrize("got, token", [
     ("power-request", "power-request"),
     ("execution-state", "execution-state"),
-    (None, "都拿不到"),
+    (None, "could not obtain either"),
 ])
 def test_each_power_outcome_says_which_one_it_got(capsys, got, token):
     """三條分支要分得出來，而且**印出那個 token 的字面值**。

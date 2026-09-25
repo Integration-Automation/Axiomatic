@@ -4565,7 +4565,7 @@ def test_a_healthy_quota_wait_probes_silently():
     assert port.probes == 10, (
         f"300 秒 / 每片 30 秒應該探測 10 次，實際 {port.probes} 次——"
         "探測被拿掉了，死亡時刻又會退回「最久晚一小時」")
-    assert "瀏覽器在等額度" not in err and "瀏覽器在等額度" not in out, (
+    assert "died while waiting for quota" not in err and "died while waiting for quota" not in out, (
         "探測正常時一個字都不該印。120 圈每圈一行的警告等於沒有訊號。"
         "實際 stderr：" + err)
     assert not [e for e in events if e[0] not in ("quota_wait",)], (
@@ -4578,14 +4578,14 @@ def test_a_browser_that_dies_mid_wait_is_logged_exactly_once():
     # 90 秒 = 3 片；第 2 片開始死。轉換只有一次，所以只該記一次。
     port = _DeadAfterPort(dies_at=2, blocked_waits=1)
     out, err, events = _run_quota_wait(port, poll=90.0)
-    hits = err.count("瀏覽器在等額度")
+    hits = err.count("died while waiting for quota")
     assert hits == 1, (
         f"「活著 → 死了」這個轉換只該記一次，實際 {hits} 次。"
         "每片都記的話，正式環境一輪會印 120 行——那就是沒有訊號。stderr：" + err)
     assert "10061" in err, (
         "原因字串沒帶進 log。10061 ＝ chromedriver 行程已結束，那一句就是下次"
         "查同一個症狀時最省時間的線索。stderr：" + err)
-    assert "不當場重啟" in err, (
+    assert "not restarting on the spot" in err, (
         "log 沒說清楚「只記錄、不重啟」——看 log 的人會以為系統已經處理過了")
     assert not [e for e in events if e[0] not in ("quota_wait",)], (
         f"偵測到死亡也不發新事件：{events}")
@@ -4608,7 +4608,7 @@ def test_a_probe_that_raises_never_kills_the_quota_wait():
     finally:
         ws._browser_gone_reason = saved
     assert "sleep 90" not in err          # 只是確認我們真的跑到了迴圈
-    assert err.count("瀏覽器在等額度") == 1, (
+    assert err.count("died while waiting for quota") == 1, (
         "探針自己壞掉要看得見（一次），但不能吞成沉默、也不能每片印一次。"
         "stderr：" + err)
     assert "probe helper blew up" in err, (
@@ -4625,7 +4625,7 @@ def test_a_transient_transport_hiccup_during_the_wait_stays_silent():
     port = _DeadAfterPort(probe_raises=True, blocked_waits=1)
     out, err, events = _run_quota_wait(port, poll=90.0)
     assert port.probes == 3, f"迴圈沒有跑完（只探測了 {port.probes} 片）"
-    assert "瀏覽器在等額度" not in err, (
+    assert "died while waiting for quota" not in err, (
         "暫時性的 transport 抖動不該被報成「瀏覽器死了」。stderr：" + err)
     print("  PASS\n")
 
@@ -6031,7 +6031,7 @@ def test_a_button_that_changes_nothing_stops_the_loop_immediately():
         assert port.dismiss_calls == 2, (
             "第 2 輪就該發現「畫面一個字都沒變」並收手，"
             f"實際按了 {port.dismiss_calls} 輪")
-        assert "沒有改變畫面" in out, (
+        assert "did not change the screen" in out, (
             "收手的理由要寫進 log，否則看起來就像 round 用完了。實際輸出：" + out)
     finally:
         ws.human_pause = saved
@@ -6053,7 +6053,7 @@ def test_the_dismiss_loop_is_bounded():
             assert ws.dismiss_blocking_dialog(port, max_rounds=3) is False
         assert port.dismiss_calls == 3, (
             f"max_rounds=3 就該按 3 輪，實際 {port.dismiss_calls}")
-        assert "連關 3 層仍有對話框擋著" in buf.getvalue(), buf.getvalue()
+        assert "still blocked by a dialog after closing 3 layers in a row" in buf.getvalue(), buf.getvalue()
         assert port.diag_calls == 1, "用完 round 也要留下控制項清單"
     finally:
         ws.human_pause = saved
@@ -7075,7 +7075,7 @@ def test_the_traceback_excerpt_keeps_our_frames_when_the_raise_is_deep():
     assert "MaxRetryError" in out and "ConnectionRefusedError" in out, out
     # 第三方那一長串要折疊，而且要說出折了幾個——沒有數字的話「折疊」與「本來就
     # 只有一個」分不出來。
-    assert "省略 11 個第三方 frame" in out, (
+    assert "omitted 11 third-party frames" in out, (
         "第三方 frame 沒有被折疊，或折疊時沒有說出省略了幾個。"
         f"實際輸出：{out!r}")
     assert len(out) < len(raw) // 2, (
@@ -7109,7 +7109,7 @@ def test_the_traceback_excerpt_is_capped_and_says_how_much_it_dropped():
            + "RecursionError: maximum recursion depth exceeded")
     out = ws._traceback_excerpt(raw)
     assert len(out) <= ws._TRACEBACK_BUDGET + 80, len(out)
-    assert "中間再省略" in out, f"截斷了卻沒說：{out[-200:]!r}"
+    assert "omitted in the middle" in out, f"截斷了卻沒說：{out[-200:]!r}"
     assert out.startswith("Traceback (most recent call last):"), out[:80]
     assert out.rstrip().endswith("RecursionError: maximum recursion depth "
                                  "exceeded"), (
@@ -7200,7 +7200,7 @@ def test_a_critical_error_carries_a_usable_traceback_and_a_drift_verdict():
         "（舊版 `format_exc()[-1500:]` 在這個形狀下留下的全是第三方 frame。）"
         f"實際：{tb!r}")
     assert "_webrunner_shared.py" in tb, tb
-    assert "省略" in tb and "第三方 frame" in tb, (
+    assert "omitted" in tb and "third-party frames" in tb, (
         f"第三方那一長串沒有被折疊：{tb!r}")
     # message 要壓成一行、而且不得帶 chromedriver 的 C++ Stacktrace。
     message = event.get("message") or ""
@@ -7279,9 +7279,9 @@ def test_the_first_time_a_dialog_shape_appears_it_is_logged_in_full():
     assert "could not dismiss" in text, text
     # 逐層的按法與結果、收手的理由、控制項清單——第一次都要在。安靜是為了穩態，
     # 不是為了讓第一次故障也查不到。
-    assert "第 1 層 via" in text, f"沒有逐層經過：{text!r}"
+    assert "layer 1 via" in text, f"沒有逐層經過：{text!r}"
     assert "clicked-corner:button@369,21" in text, f"沒說按了哪一顆：{text!r}"
-    assert "沒有改變畫面" in text, f"沒說為什麼收手：{text!r}"
+    assert "did not change the screen" in text, f"沒說為什麼收手：{text!r}"
     assert "420x322" in text, f"沒有控制項清單：{text!r}"
     print("  PASS" + chr(10))
 
@@ -7301,7 +7301,7 @@ def test_a_repeated_dialog_shape_shrinks_to_a_single_line():
     assert "could not dismiss" in lines[0], (
         "摘要行沒有帶 `could not dismiss`：歷史統計是照這個字串數的，"
         f"而且「關掉了」與「關不掉」必須分得出來。實際：{lines[0]!r}")
-    assert "第 2 次" in lines[0], (
+    assert "occurrence 2" in lines[0], (
         f"摘要行沒說這是第幾次，讀 log 的人看不出這是穩態：{lines[0]!r}")
     print("  PASS" + chr(10))
 
@@ -7996,7 +7996,7 @@ def test_a_mismatched_major_version_is_called_out():
         "browserVersion": "152.0.1.0",
         "chrome": {"chromedriverVersion": "151.0.2.0 (x)"},
     })
-    assert "主版號不符" in line, (
+    assert "major version mismatch" in line, (
         f"主版號不同卻沒有標出來：{line}。這正好是兩週一版之後最常見的那種失敗。")
     print("  PASS test_a_mismatched_major_version_is_called_out")
 
@@ -8006,7 +8006,7 @@ def test_a_matching_major_version_is_not_flagged():
         "browserVersion": "151.0.7922.174",
         "chrome": {"chromedriverVersion": "151.0.7922.138"},
     })
-    assert "主版號不符" not in line, f"次版號不同不算不符：{line}"
+    assert "major version mismatch" not in line, f"次版號不同不算不符：{line}"
     print("  PASS test_a_matching_major_version_is_not_flagged")
 
 
@@ -8208,7 +8208,7 @@ def test_the_stay_awake_notes_do_not_claim_the_request_blocks_standby():
     assert "class StayAwake:" in region and len(region) > 1500, (
         "切不出 `StayAwake` 那一段——區段標題或常數名改過了，抽取器要跟著改，"
         "不然底下的檢查全部變成恆綠的裝飾。")
-    for claim in ("Modern Standby 也擋得住", "擋得住 Modern Standby"):
+    for claim in ("blocks Modern Standby too", "can block Modern Standby"):
         assert claim not in region, (
             f"註解又宣稱電源要求「{claim}」了。它保的是本行程不被 PLM 暫停；"
             "系統照樣會進入 Modern Standby（2026-09-20 實測）。")
@@ -8216,7 +8216,7 @@ def test_the_stay_awake_notes_do_not_claim_the_request_blocks_standby():
             ("PLM", "電源要求實際保證的東西（行程不被 PLM 暫停）沒有寫出來，"
                     "讀的人只會退回『它擋得住待命』那個錯誤理解。"),
             ("DC", "DC 電源那條限制不見了。"),
-            ("5 分鐘", "DC 電源下電源要求會在睡眠逾時後 5 分鐘被系統撤銷——"
+            ("5 minutes", "DC 電源下電源要求會在睡眠逾時後 5 分鐘被系統撤銷——"
                        "少了這句，用電池跑的無人值守批次會被安靜暫停，而症狀"
                        "（行程還在、log 只是停住）正是這段註解當初要防的那一個。")):
         assert needed in region, f"`StayAwake` 註解少了「{needed}」：{why}"
@@ -8411,7 +8411,7 @@ def test_drift_is_reported_and_names_the_changed_files():
     out = buf.getvalue()
     assert "_webrunner_shared.py" in out, out
     assert "aaaaaaaaaaaa" in out and "bbbbbbbbbbbb" in out, out
-    assert "舊" in out, ("漂移那一行沒有講出「本行程跑的仍是舊版」——那是這一行"
+    assert "old version" in out, ("漂移那一行沒有講出「本行程跑的仍是舊版」——那是這一行"
                         f"存在的理由：{out!r}")
     assert "_process_control.py" not in out, (
         "延遲 import 進來的模組被當成變動列出來了。它是 `snapshot()` 之後才從磁碟"
@@ -8437,7 +8437,7 @@ def test_undecidable_drift_never_reads_as_a_clean_run():
             ws.report_code_drift()
     out = buf.getvalue()
     assert out.strip(), "判斷不出來卻完全不出聲——那跟乾淨的掃描長得一模一樣了"
-    assert "無法判斷" in out, (
+    assert "cannot tell whether the code changed" in out, (
         f"「不知道」被寫得像「有漂移」或像「一切正常」：{out!r}")
     print("  PASS\n")
 

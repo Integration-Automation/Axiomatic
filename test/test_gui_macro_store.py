@@ -2,7 +2,8 @@
 
 `_gui_control.load_macro` 的 docstring 是這樣寫的：
 
-    讀巨集並**重新驗證**每一步——檔案在磁碟上是可以被手動改壞的。
+    Read a macro and **re-validate** every step—the file on disk can be broken
+    by hand.
 
 「每一步」是真的：`steps` 逐步重驗、區塊平衡也重算。但 `save_macro` 寫進檔案的是
 **五個**欄位，而其中 `author_id` 會被 `edit_macro` 拿去 `int(...)`——沒有任何人驗過

@@ -17221,8 +17221,8 @@ def _fill_macro_fixture(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("args, hint", [
-    ("", "第 2 行"),              # `type $1` 沒有參數
-    (" a 150", "秒數上限"),        # `wait_ui $2` 代進去超過 120 秒
+    ("", "Line 2"),              # `type $1` 沒有參數
+    (" a 150", "The maximum is 120 seconds"),        # `wait_ui $2` 代進去超過 120 秒
 ])
 def test_schedule_creation_rejects_a_bad_substituted_program(
         monkeypatch, tmp_path, fill_macro, args, hint):
@@ -17253,7 +17253,7 @@ def test_schedule_creation_still_rejects_a_missing_macro(monkeypatch, tmp_path,
     monkeypatch.setattr(b, "SCHEDULE_FILE", tmp_path / "sched.json")
     message, sent = _schedule_test_message(monkeypatch)
     asyncio.run(b.cmd_schedule(message, "add 09:30 macro ghost"))
-    assert sent[-1].startswith("❌ ") and "找不到這個巨集" in sent[-1], sent
+    assert sent[-1].startswith("❌ ") and "No macro with that name was found" in sent[-1], sent
 
 
 @pytest.mark.parametrize("run_spec, created", [
@@ -17306,7 +17306,7 @@ def test_macro_run_rejects_a_bad_substituted_program_before_taking_the_gate(
     """壞掉的程式不佔鍵鼠、不進直譯器，回覆講的是哪個巨集的第幾行。"""
     message, sent, gate, ran = _macro_run_harness(monkeypatch)
     asyncio.run(b.cmd_macro(message, "run fill a 150"))
-    assert sent == ["❌ 巨集 `fill` 第 3 行：秒數上限是 120 秒。"], sent
+    assert sent == ["❌ Macro `fill`: Line 3: The maximum is 120 seconds."], sent
     assert gate == [] and ran == [], (gate, ran)
     assert fill_macro == []
 
@@ -17343,7 +17343,7 @@ def test_a_schedule_macro_failure_reports_the_safe_message(monkeypatch, fill_mac
     """
     text = _schedule_entry_text(
         monkeypatch, {"id": 5, "kind": "macro", "payload": "fill a 150"})
-    assert text == "❌ 排程 `#5` 的巨集失敗：第 3 行：秒數上限是 120 秒。", text
+    assert text == "❌ 排程 `#5` 的巨集失敗：Line 3: The maximum is 120 seconds.", text
     assert fill_macro == [], "排程在失敗之前已經碰了桌面"
 
 
@@ -17419,7 +17419,7 @@ def test_a_watch_macro_guierror_is_still_reported_as_a_failure(monkeypatch,
     ——而上面那支照樣是綠的。
     """
     sent = _watch_action_replies(monkeypatch, {"macro": "fill", "args": ["a", "150"]})
-    assert sent == ["❌ 監看 `#9` 的巨集失敗：第 3 行：秒數上限是 120 秒。"], sent
+    assert sent == ["❌ 監看 `#9` 的巨集失敗：Line 3: The maximum is 120 seconds."], sent
     assert fill_macro == [], "事前檢查沒擋住，巨集碰了桌面"
 
 
