@@ -1485,20 +1485,28 @@ def _split_add_payload(raw: str) -> list[str]:
     return pieces
 
 
+# Queue label -> that queue's slash command path, used only for usage text. Usage text may
+# only teach slash commands (DoD #3), and the label itself is the queue file's stem, which
+# does not belong in a reply either. The lookup deliberately has no default: a new queue
+# missing here is derived from the call sites by `test_bot_helpers` and goes red.
+_QUEUE_SLASH_PATH = {
+    "todo_prompt": "/todo prompt",
+    "character1": "/todo char1",
+    "character2": "/todo char2",
+    "todo_undesired": "/todo negp",
+}
+
+
 async def cmd_character_add(message: discord.Message, path: Path, label: str,
                             payload: str, repeat: int = 1) -> None:
-    raw = payload.strip()
-    if not raw:
+    new_entries = _split_add_payload(payload.strip())
+    if not new_entries:
         suffix = f"x{repeat}" if repeat > 1 else ""
         await safe_reply(
             message,
-            f"usage: `!{label}_add{suffix} <prompt>` "
+            f"usage: `{_QUEUE_SLASH_PATH[label]} add{suffix} <prompt>` "
             f"(separate multiple entries by newline or `\\`)"
         )
-        return
-    new_entries = _split_add_payload(raw)
-    if not new_entries:
-        await safe_reply(message, f"usage: `!{label}_add <prompt>`")
         return
     expanded = [e for e in new_entries for _ in range(repeat)]
     entries = read_todo_entries(path)
@@ -1537,7 +1545,7 @@ async def cmd_character_remove(message: discord.Message, path: Path, label: str,
     try:
         index = int(text)
     except ValueError:
-        await safe_reply(message, f"usage: `!{label}_remove <index>` (1-based number)")
+        await safe_reply(message, f"usage: `{_QUEUE_SLASH_PATH[label]} remove <index>` (1-based number)")
         return
     entries = read_todo_entries(path)
     if not entries:

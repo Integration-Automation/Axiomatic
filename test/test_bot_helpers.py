@@ -6747,6 +6747,92 @@ def test_every_pause_the_bot_writes_is_one_the_batch_understands(monkeypatch, tm
     assert sent[-1].startswith("用法"), "a five-thousand-digit pair count must not make the command raise"
 
 
+def _runtime_slash_qualified() -> set[str]:
+    names: set[str] = set()
+
+    def _walk(commands):
+        for command in commands:
+            if isinstance(command, discord.app_commands.Group):
+                _walk(command.commands)
+            else:
+                names.add(command.qualified_name)
+
+    _walk(b.tree.get_commands())
+    return names
+
+
+_QUEUE_HANDLERS = {"cmd_character_add", "cmd_character_remove", "_cmd_character_add_x3"}
+
+
+def _queue_labels_at_call_sites() -> set[str]:
+    """The literal label at every call site handing one to a queue handler (directly or via
+    `_slash_run`).
+
+    All three take `(message, path, label, payload, ...)`; the forwarding
+    `_cmd_character_add_x3` passes its own parameter down, which is not a literal and is
+    represented by its own call sites.
+    """
+    labels: set[str] = set()
+    for call in ast.walk(ast.parse(Path(b.__file__).read_text(encoding="utf-8"))):
+        if not isinstance(call, ast.Call):
+            continue
+        if isinstance(call.func, ast.Name) and call.func.id == "_slash_run" and len(call.args) >= 2:
+            target, after_message = call.args[1], call.args[2:]
+        else:
+            target, after_message = call.func, call.args[1:]
+        if not (isinstance(target, ast.Name) and target.id in _QUEUE_HANDLERS and len(after_message) >= 2):
+            continue
+        label = after_message[1]
+        if isinstance(label, ast.Constant) and isinstance(label.value, str):
+            labels.add(label.value)
+    return labels
+
+
+def test_every_queue_label_maps_to_a_real_slash_command():
+    """Usage text looks up `_QUEUE_SLASH_PATH[label]` with no default -- so a missing label
+    makes the command raise, and an extra one is a sentence nobody will ever notice going
+    stale. Both directions are derived from the call sites."""
+    labels = _queue_labels_at_call_sites()
+    assert len(labels) >= 4, f"only {sorted(labels)} derived from the call sites -- the extraction is broken"
+    assert labels == set(b._QUEUE_SLASH_PATH), (
+        f"call-site labels {sorted(labels)} do not match the table {sorted(b._QUEUE_SLASH_PATH)}")
+    commands = _runtime_slash_qualified()
+    for label, slash in b._QUEUE_SLASH_PATH.items():
+        for verb in ("add", "remove"):
+            assert f"{slash} {verb}".lstrip("/") in commands, (
+                f"the usage text for `{label}` teaches `{slash} {verb}`, which is not a slash command")
+
+
+def test_queue_usage_teaches_the_slash_command_and_not_the_file_name(monkeypatch, tmp_path):
+    """A blank add, one of only non-breaking spaces, one of only separators, and a non-numeric
+    remove all answer with usage text -- which used to be `` `!todo_prompt_add` ``: teaching the
+    hidden `!` surface on the slash surface (DoD #3) and naming the queue file on the way. The
+    static guard missed it because the command name is interpolated (see the interpolation
+    rule in `test_secrecy`)."""
+    sent: list = []
+
+    async def _reply(_message, content=None, **_kw):
+        sent.append(content)
+
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    queue = tmp_path / "queue.md"
+    queue.write_text("keep\n", encoding="utf-8")
+    for label, slash in b._QUEUE_SLASH_PATH.items():
+        for payload in ("", "   ", "\xa0", "\\", " \\ \\ "):
+            sent.clear()
+            _sr_run(b.cmd_character_add(types.SimpleNamespace(), queue, label, payload))
+            assert sent and sent[-1].startswith(f"usage: `{slash} add <prompt>`"), (label, payload, sent)
+        sent.clear()
+        _sr_run(b.cmd_character_add(types.SimpleNamespace(), queue, label, "", repeat=3))
+        assert sent[-1].startswith(f"usage: `{slash} addx3 <prompt>`"), sent
+        sent.clear()
+        _sr_run(b.cmd_character_remove(types.SimpleNamespace(), queue, label, "two"))
+        assert sent[-1].startswith(f"usage: `{slash} remove <index>`"), sent
+        for reply in sent:
+            assert "!" not in reply and label not in reply, reply
+    assert queue.read_text(encoding="utf-8") == "keep\n", "the usage path must not touch the queue"
+
+
 def test_ping_answers_before_the_first_heartbeat(monkeypatch):
     """Latency is NaN with no connection and infinity before the first heartbeat; both must
     get a reply, not an exception."""

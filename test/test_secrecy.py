@@ -2195,6 +2195,12 @@ def test_the_generic_half_of_the_wiki_failure_says_nothing_internal():
 # 條，不是 `!`），而豁免清單一開就會越積越多——這正是 DoD #3 存在的理由。
 
 _BANG_IN_TEXT_RE = re.compile(r"!([A-Za-z0-9_]+)")
+# A `!` followed directly by an interpolation: the command name is composed, so the name list
+# above can never match it -- `f"usage: `!{label}_add"` is the two fragments "usage: `!" and
+# "_add" in the corpus. That is how five queue commands' usage text slipped through until
+# 2026-09-25. So a fragment ending in a token-starting `!` (after a backtick, whitespace or the
+# fragment start) counts by itself; an exclamation mark after a word ("Done!") does not.
+_BANG_BEFORE_INTERPOLATION_RE = re.compile(r"(?:^|[`\s])!$")
 
 
 def _literal_texts(node: ast.AST):
@@ -2239,6 +2245,10 @@ def _bang_teachings(rows: list[tuple[str, int, str]]) -> list[str]:
             if hit in names:
                 problems.append(
                     f"{module}:{lineno} 教了 `!{hit}`：{text.strip()[:70]}")
+        if _BANG_BEFORE_INTERPOLATION_RE.search(text):
+            problems.append(
+                f"{module}:{lineno} teaches a composed `!` command (`!` followed by an "
+                f"interpolation): {text.strip()[:70]}")
     return sorted(set(problems))
 
 
@@ -2275,6 +2285,12 @@ def test_no_bot_string_teaches_a_hidden_bang_command():
     ("rc!=0 代表失敗", False),
     ("!definitelynotacommand 不是指令", False),
     ("請用 `/macro delete`。", False),
+    # f-strings arrive as separate fragments: a `!` followed directly by an interpolation.
+    ("usage: `!", True),
+    ("!", True),
+    ("請改用 !", True),
+    ("完成!", False),
+    ("Done!", False),
 ])
 def test_the_bang_detector_tells_the_shapes_apart(text, caught):
     """對照組：真的指令名要抓到，普通驚嘆號與不存在的指令不能誤報。
