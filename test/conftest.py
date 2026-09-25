@@ -496,9 +496,14 @@ def _reset_warn_dedup():
               for name in _WARN_DEDUP_MODULES]
     for cache in caches:
         cache.clear()
+    # 同一個形狀：SMTC 探測的連續逾時退避也是模組層狀態。一支測試讓它逾時，同一個
+    # worker 之後跑的 `probe_signals_async` 測試就會跳過它們換上的假探測。
+    presence_probe = importlib.import_module("presence_probe")
+    presence_probe._smtc_backoff_reset()
     yield
     for cache in caches:
         cache.clear()
+    presence_probe._smtc_backoff_reset()
 
 
 

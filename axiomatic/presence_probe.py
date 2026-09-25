@@ -656,6 +656,51 @@ async def _reap_timed_out_probe(proc, timeout: float | None = None) -> None:
         await asyncio.gather(wait_task, return_exceptions=True)
 
 
+# ---------- 連續逾時的退避（2026-09-23）------------------------------------
+#
+# 探測逾時幾乎都是**主機忙**（量到的那一天：整套測試在跑的二十分鐘裡 928 次逾時，
+# 平常一天 0～11 次）。舊行為是每個 tick 照樣再起一個 PowerShell ＋ WinRT、等滿 6 秒、
+# 殺掉——在主機最忙的時候每 8 秒加一個最貴的子行程，而且每一次都寫一行 log。
+#
+# 所以只給 presence 迴圈那條路（`probe_signals_async`）退避：連續第 n 次逾時之後跳過
+# `min(上限, 基準 × 2^(n-1))` 秒，這段期間音樂訊號退回前景視窗那一條（本來就是
+# SMTC 沒結果時的備援）。`/probe_status` 那條診斷路**不**退避，要看的就是此刻的真相。
+# log 只在一段連續逾時的**第一次**與**恢復時**各寫一行，「逾時也要吭聲」照舊成立，
+# 只是不再每 8 秒吭一次。
+_SMTC_BACKOFF_BASE_SEC = 15.0
+_SMTC_BACKOFF_MAX_SEC = 120.0
+_smtc_timeouts_in_a_row = 0
+_smtc_skip_until = 0.0
+
+
+def _smtc_note_outcome(*, timed_out: bool) -> None:
+    """記下一次探測有沒有逾時，並據此排定（或解除）退避。"""
+    global _smtc_timeouts_in_a_row, _smtc_skip_until  # pylint: disable=global-statement
+    if timed_out:
+        _smtc_timeouts_in_a_row += 1
+        exponent = min(_smtc_timeouts_in_a_row - 1, 16)   # 指數封頂，免得浮點溢位
+        delay = min(_SMTC_BACKOFF_MAX_SEC, _SMTC_BACKOFF_BASE_SEC * 2 ** exponent)
+        _smtc_skip_until = time.monotonic() + delay
+        return
+    if _smtc_timeouts_in_a_row:
+        print(f"presence_probe: SMTC probe answering again after "
+              f"{_smtc_timeouts_in_a_row} timeout(s) in a row", file=sys.stderr)
+    _smtc_timeouts_in_a_row = 0
+    _smtc_skip_until = 0.0
+
+
+def _smtc_backing_off() -> bool:
+    """presence 迴圈此刻該不該跳過 SMTC 探測。"""
+    return time.monotonic() < _smtc_skip_until
+
+
+def _smtc_backoff_reset() -> None:
+    """回到「沒有逾時過」。測試用：這是模組層狀態，會在測試之間互相汙染。"""
+    global _smtc_timeouts_in_a_row, _smtc_skip_until  # pylint: disable=global-statement
+    _smtc_timeouts_in_a_row = 0
+    _smtc_skip_until = 0.0
+
+
 async def probe_smtc_raw_async(timeout: float = 6.0) -> dict | None:
     """跑 PowerShell 拿正在 Playing 的第一個 SMTC session，回傳 raw 資料
     （**不**做 source 白名單過濾），給 /probe_status 診斷用。"""
@@ -674,9 +719,11 @@ async def probe_smtc_raw_async(timeout: float = 6.0) -> dict | None:
                                                 timeout=timeout)
     except asyncio.TimeoutError:
         # 逾時也要說一聲：這條路整個安靜掉的話，音樂狀態會永遠是「沒在播」，
-        # 而那跟「真的沒在播」長得一模一樣。
-        print(f"presence_probe: SMTC probe timed out after {timeout}s",
-              file=sys.stderr)
+        # 而那跟「真的沒在播」長得一模一樣。一段連續逾時只說第一次，恢復時再說一次。
+        if _smtc_timeouts_in_a_row == 0:
+            print(f"presence_probe: SMTC probe timed out after {timeout}s; "
+                  "backing off while it keeps timing out", file=sys.stderr)
+        _smtc_note_outcome(timed_out=True)
         # `kill()` 要包起來，理由**不是**泛泛的防禦性：`asyncio` 的
         # `Process.kill()` 走 `BaseSubprocessTransport.kill()` → `_check_proc()`，
         # 而 `_check_proc()` 在 `self._proc is None` 時直接丟 `ProcessLookupError`；
@@ -723,6 +770,7 @@ async def probe_smtc_raw_async(timeout: float = 6.0) -> dict | None:
         except Exception:  # pylint: disable=broad-except  # nosec B110
             pass
         raise
+    _smtc_note_outcome(timed_out=False)
     if proc.returncode != 0:
         # 這裡本來是 `stdout, _ = …` 然後直接 return None：stderr **被接了管線
         # 然後丟掉**，比不接還糟——不接的話錯誤訊息至少會落到主控台。
@@ -986,7 +1034,8 @@ async def probe_signals_async() -> dict:
       claude       : str | None     — 'Claude Code' or None
     music_* 的 dict 形如 {"title","artist","source"}。"""
     game = probe_game_process()
-    raw = await probe_smtc_raw_async()
+    # 連續逾時期間跳過（見 `_SMTC_BACKOFF_BASE_SEC` 那段）；音樂訊號照樣有前景視窗那條備援。
+    raw = None if _smtc_backing_off() else await probe_smtc_raw_async()
     music_strict = _filter_smtc_media(raw)
     if not music_strict:
         music_strict = probe_foreground_music()

@@ -76,6 +76,109 @@ def test_a_healthy_probe_stays_quiet(capsys):
     assert capsys.readouterr().err == "", "正常路徑印了東西"
 
 
+# ---------------------------------------------------------------------------
+# 連續逾時：退避，而且一段連續逾時只寫兩行 log（2026-09-23）
+# ---------------------------------------------------------------------------
+class _FinishedChild:
+    """立刻正常結束、沒在播音樂的子行程。"""
+    returncode = 0
+
+    async def communicate(self):
+        return b"{}", b""
+
+
+class _SlowChild:
+    """一定逾時的子行程；`wait()` 立刻回來，免得收屍那段拖時間。"""
+    returncode = None
+
+    async def communicate(self):
+        await asyncio.sleep(30)
+
+    def kill(self):
+        self.returncode = 1
+
+    async def wait(self):
+        return 1
+
+
+def _children(monkeypatch, *kinds):
+    queue = list(kinds)
+
+    async def fake_exec(*_args, **_kwargs):
+        return queue.pop(0)()
+
+    monkeypatch.setattr(pp.asyncio, "create_subprocess_exec", fake_exec)
+
+
+def test_a_timeout_streak_is_logged_once_and_its_end_once(monkeypatch, capsys):
+    """量到的那一天，主機忙的二十分鐘裡寫了 928 行一模一樣的逾時。一段連續逾時只說
+    第一次，恢復時說一次「連續幾次」——兩個端點都在，中間的重複不在。"""
+    _children(monkeypatch, _SlowChild, _SlowChild, _SlowChild, _FinishedChild)
+    capsys.readouterr()
+    for _ in range(3):
+        assert _run(pp.probe_smtc_raw_async(timeout=0.05)) is None
+    err = capsys.readouterr().err
+    assert err.count("timed out") == 1, err
+    _run(pp.probe_smtc_raw_async(timeout=30.0))
+    err = capsys.readouterr().err
+    assert "answering again after 3 timeout(s)" in err, err
+    assert not pp._smtc_backing_off()
+
+
+def test_the_backoff_doubles_and_is_capped():
+    """15、30、60、120、120……；次數再大也不會讓浮點溢位（那會讓 presence 迴圈丟例外）。"""
+    def _scheduled():
+        # 量「排到多久以後」：記下呼叫前的時鐘，排定值減掉它。不用 `round(… - 現在)`——
+        # 主機忙的時候兩次讀時鐘之間可能隔半秒以上，四捨五入就翻到隔壁那個整數。
+        before = pp.time.monotonic()
+        pp._smtc_note_outcome(timed_out=True)
+        return pp._smtc_skip_until - before
+
+    delays = [_scheduled() for _ in range(6)]
+    for got, want in zip(delays, [15, 30, 60, 120, 120, 120]):
+        assert want <= got < want + 5, delays
+    pp._smtc_timeouts_in_a_row = 10 ** 6
+    assert 120 <= _scheduled() < 125
+
+
+def test_the_presence_loop_skips_the_probe_while_backing_off(monkeypatch):
+    """退避期間 presence 迴圈不再起那個最貴的子行程；退避一到就照常探。"""
+    calls: list = []
+
+    async def fake_raw(*_args, **_kwargs):
+        calls.append(1)
+        return None
+
+    monkeypatch.setattr(pp, "probe_smtc_raw_async", fake_raw)
+    monkeypatch.setattr(pp, "probe_game_process", lambda: None)
+    monkeypatch.setattr(pp, "probe_foreground_music", lambda: None)
+    monkeypatch.setattr(pp, "probe_claude_code", lambda: None)
+    pp._smtc_note_outcome(timed_out=True)
+    _run(pp.probe_signals_async())
+    assert calls == []
+    monkeypatch.setattr(pp, "_smtc_skip_until", 0.0)
+    _run(pp.probe_signals_async())
+    assert calls == [1]
+
+
+def test_a_probe_that_fails_fast_ends_the_streak(monkeypatch, capsys):
+    """「逾時」與「很快就失敗」是兩件事：後者代表主機不忙、腳本本身有問題，要照常每次
+    都探、每次都報（那是 `test_a_failing_smtc_probe_says_why` 守的），不得被當成逾時退避。"""
+
+    class _FailingChild(_FinishedChild):
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"boom"
+
+    _children(monkeypatch, _SlowChild, _FailingChild)
+    _run(pp.probe_smtc_raw_async(timeout=0.05))
+    assert pp._smtc_backing_off()
+    _run(pp.probe_smtc_raw_async(timeout=30.0))
+    assert not pp._smtc_backing_off()
+    assert "boom" in capsys.readouterr().err
+
+
 def test_a_timed_out_child_is_actually_reaped(monkeypatch, capsys):
     """逾時之後不只要 `kill()`，還要 `wait()` 把它收掉。
 
