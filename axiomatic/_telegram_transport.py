@@ -437,23 +437,29 @@ class TelegramTransport(ChatTransport):
         return self._conversation(key, chat_type, channel_id, is_command_chat)
 
     def _attachments(self, raw: dict) -> list[ChatAttachment]:
-        """訊息附帶的檔案／圖片。取最大的那一張（平台把同一張圖給好幾個尺寸）。"""
+        """Files / photos attached to the message. Takes the biggest photo (the platform sends
+        the same picture in several sizes).
+
+        Sizes go through `_as_int`: `int()` raises on an unreadable value, and raising here
+        means the whole message (text included) never reaches the dispatcher —
+        `_handle_update` only logs the exception type. The size is informational (the download
+        has its own cap), so an unreadable one counts as 0."""
         found: list[ChatAttachment] = []
         document = raw.get("document")
         if isinstance(document, dict) and document.get("file_id"):
             found.append(self._attachment(
                 document.get("file_id"),
                 str(document.get("file_name") or "upload.bin"),
-                int(document.get("file_size") or 0)))
+                _as_int(document.get("file_size"))))
         photos = raw.get("photo")
         if isinstance(photos, list) and photos:
             biggest = max(
                 (p for p in photos if isinstance(p, dict) and p.get("file_id")),
-                key=lambda p: int(p.get("file_size") or 0), default=None)
+                key=lambda p: _as_int(p.get("file_size")), default=None)
             if biggest is not None:
                 found.append(self._attachment(
                     biggest.get("file_id"), "photo.jpg",
-                    int(biggest.get("file_size") or 0)))
+                    _as_int(biggest.get("file_size"))))
         return found
 
     def _attachment(self, file_id: Any, filename: str,

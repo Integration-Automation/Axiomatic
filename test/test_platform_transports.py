@@ -771,6 +771,22 @@ def _drive(transport, update):
     return seen
 
 
+def test_an_unreadable_attachment_size_does_not_drop_the_message(monkeypatch, tmp_path):
+    """The attachment size is only informational. An unreadable value used to make `int()`
+    raise, so the whole message (text included) never reached the dispatcher; now it counts
+    as 0, the message goes through, and the biggest photo is still picked."""
+    transport = _built(monkeypatch, tmp_path)
+    update = _update(text="hello")
+    update["message"]["document"] = {"file_id": "d1", "file_name": "a.txt", "file_size": "big"}
+    update["message"]["photo"] = [{"file_id": "p1", "file_size": ["x"]},
+                                  {"file_id": "p2", "file_size": 900},
+                                  {"file_id": "p3", "file_size": None}]
+    seen = _drive(transport, update)
+    assert len(seen) == 1 and seen[0].content == "hello"
+    sizes = [(a.filename, a.size) for a in seen[0].attachments]
+    assert sizes == [("a.txt", 0), ("photo.jpg", 900)], sizes
+
+
 def test_a_message_from_the_owner_reaches_the_dispatcher(monkeypatch, tmp_path):
     transport = _built(monkeypatch, tmp_path)
     seen = _drive(transport, _update())
