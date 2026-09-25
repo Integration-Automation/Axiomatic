@@ -455,6 +455,17 @@ def test_the_listening_kind_carries_its_activity_type():
                               cfg, 0)["type"] == 0
 
 
+def test_a_mistyped_template_is_sent_as_written_instead_of_raising():
+    """The template is a hand-written config value. Every way of mistyping it must be
+    sent as written — raising would break every heartbeat here, freezing the status on the
+    last good one with no visible reason."""
+    for template in ("{nam}", "{0}", "{name:>5x}", "{name.foo}", "{name[x]}", "{"):
+        cfg = rpc.load_rpc_config()
+        cfg["kinds"]["playing"] = dict(cfg["kinds"]["playing"], name=template)
+        act = rpc.build_activity({"kind": "playing", "name": "Foo"}, cfg, 0)
+        assert act["name"] == template, (template, act)
+
+
 def test_a_timestamp_is_only_sent_when_the_kind_asks_for_it():
     cfg = rpc.load_rpc_config()
     assert "timestamps" in rpc.build_activity(

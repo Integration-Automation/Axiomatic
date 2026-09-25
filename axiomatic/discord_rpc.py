@@ -259,9 +259,14 @@ def build_activity(probe, cfg: dict, started_at_ms: int) -> dict | None:
         return None
 
     def _fmt(value: str) -> str:
+        # The template is a hand-written config value and can be mistyped in more
+        # than one way: `{nam}` is KeyError, `{0}` IndexError, `{name:>5x}`
+        # ValueError, `{name.foo}` AttributeError and `{name[x]}` TypeError. The last
+        # two used to escape here on every heartbeat, freezing the status on the last
+        # good one. A mistyped template is sent as written instead.
         try:
             return value.format(name=name)
-        except (KeyError, IndexError, ValueError):
+        except (KeyError, IndexError, ValueError, AttributeError, TypeError):
             return value
 
     activity: dict = {}
