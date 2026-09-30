@@ -294,7 +294,7 @@ def test_repo_row_skips_linked_worktrees(tmp_path):
     wt = tmp_path / "wt_sc"
     wt.mkdir()
     (wt / ".git").write_text(
-        "gitdir: D:/Codes/Imervue/.git/worktrees/wt_sc\n", encoding="utf-8")
+        "gitdir: C:/src/other-repo/.git/worktrees/wt_sc\n", encoding="utf-8")
     assert b._churn_repo_row(wt, lambda d: "should-not-run") is None
 
     normal = tmp_path / "normal"
