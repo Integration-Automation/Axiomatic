@@ -728,11 +728,10 @@ def test_the_slash_remove_passes_the_id_ahead_of_the_index(monkeypatch):
 # 六、迴圈那條路沒有被改到
 # ===========================================================================
 
-def test_the_loop_path_still_waits_in_place():
-    """自走迴圈的用量上限 handler 維持原樣：原地等 ＋ `continue`，不改成停進佇列。
-
-    迴圈整段等待都在同一個行程裡、而且握著 per-session 鎖，改成停放反而會把脈絡與
-    鎖的語意一起弄亂。這一支釘住兩條路是**分開**的。"""
+def test_the_loop_path_saves_to_its_own_marker_not_the_queue():
+    """自走迴圈撞到用量上限時也是「存檔、到點接回來」（2026-09-26 起），但存的是它自己的
+    `loop_pending` 標記、接回來走自動接續——**不是**這份提問佇列。一個迴圈塞進佇列會被當成
+    一題單輪提問重跑一次就結束，任務也就沒了。這一支釘住兩條路是**分開**的。"""
     loop = _func("_dorossi_run_loop")
     handlers = [h for node in ast.walk(loop)
                 if isinstance(node, ast.Try)
@@ -741,9 +740,10 @@ def test_the_loop_path_still_waits_in_place():
                 and "_DorossiUsageLimitError" in ast.unparse(h.type)]
     assert handlers, "找不到迴圈的用量上限 handler"
     src = "\n".join(ast.unparse(h) for h in handlers)
-    assert "_dorossi_wait_for_usage_reset" in src
+    assert "_dorossi_mark_loop_usage_wait" in src
     assert "_dorossi_usage_park_turn" not in src, (
-        "迴圈那條路被改成停進佇列了——那不是這次要動的東西")
+        "迴圈那條路被改成停進提問佇列了——接回來只會跑一輪")
+    assert "_dorossi_wait_for_usage_reset" not in src, "迴圈又在原地等了"
 
 
 def test_the_loop_wait_still_uses_the_process_clock():

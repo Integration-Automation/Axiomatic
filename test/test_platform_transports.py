@@ -246,6 +246,56 @@ def test_an_embed_becomes_text_instead_of_vanishing():
 
 
 # ---------------------------------------------------------------------------
+# Command hints: a platform without a slash menu sees text commands it can type
+# ---------------------------------------------------------------------------
+_HINTS = {"/gen pause": "!pause", "/fav clear": "!fav_clear", "/sys disk": "!disk",
+          "/sys disk extra": "!disk_extra"}
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("usage: `/gen pause`", "usage: `!pause`"),
+    ("`/gen pause after <N>`", "`!pause after <N>`"),
+    ("`/fav clear <character>` (or `*`)", "`!fav_clear <character>` (or `*`)"),
+    # longest prefix: the three-word entry beats the two-word one
+    ("`/sys disk extra 1`", "`!disk_extra 1`"),
+    # word boundaries: `/sys diskette` is not `/sys disk`
+    ("`/sys diskette`", "`/sys diskette`"),
+    # not in the table (shared alias, no text command, typo): left as written
+    ("`/win state close x`", "`/win state close x`"),
+    # outside backticks: untouched
+    ("/gen pause later", "/gen pause later"),
+    ("`status` and `/gen pause`", "`status` and `!pause`"),
+    ("no backticks", "no backticks"),
+    # backticked but not starting with a slash is not a hint. The same text needs a `/...`
+    # span too: otherwise the "no `/" fast path returns first, the starts-with-slash check is
+    # never reached, and deleting it stays green.
+    ("`/gen pause` and `gen pause`", "`!pause` and `gen pause`"),
+    ("", ""),
+])
+def test_command_hints_are_rewritten_inside_code_spans_only(text, expected):
+    assert cp.rewrite_command_hints(text, _HINTS) == expected
+
+
+def test_a_rewritten_hint_is_left_alone_the_second_time():
+    once = cp.rewrite_command_hints("`/gen pause` or `/fav clear x`", _HINTS)
+    assert cp.rewrite_command_hints(once, _HINTS) == once
+    assert cp.rewrite_command_hints("`/gen pause`", {}) == "`/gen pause`"
+
+
+def test_the_hint_rewrite_stays_linear_on_hostile_input():
+    """Every message to another platform goes through this, and messages echo user input.
+    A backtracking pattern anchored on backticks would let one crafted input stall the whole
+    bot on the event loop."""
+    import time
+    hostile = ["`" * 200_000, "`/" * 100_000, ("`/gen " + "a" * 50) * 4_000,
+               "`/" + "a" * 200_000, "`" + "/gen pause " * 20_000 + "`"]
+    for text in hostile:
+        started = time.perf_counter()
+        cp.rewrite_command_hints(text, _HINTS)
+        assert time.perf_counter() - started < 1.0, text[:20]
+
+
+# ---------------------------------------------------------------------------
 # 做不到的事要看得見
 # ---------------------------------------------------------------------------
 class _StubTransport(cp.ChatTransport):
@@ -276,6 +326,56 @@ def _stub(**caps):
     channel = cp.ChatConversation(transport, "c1", uid=-5, is_direct=True,
                                   is_command_chat=True)
     return transport, channel
+
+
+def test_a_platform_without_a_slash_menu_gets_text_command_hints():
+    """Both choke points rewrite -- send and edit; embed text counts too (flattened, then
+    rewritten, with nothing lost)."""
+    transport, channel = _stub(edit_message=True)
+    transport.text_commands = _HINTS
+    sent = asyncio.run(channel.send("usage: `/gen pause`"))
+    asyncio.run(channel.send("intro `/fav clear x`", embed=_FakeEmbed()))
+    asyncio.run(sent.edit("now `/gen pause after 2`"))
+    assert transport.sent[0] == "usage: `!pause`"
+    assert transport.sent[1].startswith("intro `!fav_clear x`") and "欄位: 值" in transport.sent[1]
+    assert transport.edits == ["now `!pause after 2`"]
+
+
+def test_a_platform_with_a_slash_menu_keeps_the_slash_hints():
+    transport, channel = _stub(edit_message=True, slash_commands=True)
+    transport.text_commands = _HINTS
+    sent = asyncio.run(channel.send("usage: `/gen pause`"))
+    asyncio.run(sent.edit("now `/gen pause after 2`"))
+    assert transport.sent == ["usage: `/gen pause`"]
+    assert transport.edits == ["now `/gen pause after 2`"]
+
+
+def test_a_file_only_send_is_not_turned_into_text():
+    """A send with no text and no embed (attachments only) reaches the platform as it was,
+    not as an empty string."""
+    transport, channel = _stub()
+    transport.text_commands = _HINTS
+    asyncio.run(channel.send(file=object()))
+    assert transport.sent == [None]
+
+
+def test_build_transports_hands_the_hints_to_every_transport(monkeypatch):
+    built_with: list = []
+
+    def _factory(context):
+        built_with.append(context)
+        return _StubTransport(cp.PlatformCapabilities())
+
+    monkeypatch.setattr(cp, "_FACTORIES", {"a": _factory, "b": _factory})
+    monkeypatch.setattr(cp, "import_transport_modules", lambda: None)
+    transports = cp.build_transports(cp.TransportContext(text_commands=dict(_HINTS)))
+    assert len(transports) == 2
+    for transport in transports:
+        assert dict(transport.text_commands) == _HINTS
+    # what is handed out is read-only: one transport cannot change another's table
+    with pytest.raises(TypeError):
+        transports[0].text_commands["/x"] = "!x"
+    assert cp.ChatTransport.text_commands == {}
 
 
 @pytest.mark.parametrize("reply_reference", [True, False])

@@ -1,9 +1,9 @@
 """自走迴圈要**撐過 bot 重啟**，而不是只撐過用量上限。
 
-`test_dorossi_usage_limit.py` 釘的是「後端擋住了 → 睡到額度回來再續跑」。這一份釘的是
+`test_dorossi_usage_limit.py` 釘的是「後端擋住了 → 存檔、釋放名額、到時續跑」。這一份釘的是
 另一半：**行程本身沒了**。`/sys restart`、supervisor 重啟、主機當機都會讓迴圈連同它那場長達數小時的等待一起蒸發，而舊
 行為只在 slot 留一個 `loop_pending` 等擁有者事後手動 `/dorossi session continue`。無人
-值守的長任務因此常常整夜卡在原地——這正是「等額度」那一半想解決卻只解決了一半的事。
+值守的長任務因此常常整夜卡在原地；磁碟上的續跑標記讓重啟後能接回來。
 
 四個決定，每一個都有反例測試：
 
@@ -1070,3 +1070,265 @@ def test_an_at_bot_anchor_still_resumes_with_the_real_message(monkeypatch):
     monkeypatch.setattr(b, "_dorossi_resume_loop", _fake_resume)
     _run_scan()
     assert scheduled and calls == [own]
+
+
+# ---------------------------------------------------------------------------
+# 六、撞到方案用量上限：存檔、收掉迴圈、到點接回來（2026-09-26）
+# ---------------------------------------------------------------------------
+# 原地等待那一版（2026-08-31～09-26）一次睡五、六個小時，整段握著對話的鎖、並行名額與
+# 電源要求。現在迴圈把接續點寫進標記（stop＝`usage_wait`、`resume_at`）就結束，到點由
+# 同一套自動接續接回來——這一段釘住那套機制多出來的規則。
+
+def _usage_wait(resume_at, **over) -> dict:
+    slot = _marker(**over)
+    db._dorossi_mark_loop_usage_wait(slot, resume_at=resume_at, usage_waits=2,
+                                     resume_prompt="重跑這一輪", injections=["補充"],
+                                     after=["提交"])
+    return slot
+
+
+def test_marking_a_usage_wait_keeps_what_the_resume_needs_and_clears_the_breaker():
+    slot = _marker(auto_tries=3)
+    db._dorossi_mark_loop_usage_wait(slot, resume_at=123.0, usage_waits=2,
+                                     resume_prompt="p", injections=["a", 5, ""],
+                                     after=["c"])
+    m = slot["loop_pending"]
+    assert (m["live"], m["stop"], m["resume_at"], m["usage_waits"]) == (
+        False, "usage_wait", 123.0, 2)
+    assert (m["resume_prompt"], m["resume_inject"], m["resume_after"]) == ("p", ["a"], ["c"])
+    assert "auto_tries" not in m, (
+        "迴圈是自己乾淨停下來的，證明接續沒有弄死 bot——斷路器要從頭算，否則幾次用量等待"
+        "之後自動接續就永久放棄")
+    empty: dict = {}
+    db._dorossi_mark_loop_usage_wait(empty, resume_at=1.0, usage_waits=1,
+                                     resume_prompt="p", injections=[])
+    assert empty == {}, "不得建立標記"
+
+
+def test_the_saved_resume_state_is_taken_once_and_shape_checked():
+    slot = _usage_wait(time.time())
+    assert db._dorossi_take_loop_resume(slot) == ("重跑這一輪", ["補充"], ["提交"], 2)
+    assert db._dorossi_take_loop_resume(slot) == (None, [], [], 0), "只能用一次"
+    slot["loop_pending"].update(resume_prompt=5, resume_inject="x", resume_after=[1, "ok"],
+                                usage_waits=True)
+    assert db._dorossi_take_loop_resume(slot) == (None, [], ["ok"], 0)
+    assert db._dorossi_take_loop_resume({}) == (None, [], [], 0)
+
+
+def test_a_usage_wait_is_resumed_only_once_its_time_has_come():
+    now = time.time()
+    slot = _usage_wait(now + 600)
+    assert db._dorossi_loop_marker_wants_autoresume(slot["loop_pending"])
+    assert db._dorossi_loop_autoresume_plan(slot, now=now) is None, "還沒到點就接了"
+    assert db._dorossi_loop_autoresume_plan(slot, now=now + 601) == (111, 222, 0)
+
+
+def test_the_age_of_a_usage_wait_counts_from_its_resume_time(monkeypatch):
+    """一次等待可能五、六個小時。年齡若照舊從停下來時的心跳算，一個等得比窗口久的任務會在
+    到點那一刻被判「太舊」，正好在最該接的時候不接。從到點那一刻算。"""
+    monkeypatch.setattr(db, "DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC", 3600)
+    now = time.time()
+    slot = _usage_wait(now - 60, ts=now - 6 * 3600)
+    assert db._dorossi_loop_autoresume_plan(slot, now=now) is not None
+    stale = _usage_wait(now - 7200, ts=now - 6 * 3600)
+    assert db._dorossi_loop_autoresume_plan(stale, now=now) is None, (
+        "到點之後又過了比窗口還久（例如 bot 整段沒開）——那照舊算太舊，交給人工")
+
+
+def test_switching_off_crash_resume_does_not_strand_a_usage_wait(monkeypatch):
+    """`dorossi_loop_autoresume_max_age_sec = 0` 關掉的是「被砍死之後自動接」。原地等待那一版
+    本來就不看這個設定，改成存檔等待不該讓用量等待多一個會把任務永遠留在原地的開關。"""
+    monkeypatch.setattr(db, "DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC", 0)
+    now = time.time()
+    assert db._dorossi_loop_autoresume_plan(_marker(ts=now - 10), now=now) is None
+    assert db._dorossi_loop_autoresume_plan(
+        _usage_wait(now - 1, ts=now - 10), now=now) is not None
+
+
+@pytest.mark.parametrize("at", ["later", float("nan"), None, True])
+def test_a_broken_resume_time_counts_as_due(at):
+    """手改壞的時刻當作已到點：把一個擁有者交代過的任務永遠擋住，比早探一次糟。"""
+    slot = _usage_wait(time.time() + 600)
+    slot["loop_pending"]["resume_at"] = at
+    assert db._dorossi_loop_usage_wait_due(slot["loop_pending"])
+    assert db._dorossi_loop_usage_resume_at(slot["loop_pending"]) is None
+
+
+def test_a_paused_usage_stop_is_never_resumed_by_itself():
+    slot = _marker()
+    db._dorossi_mark_loop_usage_wait(slot, resume_at=0.0, usage_waits=1,
+                                     resume_prompt="p", injections=[], paused=True)
+    assert slot["loop_pending"]["stop"] == "paused"
+    assert not db._dorossi_loop_marker_wants_autoresume(slot["loop_pending"])
+    assert db._dorossi_loop_autoresume_plan(slot) is None
+
+
+def test_yield_turns_a_pending_resume_into_a_manual_one_and_keeps_the_saved_round():
+    slot = _usage_wait(time.time() - 1)
+    db._dorossi_mark_loop_paused(slot)
+    assert slot["loop_pending"]["stop"] == "paused"
+    assert db._dorossi_loop_autoresume_plan(slot) is None
+    assert slot["loop_pending"]["resume_prompt"] == "重跑這一輪"
+    empty: dict = {}
+    db._dorossi_mark_loop_paused(empty)
+    assert empty == {}
+
+
+def test_a_usage_wait_that_is_not_due_is_not_reported_as_abandoned():
+    now = time.time()
+    waiting = _usage_wait(now + 600)
+    due_without_anchor = _usage_wait(now - 1, channel_id=None)
+    state = {"7": {"sessions": {"s1": waiting, "s2": due_without_anchor}}}
+    found = [sid for _uid, sid, _age in db.dorossi_abandoned_loops(state, now=now)]
+    assert found == ["s2"], "還在等的任務被報成被遺棄；或到點了卻接不回來的沒被報"
+
+
+def _resume_recorder(monkeypatch):
+    calls: list = []
+
+    async def _noop():
+        return None
+
+    def _fake_resume(message, sid, *, ack_override=None):
+        calls.append((message, sid, ack_override))
+        return _noop()
+
+    monkeypatch.setattr(b, "_dorossi_resume_loop", _fake_resume)
+    return calls
+
+
+class _NoChannelClient:
+    def get_channel(self, cid):
+        raise AssertionError("手上有原本那則訊息，卻還去查平台")
+
+
+def test_the_scan_resumes_a_due_usage_wait_with_the_message_it_kept(monkeypatch):
+    """同一個行程裡到點：用迴圈停下時留下的那則訊息接回去，不查錨點（查不回來的任務——
+    訊息被刪了、沒有斜線選單的平台——在原地等待那一版照樣接得回來）。接回去時講的是
+    「用量已重設」，不是「bot 重啟或斷線」。"""
+    slot = _usage_wait(time.time() - 1)
+    _install(monkeypatch, _store(slot))
+    calls = _resume_recorder(monkeypatch)
+    kept = object()
+    key = b._dorossi_session_key(str(OWNER), "s1")
+    monkeypatch.setattr(b, "_dorossi_usage_resume_messages", {key: kept})
+    monkeypatch.setattr(b, "client", _NoChannelClient())
+    _run_scan()
+    assert len(calls) == 1 and calls[0][0] is kept and calls[0][1] == "s1"
+    assert "用量已重設" in calls[0][2], calls[0][2]
+    assert key not in b._dorossi_usage_resume_messages
+
+
+def test_the_scan_leaves_a_usage_wait_alone_until_it_is_due(monkeypatch):
+    _install(monkeypatch, _store(_usage_wait(time.time() + 600)))
+    calls = _resume_recorder(monkeypatch)
+    key = b._dorossi_session_key(str(OWNER), "s1")
+    monkeypatch.setattr(b, "_dorossi_usage_resume_messages", {key: object()})
+    _run_scan()
+    assert calls == [] and key in b._dorossi_usage_resume_messages
+
+
+def test_after_a_restart_a_due_usage_wait_comes_back_through_its_anchor(monkeypatch):
+    scheduled, saved = _install(monkeypatch, _store(_usage_wait(time.time() - 1)))
+    monkeypatch.setattr(b, "_dorossi_usage_resume_messages", {})
+    _run_scan()
+    assert len(scheduled) == 1, "重啟之後到點的用量等待沒有被接回去"
+    assert saved["state"][str(OWNER)]["sessions"]["s1"]["loop_pending"][
+        "auto_tries"] == 1
+
+
+class _HeldLock:
+    def locked(self):
+        return True
+
+
+def test_the_scan_skips_a_session_that_is_busy_with_another_turn(monkeypatch):
+    """同一次重設時到點的停放提問可能正在同一個對話上跑。接續那一條看到鎖被拿著只會回
+    「忙線中」並放棄，還白白算進斷路器——先跳過，下一拍再接。"""
+    scheduled, saved = _install(monkeypatch, _store(_usage_wait(time.time() - 1)))
+    key = b._dorossi_session_key(str(OWNER), "s1")
+    monkeypatch.setattr(b, "_dorossi_session_locks", {key: _HeldLock()})
+    _run_scan()
+    assert not scheduled
+    assert "auto_tries" not in saved["state"][str(OWNER)]["sessions"]["s1"]["loop_pending"]
+
+
+def _kick_env(monkeypatch, slot, *, held=True, cap=0, busy=()):
+    key = b._dorossi_session_key(str(OWNER), "s1")
+    kicked: list = []
+
+    def _fake_schedule(coro, *, label=""):
+        kicked.append(label)
+        coro.close()
+
+    monkeypatch.setattr(b, "_dorossi_load_state", lambda: _store(slot))
+    monkeypatch.setattr(b, "_schedule_coro", _fake_schedule)
+    monkeypatch.setattr(b, "_dorossi_loops", {k: object() for k in busy})
+    monkeypatch.setattr(b, "_dorossi_resume_inflight", set())
+    monkeypatch.setattr(b, "_dorossi_session_locks", {})
+    monkeypatch.setattr(b, "_dorossi_autoresume_reported", set())
+    monkeypatch.setattr(b, "DOROSSI_MAX_PARALLEL_LOOPS", cap)
+    monkeypatch.setattr(b, "_dorossi_usage_resume_messages",
+                        {key: object()} if held else {})
+    return kicked, key
+
+
+def test_the_watch_tick_kicks_the_scan_only_when_a_usage_wait_is_due(monkeypatch):
+    now = time.time()
+    kicked, _ = _kick_env(monkeypatch, _usage_wait(now + 600))
+    assert b._dorossi_kick_due_usage_resumes(now=now) is False and kicked == []
+    assert b._dorossi_kick_due_usage_resumes(now=now + 601) is True
+    assert kicked == ["dorossi-usage-resume"]
+
+
+def test_the_watch_tick_does_not_hammer_the_platform_for_a_declined_marker(monkeypatch):
+    """重啟之後手上沒有原本的訊息、錨點又查不回來：掃描會報一次「接不回來」。之後每 30 秒
+    再掃一次只是白打平台 API，所以已經報過的同一個標記不再觸發。"""
+    slot = _usage_wait(time.time() - 1)
+    kicked, _ = _kick_env(monkeypatch, slot, held=False)
+    b._dorossi_autoresume_reported.add((str(OWNER), "s1", slot["loop_pending"]["ts"]))
+    assert b._dorossi_kick_due_usage_resumes() is False and kicked == []
+
+
+def test_the_watch_tick_waits_for_a_free_loop_slot(monkeypatch):
+    kicked, _ = _kick_env(monkeypatch, _usage_wait(time.time() - 1), cap=1,
+                          busy=[("9", "s9")])
+    assert b._dorossi_kick_due_usage_resumes() is False and kicked == []
+
+
+def test_the_watch_tick_drops_a_kept_message_nobody_will_use(monkeypatch):
+    """任務被 abort、讓出、手動接回去或整個對話被刪之後，留著的觸發訊息要丟掉。"""
+    slot = _usage_wait(time.time() - 1)
+    db._dorossi_mark_loop_aborted(slot)
+    _kicked, key = _kick_env(monkeypatch, slot)
+    assert b._dorossi_kick_due_usage_resumes() is False
+    assert key not in b._dorossi_usage_resume_messages
+
+
+def test_the_parked_watch_loop_also_brings_back_usage_waits():
+    tree = _tree()
+    watch = _find_func(tree, "_dorossi_parked_watch_loop")
+    assert _calls_named(watch, "_dorossi_kick_due_usage_resumes"), (
+        "沒有任何東西會在到點時把存檔等待的自走任務叫回來")
+
+
+class _YieldMsg:
+    def __init__(self):
+        self.author = _StubAuthor(OWNER)
+
+
+def test_yield_also_holds_back_a_task_that_would_come_back_by_itself(monkeypatch):
+    """讓出的用意是「另一位編輯者要改同一批檔案」。存檔等方案用量重設的任務此刻沒在改檔，
+    但到點會自己接回來繼續改——讓出要把它改成暫停，並且講一聲。"""
+    slot = _usage_wait(time.time() + 600)
+    replies: list = []
+
+    async def _reply(_message, content=None, **_kw):
+        replies.append(content)
+
+    _install(monkeypatch, _store(slot))
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    monkeypatch.setattr(b, "_dorossi_event", lambda *_a, **_k: None)
+    asyncio.run(asyncio.wait_for(b.mcmd_yield(_YieldMsg(), ""), 5))
+    assert slot["loop_pending"]["stop"] == "paused", "讓出沒有擋住會自己回來的任務"
+    assert len(replies) == 1 and "`s1`" in replies[0] and "暫停" in replies[0], replies

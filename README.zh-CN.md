@@ -403,6 +403,8 @@ py -3 install_autostart.py --remove
 [`docs/platforms.md`](docs/platforms.md)；有斜杠菜单的地方，斜杠命令仍然是唯一对外
 宣传的接口。
 
+在那些平台上，bot 回复里的命令提示会自动写成文本命令的写法（有一对一文本命令的那些）。
+
 ---
 
 <!-- section: batch-behaviour -->
@@ -476,6 +478,13 @@ id 都是占位值。
 `/dorossi ai` 换后端，`@bot /model <别名> …` 换这个会话的模型。撞到套餐用量上限
 的那一轮会**自己停进队列**、带一个墙上时钟的重跑时刻，时间到自动回来——
 `/dorossi queue show` 看得到停放中的提问，`/dorossi queue remove`（用 id）取消其中一条。
+
+`/dorossi ai` 可选 `claude`、`codex` 或 `gemini`。Gemini 使用已登录的
+Antigravity CLI（`agy`），需要 `dorossi_cc_tools=full`；`off` 模式无法保证工具隔离。
+`/dorossi tokens` 会显示报告的额度和本机 token 用量。自主任务达到套餐用量上限时会
+保存中断的回合、释放名额，到预定时间自动续跑。bot 重启后如平台能找回原消息也会
+自动继续；找不到时请用 `/dorossi session continue`。`/dorossi yield` 可将已保存的
+任务改为等待手动继续。
 
 **看看这台机器现在在忙什么。** 一次长批处理跑着的时候，这会显示浏览器吃了多少内存、
 批处理跑了多久、整机还剩多少内存与磁盘——那是 `/gen current` 与 `/dorossi running`

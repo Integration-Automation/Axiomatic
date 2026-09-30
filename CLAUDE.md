@@ -118,7 +118,12 @@ Every change MUST satisfy these before commit:
    like it is still running. The send-string half
    (`test_secrecy.test_no_bot_string_teaches_a_hidden_bang_command`) is
    **unchanged**: it scans `discord_bot.py`'s send sites, i.e. the slash
-   platform's surface.
+   platform's surface. So send strings in the source stay in slash form; on a
+   platform without a slash menu, `_chat_platform.rewrite_command_hints` rewrites
+   a backticked **one-to-one** slash command into its text command at send time
+   (the table is `discord_bot._text_command_hints()`). Text commands appearing
+   there come from that step and are not a violation -- do not "add" the text
+   form to the source, and do not remove the step.
 4. Any new dependency added to `requirements.txt` MUST be `pip install`-ed
    during the change, so the launcher can actually start the bot afterwards.
    **`requirements.txt` pins nothing but floors what it must.** No `==` — a
@@ -166,7 +171,7 @@ it too, in a separate change applied only while no batch runs) — its only stat
 is a process-local counter, never shared across processes;
 `_connectivity` is a pure "can this host reach the internet" probe both batch
 supervisors use to tell a network outage from a crash. (`_external_apis`,
-`_help_strings`, `dorossi_backend`, `discord_rpc` are bot-only helpers, not
+`_help_strings`, `dorossi_backend`, `_dorossi_gemini`, `discord_rpc` are bot-only helpers, not
 boundary channels; `_gui_control` is bot-only too — the desktop-automation
 façade over the external library. None of them may import `discord_bot` —
 that would be circular.)

@@ -448,6 +448,9 @@ STALE_COMPONENTS = {
         # 「bot 陳舊」——這是這張表結構上看不見的一角，不是忘了。
         "axiomatic/_chat_platform.py",
         "axiomatic/_platform_runtime.py",
+        # 2026-09-28: the third conversation backend's CLI adapter; both
+        # `dorossi_backend` and the bot import it at module level.
+        "axiomatic/_dorossi_gemini.py",
     )),
     "batch supervisor": ("start_webrunner.py", (
         "start_webrunner.py",

@@ -4661,8 +4661,16 @@ def test_dorossi_loop_pending_resume():
         "context alive -> resume-continue")
     sess.pop("cc_session_id")
     sess["codex_session_id"] = "cx-1"
+    sess["ai_provider"] = "codex"
     _eq(db._dorossi_loop_resume_plan(sess), ("continue", None),
         "Codex context alive -> resume-continue")
+    sess["ai_provider"] = "gemini"
+    _eq(db._dorossi_loop_resume_plan(sess), ("fresh", "整理測試"),
+        "another backend's context is not resumed")
+    sess["gemini_session_id"] = "gm-1"
+    _eq(db._dorossi_loop_resume_plan(sess), ("continue", None),
+        "Gemini context alive -> resume-continue")
+    sess.pop("gemini_session_id")
     # 脈絡被清（保留標記）→ 用原任務文字 fresh 重跑。
     sess.pop("codex_session_id")
     _eq(db._dorossi_loop_resume_plan(sess), ("fresh", "整理測試"),
@@ -6831,6 +6839,42 @@ def test_queue_usage_teaches_the_slash_command_and_not_the_file_name(monkeypatch
         for reply in sent:
             assert "!" not in reply and label not in reply, reply
     assert queue.read_text(encoding="utf-8") == "keep\n", "the usage path must not touch the queue"
+
+
+def test_text_command_hints_are_one_to_one_and_real():
+    """The table rewrites hints on platforms without a slash menu; one wrong entry teaches a
+    command that cannot be typed."""
+    hints = b._text_command_hints()
+    # positive control: 107 measured on 2026-09-25 (Jeffrey_RPA).
+    assert len(hints) >= 80, f"only {len(hints)} derived -- the extraction is broken"
+    assert hints["/gen pause"] == "!pause"
+    assert hints["/todo prompt add"] == "!todo_prompt_add"
+    commands = _runtime_slash_qualified()
+    shared: dict = {}
+    for command in b.tree.walk_commands():
+        bang = command.extras.get("bang")
+        if isinstance(bang, str):
+            shared.setdefault(bang, []).append(command.qualified_name)
+    for slash, bang in hints.items():
+        assert slash.lstrip("/") in commands, slash
+        assert shared.get(bang) == [slash.lstrip("/")], (
+            f"`{bang}` is not `{slash}`'s own text command -- a shared alias's sub-command is not "
+            "always the same word")
+    assert "/win state" not in hints, "shared aliases (`!win`) are deliberately left out"
+
+
+def test_the_chat_transports_are_built_with_the_hints(monkeypatch):
+    captured: list = []
+
+    def _build(context):
+        captured.append(context)
+        return []
+
+    monkeypatch.setattr(b, "_chat_transports", [])
+    monkeypatch.setattr(b._chat_platform, "build_transports", _build)
+    b._build_chat_transports()
+    assert len(captured) == 1
+    assert captured[0].text_commands == b._text_command_hints()
 
 
 def test_ping_answers_before_the_first_heartbeat(monkeypatch):

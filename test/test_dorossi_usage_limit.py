@@ -1,4 +1,4 @@
-"""撞到方案用量上限之後：**等額度回來再續跑**，而不是停掉整個自走任務。
+"""撞到方案用量上限後：存檔釋放名額，到時自動續跑。
 
 後端的用量額度是每 5 小時滾動重設的。舊行為是撞到上限就結束整個迴圈、在 slot 留一個
 `loop_pending` 標記，等擁有者事後手動 `/dorossi session continue <id>` 接續——對一個
@@ -23,9 +23,9 @@
 白做。這一條在 `_dorossi_cc_usage_limit` 帶出 `session_id`、在迴圈的 handler 寫回。
 
 另外釘住兩個純粹是「以後別人改壞」的形狀（AST，不是字串比對）：迴圈的
-`except _DorossiUsageLimitError` 區塊必須以 `continue` 收尾（不是 `return`），而且必須
-真的呼叫等待函式；等待函式必須輪詢 `st.abort` 並且用 `time.monotonic`——等待可能長達
-數小時，期間的 NTP 校時不該讓它變成幾秒或幾天。
+`except _DorossiUsageLimitError` 區塊必須以 `return` 收尾（讓迴圈離開），而且必須
+先把後端回報的工作階段寫回磁碟、保存中斷回合與續跑時間；退避等待函式只留給暫時性
+故障的短等待使用。
 """
 from __future__ import annotations
 
@@ -853,22 +853,19 @@ def _usage_handler():
     raise AssertionError("_dorossi_run_loop 裡找不到用量上限的 except 區塊")
 
 
-def test_the_loop_continues_instead_of_stopping():
-    """這一支就是整個改動的重點，也是最容易被「順手簡化」掉的一行。
-
-    舊版這個 handler 只有 `return`（貼一句「已達方案用量上限」就結束整個自走任務）。
-    現在必須以 `continue` 收尾——等完額度回來，用同一個 prompt 重跑這一輪。
+def test_the_loop_ends_instead_of_waiting_in_place():
+    """**2026-09-26 起這一支反過來了。** 2026-08-31～09-26 這個 handler 必須以 `continue`
+    收尾、原地睡到額度回來；那一版一次等五、六個小時，整段握著 per-session 鎖、
+    `DOROSSI_MAX_PARALLEL_LOOPS` 的名額與電源要求。擁有者要求改成存檔、收掉迴圈、到點
+    再接。所以 handler 裡**不得**再有原地等待、不得 `continue`，最後一個敘述是 `return`。
     """
     handler = _usage_handler()
-    assert any(isinstance(n, ast.Continue) for n in ast.walk(handler)), (
-        "用量上限的 handler 沒有 `continue`——它又變回「撞到就停」了")
-
-
-def test_the_handler_actually_waits():
-    handler = _usage_handler()
     calls = {_dotted(n.func) for n in ast.walk(handler) if isinstance(n, ast.Call)}
-    assert "_dorossi_wait_for_usage_reset" in calls, "handler 沒有真的等待"
-    assert "_dorossi_usage_wait_seconds" in calls, "handler 沒有算等待秒數"
+    assert "_dorossi_wait_for_usage_reset" not in calls, "handler 又在原地等了"
+    assert not any(isinstance(n, ast.Continue) for n in ast.walk(handler)), (
+        "handler 有 `continue`——迴圈又留在原地等了")
+    assert isinstance(handler.body[-1], ast.Return), "handler 沒有以 return 收尾"
+    assert "_dorossi_usage_wait_seconds" in calls, "handler 沒有算接續時刻"
 
 
 def _calls_named(node, name):
@@ -876,49 +873,56 @@ def _calls_named(node, name):
             if isinstance(c, ast.Call) and _dotted(c.func) == name]
 
 
-def test_the_handler_persists_the_session_before_waiting():
-    """不存回 session id，等額度回來 resume 的就是上一輪的舊 id，這一輪做完的事
-    全部白做。用量上限幾乎都是「做到一半」才撞上，所以這不是邊界案例。
+def _rmw_running(handler, helper):
+    """handler 裡**真的交給** `_dorossi_state_rmw` 執行、而且會呼叫 `helper` 的那些 rmw。
 
-    這一支刻意**不是**「`_dorossi_persist_advance` 這個名字有出現在 handler 裡」。
-    那個版本寫過，而且被 mutation 打穿：把 `await _dorossi_state_rmw(...)` 整行拿
-    掉，巢狀的 `_limit_save_mut` 仍然定義在 handler 裡，名字照樣掃得到，於是守門
-    通過、行為卻已經退化成「等完額度 resume 舊 id」。要釘的是**機制**——那個
-    mutator 真的被交給 rmw 執行過，而且發生在等待之前。
-    """
+    只看「名字有出現在 handler 裡」會被 mutation 打穿：把 `await _dorossi_state_rmw(...)`
+    整行拿掉，巢狀的 mutator 仍然定義在 handler 裡，名字照樣掃得到。要釘的是**機制**。"""
+    mutators = {n.name for n in ast.walk(handler)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and _calls_named(n, helper)}
+    return [n for n in _calls_named(handler, "_dorossi_state_rmw")
+            if any((isinstance(a, ast.Name) and a.id in mutators)
+                   or _calls_named(a, helper) for a in n.args)]
+
+
+def test_the_handler_saves_the_session_and_the_resume_point_before_it_speaks():
+    """兩件事都要**真的寫進 store**，而且在貼出通知之前：先把後端當下的 session id 寫回
+    slot（不寫的話接回來 resume 的是上一輪的舊 id，這一輪白做），再把接續時刻與要重跑
+    的那一輪寫進標記。通知送不出去（斷線）時，存檔也必須已經落地。"""
     handler = _usage_handler()
-    assert _calls_named(handler, "_dorossi_persist_advance"), (
-        "handler 沒有把後端當下的 session id 寫回 slot")
-
-    # handler 內部定義、且會寫回 session id 的 mutator（具名的那些）
-    savers = {n.name for n in ast.walk(handler)
-              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-              and _calls_named(n, "_dorossi_persist_advance")}
-
-    rmw = [n for n in _calls_named(handler, "_dorossi_state_rmw")
-           if any((isinstance(a, ast.Name) and a.id in savers)
-                  or _calls_named(a, "_dorossi_persist_advance")
-                  for a in n.args)]
-    assert rmw, ("handler 準備好了 mutator 卻沒有交給 _dorossi_state_rmw 真的執行"
-                 "——等額度回來會 resume 上一輪的舊 id，這一輪白做")
-
-    waits = _calls_named(handler, "_dorossi_wait_for_usage_reset")
-    assert waits, "handler 沒有真的等待"
-    assert min(n.lineno for n in rmw) < min(n.lineno for n in waits), (
-        "session id 是等待**之後**才寫回的——等待期間被 kill 就白做一輪")
+    saves = _rmw_running(handler, "_dorossi_persist_advance")
+    marks = _rmw_running(handler, "_dorossi_mark_loop_usage_wait")
+    assert saves, "handler 沒有把後端當下的 session id 寫回 slot"
+    assert marks, "handler 沒有把接續需要的東西寫進標記——收掉迴圈之後就接不回來"
+    notices = [n for n in _calls_named(handler, "live.finalize")
+               if _calls_named(n, "_dorossi_usage_limit_wait_reply")]
+    assert notices, "handler 沒有告訴擁有者會自動續跑"
+    assert (min(n.lineno for n in saves) < min(n.lineno for n in marks)
+            < min(n.lineno for n in notices)), (
+        "順序應該是：存 session id → 存接續點 → 貼通知")
 
 
-def test_an_abort_during_the_wait_still_ends_the_loop():
-    """等待函式回 False 時必須 `return`，不能忽略回傳值繼續跑——否則 `/dorossi abort`
-    在等待期間按下去會沒有反應。"""
-    handler = _usage_handler()
-    guarded = [n for n in ast.walk(handler)
-               if isinstance(n, ast.If)
-               and any(_dotted(c.func) == "_dorossi_wait_for_usage_reset"
-                       for c in ast.walk(n.test) if isinstance(c, ast.Call))]
-    assert guarded, "等待函式的回傳值沒有被檢查"
-    assert any(isinstance(x, ast.Return) for n in guarded for x in ast.walk(n)), (
-        "等待被 abort 打斷時沒有結束迴圈")
+def test_an_abort_while_the_task_waits_on_disk_cancels_the_resume(monkeypatch, tmp_path):
+    """等的那幾個小時正是擁有者最可能按停的時候。迴圈已經不在了，所以 abort 要落在標記上：
+    `/dorossi abort` 的「沒在跑、等著自動接續」那一條必須認得撞到用量上限而存檔的任務，
+    標成 abort 之後到點也不接。"""
+    store = tmp_path / "session.json"
+    monkeypatch.setattr(db, "DOROSSI_SESSION_FILE", store)
+    monkeypatch.setattr(b, "_dorossi_loops", {})
+    monkeypatch.setattr(b, "_dorossi_resume_inflight", set())
+    uid = "7"
+    sess = {"cc_session_id": "cc-1", "loop_pending": {
+        "ts": time.time(), "task": "t", "live": True, "channel_id": 1, "message_id": 2}}
+    db._dorossi_mark_loop_usage_wait(sess, resume_at=time.time() - 1, usage_waits=1,
+                                     resume_prompt="p", injections=[])
+    db._dorossi_save_state({uid: {"active": "s1", "next_seq": 2, "sessions": {"s1": sess}}})
+    done = asyncio.run(asyncio.wait_for(b._dorossi_cancel_autoresume(uid, None), 5))
+    assert done == ["s1"], "abort 沒有認出這個等著接續的任務"
+    marker = db._dorossi_load_state()[uid]["sessions"]["s1"]["loop_pending"]
+    assert marker["stop"] == "abort"
+    assert db._dorossi_loop_autoresume_plan(
+        db._dorossi_load_state()[uid]["sessions"]["s1"]) is None, "abort 之後到點還是會接"
 
 
 def test_the_backoff_counter_is_reset_once_per_completed_round():
@@ -961,11 +965,24 @@ def test_the_backoff_counter_is_reset_once_per_completed_round():
 # ---------------------------------------------------------------------------
 
 def test_the_wait_notice_says_it_will_resume_by_itself():
-    """措辭必須讓擁有者知道**不必**手動接續，否則他仍然會去按
-    `/dorossi session continue`，等於這個功能沒做。"""
-    text = b._dorossi_usage_limit_wait_reply(_exc(), 900.0)
-    assert "自動" in text and "續跑" in text
-    assert "/dorossi abort" in text          # 不想等的出口
+    """措辭必須讓擁有者知道**不必**手動接續、進度存好了、幾點會接，以及想提早接或不要了
+    各怎麼做。"""
+    now = _local_epoch(2026, 9, 26, 20, 0)
+    text = b._dorossi_usage_limit_wait_reply(_exc(), 900.0, sid="s3", carried=2, now=now)
+    assert "自動續跑" in text and "不必手動接續" in text and "存檔" in text, text
+    assert "（20:15）" in text, text
+    assert "/dorossi session continue s3" in text     # 想提早接
+    assert "/dorossi abort" in text                   # 不要了
+    assert "你補充的 2 則訊息" in text
+    assert "補充" not in b._dorossi_usage_limit_wait_reply(_exc(), 900.0, sid="s3", now=now)
+
+
+def test_the_paused_notice_says_nothing_will_come_back_by_itself():
+    """讓出之後撞到上限：講清楚改動還沒提交、不會自己接回來、怎麼接。"""
+    text = b._dorossi_usage_limit_paused_reply("s3", 1)
+    assert "讓出編輯權" in text and "還沒提交" in text, text
+    assert "/dorossi session continue s3" in text
+    assert "自動" not in text, "讓出的任務不會自動接續，不能這樣講"
 
 
 @pytest.mark.parametrize("exc", [
@@ -977,7 +994,7 @@ def test_the_wait_notice_says_it_will_resume_by_itself():
 def test_the_wait_notice_never_leaks_the_raw_backend_text(exc):
     """例外訊息本身帶著原始診斷字串（主機路徑、CLI 名稱）。回覆只能用已經收斂過的
     `reset_hint`，絕不可把 `str(exc)` 組進去。"""
-    text = b._dorossi_usage_limit_wait_reply(exc, 900.0)
+    text = b._dorossi_usage_limit_wait_reply(exc, 900.0, sid="s1")
     low = text.lower()
     for banned in (":\\", ":/", ".log", "claude", "exited", "rate limit"):
         assert banned not in low, f"{banned!r} 漏進了對外字串：{text!r}"
@@ -2034,11 +2051,8 @@ class _Placeholder:
         self.content = content
 
 
-def _waiting_state(uid, sid, *, reset_at=None, waiting=True):
-    st = b._DorossiLoopState(uid, sid)
-    st.usage_waiting = waiting
-    st.usage_reset_at = reset_at
-    return st
+def _loop_state(uid, sid):
+    return b._DorossiLoopState(uid, sid)
 
 
 def _assert_generic(text: str) -> None:
@@ -2048,34 +2062,19 @@ def _assert_generic(text: str) -> None:
         assert banned not in low, (banned, text)
 
 
-def test_queued_placeholders_explain_a_usage_wait(monkeypatch):
-    """已經在排隊的佔位訊息：重新編號時要講「前面在等用量重設、預計何時」與做法；
-    位置照樣要對。反面對照：沒有在等時，字串與原本逐字相同。"""
+def test_queued_placeholders_keep_the_plain_position_text(monkeypatch):
+    """排隊佔位訊息只講排第幾。以前前面是「在等用量重設的自走任務」時要多講一段原因——
+    那個任務握著鎖好幾個小時；2026-09-26 起撞到用量上限的迴圈會存檔、收掉、放開鎖，不再
+    有「前面卡著一個在等額度的任務」這回事。"""
     uid, sid = "7", "s1"
     key = b._dorossi_session_key(uid, sid)
     first, second = _Placeholder(), _Placeholder()
-    reset_at = time.time() + 2 * 3600
     monkeypatch.setattr(b, "_dorossi_waiters", {
         key: [b._DorossiWaiter(first), b._DorossiWaiter(second)]})
-    monkeypatch.setattr(b, "_dorossi_loops", {
-        key: _waiting_state(uid, sid, reset_at=reset_at)})
-
-    asyncio.run(asyncio.wait_for(b._dorossi_refresh_waiters(key), 5))
-    clock = _expected_clock(reset_at, time.time())
-    for msg, ahead in ((first, 1), (second, 2)):
-        assert f"前面還有 {ahead} 筆" in msg.content, msg.content
-        assert "等方案用量重設" in msg.content, msg.content
-        assert f"預計 {clock}" in msg.content, msg.content
-        for option in ("/dorossi abort", "/dorossi session new", "/dorossi ai"):
-            assert option in msg.content, (option, msg.content)
-        _assert_generic(msg.content)
-
-    # 反面對照：同一個迴圈不在等了 ⇒ 回到原本的字串，一個字都不多。
-    b._dorossi_loops[key].usage_waiting = False
+    monkeypatch.setattr(b, "_dorossi_loops", {key: _loop_state(uid, sid)})
     asyncio.run(asyncio.wait_for(b._dorossi_refresh_waiters(key), 5))
     assert first.content == "⏳ 已排入佇列，處理中…（前面還有 1 筆）"
     assert second.content == "⏳ 已排入佇列，處理中…（前面還有 2 筆）"
-    # 沒有迴圈的一般排隊（首次回覆用的就是這一支）也逐字不變。
     monkeypatch.setattr(b, "_dorossi_loops", {})
     assert (b._dorossi_queue_position_text(key, 3)
             == "⏳ 已排入佇列，處理中…（前面還有 3 筆）")
@@ -2106,7 +2105,7 @@ def test_the_injection_buffer_refuses_one_more_than_its_cap(monkeypatch, tmp_pat
         return sid
 
     monkeypatch.setattr(b, "_dorossi_resolve_turn_slot", _slot)
-    st = _waiting_state(uid, sid, waiting=False)
+    st = _loop_state(uid, sid)
     st.injections.extend(f"舊補充{i}" for i in range(already))
     monkeypatch.setattr(b, "_dorossi_loops", {b._dorossi_session_key(uid, sid): st})
 
@@ -2154,12 +2153,10 @@ def test_a_full_session_queue_refuses_and_gives_its_lock_reference_back(monkeypa
     assert len(b._dorossi_waiters[key]) == b.DOROSSI_MAX_WAITING, "被拒絕的那一輪還是排進去了"
 
 
-@pytest.mark.parametrize("state", ["waiting_timed", "waiting_untimed",
-                                   "not_waiting"])
-def test_an_injection_during_a_usage_wait_says_when_it_will_run(
-        monkeypatch, tmp_path, state):
-    """**這一條是 2026-09-19 實際走到的路。** 迴圈在等用量重設時，同一個對話的新提問
-    進注入緩衝；回覆必須講清楚「重設後才會跑下一輪」，不能只說「下一輪會帶進去」。"""
+def test_an_injection_into_a_running_loop_gets_the_plain_ack(monkeypatch, tmp_path):
+    """進得了注入緩衝的一定是真的在跑的迴圈（撞到用量上限的已經存檔收掉、不在 registry
+    裡），所以回覆就是「下一輪會帶進去」。2026-09-19 那次「補了一句，下一輪在兩小時後」
+    的情形已經不存在：那段時間這個對話沒有迴圈，新提問照一般提問處理。"""
     monkeypatch.setattr(db, "DOROSSI_SESSION_FILE", tmp_path / "session.json")
     monkeypatch.setattr(b, "DOROSSI_EVENTS_FILE", tmp_path / "events.ndjson")
     uid, sid = str(b.DOROSSI_USER_ID), "s1"
@@ -2168,48 +2165,39 @@ def test_an_injection_during_a_usage_wait_says_when_it_will_run(
         return sid
 
     monkeypatch.setattr(b, "_dorossi_resolve_turn_slot", _slot)
-    reset_at = time.time() + 2 * 3600
-    st = _waiting_state(uid, sid,
-                        reset_at=reset_at if state == "waiting_timed" else None,
-                        waiting=state != "not_waiting")
-    monkeypatch.setattr(b, "_dorossi_loops",
-                        {b._dorossi_session_key(uid, sid): st})
-
+    st = _loop_state(uid, sid)
+    monkeypatch.setattr(b, "_dorossi_loops", {b._dorossi_session_key(uid, sid): st})
     msg = _InjectMsg()
     asyncio.run(asyncio.wait_for(b.mcmd_dorossi(msg, "補一句"), 5))
     assert st.injections == ["補一句"], "補充沒有進注入緩衝"
-    assert len(msg.replies) == 1, msg.replies
-    text = msg.replies[0]
-    if state == "not_waiting":
-        assert text == _NORMAL_INJECT_ACK, text
-        return
-    assert "等方案用量重設" in text and "重設後才會跑下一輪" in text, text
-    assert "下一輪會帶進去" not in text, text
-    for option in ("/dorossi abort", "/dorossi session new", "/dorossi ai"):
-        assert option in text, (option, text)
-    if state == "waiting_timed":
-        assert f"預計 {_expected_clock(reset_at, time.time())}" in text, text
-    else:
-        assert "預計" not in text, "重設時刻不知道卻寫了時間——那是猜的"
-    _assert_generic(text)
+    assert msg.replies == [_NORMAL_INJECT_ACK], msg.replies
 
 
-def test_the_status_line_shows_a_usage_wait(monkeypatch, tmp_path):
-    """`/dorossi status` 的那一行也要看得出來：running 之外多一個 `usage-wait`。"""
+def _usage_wait_slot(resume_at):
+    sess = {"loop_pending": {"ts": time.time(), "task": "t", "live": True}}
+    db._dorossi_mark_loop_usage_wait(sess, resume_at=resume_at, usage_waits=1,
+                                     resume_prompt="p", injections=[])
+    return sess
+
+
+def test_the_status_line_shows_a_task_saved_for_the_quota(monkeypatch, tmp_path):
+    """`/dorossi queue show` 的那一行要看得出來：存檔等方案用量重設的任務多一個
+    `usage-wait until HH:MM`（它不在跑，所以沒有 running）；別種停下來的任務沒有。"""
     store = tmp_path / "session.json"
     monkeypatch.setattr(db, "DOROSSI_SESSION_FILE", store)
-    uid, sid = "7", "s1"
-    store.write_text(
-        '{"7": {"active": "s1", "next_seq": 2, "sessions": {"s1": {}}}}',
-        encoding="utf-8")
-    reset_at = time.time() + 2 * 3600
-    st = _waiting_state(uid, sid, reset_at=reset_at)
-    monkeypatch.setattr(b, "_dorossi_loops",
-                        {b._dorossi_session_key(uid, sid): st})
-    line = "\n".join(b._dorossi_waiter_lines(uid))
-    assert f"usage-wait until {_expected_clock(reset_at, time.time())}" in line, line
-    st.usage_waiting = False
-    assert "usage-wait" not in "\n".join(b._dorossi_waiter_lines(uid))
+    monkeypatch.setattr(b, "_dorossi_loops", {})
+    uid = "7"
+    resume_at = time.time() + 2 * 3600
+    other = {"loop_pending": {"ts": time.time(), "task": "t", "live": False,
+                              "stop": "network"}}
+    db._dorossi_save_state({uid: {"active": "s1", "next_seq": 3, "sessions": {
+        "s1": _usage_wait_slot(resume_at), "s2": other}}})
+    lines = b._dorossi_waiter_lines(uid)
+    first = next(line for line in lines if "`s1`" in line)
+    second = next(line for line in lines if "`s2`" in line)
+    assert f"usage-wait until {_expected_clock(resume_at, time.time())}" in first, first
+    assert "pending-resume" in first and "running" not in first, first
+    assert "usage-wait" not in second, second
 
 
 class _SentMsg:
@@ -2249,13 +2237,10 @@ class _LoopMsg:
         return _SentMsg(content)
 
 
-def test_the_loop_marks_its_usage_wait_and_clears_it(monkeypatch, tmp_path):
-    """走真的 `_dorossi_run_loop`：撞上用量上限 → 等待期間旗標與重設時刻都在、
-    已經排隊的佔位訊息被改成講原因 → 等完旗標清掉、佔位訊息回到一般字串。
-
-    後端與等待函式換成替身：第一輪丟用量上限，等待替身在「等待中」那一刻拍照；
-    第二輪設 abort 再丟一次，handler 開頭就 return，迴圈乾淨結束。
-    """
+def test_the_real_loop_saves_to_disk_and_lets_go(monkeypatch, tmp_path):
+    """走真的 `_dorossi_run_loop` 與真的 store：撞上用量上限 → **不等**、存檔、放掉
+    registry 與電源要求，已經排隊的佔位訊息不被改掉；標記在磁碟上、接續時刻不早於後端
+    說的重設時刻，這個行程到點接續要用的訊息也留下了。等待函式被叫到就是失敗。"""
     store = tmp_path / "session.json"
     monkeypatch.setattr(db, "DOROSSI_SESSION_FILE", store)
     monkeypatch.setattr(b, "DOROSSI_EVENTS_FILE", tmp_path / "events.ndjson")
@@ -2266,37 +2251,33 @@ def test_the_loop_marks_its_usage_wait_and_clears_it(monkeypatch, tmp_path):
     key = b._dorossi_session_key(uid, sid)
     queued = _Placeholder("⏳ 已排入佇列，處理中…（前面還有 1 筆）")
     monkeypatch.setattr(b, "_dorossi_loops", {})
+    monkeypatch.setattr(b, "_dorossi_usage_resume_messages", {})
+    monkeypatch.setattr(b, "_dorossi_power_holds", {})
     monkeypatch.setattr(b, "_dorossi_waiters", {key: [b._DorossiWaiter(queued)]})
     reset_at = time.time() + 2 * 3600
     rounds = {"n": 0}
-    seen: dict = {}
 
     async def _round(*_args):
         rounds["n"] += 1
-        if rounds["n"] >= 2:
-            b._dorossi_loops[key].abort = True
-        raise db._DorossiUsageLimitError("limit", None, reset_at=reset_at)
+        raise db._DorossiUsageLimitError("limit", None, reset_at=reset_at,
+                                         session_id="cc-mid")
 
-    async def _wait(st, _delay):
-        seen.update(st=st, waiting=st.usage_waiting, reset_at=st.usage_reset_at,
-                    placeholder=queued.content)
-        return True
+    async def _wait(_st, _delay):
+        raise AssertionError("撞到用量上限還是原地等了")
 
+    message = _LoopMsg()
     monkeypatch.setattr(b, "_dorossi_loop_one_round", _round)
     monkeypatch.setattr(b, "_dorossi_wait_for_usage_reset", _wait)
     asyncio.run(asyncio.wait_for(
-        b._dorossi_run_loop(_LoopMsg(), "任務", None, uid, sid), 15))
+        b._dorossi_run_loop(message, "任務", None, uid, sid), 15))
 
-    assert rounds["n"] == 2 and seen, "迴圈沒有走到等待那一步"
-    assert seen["waiting"] is True, "等待期間沒有標記在等用量重設"
-    assert seen["reset_at"] == reset_at, "重設時刻沒有交給迴圈狀態"
-    assert "等方案用量重設" in seen["placeholder"], (
-        "進入等待時沒有重新編號，已經在排隊的人看不到原因："
-        f"{seen['placeholder']!r}")
-    assert f"預計 {_expected_clock(reset_at, time.time())}" in seen["placeholder"]
-    st = seen["st"]
-    assert st.usage_waiting is False and st.usage_reset_at is None, (
-        "等待結束後旗標沒清掉——之後的補充會一直被說成「在等用量重設」")
-    assert queued.content == "⏳ 已排入佇列，處理中…（前面還有 1 筆）", (
-        f"等完之後佔位訊息還掛著原因：{queued.content!r}")
-    assert key not in b._dorossi_loops
+    assert rounds["n"] == 1
+    assert key not in b._dorossi_loops, "迴圈沒有離開 registry——名額還佔著"
+    assert not b._dorossi_power_holds.get(("loop", key)), "電源要求沒有放掉"
+    assert queued.content == "⏳ 已排入佇列，處理中…（前面還有 1 筆）"
+    sess = db._dorossi_load_state()[uid]["sessions"][sid]
+    marker = sess["loop_pending"]
+    assert sess["cc_session_id"] == "cc-mid"
+    assert marker["stop"] == "usage_wait" and marker["live"] is False
+    assert marker["resume_at"] >= reset_at
+    assert b._dorossi_usage_resume_messages.get(key) is message

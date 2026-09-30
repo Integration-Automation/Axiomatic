@@ -189,6 +189,7 @@ from _webrunner_shared import SINGLE_IMAGE_SERVER_FLAG
 # 不 import discord、也不 import discord_bot（循環）。bot 只保留 Dorossi 的 discord／
 # runtime orchestration（mcmd_dorossi／process_turn／run_loop／mcmd_session／live 串流／
 # 佇列鎖／自走旗標／回覆組裝），把後端叫用、session 儲存與純判定委派給這裡。
+from _dorossi_gemini import parse_agy_usage_report
 from dorossi_backend import (
     # --- backend config / corpus the bot orchestration still references -------
     DOROSSI_BACKEND,
@@ -241,7 +242,9 @@ from dorossi_backend import (
     # --- backend invocations --------------------------------------------------
     _dorossi_via_claude_code,
     _dorossi_via_codex,
+    _dorossi_via_gemini,
     find_codex_executable,
+    find_gemini_executable,
     _dorossi_via_api,
     # 收尾原語。**任何「起了子行程並接了管線」的收尾都走它**，不要自己寫
     # `proc.kill(); await proc.wait()`——`await proc.wait()` 等的是**管線 EOF**
@@ -291,11 +294,16 @@ from dorossi_backend import (
     _dorossi_touch_loop_pending,
     _dorossi_mark_loop_stopped,
     _dorossi_mark_loop_aborted,
+    _dorossi_mark_loop_paused,
     _dorossi_loop_marker_wants_autoresume,
     _dorossi_clear_loop_pending,
     _dorossi_loop_resume_plan,
     _dorossi_loop_autoresume_plan,
     _dorossi_count_autoresume,
+    _dorossi_mark_loop_usage_wait,
+    _dorossi_loop_usage_resume_at,
+    _dorossi_loop_usage_wait_due,
+    _dorossi_take_loop_resume,
     _dorossi_session_is_stale,
     _dorossi_most_recent_session,
     _dorossi_is_session_id,
@@ -4980,7 +4988,7 @@ def _dorossi_loop_gate_open(message: "discord.Message", backend: str) -> bool:
     自判路徑＝閘門 ∧ ¬片語 ∧ turn-1 吐出開場哨符。把閘門抽成獨立述詞，避免條件散落。"""
     return (
         message.author.id == OWNER_USER_ID
-        and backend in ("claude_code", "codex")
+        and backend in ("claude_code", "codex", "gemini")
         and DOROSSI_CC_TOOLS == "full"
     )
 
@@ -5159,11 +5167,6 @@ class _DorossiLoopState:
     * `proc`：這個迴圈目前回合的後端子行程（abort 用來即時 kill）。
     * `injections`：這個迴圈的中途注入緩衝——自走進行中，擁有者對「同一個
       session」新打的 `@bot <提問>` 收進來，於下一輪邊界 drain 折進 prompt。
-    * `usage_waiting`／`usage_reset_at`：迴圈**正在等方案用量重設**（且只有這一種
-      等待——沉默／暫時性故障／錯誤重試的退避不算），以及後端報的重設時刻（epoch，
-      不知道就是 None）。只在用量上限那個 handler 裡、等待前設起、等待結束（含被
-      abort）時在 `finally` 清掉。讀它的是排隊／中途補充的回覆：2026-09-19 擁有者在
-      等待期間補了一句話，只收到「下一輪會帶進去」，而下一輪在兩小時後。
     * `round_no`／`compacting`／`backend`：現在是第幾輪（每次呼叫後端前 +1，重試也
       算一輪；自判轉進時從 1 起算，因為第一輪已經在單輪路徑跑過）、這一輪是不是壓縮
       維護輪、這一輪用的後端 id。`wait_deadline`：正在退避等待時的截止時刻
@@ -5174,7 +5177,7 @@ class _DorossiLoopState:
     所有欄位只在 event loop 內同步讀寫，不需鎖。"""
 
     __slots__ = ("uid", "sid", "abort", "paused", "proc", "injections",
-                 "started_ts", "usage_waiting", "usage_reset_at", "round_no",
+                 "started_ts", "round_no",
                  "compacting", "backend", "wait_deadline", "offline_since",
                  "offline_target")
 
@@ -5186,8 +5189,6 @@ class _DorossiLoopState:
         self.proc = None
         self.injections: list = []
         self.started_ts = time.time()
-        self.usage_waiting = False
-        self.usage_reset_at = None
         self.round_no = 0
         self.compacting = False
         self.backend = None
@@ -5517,37 +5518,11 @@ def _dorossi_reset_clock(reset_at, *, now: float | None = None) -> str | None:
         return None
 
 
-def _dorossi_usage_wait_clause(st, *, now: float | None = None) -> str:
-    """`st`（一個自走迴圈的狀態）正在等方案用量重設時回「正在等方案用量重設（預計
-    HH:MM）」，否則回空字串。重設時刻不知道就只講前半句。`st` 可以是 None。"""
-    if st is None or not getattr(st, "usage_waiting", False):
-        return ""
-    clock = _dorossi_reset_clock(getattr(st, "usage_reset_at", None), now=now)
-    return (f"正在等方案用量重設（預計 {clock}）" if clock
-            else "正在等方案用量重設")
-
-
-# 等方案用量重設時可選的做法。**`/dorossi abort` 不等於「現在就能問」**：方案用量是
-# 整個帳號的，重設之前同一個後端的任何提問都會撞到同一個上限——2026-09-19 擁有者
-# 20:39 abort 之後在另一個頻道發問，那一則一樣撞上。所以要講清楚，要現在就問得換
-# 另一個後端（開新對話才換得了：有任務在跑的對話 `/dorossi ai` 會拒絕切換）。
-_DOROSSI_USAGE_WAIT_OPTIONS = (
-    "不想等可以用 `/dorossi abort` 中止它；重設之前同一個後端的提問都會撞到同一個"
-    "上限，要現在就問，請開新對話（`/dorossi session new`）並用 `/dorossi ai` 換另一個"
-    "後端。")
-
-
 def _dorossi_queue_position_text(key: tuple, ahead: int, *,
                                  now: float | None = None) -> str:
-    """排隊佔位訊息的內容：排第幾，以及（前面是在等用量重設的自走任務時）為什麼
-    還輪不到、要等到何時、可以怎麼做。首次回覆與 `_dorossi_refresh_waiters` 的每一次
-    重新編號共用這一支，所以原因不會在第一次重新編號時消失。一般情形的字串逐字維持
-    原樣。"""
-    clause = _dorossi_usage_wait_clause(_dorossi_loops.get(key), now=now)
-    if not clause:
-        return f"⏳ 已排入佇列，處理中…（前面還有 {ahead} 筆）"
-    return (f"⏳ 已排入佇列（前面還有 {ahead} 筆）。前面的自走任務{clause}，"
-            f"重設之前不會輪到這一則。{_DOROSSI_USAGE_WAIT_OPTIONS}")
+    """排隊佔位訊息只顯示位置；用量等待的迴圈已收掉，不再佔住對話鎖。"""
+    del key, now
+    return f"⏳ 已排入佇列，處理中…（前面還有 {ahead} 筆）"
 
 
 async def _dorossi_refresh_waiters(key: tuple) -> None:
@@ -5557,9 +5532,7 @@ async def _dorossi_refresh_waiters(key: tuple) -> None:
     guarded so a since-deleted placeholder is skipped, never crashing the loop.
     Snapshot first so the list can't shift mid-iteration while awaiting.
 
-    The text comes from `_dorossi_queue_position_text`, so when the lock holder is
-    an autonomous loop waiting for the plan's usage reset the placeholder says so
-    (the loop calls this on entering and leaving that wait)."""
+    The text comes from `_dorossi_queue_position_text`."""
     for i, waiter in enumerate(list(_dorossi_waiters.get(key, ()))):
         msg = waiter.placeholder
         if msg is None:
@@ -5588,7 +5561,8 @@ async def _dorossi_state_rmw(mutate):
 
 def _dorossi_persist_advance(state: dict, uid: str, sid: str, *,
                             new_sid, new_hist=None, codex_sid=None,
-                            usage_mark=None) -> bool:
+                            gemini_sid=None,
+                            usage_mark=None, gemini_usage_mark=None) -> bool:
     """Fail-CLOSED persist of a turn's session advance into slot `sid` (single
     source for the turn path AND the loop path). Looks the slot up by its EXACT
     id with NO active-fallback: if it vanished — a concurrent `@bot session <id>
@@ -5615,6 +5589,10 @@ def _dorossi_persist_advance(state: dict, uid: str, sid: str, *,
         sess["cc_session_id"] = new_sid
     if codex_sid is not None:
         sess["codex_session_id"] = codex_sid
+    if gemini_sid is not None:
+        sess["gemini_session_id"] = gemini_sid
+    if isinstance(gemini_usage_mark, dict):
+        sess["gemini_usage_mark"] = gemini_usage_mark
     if new_hist is not None:
         sess["api_history"] = new_hist
     if isinstance(usage_mark, dict):
@@ -6058,7 +6036,7 @@ def _scrub_emails(text: str, replacement: str = "[account]") -> str:
 # 後端供應商 / 產品名。`_redact_for_discord` 只刷出圖服務品牌，這裡補上對話
 # 後端那一組 —— 外部 CLI 的報表會把自己的產品名寫在標題與方案名稱裡。
 _SCRUB_VENDOR_RE = re.compile(
-    r"anthropic|claude|codex|openai|chatgpt|gpt-[\w.]+", re.IGNORECASE)
+    r"anthropic|claude|codex|openai|chatgpt|gemini|google|gpt-[\w.]+", re.IGNORECASE)
 
 
 def _scrub_external_report(text: str) -> str:
@@ -6409,7 +6387,7 @@ def _dorossi_error_hint(backend: str, exc: Exception) -> str:
         return ("這個對話記錄的工作目錄已經不存在或無法使用，這一輪沒有執行。"
                 "請把目錄放回原處再試一次，或用 `/dorossi session new` "
                 "開一個新對話並重新指定工作目錄。")
-    if backend in ("claude_code", "codex"):
+    if backend in ("claude_code", "codex", "gemini"):
         # 對外訊息維持泛用（Layer 1）；**只有 stderr 這一行**要講對原因。
         # 原本無論什麼失敗都印「CLI backend unavailable or not authenticated」，
         # 那對「伺服器過載」是**錯的診斷**：2026-09-03 那次 529 打死自走迴圈時，
@@ -6468,23 +6446,42 @@ def _dorossi_usage_limit_reply(exc: _DorossiUsageLimitError) -> str:
     return base
 
 
-def _dorossi_usage_limit_wait_reply(exc: _DorossiUsageLimitError,
-                                    delay: float) -> str:
-    """自走模式撞上方案用量上限、但**不打算停下來**時的通知。與
-    `_dorossi_usage_limit_reply` 的差別只在語意——那一句是「停了」，這一句是
-    「先等，時間到會自己續跑」，所以措辭必須讓擁有者知道不必手動接續。
+def _dorossi_usage_limit_wait_reply(exc: _DorossiUsageLimitError, delay: float, *,
+                                    sid: str, carried: int = 0,
+                                    now: float | None = None) -> str:
+    """自走模式撞上方案用量上限、已經**存檔並收掉迴圈**、到點會自己接回來時的通知。與
+    `_dorossi_usage_limit_reply` 的差別在語意——那一句是「停了」，這一句是「存好了，
+    時間到會自己續跑」，所以措辭必須讓擁有者知道不必手動接續，以及想提早接或不要了
+    各怎麼做。`carried` 是一起存下、接續時會帶入的中途補充則數。
 
-    保密面與 `_dorossi_usage_limit_reply` 同級：只講「方案用量」、等待長度與已經
-    收斂過的 `reset_hint`，不帶原始例外文字、不帶後端／服務名稱。"""
-    base = ("⏸️ 已達方案用量上限，先暫停等額度重設，"
-            f"約 {_format_duration_short(delay)} 後自動續跑（不必手動接續）。")
+    保密面與 `_dorossi_usage_limit_reply` 同級：只講「方案用量」、等待長度、接續時刻與
+    已經收斂過的 `reset_hint`，不帶原始例外文字、不帶後端／服務名稱。"""
+    now = time.time() if now is None else now
+    when = f"約 {_format_duration_short(delay)} 後"
+    clock = _dorossi_reset_clock(now + max(0.0, float(delay)), now=now)
+    if clock:
+        when += f"（{clock}）"
+    base = f"⏸️ 已達方案用量上限。進度已存檔，這個任務先停下來，{when}自動續跑（不必手動接續）。"
+    if carried:
+        base += f"你補充的 {carried} 則訊息也存起來了，續跑時一起帶入。"
     reset = getattr(exc, "reset_hint", None)
     if reset:
         base += f"（用量預計於 {reset} 重設）"
-    return base + " 不想等就用 `/dorossi abort`。"
+    return (base + f" 想提早接就用 `/dorossi session continue {sid}`，"
+            "不要了就用 `/dorossi abort`。")
 
 
-# 等待期間檢查 abort 的間隔。等待可能長達數小時，而 `/dorossi abort` 必須維持
+def _dorossi_usage_limit_paused_reply(sid: str, carried: int = 0) -> str:
+    """自走模式撞上方案用量上限時，擁有者已經要求讓出（`/dorossi yield`）：存檔、停下，
+    **不**自動接續。提交指示沒能跑（後端沒有額度），所以要講清楚手上的改動還沒提交、
+    接回來時會先補做。`carried` 是一起存下、還沒跑的指示則數（補充與提交指示）。保密面
+    同 `_dorossi_usage_limit_wait_reply`。"""
+    note = "（還沒跑的補充與提交指示都存起來了）" if carried else ""
+    return (f"⏸️ 已達方案用量上限，任務已存檔並讓出編輯權{note}。手上的改動還沒提交；"
+            f"換手完成、額度回來後用 `/dorossi session continue {sid}` 接續，會先把該做的補完。")
+
+
+# 等待期間檢查 abort 的間隔。退避可能長達十幾分鐘，而 `/dorossi abort` 必須維持
 # 「秒級生效」——這條路徑上 `st.proc` 是 None（沒有行程可殺），旗標輪詢是 abort
 # 唯一的著力點。
 _DOROSSI_USAGE_WAIT_POLL_SEC = 5.0
@@ -6492,11 +6489,15 @@ _DOROSSI_USAGE_WAIT_POLL_SEC = 5.0
 
 async def _dorossi_wait_for_usage_reset(st: "_DorossiLoopState",
                                         delay: float) -> bool:
-    """睡 `delay` 秒等方案用量重設，期間持續讓出事件迴圈並輪詢 abort。
+    """自走迴圈的退避等待：睡 `delay` 秒，期間持續讓出事件迴圈並輪詢 abort。
     睡滿回 True；被 abort 打斷回 False（呼叫端必須直接結束迴圈）。
 
-    用 `time.monotonic()` 而非 `time.time()`：等待可能橫跨數小時，期間的系統時鐘
-    調整（NTP 校時、手動改時間、日光節約）不該讓等待變成幾秒或幾天。
+    名字是歷史：2026-09-26 以前方案用量上限也在這裡原地等好幾個小時；現在用量上限改成
+    存檔、收掉迴圈、到點接回來（見 `_dorossi_run_loop` 的用量上限 handler），這裡只剩
+    輸出靜默重生、暫時性故障與錯誤重試那幾種短退避。
+
+    用 `time.monotonic()` 而非 `time.time()`：系統時鐘調整（NTP 校時、手動改時間、
+    日光節約）不該讓等待變成幾秒或幾天。
 
     等待期間把截止時刻掛在 `st.wait_deadline`（同一個 monotonic 刻度），讓
     `/dorossi running` 分得出「在等」與「在跑」；`finally` 清掉，abort 與取消也一樣。
@@ -6728,13 +6729,15 @@ def _dorossi_waiter_lines(uid: str) -> list[str]:
             bits.append(f"waiting={len(waiters)}/{DOROSSI_MAX_WAITING}")
         if loop is not None:
             bits.append(f"loop inject={len(loop.injections)}/{DOROSSI_LOOP_INJECT_MAX}")
-            if loop.usage_waiting:
-                clock = _dorossi_reset_clock(loop.usage_reset_at)
-                bits.append(f"usage-wait until {clock}" if clock else "usage-wait")
         if parked:
             clocks = "、".join(_dorossi_parked_clock(r) for r in parked[:3])
             bits.append(f"parked={len(parked)} until {clocks}")
-        if sess.get("loop_pending"):
+        marker = sess.get("loop_pending")
+        if marker:
+            # 撞到方案用量上限而存檔停下的自走任務：不在跑，但到點會自己接回來。
+            if isinstance(marker, dict) and marker.get("stop") == "usage_wait":
+                clock = _dorossi_reset_clock(_dorossi_loop_usage_resume_at(marker))
+                bits.append(f"usage-wait until {clock}" if clock else "usage-wait")
             bits.append("pending-resume")
         if sess.get("archived"):
             bits.append("archived")
@@ -6762,7 +6765,7 @@ async def mcmd_status(message: discord.Message, rest: str = "") -> None:
     sessions = rec.get("sessions") or {}
     active_sess = sessions.get(active) if active in sessions else {}
     provider = active_sess.get("ai_provider", "claude") if active_sess else "claude"
-    backend = "codex" if provider == "codex" else DOROSSI_BACKEND
+    backend = provider if provider in ("codex", "gemini") else DOROSSI_BACKEND
     eff, model = _dorossi_session_tuning(active_sess or {})
     wait_total = sum(
         1 for q in _dorossi_waiters.values() for w in q if not w.canceled)
@@ -6795,6 +6798,20 @@ _DOROSSI_TURN_PHASE_TEXT = {
     "compact": "執行中",
     "loop": "轉進自走任務中",
 }
+
+
+def _dorossi_usage_wait_markers(state: dict) -> list[tuple[str, float | None]]:
+    """撞到方案用量上限、存檔等著自動接續的自走任務：`[(sid, 接續時刻), …]`，時刻早的在
+    前（算不出來的排最後）。`state` 形狀不對一律當作沒有。純函式、永不 raise。"""
+    out: list[tuple[str, float | None]] = []
+    for rec in (state.values() if isinstance(state, dict) else ()):
+        sessions = rec.get("sessions") if isinstance(rec, dict) else None
+        for sid, sess in (sessions.items() if isinstance(sessions, dict) else ()):
+            marker = sess.get("loop_pending") if isinstance(sess, dict) else None
+            if isinstance(marker, dict) and marker.get("stop") == "usage_wait":
+                out.append((str(sid), _dorossi_loop_usage_resume_at(marker)))
+    out.sort(key=lambda row: (row[1] is None, row[1] or 0.0))
+    return out
 
 
 def _dorossi_running_clock(ts, now: float) -> str:
@@ -6878,15 +6895,12 @@ def _dorossi_running_report(state: dict, source, *,
         bits = [kind]
         if st.backend:
             bits.append(f"後端 {_backend_display(st.backend)}")
-        clause = _dorossi_usage_wait_clause(st, now=now)
         if st.abort:
             bits.append("中止中")
         elif st.paused:
             bits.append("⏸️ 已讓出（等你接手）")
         elif st.offline_since is not None:
             bits.append(_offline_text(st.offline_since, st.offline_target))
-        elif clause:
-            bits.append(f"⏸️ {clause}")
         elif st.wait_deadline is not None:
             remain = max(0.0, st.wait_deadline - time.monotonic())
             bits.append(f"⏸️ 等待自動重試（約 {_format_duration(remain)}後）")
@@ -6929,6 +6943,15 @@ def _dorossi_running_report(state: dict, source, *,
         clocks = "、".join(_dorossi_parked_clock(r) for r in parked[:3])
         lines.append(f"⏸️ 正在等方案用量重設：{len(parked)} 件（預計 {clocks}，"
                      "時間到會自動重跑）")
+    # 撞到方案用量上限而存檔停下的自走任務：跟停放列同一個性質（不在跑、到點會自己接），
+    # 不列出來的話 `/dorossi running` 看起來是空的，而幾小時後會憑空冒出一個自走任務。
+    waiting = _dorossi_usage_wait_markers(state)
+    if waiting:
+        clocks = "、".join(
+            f"`{sid}` " + (_dorossi_reset_clock(at, now=now) or "?")
+            for sid, at in waiting[:3])
+        lines.append(f"⏸️ 自走任務在等方案用量重設：{len(waiting)} 件（{clocks}，"
+                     "時間到會自動接續，不佔名額）")
     for _ts, head, tail in sorted(items, key=lambda item: item[0]):
         lines.append(head)
         lines.append(tail)
@@ -7090,9 +7113,9 @@ async def _dorossi_run_queued_row(queue_id: str | None, start) -> None:
 
 # --- 撞到方案用量上限的單輪回合：停進佇列、時間到自動重跑（2026-09-23） ---------
 #
-# 自走迴圈撞上用量上限時是**原地等**（`_dorossi_wait_for_usage_reset`，用
-# `time.monotonic()`，沒有上限）。單輪回合不能這樣等：擁有者問完就走，bot 可能在重設
-# 之前重啟，主機也可能整段睡過去——一個掛在記憶體裡的 sleep 三種情形都會把那一題弄丟。
+# 單輪回合不能原地等：擁有者問完就走，bot 可能在重設之前重啟，主機也可能整段睡過去——
+# 一個掛在記憶體裡的 sleep 三種情形都會把那一題弄丟。（自走迴圈原本是原地等，2026-09-26
+# 起也改成存檔、到點接回來，走的是 `loop_pending` 標記與自動接續，不是這份佇列。）
 # 所以單輪走的是「跟斷網那條路同一個形狀」：把那一輪**停進既有的排隊佇列**
 # （`dorossi_queue.ndjson`，原子寫入），多帶一個**牆上時鐘**的 `run_at`，時間到了由既有的
 # 還原機制重跑——per-session 鎖、後端號誌、`running`／`tries` 帳全部照舊。
@@ -7308,7 +7331,8 @@ def _dorossi_restore_due_parked_rows() -> int:
 
 
 async def _dorossi_parked_watch_loop() -> None:
-    """每 `_DOROSSI_PARKED_TICK_SEC` 秒看一次有沒有停放列到點了。長命背景迴圈（受監督）。
+    """每 `_DOROSSI_PARKED_TICK_SEC` 秒看一次有沒有停放列、或存檔等方案用量重設的自走任務
+    （`_dorossi_kick_due_usage_resumes`）到點了。長命背景迴圈（受監督）。
 
     **輪詢而不是排一個 `asyncio` 計時器**，理由跟 `run_at` 用牆上時鐘一樣：計時器活不過
     重啟，主機睡著時也不走。重啟與醒來各自還有一條路會掃（`on_ready` 的
@@ -7320,6 +7344,8 @@ async def _dorossi_parked_watch_loop() -> None:
             _dorossi_restore_due_parked_rows()
         except Exception:  # pylint: disable=broad-except
             traceback.print_exc()
+        # 同一面牆的自走任務：撞到方案用量上限時存檔收掉，到點在這裡被叫回來。
+        _dorossi_kick_due_usage_resumes()
 
 
 def _dorossi_drop_parked_rows(uid: str, sids=None) -> list[dict]:
@@ -8209,13 +8235,14 @@ async def mcmd_compact(message: discord.Message, rest: str = "") -> None:
     if not _dorossi_owner_only(message):
         await safe_reply(message, "此指令僅限擁有者使用。")
         return
-    if DOROSSI_BACKEND == "api":
-        await safe_reply(message, "目前後端不支援手動 compact。")
-        return
     uid = str(message.author.id)
     sid, err = _dorossi_active_or_named_sid(uid, rest)
     if err:
         await safe_reply(message, err)
+        return
+    record = (_dorossi_load_state().get(uid) or {}).get("sessions") or {}
+    if dorossi_session_backend(record.get(sid) or {}) == "api":
+        await safe_reply(message, "目前後端不支援手動 compact。")
         return
     key = _dorossi_session_key(uid, sid)
     if key in _dorossi_loops:
@@ -8638,13 +8665,8 @@ async def mcmd_ai(message: discord.Message, rest: str) -> None:
         return
     choice = rest.strip().lower()
     uid = str(message.author.id)
-    if choice not in ("", "claude", "codex"):
-        await safe_reply(message, "用法：`/dorossi ai <claude|codex>`")
-        return
-    state = _dorossi_load_state()
-    current_sid = (state.get(uid) or {}).get("active")
-    if choice and current_sid and _dorossi_session_key(uid, current_sid) in _dorossi_loops:
-        await safe_reply(message, "這個對話的任務正在進行中，請先中止再切換。")
+    if choice not in ("", "claude", "codex", "gemini"):
+        await safe_reply(message, "用法：`/dorossi ai <claude|codex|gemini>`")
         return
     def _mut(state: dict) -> str:
         _sid, sess = _dorossi_active_session(state, uid)
@@ -8654,7 +8676,7 @@ async def mcmd_ai(message: discord.Message, rest: str) -> None:
         return sess.get("ai_provider", "claude")
     selected = await _dorossi_state_rmw(_mut)
     if choice:
-        await safe_reply(message, f"✅ 這段對話已切換為 `{selected}`。")
+        await safe_reply(message, f"✅ 這段對話已切換為 `{selected}`；目前回合會完成，後續回合使用新後端。")
     else:
         await safe_reply(message, f"這段對話目前使用 `{selected}`。")
 
@@ -8910,19 +8932,10 @@ async def mcmd_dorossi(message: discord.Message, rest: str,
                 if s is not None:
                     _dorossi_apply_turn_tuning(s, effort, model_tier)
             await _dorossi_state_rmw(_inject_tune_mut)
-        # 迴圈正在等方案用量重設時，「下一輪」可能是幾個小時後——2026-09-19 20:38 擁有
-        # 者就是在這種時候補了一句，只收到「下一輪會帶進去」，等了一陣子按 abort，再問
-        # 「為甚麼加入任務會不執行」。所以這時要講清楚在等什麼、等到何時、可以怎麼做。
-        # （這一條路才是等待期間會走到的：迴圈在第一個 await 之前就註冊了，同一個對話
-        # 的新提問一律進注入緩衝，不會排進下面的佇列。）
-        clause = _dorossi_usage_wait_clause(loop_st)
-        if clause:
-            await safe_reply(
-                message,
-                f"📨 已加入目前任務。不過這個任務{clause}，重設後才會跑下一輪、"
-                f"帶進這則補充。{_DOROSSI_USAGE_WAIT_OPTIONS}")
-        else:
-            await safe_reply(message, "📨 已加入目前任務，下一輪會帶進去。")
+        # 以前迴圈會在這裡原地等方案用量重設好幾個小時，這一句得另外講清楚「下一輪」是
+        # 何時（2026-09-19）。2026-09-26 起撞到用量上限的迴圈會存檔、收掉，不在
+        # `_dorossi_loops` 裡，所以走到這裡的一定是真的在跑的迴圈。
+        await safe_reply(message, "📨 已加入目前任務，下一輪會帶進去。")
         return
 
     # Per-SESSION queue: if a turn is already running on THIS session, wait behind
@@ -9464,7 +9477,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
         _slot_id, slot = _dorossi_session_by_id(state, uid, sid)
         return slot.get("ai_provider", "claude")
     provider = await _dorossi_state_rmw(_provider_mut)
-    backend = "codex" if provider == "codex" else DOROSSI_BACKEND
+    backend = provider if provider in ("codex", "gemini") else DOROSSI_BACKEND
     turn.backend = backend
     # Pre-flight: missing prerequisite → actionable reply (not a stack trace).
     # Edit the placeholder if queued, else a plain reply.
@@ -9485,6 +9498,14 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
         print("[dorossi] preflight: `codex` CLI not on PATH", file=sys.stderr)
         await _preflight_fail("Dorossi 暫時無法回應，請稍後再試。")
         return
+    if backend == "gemini" and find_gemini_executable() is None:
+        print("[dorossi] preflight: Antigravity CLI (agy) unavailable", file=sys.stderr)
+        await _preflight_fail("Dorossi 暫時無法回應，請稍後再試。")
+        return
+    if backend == "gemini" and DOROSSI_CC_TOOLS != "full":
+        print("[dorossi] preflight: agy cannot enforce tool-free mode", file=sys.stderr)
+        await _preflight_fail("Dorossi 暫時無法回應，請稍後再試。")
+        return
     if backend == "api" and AsyncAnthropic is None:
         print(
             "[dorossi] preflight: api backend not installed — `pip install anthropic`.",
@@ -9501,6 +9522,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
         _sid, sess = _dorossi_session_by_id(state, uid, sid)
         stale = (_dorossi_session_is_stale(sess) and (
             sess.get("cc_session_id") or sess.get("codex_session_id")
+            or sess.get("gemini_session_id")
             or sess.get("api_history")))
         if stale:
             _dorossi_reset_session(sess)
@@ -9518,6 +9540,8 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
             # 本輪拿它換算成「這一輪」的數字。見 `_dorossi_persist_advance`。
             "cc_usage_mark": sess.get("cc_usage_mark"),
             "codex_session_id": sess.get("codex_session_id"),
+            "gemini_session_id": sess.get("gemini_session_id"),
+            "gemini_usage_mark": sess.get("gemini_usage_mark"),
             # Resolved per-session working dir (isolates parallel processes); may
             # persist `cc_workdir` into the slot. Falls back to a user override.
             "cc_cwd": _dorossi_resolve_cc_workdir(sess, uid, sid),
@@ -9617,6 +9641,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                                 on_proc=turn.set_proc))
                     new_hist = None
                     codex_sid = None
+                    gemini_sid = None
                 elif backend == "codex":
                     try:
                         answer, codex_sid, _info = await _dorossi_turn_backend(
@@ -9636,6 +9661,32 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                                 on_proc=turn.set_proc))
                     new_sid = None
                     new_hist = None
+                    gemini_sid = None
+                elif backend == "gemini":
+                    turn_prompt = (prompt + DOROSSI_LOOP_SELFJUDGE_SUFFIX
+                                   if self_judge else prompt)
+                    on_text = (_dorossi_loop_on_text(live) if self_judge
+                               else live.update)
+                    try:
+                        answer, gemini_sid, _info = await _dorossi_turn_backend(
+                            turn, live, lambda: _dorossi_via_gemini(
+                                turn_prompt, snap["gemini_session_id"], on_text=on_text,
+                                extra_dir=snap["cc_extra_dir"], workdir=snap["cc_cwd"],
+                                model=snap["model"], effort=snap["effort"],
+                                on_proc=turn.set_proc,
+                                previous_usage=snap["gemini_usage_mark"]))
+                    except _DorossiResumeError:
+                        await live.finalize("⏳ 重新整理對話中…")
+                        live.reopen()
+                        answer, gemini_sid, _info = await _dorossi_turn_backend(
+                            turn, live, lambda: _dorossi_via_gemini(
+                                turn_prompt, None, on_text=on_text,
+                                extra_dir=snap["cc_extra_dir"], workdir=snap["cc_cwd"],
+                                model=snap["model"], effort=snap["effort"],
+                                on_proc=turn.set_proc))
+                    new_sid = None
+                    codex_sid = None
+                    new_hist = None
                 else:
                     # API backend is non-streaming (one shot) — no live progress,
                     # but the answer still lands in the same single message.
@@ -9644,6 +9695,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                             prompt, snap["api_history"], model=snap["model"]))
                     new_sid = None
                     codex_sid = None
+                    gemini_sid = None
                     _info = {}
         # Persist the advanced session (survives !restart) before replying, via a
         # state RMW on slot `sid` — never carry a `state` dict across the backend
@@ -9656,7 +9708,9 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
             _dorossi_persist_advance(state, uid, sid,
                                      new_sid=new_sid, new_hist=new_hist,
                                      codex_sid=codex_sid,
-                                     usage_mark=(_info or {}).get("usage_mark"))
+                                     gemini_sid=gemini_sid,
+                                     usage_mark=(_info or {}).get("usage_mark"),
+                                     gemini_usage_mark=(_info or {}).get("gemini_usage_mark"))
         await _dorossi_state_rmw(_save_mut)
         generated_images = (_info or {}).get("images", [])
         sent_image_count = await _dorossi_send_images(message, generated_images)
@@ -9754,7 +9808,8 @@ async def _dorossi_loop_one_round(prompt: str, snap: dict,
     model = snap.get("model")
     abort_check = lambda: st.abort  # noqa: E731 (small predicate)
     backend = snap.get("backend", "claude_code")
-    invoke = _dorossi_via_codex if backend == "codex" else _dorossi_via_claude_code
+    invoke = {"codex": _dorossi_via_codex,
+              "gemini": _dorossi_via_gemini}.get(backend, _dorossi_via_claude_code)
     common = dict(
         on_text=on_text, extra_dir=extra_dir, workdir=workdir,
         silence_limit=silence_limit, on_proc=st.set_proc,
@@ -9770,8 +9825,12 @@ async def _dorossi_loop_one_round(prompt: str, snap: dict,
         # 另一條路只吃模型（沒有力度旗標、沒有預算旗標）。2026-09-23 之前這裡什麼都
         # 不帶，所以自走迴圈在那個後端上一樣吃不到 `/model`。
         common.update(model=model)
-    stored_id = (snap.get("codex_session_id") if backend == "codex"
-                 else snap.get("cc_session_id"))
+        if backend == "gemini":
+            common["previous_usage"] = snap.get("gemini_usage_mark")
+            common["effort"] = effort
+    stored_id = (snap.get("codex_session_id") if backend == "codex" else
+                 snap.get("gemini_session_id") if backend == "gemini" else
+                 snap.get("cc_session_id"))
     try:
         return await invoke(prompt, stored_id, **common)
     except _DorossiResumeError:
@@ -9781,13 +9840,16 @@ async def _dorossi_loop_one_round(prompt: str, snap: dict,
             raise
         await live.finalize("⏳ 重新整理對話中…")
         live.reopen()
+        if backend == "gemini":
+            common["previous_usage"] = None
         return await invoke(prompt, None, **common)
 
 
 async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
                             placeholder, uid: str, sid: str, *,
                             already_ran_first: bool = False,
-                            ack_override: str | None = None) -> None:
+                            ack_override: str | None = None,
+                            resuming: bool = False) -> None:
     """驅動 Dorossi 自走模式：在「本 session（uid, sid）的 per-session 鎖」內（由
     _dorossi_process_turn 持有）一輪一輪推進同一個工作階段，直到 (a) 被 `/dorossi abort`
     中止、(b) 輸出沉默 backstop 觸發、或 (c) 連續 DOROSSI_LOOP_EXHAUSTION_ROUNDS 輪都
@@ -9832,17 +9894,23 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
         「自然收尾」（連續無進展而停止）與「slot 已被刪」不留標記；abort／沉默／用量
         上限／例外／bot 重啟都會留著 → 擁有者可用 `/dorossi session continue <id>` 接續
         （見 _dorossi_resume_loop／_dorossi_loop_resume_plan）。
-      * **方案用量上限不停止迴圈，改成等到額度回來再續跑。** 後端的用量是每 5 小時
-        滾動重設的，舊行為（撞到就停、留 loop_pending 等人工 `/dorossi session
-        continue`）代表無人值守的長任務每天要人接好幾次，實質上跑不完。現在的處理
+      * **方案用量上限不讓任務結束，而是存檔、收掉迴圈、到點自動接回來。** 後端的用量
+        是每 5 小時滾動重設的；「撞到就停、等人工接續」讓無人值守的長任務每天要人接好
+        幾次，「原地睡到額度回來」（2026-08-31～09-26）則讓一個什麼都沒在做的迴圈握著
+        per-session 鎖、`DOROSSI_MAX_PARALLEL_LOOPS` 的名額與電源要求好幾個小時。現在
         依序是：先把後端當下的 session id 寫回 slot（**不做這件事就會丟掉這一輪已經
         做完的工作**——用量上限幾乎都是做到一半才撞上，之後 resume 舊 id 等於重來）、
-        算等待秒數（`_dorossi_usage_wait_seconds`：有機器可讀的重設時刻就睡到那時，
-        否則退避探測）、貼一則說明會自動續跑的訊息、`_dorossi_wait_for_usage_reset`
-        期間每 5 秒輪詢 abort、醒來後 drain 等待期間的注入再重跑同一輪。
-        這一輪**不計入** consecutive_idle：等待不是「沒有進展」，是「還不能動」。
-        `usage_waits` 只在有任何一輪跑完時歸零。`DOROSSI_USAGE_WAIT_MAX_CONSECUTIVE`
-        預設 0 ＝不設限（擁有者裁決：不得有回合／花費類上限；等待本身不花錢）。
+        算等待秒數（`_dorossi_usage_wait_seconds`：有機器可讀的重設時刻就等到那時，
+        否則退避探測）、把接續時刻、要重跑的這一輪提示、還沒帶入的注入與連續等待次數
+        寫進標記（`_dorossi_mark_loop_usage_wait`，stop＝`usage_wait`）、貼一則說明會
+        自動續跑的訊息，然後 return——`finally` 照常放掉鎖、名額與電源要求。到點由
+        `_dorossi_parked_watch_loop` 叫自動接續掃描，走 `/dorossi session continue` 同一條
+        路（`resuming=True` 把存下的提示、注入與等待次數拿回來）；bot 重啟之後一樣接得
+        回來（標記與時刻都在磁碟上）。等待**不計入** consecutive_idle：接續後的迴圈從零
+        算起。`usage_waits` 只在有任何一輪跑完時歸零（跨接續帶著走，退避倍數才會長）。
+        `DOROSSI_USAGE_WAIT_MAX_CONSECUTIVE` 預設 0 ＝不設限（擁有者裁決：不得有回合／花費
+        類上限；等待本身不花錢）。撞到上限前擁有者已要求讓出（`st.paused`）時記成
+        `paused`，不自動接。
       * 並行數操作閥：迴圈啟動前檢查 `DOROSSI_MAX_PARALLEL_LOOPS`（0＝不設限）——
         這是行程數操作閥、不是花費上限（擁有者裁決不得有花費類上限）。
       * **斷網不停迴圈**（2026-09-22）。後端連不上伺服器（`_DorossiOfflineError`）與
@@ -9922,14 +9990,29 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
         anchor_cid = getattr(getattr(message, "channel", None), "id", None)
         anchor_mid = getattr(message, "id", None)
 
-        def _pending_mut(state: dict) -> None:
+        def _pending_mut(state: dict):
             rec = _dorossi_user_record(state, uid)
             s = rec["sessions"].get(sid)
-            if s is not None:
-                _dorossi_mark_loop_pending(s, task_prompt,
-                                           channel_id=anchor_cid,
-                                           message_id=anchor_mid)
-        await _dorossi_state_rmw(_pending_mut)
+            if s is None:
+                return None, [], [], 0
+            # 接續撞到方案用量上限而存檔停下的任務：先把存下的東西拿回來，再重建標記
+            # （重建會把它們清掉）。新任務與自判轉進不拿——那是別的請求。
+            carried = _dorossi_take_loop_resume(s) if resuming else (None, [], [], 0)
+            _dorossi_mark_loop_pending(s, task_prompt,
+                                       channel_id=anchor_cid,
+                                       message_id=anchor_mid)
+            return carried
+        (resume_prompt, carried_inject, carried_after,
+         usage_waits) = await _dorossi_state_rmw(_pending_mut)
+        # 跟原地等待那一版等完之後的做法一樣：有補充就把補充當這一輪的提示，沒有就重跑撞到
+        # 上限的那一輪；讓出時扣著的提交指示排在這一輪之後的回合邊界。脈絡已經不在
+        # （`already_ran_first` 為假，用原任務重新起跑）時補充也留到那個邊界。
+        if already_ran_first and carried_inject:
+            prompt = _dorossi_build_injection_prompt(carried_inject)
+            carried_inject = []
+        elif already_ran_first and resume_prompt:
+            prompt = resume_prompt
+        st.injections.extend(carried_inject + carried_after)
         # 進入自走模式的 ack（沿用排隊佔位訊息，否則發一則新訊息）。放進 try，確保
         # 即便 ack 送出失敗，finally 也一定會清掉自走狀態與注入緩衝。自判轉進會帶
         # ack_override（措辭與「明確下令」不同），且 placeholder 已被 turn-1 用掉而
@@ -9982,8 +10065,11 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
                         # 上一輪存下的原始累計值（見 `_dorossi_persist_advance`）。
                         "cc_usage_mark": s.get("cc_usage_mark"),
                         "codex_session_id": s.get("codex_session_id"),
-                        "backend": ("codex" if s.get("ai_provider") == "codex"
-                                    else DOROSSI_BACKEND),
+                        "gemini_session_id": s.get("gemini_session_id"),
+                        "gemini_usage_mark": s.get("gemini_usage_mark"),
+                        "backend": dorossi_session_backend(s),
+                        "loop_task": (s.get("loop_pending") or {}).get("task", ""),
+                        "last_backend": (s.get("loop_pending") or {}).get("last_backend"),
                         # resolved per-session workdir (isolates parallel procs)
                         "cc_cwd": _dorossi_resolve_cc_workdir(s, uid, sid),
                         "cc_extra_dir": s.get("cc_extra_dir"),
@@ -9999,10 +10085,18 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
                 await live.finalize(f"{tag}已停止：這個對話已被重置或刪除。")
                 return
             st.backend = round_snap["backend"]
+            round_prompt = prompt
+            if (round_snap["last_backend"]
+                    and round_snap["last_backend"] != round_snap["backend"]):
+                round_prompt = (
+                    "接手仍在進行的任務。原始任務：\n"
+                    + str(round_snap["loop_task"])[:2000]
+                    + "\n請先檢查目前工作目錄與已完成的進度，避免重做；"
+                    "接著完成未完成的部分。這一輪的指示：\n" + prompt)
             try:
                 async with message.channel.typing():
                     answer, new_sid, info = await _dorossi_loop_one_round(
-                        prompt, round_snap, live, on_text, silence_limit, st)
+                        round_prompt, round_snap, live, on_text, silence_limit, st)
             except _DorossiLoopSilence:
                 if st.abort:
                     return
@@ -10065,9 +10159,13 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
                             codex_sid=(limit_sid
                                        if round_snap["backend"] == "codex" else None))
                     await _dorossi_state_rmw(_limit_save_mut)
-                # (2) 決定要等多久，然後**等下去而不是停掉**。方案用量是每 5 小時
-                #     滾動重設的，舊行為（停掉、留 loop_pending 等人工接續）等於
-                #     無人值守的長任務每天要人接好幾次。
+                # (2) 存檔、收掉這個迴圈，到點再接回來——**不原地等**。2026-08-31～09-26
+                #     這裡是原地睡到額度回來（一次可能五、六個小時），整段期間一直握著
+                #     per-session 鎖（同一個對話的提問全排在後面）、`DOROSSI_MAX_PARALLEL_LOOPS`
+                #     的一個名額（預設 3）與一份電源要求（主機睡不了），`/dorossi running`
+                #     上就是一個一直掛著的任務。擁有者 2026-09-26 要求改成存檔等待、之後接續、
+                #     並釋放資源。所以：接續需要的東西寫進標記，return，`finally` 照常放掉
+                #     上面三樣；到點由 `_dorossi_parked_watch_loop` 叫自動接續掃描接回來。
                 usage_waits += 1
                 if (DOROSSI_USAGE_WAIT_MAX_CONSECUTIVE > 0
                         and usage_waits > DOROSSI_USAGE_WAIT_MAX_CONSECUTIVE):
@@ -10077,53 +10175,39 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
                     await live.finalize(tag + _dorossi_usage_limit_reply(exc))
                     return
                 delay = _dorossi_usage_wait_seconds(exc, usage_waits)
-                await live.finalize(
-                    tag + _dorossi_usage_limit_wait_reply(exc, delay))
-                _dorossi_event("usage_wait", uid=uid, sid=sid,
-                               waits=usage_waits, delay=round(delay),
-                               timed=bool(getattr(exc, "reset_at", None)))
-                # 睡下去之前把心跳推到現在。一次等待可能長達 6 小時，而跨重啟自動
-                # 接續是用心跳的年齡判斷「這個標記還新不新」——不推的話，一個連續
-                # 等了大半天的迴圈會因為「上一輪跑完是很久以前」而被判定過舊，正好
-                # 在最該接回去的時候不接。
-                def _limit_touch_mut(state: dict) -> None:
+                resume_at = time.time() + delay
+                # 還沒帶入的補充一起存：收掉迴圈之後注入緩衝就不在了。擁有者已經要求讓出
+                # 時，扣著的提交指示另外存、排在第一輪之後——接回來先補完被打斷的那一輪
+                # （「先執行」的指示），再提交。
+                carried = st.drain_injections()
+                paused = st.paused
+                after = st.take_deferred_commit() if paused else []
+                # 壓縮輪不重跑：接續後的迴圈不知道那一輪是壓縮輪，會把摘要貼出去。
+                resume_prompt = None if is_compact_round else prompt
+
+                def _usage_stop_mut(state: dict) -> None:
                     s = _dorossi_user_record(state, uid)["sessions"].get(sid)
                     if s is not None:
-                        _dorossi_touch_loop_pending(s)
-                await _dorossi_state_rmw(_limit_touch_mut)
-                # 等待期間讓外面看得出這個迴圈在等什麼：同一個對話的新提問（中途補充
-                # 的回覆）與已經在排隊的佔位訊息都讀 `st.usage_waiting`／`usage_reset_at`
-                # 講清楚「在等用量重設、預計何時」。進入等待時重新編號一次，已經在排隊的
-                # 人才看得到（他們是在迴圈接手之前排進來的，例如自判轉進前的第一輪）。
-                # 旗標只在這個 handler 設、在 `finally` 清——沉默／暫時性故障／錯誤重試
-                # 也用同一支等待函式，但那些不是「在等用量」。
-                st.usage_reset_at = getattr(exc, "reset_at", None)
-                st.usage_waiting = True
-                try:
-                    await _dorossi_refresh_waiters(key)
-                    if not await _dorossi_wait_for_usage_reset(st, delay):
-                        return  # 等待中被 abort（abort 自己貼確認訊息）
-                finally:
-                    st.usage_waiting = False
-                    st.usage_reset_at = None
-                await _dorossi_refresh_waiters(key)   # 原因拿掉：要開始跑了
-                # (3) 等完先收擁有者在這段期間補充的訊息——一次數小時的等待正是最
-                #     可能有人插話的窗口，直接丟掉會讓那些話等到下一輪邊界才生效。
-                #     有補充就折進下一輪 prompt，沒有就用同一個 prompt 重跑這一輪
-                #     （這一輪沒有成功，不計 idle、不推進 exhaustion）。
-                #     **壓縮輪例外**：那一輪的輸出刻意不貼到 Discord，把擁有者的
-                #     指示折進去會讓回覆被吞掉。此時不 drain，讓補充留在緩衝裡，
-                #     由壓縮完成後的下一個正常輪邊界處理（與既有語意一致）。
-                waited_inject = [] if is_compact_round else st.drain_injections()
-                if waited_inject:
-                    prompt = _dorossi_build_injection_prompt(waited_inject)
-                    try:
-                        await message.channel.send(
-                            f"{tag}📨 已帶入你補充的 {len(waited_inject)} 則訊息，繼續推進…",
-                            allowed_mentions=discord.AllowedMentions.none())
-                    except Exception:  # pylint: disable=broad-except  # nosec B110
-                        pass
-                continue
+                        _dorossi_mark_loop_usage_wait(
+                            s, resume_at=resume_at, usage_waits=usage_waits,
+                            resume_prompt=resume_prompt, injections=carried,
+                            after=after, paused=paused)
+                await _dorossi_state_rmw(_usage_stop_mut)
+                stop_reason = "paused" if paused else "usage_wait"
+                _dorossi_event("usage_wait", uid=uid, sid=sid,
+                               waits=usage_waits, delay=round(delay),
+                               timed=bool(getattr(exc, "reset_at", None)),
+                               paused=paused)
+                if paused:
+                    await live.finalize(tag + _dorossi_usage_limit_paused_reply(
+                        sid, len(carried) + len(after)))
+                    return
+                # 這個行程裡到點接續時用原本這則訊息（不必向平台查回錨點）；重啟之後
+                # 這份就沒了，改由掃描用標記裡的錨點查回來。
+                _dorossi_usage_resume_messages[key] = message
+                await live.finalize(tag + _dorossi_usage_limit_wait_reply(
+                    exc, delay, sid=sid, carried=len(carried)))
+                return
             except _DorossiOfflineError as exc:
                 if st.abort:
                     return
@@ -10269,9 +10353,12 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
                 # `_dorossi_persist_advance`.
                 _dorossi_persist_advance(
                     state, uid, sid,
-                    new_sid=(new_sid if round_snap["backend"] != "codex" else None),
+                    new_sid=(new_sid if round_snap["backend"] == "claude_code" else None),
                     codex_sid=(new_sid if round_snap["backend"] == "codex" else None),
-                    usage_mark=(None if round_snap["backend"] == "codex"
+                    gemini_sid=(new_sid if round_snap["backend"] == "gemini" else None),
+                    gemini_usage_mark=((info or {}).get("gemini_usage_mark")
+                                       if round_snap["backend"] == "gemini" else None),
+                    usage_mark=(None if round_snap["backend"] in ("codex", "gemini")
                                 else (info or {}).get("usage_mark")))
                 # 心跳＋當機迴圈計數歸零。「這一輪真的跑完了」同時證明兩件事：標記
                 # 不是陳年遺留（所以跨重啟自動接續的年齡窗要從這裡起算），而且接續
@@ -10279,6 +10366,9 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
                 s = _dorossi_user_record(state, uid)["sessions"].get(sid)
                 if s is not None:
                     _dorossi_touch_loop_pending(s, reset_tries=True)
+                    marker = s.get("loop_pending")
+                    if isinstance(marker, dict):
+                        marker["last_backend"] = round_snap["backend"]
             await _dorossi_state_rmw(_loop_save_mut)
             generated_images = (info or {}).get("images", [])
             sent_image_count = await _dorossi_send_images(
@@ -10352,6 +10442,17 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
             # 或這一輪根本沒產出（避免空轉黑洞）。連續達 DOROSSI_LOOP_EXHAUSTION_ROUNDS
             # 輪才真正停止；單次自報完成會被推回再找一輪（見 prompt 選擇）。
             idle = done or (not chunks and not sent_image_count)
+            if idle:
+                # A switch can arrive while the old backend finishes its answer.
+                # Let the selected backend take over before counting completion.
+                def _backend_changed(state: dict) -> bool:
+                    slot = (_dorossi_user_record(state, uid).get("sessions") or {}).get(sid)
+                    return (slot is not None
+                            and dorossi_session_backend(slot) != round_snap["backend"])
+                if await _dorossi_state_rmw(_backend_changed):
+                    consecutive_idle = 0
+                    prompt = DOROSSI_LOOP_CONTINUE_PROMPT
+                    continue
             consecutive_idle = consecutive_idle + 1 if idle else 0
             exhausted = consecutive_idle >= DOROSSI_LOOP_EXHAUSTION_ROUNDS
             if exhausted:
@@ -10380,7 +10481,7 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
             # 上面剛設好的 prompt；計數會在壓縮輪收尾時重置。三條觸發（輪數／花費／脈絡
             # token）任一達到即壓縮；脈絡 token 取自本輪 info 的**最後一次 API 呼叫**
             # （`ctx`，讀不到才退回 in＋cr＋cc 的加總），與單輪共用門檻。
-            if (round_snap["backend"] == "claude_code"
+            if (round_snap["backend"] in ("claude_code", "gemini")
                     and _dorossi_loop_compaction_due(
                         rounds_since_compact, cost_since_compact,
                         _dorossi_context_tokens(info))):
@@ -10620,7 +10721,7 @@ async def cmd_backfill_paths(message: discord.Message, limit: int = 200,
 
 # 後端識別字串（`claude_code` / `codex` / `api`）本身就是供應商／產品名，
 # 不得外送。對外只給不具識別性的代號；診斷需要真值時看 stderr / log。
-_BACKEND_DISPLAY = {"claude_code": "A", "codex": "B", "api": "C"}
+_BACKEND_DISPLAY = {"claude_code": "A", "codex": "B", "api": "C", "gemini": "D"}
 
 
 def _backend_display(backend: str) -> str:
@@ -10651,7 +10752,7 @@ def _dorossi_backend_default_model(backend: str) -> str:
     """這個後端「沒指定時」實際會用的模型值——顯示端用。"""
     if backend == "api":
         return DOROSSI_MODEL
-    if backend == "codex":
+    if backend in ("codex", "gemini"):
         # 另一個後端不帶 `-m` 時用它自己設定檔裡的模型，本行程無從得知是哪一個。
         return ""
     return DOROSSI_CC_MODEL
@@ -10867,8 +10968,7 @@ async def _dorossi_resume_all(message: discord.Message) -> None:
     for sid, label, verdict in plan:
         if verdict == "resume":
             sess = sessions.get(sid) or {}
-            backend = ("codex" if sess.get("ai_provider") == "codex"
-                       else DOROSSI_BACKEND)
+            backend = dorossi_session_backend(sess)
             key = _dorossi_session_key(uid, sid)
             lock = _dorossi_session_locks.get(key)
             if not _dorossi_loop_gate_open(message, backend):
@@ -10946,8 +11046,7 @@ async def _dorossi_resume_loop_now(message: discord.Message,
     if not sid or sid not in sessions:
         await safe_reply(message, "找不到該 session（用 `/dorossi session list` 看清單）。")
         return
-    backend = ("codex" if sessions[sid].get("ai_provider") == "codex"
-               else DOROSSI_BACKEND)
+    backend = dorossi_session_backend(sessions[sid])
     if not _dorossi_loop_gate_open(message, backend):
         await safe_reply(message, "此功能目前無法使用。")
         return
@@ -10974,7 +11073,8 @@ async def _dorossi_resume_loop_now(message: discord.Message,
                 already_ran_first=(mode == "continue"),
                 ack_override=(ack_override or
                               "🔁 接續先前的任務，會持續推進直到你喊停"
-                              "（`/dorossi abort`），連續沒有進展才會自動停。"))
+                              "（`/dorossi abort`），連續沒有進展才會自動停。"),
+                resuming=True)
     finally:
         _dorossi_release_session_lock(key)
 
@@ -11099,6 +11199,10 @@ class _DorossiInteractionTrigger:
 # 地方是 `_dorossi_resume_loop` 的 `finally`）。
 # 同時只跑一個掃描：掃描中又被觸發就記一筆，掃完再掃一次。
 _dorossi_resume_inflight: set = set()     # {(uid, sid)}：已排定接續、還沒結束的
+# 撞到方案用量上限而存檔停下的自走任務 → 觸發它的那則訊息（只在這個行程裡）。到點接續時
+# 直接用它，不必向平台查回錨點——查不回來（訊息被刪、沒有斜線選單的平台）的任務在原地等待
+# 那一版照樣接得回來，改成存檔等待不該讓它們接不回來。重啟之後這份是空的，改走錨點。
+_dorossi_usage_resume_messages: dict = {}
 _dorossi_resume_scan_busy = False
 _dorossi_resume_scan_again = False
 # 報過「沒辦法自動接續」的標記（uid, sid, 心跳）：每次重連都重掃，沒有這一份就會
@@ -11161,8 +11265,8 @@ async def _dorossi_autoresume_pending_loops() -> None:
 
     永不 raise：這是 `on_ready` 的一環，在這裡炸掉會連帶影響 presence 與背景任務。
     """
-    if DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC <= 0:
-        return  # 設定關閉 → 回到純人工接續
+    # 「設定關閉」（`DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC <= 0`）由計畫函式判斷：它只關掉
+    # 被砍死／斷網那一種；撞到方案用量上限而存檔停下的照樣到點接回來。
     try:
         state = _dorossi_load_state()
     except Exception:  # pylint: disable=broad-except
@@ -11178,15 +11282,22 @@ async def _dorossi_autoresume_pending_loops() -> None:
         for sid, sess in list(sessions.items()):
             if not isinstance(sess, dict):
                 continue
+            marker = sess.get("loop_pending")
             plan = _dorossi_loop_autoresume_plan(sess)
+            if (plan is None and _dorossi_session_key(uid, sid) in _dorossi_usage_resume_messages
+                    and _dorossi_loop_usage_wait_due(marker)):
+                plan = (None, None, 0)   # 手上還有原本那則訊息：不必有錨點
             if plan is not None:
-                targets.append((sess.get("loop_pending", {}).get("ts") or 0.0,
-                                uid, sid, plan))
+                targets.append((marker.get("ts") or 0.0, uid, sid, plan,
+                                marker.get("stop")))
     if not targets:
         return
-    # 已經在跑、或已經排定接續的不再接一次（這個掃描會在同一個行程裡跑很多次）。
+    # 已經在跑、或已經排定接續的不再接一次（這個掃描會在同一個行程裡跑很多次）。這個對話
+    # 正在跑別的回合（例如同一次重設時到點的停放提問）也先跳過：接續那一條看到鎖被拿著會
+    # 回「忙線中」並放棄，而這一次還會白白算進斷路器——下一次掃描再接。
     busy = set(_dorossi_loops) | _dorossi_resume_inflight
-    targets = [t for t in targets if _dorossi_session_key(t[1], t[2]) not in busy]
+    targets = [t for t in targets if _dorossi_session_key(t[1], t[2]) not in busy
+               and not _dorossi_session_locked(_dorossi_session_key(t[1], t[2]))]
     if not targets:
         return
     targets.sort(key=lambda t: t[0], reverse=True)  # 心跳最新的優先
@@ -11202,39 +11313,45 @@ async def _dorossi_autoresume_pending_loops() -> None:
             targets = targets[:room]
     declined: list[str] = []
     declined_keys: list = []
-    for ts_, uid, sid, (cid, mid, tries) in targets:
+    for ts_, uid, sid, (cid, mid, tries), stop in targets:
         key = _dorossi_session_key(uid, sid)
         if key in _dorossi_loops or key in _dorossi_resume_inflight:
             continue
-        try:
-            channel = client.get_channel(cid) or await client.fetch_channel(cid)
-        except Exception as error:  # pylint: disable=broad-except
-            print(f"[dorossi] autoresume {sid}: channel unavailable ({error!r})",
-                  file=sys.stderr)
-            declined.append(sid)
-            declined_keys.append((uid, sid, ts_))
-            continue
-        # 錨點可能是 `@bot` 的使用者訊息，也可能是斜線指令的 interaction id（那才是
-        # 擁有者的常態）——後者要從 bot 自己的回覆反查，見 `_resolve_trigger_message`。
-        # 查不到的原因已由它寫進 stderr。
-        found = await _resolve_trigger_message(
-            channel, mid, label=f"dorossi autoresume {sid}")
-        if found is None:
-            declined.append(sid)
-            declined_keys.append((uid, sid, ts_))
-            continue
-        anchor, invoker, via_interaction = found
-        invoker_id = getattr(invoker, "id", None)
-        if invoker_id != OWNER_USER_ID or uid != str(invoker_id):
-            print(f"[dorossi] autoresume {sid}: invoker is not the owner",
-                  file=sys.stderr)
-            declined.append(sid)
-            declined_keys.append((uid, sid, ts_))
-            continue
-        # 斜線那一條找回來的是 bot 的回覆（作者是 bot），不能直接當 `message`：
-        # 包成以平台說的發起人為作者、沿用原本 id 的替身。
-        trigger = (_DorossiInteractionTrigger(anchor, invoker, mid, channel)
-                   if via_interaction else anchor)
+        # 撞到方案用量上限而停下、而且還是這個行程停的：直接用觸發它的那則訊息，就像原地
+        # 等待那一版一樣（授權在那則訊息進來時就驗過了；`_dorossi_resume_loop_now` 還會用
+        # 它再過一次自走閘門）。其餘一律向平台查回錨點。
+        trigger = (_dorossi_usage_resume_messages.pop(key, None)
+                   if stop == "usage_wait" else None)
+        if trigger is None:
+            try:
+                channel = client.get_channel(cid) or await client.fetch_channel(cid)
+            except Exception as error:  # pylint: disable=broad-except
+                print(f"[dorossi] autoresume {sid}: channel unavailable ({error!r})",
+                      file=sys.stderr)
+                declined.append(sid)
+                declined_keys.append((uid, sid, ts_))
+                continue
+            # 錨點可能是 `@bot` 的使用者訊息，也可能是斜線指令的 interaction id（那才是
+            # 擁有者的常態）——後者要從 bot 自己的回覆反查，見 `_resolve_trigger_message`。
+            # 查不到的原因已由它寫進 stderr。
+            found = await _resolve_trigger_message(
+                channel, mid, label=f"dorossi autoresume {sid}")
+            if found is None:
+                declined.append(sid)
+                declined_keys.append((uid, sid, ts_))
+                continue
+            anchor, invoker, via_interaction = found
+            invoker_id = getattr(invoker, "id", None)
+            if invoker_id != OWNER_USER_ID or uid != str(invoker_id):
+                print(f"[dorossi] autoresume {sid}: invoker is not the owner",
+                      file=sys.stderr)
+                declined.append(sid)
+                declined_keys.append((uid, sid, ts_))
+                continue
+            # 斜線那一條找回來的是 bot 的回覆（作者是 bot），不能直接當 `message`：
+            # 包成以平台說的發起人為作者、沿用原本 id 的替身。
+            trigger = (_DorossiInteractionTrigger(anchor, invoker, mid, channel)
+                       if via_interaction else anchor)
 
         # **再查一次、當場登記，中間不得有 await**（2026-09-24）。迴圈開頭那一次查詢之後
         # 隔了抓頻道、抓錨點好幾個網路往返，而擁有者在重啟後最常做的事正是
@@ -11260,12 +11377,16 @@ async def _dorossi_autoresume_pending_loops() -> None:
             traceback.print_exc()
             continue
         print(f"[dorossi] autoresume {sid} (try {tries + 1}"
-              f"/{DOROSSI_LOOP_AUTORESUME_MAX_TRIES or '∞'})", file=sys.stderr)
+              f"/{DOROSSI_LOOP_AUTORESUME_MAX_TRIES or '∞'}, {stop or 'killed'})",
+              file=sys.stderr)
         _schedule_coro(
             _dorossi_resume_loop(
                 trigger, sid,
-                ack_override=("🔁 中斷的任務還沒做完（bot 重啟或斷線），已自動接續，"
-                              "會持續推進直到你喊停（`/dorossi abort`）。")),
+                ack_override=(
+                    "🔁 方案用量已重設，接續先前存檔停下的任務，會持續推進直到你喊停"
+                    "（`/dorossi abort`）。" if stop == "usage_wait" else
+                    "🔁 中斷的任務還沒做完（bot 重啟或斷線），已自動接續，"
+                    "會持續推進直到你喊停（`/dorossi abort`）。")),
             label=f"dorossi-autoresume-{sid}")
 
     # 同一個標記（同一個心跳）只報一次：這個掃描每次重連都會跑。
@@ -11273,6 +11394,54 @@ async def _dorossi_autoresume_pending_loops() -> None:
              if k not in _dorossi_autoresume_reported]
     _dorossi_autoresume_reported.update(declined_keys)
     await _dorossi_report_autoresume_declined(fresh)
+
+
+def _dorossi_session_locked(key: tuple) -> bool:
+    """這個對話的 per-session 鎖此刻有人拿著嗎？（沒有鎖物件＝沒有）。同步、永不 raise。"""
+    lock = _dorossi_session_locks.get(key)
+    return lock is not None and lock.locked()
+
+
+def _dorossi_kick_due_usage_resumes(*, now: float | None = None) -> bool:
+    """到點的「等方案用量重設」自走任務有沒有該接的？有就排一次自動接續掃描，回 True。
+
+    由 `_dorossi_parked_watch_loop` 每一拍呼叫——掃描本身要查平台，所以只在真的有東西
+    要接時才叫它：到點、沒在跑、沒排定、這個對話的鎖沒人拿著、還有名額，而且不是已經
+    報過「接不回來」的同一個標記（那種每 30 秒再查一次平台只是白打 API）。順手丟掉
+    手上已經用不到的觸發訊息（任務被 abort、讓出、手動接回去或整個對話被刪了）。
+    同步、永不 raise。"""
+    try:
+        state = _dorossi_load_state()
+        now = time.time() if now is None else now
+        busy = set(_dorossi_loops) | _dorossi_resume_inflight
+        waiting = set()
+        wanted = False
+        for uid, rec in (state.items() if isinstance(state, dict) else ()):
+            sessions = rec.get("sessions") if isinstance(rec, dict) else None
+            for sid, sess in (sessions.items() if isinstance(sessions, dict) else ()):
+                marker = sess.get("loop_pending") if isinstance(sess, dict) else None
+                if not isinstance(marker, dict) or marker.get("stop") != "usage_wait":
+                    continue
+                key = _dorossi_session_key(uid, sid)
+                waiting.add(key)
+                if (key in busy or _dorossi_session_locked(key)
+                        or not _dorossi_loop_usage_wait_due(marker, now=now)):
+                    continue
+                if (key not in _dorossi_usage_resume_messages
+                        and (uid, sid, marker.get("ts") or 0.0)
+                        in _dorossi_autoresume_reported):
+                    continue
+                wanted = True
+        for key in [k for k in _dorossi_usage_resume_messages if k not in waiting]:
+            _dorossi_usage_resume_messages.pop(key, None)
+        if not wanted or (DOROSSI_MAX_PARALLEL_LOOPS > 0
+                          and len(busy) >= DOROSSI_MAX_PARALLEL_LOOPS):
+            return False
+        _schedule_coro(_dorossi_resume_scan(), label="dorossi-usage-resume")
+        return True
+    except Exception:  # pylint: disable=broad-except
+        traceback.print_exc()
+        return False
 
 
 async def _dorossi_report_autoresume_declined(sids: list) -> None:
@@ -12975,20 +13144,22 @@ def _render_dorossi_local_usage() -> str:
     totals = dorossi_local_usage_totals(time.time())
 
     def _line(label: str, bucket: dict) -> str:
+        suffix = (f"；另有 {bucket['unpriced']} 輪實際費用未知"
+                  if bucket.get("unpriced") else "")
         return (f"{label}：{bucket['tokens']:,} tokens"
-                f"（≈ US${bucket['usd']:,.2f}）")
+                f"（≈ US${bucket['usd']:,.2f}{suffix}）")
 
     return (
         _line("今日", totals["today"]) + "\n"
         + _line("近 7 日", totals["last7d"]) + "\n"
         + _line("累計", totals["lifetime"]) + "\n"
-        "註：金額是後端 CLI 每輪回報的 total_cost_usd 加總（公開費率估算）；"
-        "訂閱方案下不另計費。")
+        "註：金額包含後端回報值與依公開費率換算的估值；"
+        "未知費用未列入金額，實際帳單依登入與計價方案而定。")
 
 
 async def mcmd_tokens(message: discord.Message, rest: str) -> None:
-    """`/dorossi tokens`（限擁有者）— 兩段用量：這支 bot 自己的 Dorossi 花費
-    （含美元估算），加上 Codex 的帳號額度。
+    """`/dorossi tokens`（限擁有者）：本機 Dorossi 用量、Codex 帳號額度
+    與 Antigravity 各模型群組的每週剩餘額度。
 
     **帳號整體用量拿不到**：Claude 那邊的整體用量只有互動式的 `/usage` 指令看得
     到，非互動的 CLI（`-p` 印出模式）會把 `/usage` 當成給模型的話、根本沒有
@@ -13003,7 +13174,8 @@ async def mcmd_tokens(message: discord.Message, rest: str) -> None:
         await safe_reply(message, "用法：`/dorossi tokens`")
         return
 
-    codex_result = await _query_codex_account_usage()
+    codex_result, agy_result = await asyncio.gather(
+        _query_codex_account_usage(), _query_agy_account_usage())
     # 第一段是本程式自算的本機數字（見 `_render_dorossi_local_usage`），不是外部
     # CLI 的逐字輸出，所以不過濾。第二段走 `_format_codex_account_usage`，每個欄位
     # 也都是本程式自己組出來的受控數值，同樣不需要過濾。
@@ -13019,12 +13191,38 @@ async def mcmd_tokens(message: discord.Message, rest: str) -> None:
         "所以上面改列本機自身用量。")
     codex_heading = _owner_detail(
         message, "**Codex 帳號額度**", "**後端帳號額度**")
+    agy_heading = _owner_detail(
+        message, "**Antigravity 額度**", "**後端帳號額度**")
     text = (
         "**本機用量（本 bot 自身花費 · 估算美元）**\n"
         + _render_dorossi_local_usage()
         + "\n\n" + claude_note
-        + "\n\n" + codex_heading + "\n" + codex_result)
+        + "\n\n" + codex_heading + "\n" + codex_result
+        + "\n\n" + agy_heading + "\n" + agy_result)
     await safe_reply(message, text[:2000])
+
+
+async def _query_agy_account_usage() -> str:
+    """Read AGY's standalone usage report and expose validated quota fields."""
+    exe = find_gemini_executable()
+    if not exe:
+        return "查詢失敗：找不到後端 CLI。"
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            exe, "-p", "/usage", "--output-format", "text",
+            "--print-timeout", "30s", stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, cwd=str(PROJECT_ROOT))
+        out, _ = await asyncio.wait_for(proc.communicate(), 35)
+        if proc.returncode != 0:
+            return "查詢失敗，請確認後端 CLI 已登入。"
+        return parse_agy_usage_report(out.decode("utf-8", errors="replace"))
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[tokens] agy /usage failed: {exc!r}", file=sys.stderr)
+        return "查詢失敗，請確認後端 CLI 已登入。"
+    finally:
+        await _reap_usage_query_proc(proc)
 
 
 async def _read_json_response(proc, wanted_ids: set[int], timeout: float) -> dict:
@@ -13184,6 +13382,14 @@ async def _dorossi_cancel_autoresume(uid: str, sids) -> list:
     """把「沒在跑、但等著被自動接續」的任務標成擁有者中止（`_dorossi_mark_loop_aborted`），
     回傳改了哪些 sid。`sids` 為 None ＝這個使用者的全部。正在跑或已經排定接續的不動
     （那些歸 abort 本身處理）。"""
+    return await _dorossi_settle_pending_loops(uid, sids, _dorossi_mark_loop_aborted)
+
+
+async def _dorossi_settle_pending_loops(uid: str, sids, settle) -> list:
+    """把「沒在跑、但等著被自動接續」的任務交給 `settle`（在標記上寫下擁有者的決定：
+    `_dorossi_mark_loop_aborted` 或 `_dorossi_mark_loop_paused`），回傳改了哪些 sid。
+    `sids` 為 None ＝這個使用者的全部。正在跑或已經排定接續的不動（那些歸迴圈自己的
+    abort／讓出處理）。"""
     busy = set(_dorossi_loops) | _dorossi_resume_inflight
 
     def _pending(state: dict) -> list:
@@ -13203,7 +13409,7 @@ async def _dorossi_cancel_autoresume(uid: str, sids) -> list:
     def _mut(state: dict) -> list:
         done = []
         for sid, sess in _pending(state):
-            _dorossi_mark_loop_aborted(sess)
+            settle(sess)
             done.append(sid)
         return sorted(done, key=_dorossi_session_sort_key)
 
@@ -13472,14 +13678,28 @@ async def mcmd_yield(message: discord.Message, rest: str = "") -> None:
         return
 
     arg = rest.strip().lower()
+    uid = str(message.author.id)
+    state = _dorossi_load_state()
+    active = (state.get(uid) or {}).get("active")
+    if arg in ("all", "全部"):
+        pending_sids = None
+    elif _dorossi_is_session_id(arg):
+        pending_sids = [arg]
+    else:
+        pending_sids = [active] if active and not arg else []
+    held = (await _dorossi_settle_pending_loops(uid, pending_sids, _dorossi_mark_loop_paused)
+            if pending_sids != [] else [])
+    if held:
+        _dorossi_event("yield", uid=uid, scope="pending", count=len(held))
+        ids = "、".join(f"`{s}`" for s in held)
+        await safe_reply(message, f"{ids} 已改成暫停，不會再自動接續。"
+                          "換手完成後用 `/dorossi session continue <id>` 接回來。")
     running = list(_dorossi_loops)
     if not running:
-        await safe_reply(message, "目前沒有正在進行的自走任務可以讓出。")
+        if not held:
+            await safe_reply(message, "目前沒有正在進行的自走任務可以讓出。")
         return
 
-    uid = str(message.author.id)
-    state = _dorossi_load_state()   # read-only（容忍瞬間 stale）
-    active = (state.get(uid) or {}).get("active")
     active_key = _dorossi_session_key(uid, active) if active else None
     kind, payload = _dorossi_select_abort_target(running, arg, active_key)
     if kind == "all":
@@ -25115,6 +25335,26 @@ def _own_platform_config() -> dict:
     return {ACTIVE_PLATFORM: section} if section else {}
 
 
+def _text_command_hints() -> dict[str, str]:
+    """Slash command -> its text command (`/gen pause` -> `!pause`), for rewriting hints on
+    platforms without a slash menu.
+
+    Only **one-to-one** aliases: `extras["bang"]` belongs to this slash command alone. Shared
+    aliases are deliberately left out (`!win` stands for ten `/win ...`) -- the text surface
+    reads the sub-command as an argument, and not always under the same word
+    (`/win state close` is `!win close` there), so a mechanical mapping would teach a form
+    that does not work; those hints stay in slash form.
+    """
+    owners: dict[str, list[str]] = {}
+    for command in tree.walk_commands():
+        if isinstance(command, discord.app_commands.Group):
+            continue
+        bang = command.extras.get("bang")
+        if isinstance(bang, str) and bang.startswith("!"):
+            owners.setdefault(bang, []).append("/" + command.qualified_name)
+    return {slashes[0]: bang for bang, slashes in owners.items() if len(slashes) == 1}
+
+
 def _build_chat_transports() -> None:
     """第一次 `on_ready` 時建一次。沒設定的平台安靜缺席，整支永不 raise。"""
     global _chat_transports
@@ -25128,6 +25368,7 @@ def _build_chat_transports() -> None:
             handle_message=dispatch_external_message,
             project_root=PROJECT_ROOT,
             on_recovered=_dorossi_outbox_flush,
+            text_commands=_text_command_hints(),
         )
         _chat_transports = _chat_platform.build_transports(context)
     except Exception as error:  # pylint: disable=broad-except

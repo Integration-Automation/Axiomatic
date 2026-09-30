@@ -441,6 +441,8 @@ through the text surface instead. That surface is documented for those
 platforms only, in [`docs/platforms.md`](docs/platforms.md); where a slash menu
 exists, slash commands remain the only advertised interface.
 
+On those platforms the command hints in the bot's replies are rewritten into the text-command form automatically (for commands that have a one-to-one text command).
+
 ---
 
 <!-- section: batch-behaviour -->
@@ -527,6 +529,15 @@ once — **including ones you aborted**; archive a session with
 plan usage limit **parks itself** in the queue with a wall-clock re-run time and
 comes back on its own — `/dorossi queue show` lists parked turns and
 `/dorossi queue remove` (by id) cancels one.
+
+`/dorossi ai` accepts `claude`, `codex`, or `gemini`. Gemini uses a signed-in
+Antigravity CLI (`agy`) and requires `dorossi_cc_tools=full`; its tool isolation
+cannot be guaranteed in `off` mode. `/dorossi tokens` shows its reported quota
+alongside local token usage. When an autonomous loop reaches the plan usage
+limit, it saves the interrupted round, releases its slot, and resumes at the
+scheduled time. It can resume after a bot restart when the platform can recover
+the original message; otherwise use `/dorossi session continue`. `/dorossi yield`
+holds a saved loop for manual continuation.
 
 **See what the machine is doing.** While a long batch runs, this shows the
 browser's memory, the batch runtime and how much RAM and disk are left — the OS

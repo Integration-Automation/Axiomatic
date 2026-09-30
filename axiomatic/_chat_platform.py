@@ -52,9 +52,11 @@ import abc
 import asyncio
 import hashlib
 import importlib
+import re
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Iterable
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 # One row per new platform. **This list is the sole entry point for
 # registration**: `build_transports()` only imports the modules listed here, and
@@ -107,6 +109,9 @@ class PlatformCapabilities:
     read_attachments: bool = False
     text_limit: int = 2000
     file_bytes_limit: int = 0
+    # Whether the platform has a native slash menu. Without one, the command hints the bot
+    # sends are rewritten into text commands at send time (see `rewrite_command_hints`).
+    slash_commands: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +323,15 @@ def flatten_embed(embed: Any) -> str:
     return "\n".join(lines)
 
 
+def outbound_text(content: Any = None, embed: Any = None) -> str:
+    """The plain text of a send: `content` followed by the flattened embed."""
+    text = "" if content is None else str(content)
+    extra = flatten_embed(embed)
+    if extra:
+        text = f"{text}\n{extra}".strip() if text else extra
+    return text
+
+
 def outbound_parts(content: Any = None, *, embed: Any = None, file: Any = None,
                    files: Any = None) -> tuple[str, list[OutboundFile]]:
     """Normalise the handler's send arguments into `(text, attachment list)`.
@@ -326,16 +340,55 @@ def outbound_parts(content: Any = None, *, embed: Any = None, file: Any = None,
     across two hundred-plus places in the module, and rewriting each one to be
     platform-neutral is impossible; so the normalisation lives in this one place.
     """
-    text = "" if content is None else str(content)
-    extra = flatten_embed(embed)
-    if extra:
-        text = f"{text}\n{extra}".strip() if text else extra
+    text = outbound_text(content, embed)
     out: list[OutboundFile] = []
     for one in ([file] if file is not None else []) + list(files or []):
         parsed = _read_outbound_file(one)
         if parsed is not None:
             out.append(parsed)
     return text, out
+
+
+# ---------------------------------------------------------------------------
+# Command hints on platforms without a slash menu
+# ---------------------------------------------------------------------------
+# Usage text the bot sends is always written in slash form (`CLAUDE.md` DoD #3), and on a
+# platform without a slash menu that cannot be typed -- the only entry point there is the
+# text command (`docs/platforms.md`). So at send time, at this one choke point
+# (`ChatConversation.send` and `SentChatMessage.edit`), a backticked slash command is
+# replaced with its text command. The table (`/gen pause` -> `!pause`) is derived by the bot
+# from the command tree and handed to every transport through
+# `TransportContext.text_commands`; it holds one-to-one aliases only, see
+# `discord_bot._text_command_hints`.
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+# Slash commands are at most three words deep (group / subgroup / command), so the
+# longest-prefix match only has to try three.
+_MAX_COMMAND_WORDS = 3
+
+
+def rewrite_command_hints(text: str, text_commands: Mapping[str, str]) -> str:
+    """Rewrite a backticked hint that starts with a slash command into its text command,
+    keeping the arguments after it.
+
+    Longest prefix, on word boundaries: `` `/gen pause after <N>` `` -> `` `!pause after <N>` ``.
+    Anything not in the table (no text command, a shared alias, a typo) is left as written --
+    a wrong rewrite is worse than none. Text outside backticks is untouched, and rewriting a
+    rewritten text changes nothing.
+    """
+    if not text_commands or "`/" not in text:
+        return text
+
+    def _span(match: re.Match) -> str:
+        words = match.group(1).split(" ")
+        if not words[0].startswith("/"):
+            return match.group(0)
+        for count in range(min(len(words), _MAX_COMMAND_WORDS), 0, -1):
+            bang = text_commands.get(" ".join(words[:count]))
+            if bang:
+                return "`" + " ".join([bang, *words[count:]]) + "`"
+        return match.group(0)
+
+    return _CODE_SPAN_RE.sub(_span, text)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +497,11 @@ class ChatConversation:
         return self._transport
 
     async def send(self, content: Any = None, **kwargs) -> "SentChatMessage | None":
+        hints = getattr(self._transport, "text_commands", None)
+        if hints and not self.capabilities.slash_commands and (
+                content is not None or kwargs.get("embed") is not None):
+            content = rewrite_command_hints(
+                outbound_text(content, kwargs.pop("embed", None)), hints)
         return await self._transport.deliver(self, content, **kwargs)
 
     def typing(self) -> _TypingScope:
@@ -527,6 +585,9 @@ class SentChatMessage:
             raise UnsupportedOperation(
                 f"{self.channel.transport.name} cannot edit a sent message")
         text = "" if content is None else str(content)
+        if not self.channel.capabilities.slash_commands:
+            text = rewrite_command_hints(
+                text, getattr(self.channel.transport, "text_commands", None) or {})
         if text == self._content:
             return self
         await self.channel.transport.revise(self, text, **kwargs)
@@ -635,6 +696,9 @@ class TransportContext:
     # Called once when the platform reconnects after a disconnect (to send parked
     # answers). Must not raise, must not block receiving.
     on_recovered: Callable[[], Awaitable[None]] | None = None
+    # Slash command -> text command (`/gen pause` -> `!pause`), for rewriting command hints on
+    # platforms without a slash menu. `build_transports` hands it to every transport.
+    text_commands: dict = field(default_factory=dict)
 
 
 class ChatTransport(abc.ABC):
@@ -648,6 +712,9 @@ class ChatTransport(abc.ABC):
     """
 
     name: str = "chat"
+    # Set by `build_transports` from `TransportContext.text_commands`; a read-only empty table
+    # is the default.
+    text_commands: Mapping[str, str] = MappingProxyType({})
 
     @property
     @abc.abstractmethod
@@ -784,6 +851,7 @@ def build_transports(context: TransportContext) -> list[ChatTransport]:
     next reconnect tries again).
     """
     import_transport_modules()
+    hints = MappingProxyType(dict(context.text_commands or {}))
     built: list[ChatTransport] = []
     for name in sorted(_FACTORIES):
         try:
@@ -793,5 +861,6 @@ def build_transports(context: TransportContext) -> list[ChatTransport]:
                   file=sys.stderr)
             continue
         if transport is not None:
+            transport.text_commands = hints
             built.append(transport)
     return built

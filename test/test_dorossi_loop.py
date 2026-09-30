@@ -20,6 +20,7 @@ import ast
 import asyncio
 import os
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -150,6 +151,7 @@ def loop_env(monkeypatch):
     env.placeholder = types.SimpleNamespace(id=1)
 
     monkeypatch.setattr(b, "_dorossi_loops", {})
+    monkeypatch.setattr(b, "_dorossi_usage_resume_messages", {})
     monkeypatch.setattr(b, "_dorossi_state_rmw", fake_rmw)
     monkeypatch.setattr(b, "safe_reply", fake_safe_reply)
     monkeypatch.setattr(b, "_DorossiLiveMessage", _FakeLive)
@@ -181,6 +183,54 @@ def _run(env, **kwargs):
     except _LoopHalt:
         env.halted = True
     return env
+
+
+def test_switch_during_final_round_hands_task_to_selected_backend(loop_env):
+    b.DOROSSI_LOOP_EXHAUSTION_ROUNDS = 1
+    def switch_while_running(_st):
+        _slot(loop_env)["ai_provider"] = "codex"
+        return ("done " + SENTINEL, "cc-new", {})
+
+    loop_env.rounds = [switch_while_running, _work()]
+    _run(loop_env)
+    assert loop_env.halted, "The old backend's completion ended the task"
+    assert loop_env.played[0][1]["backend"] == "claude_code"
+    assert loop_env.played[1][1]["backend"] == "codex"
+    assert "整理測試" in loop_env.played[1][0]
+    assert _slot(loop_env)["loop_pending"]["last_backend"] == "codex"
+
+
+def test_resume_uses_the_selected_backends_session_id():
+    slot = {"loop_pending": {"task": "finish this", "last_backend": "claude_code"},
+            "cc_session_id": "old-claude", "ai_provider": "codex"}
+    assert db._dorossi_loop_resume_plan(slot) == ("fresh", "finish this")
+    db._dorossi_mark_loop_pending(slot, "")
+    assert slot["loop_pending"]["last_backend"] == "claude_code"
+    slot["codex_session_id"] = "current-codex"
+    assert db._dorossi_loop_resume_plan(slot) == ("continue", None)
+
+
+def test_ai_command_switches_a_running_session_without_stopping_it(monkeypatch):
+    uid = str(b.DOROSSI_USER_ID)
+    state = {uid: {"active": "s1", "sessions": {"s1": {"ai_provider": "claude"}}}}
+    key = b._dorossi_session_key(uid, "s1")
+    running = object()
+    replies = []
+
+    async def rmw(mutate):
+        return mutate(state)
+
+    async def reply(_message, content):
+        replies.append(content)
+
+    monkeypatch.setattr(b, "_dorossi_loops", {key: running})
+    monkeypatch.setattr(b, "_dorossi_state_rmw", rmw)
+    monkeypatch.setattr(b, "safe_reply", reply)
+    message = types.SimpleNamespace(author=types.SimpleNamespace(id=b.DOROSSI_USER_ID))
+    asyncio.run(b.mcmd_ai(message, "codex"))
+    assert state[uid]["sessions"]["s1"]["ai_provider"] == "codex"
+    assert b._dorossi_loops[key] is running
+    assert "後續回合" in replies[0]
 
 
 def _slot(env):
@@ -546,34 +596,77 @@ def test_an_injection_at_the_boundary_stops_the_loop_from_stopping(loop_env):
 # 等待：用量上限、輸出靜默
 # --------------------------------------------------------------------------
 
-def test_a_usage_limit_saves_the_round_id_before_waiting(loop_env):
-    """撞到方案用量上限時，**先把後端當下的工作階段 id 寫回 slot 再去等**。
+def _limit(session_id="cc-mid", reset_at=None):
+    return b._DorossiUsageLimitError("limit", None, session_id=session_id,
+                                     reset_at=reset_at)
 
-    用量上限幾乎都是「做到一半」才撞上。不寫回去的話，額度回來之後 resume 的是
-    **上一輪**的舊 id，這一輪做完的事全部白做——而且不會有任何錯誤訊息，只是進度
-    莫名其妙倒退。
+
+def _pending(env):
+    return _slot(env)["loop_pending"]
+
+
+def _resume(env, rounds):
+    """用 `/dorossi session continue` 那一條路的參數再跑一次（脈絡還在）。"""
+    env.played.clear()
+    env.rounds = rounds
+    return _run(env, already_ran_first=True, resuming=True)
+
+
+def test_a_usage_limit_saves_the_task_and_ends_the_loop(loop_env):
+    """撞到方案用量上限：**先把後端當下的工作階段 id 寫回 slot**，再把接續需要的東西存進
+    標記，然後**結束迴圈**——不原地等（2026-09-26 擁有者要求）。
+
+    用量上限幾乎都是「做到一半」才撞上，不寫回 id 的話接回來 resume 的是上一輪的舊 id，
+    這一輪做完的事全部白做。原地等的那一版一次等五、六個小時，整段握著這個對話的鎖、
+    並行名額與電源要求；現在迴圈離開 registry、`finally` 放掉那些，到點由自動接續接回來。
     """
-    limit = b._DorossiUsageLimitError("limit", None, session_id="cc-mid")
-    seen = []
-    loop_env.rounds = [limit, _record_slot_id(loop_env, seen), _finished()]
+    reset_at = time.time() + 3600
+    loop_env.rounds = [_work(), _limit(reset_at=reset_at)]
     _run(loop_env)
-    assert seen == ["cc-mid"], (
-        f"等額度回來之前沒有保住這一輪推進到的工作階段：{seen}")
-    assert loop_env.waits, "沒有進入等待"
+    assert not loop_env.halted and len(loop_env.played) == 2
+    assert loop_env.waits == [], "撞到用量上限還是原地等了"
+    key = b._dorossi_session_key(UID, SID)
+    assert key not in b._dorossi_loops, "迴圈沒有收掉，名額還佔著"
+    assert _slot(loop_env)["cc_session_id"] == "cc-mid", (
+        "沒有保住這一輪推進到的工作階段——接回來會 resume 上一輪的舊 id")
+    marker = _pending(loop_env)
+    assert marker["stop"] == "usage_wait" and marker["live"] is False
+    assert marker["resume_prompt"] == loop_env.played[1][0], "存下的不是撞到上限的那一輪"
+    assert marker["usage_waits"] == 1
+    assert marker["resume_at"] >= reset_at, "排定的接續時刻早於後端說的重設時刻"
+    assert b._dorossi_usage_resume_messages[key] is loop_env.message, (
+        "這個行程裡到點接續要用原本那則訊息")
+    said = _said(loop_env)
+    assert "自動續跑" in said and f"/dorossi session continue {SID}" in said, said
     assert any(kind == "usage_wait" for kind, _ in loop_env.events)
 
 
-def test_waiting_for_quota_is_not_counted_as_a_round_without_progress(loop_env):
-    """等待不是「沒有進展」，是「還不能動」——不可以推進 exhaustion 計數。
-
-    門檻設 2。腳本是「撞上限 → 自報完成 → 自報完成」：若等待被算成一次沒有進展，
-    迴圈會在第二個自報完成之前就停掉，於是一個只是在等額度的任務被當成做完了。
-    """
-    limit = b._DorossiUsageLimitError("limit", None, session_id="cc-mid")
-    loop_env.rounds = [limit, _finished(), _finished()]
+def test_the_resumed_task_reruns_the_round_that_hit_the_limit(loop_env):
+    """接回來先重跑撞到上限的那一輪（跟原地等待那一版等完之後一樣），而且等待不算
+    「沒有進展」：門檻設 2，接回來之後要真的跑滿兩個自報完成才停。"""
+    loop_env.rounds = [_work(), _limit()]
     _run(loop_env)
-    assert len(loop_env.played) == 3, (
-        f"等待被算進 exhaustion 了：只跑了 {len(loop_env.played)} 輪")
+    interrupted = loop_env.played[1][0]
+    _resume(loop_env, [_finished(), _finished()])
+    assert not loop_env.halted
+    assert loop_env.played[0][0] == interrupted, "接回來沒有重跑撞到上限的那一輪"
+    assert len(loop_env.played) == 2, "等待被算進 exhaustion 了"
+    assert "loop_pending" not in _slot(loop_env), "做完了標記還在"
+
+
+def test_the_backoff_keeps_growing_across_resumes_until_a_round_succeeds(loop_env):
+    """沒有重設時刻時用退避探測。接續後的迴圈要從存下的次數接著算，否則每次都只等最短
+    那一格，一個五小時的視窗會被拆成二十次無效探測。有一輪跑完才歸零。"""
+    loop_env.rounds = [_limit()]
+    _run(loop_env)
+    assert _pending(loop_env)["usage_waits"] == 1
+    _resume(loop_env, [_limit()])
+    assert _pending(loop_env)["usage_waits"] == 2, "接續後退避倍數從頭算了"
+    first, second = [data["delay"] for kind, data in loop_env.events
+                     if kind == "usage_wait"]
+    assert second > first, (first, second)
+    _resume(loop_env, [_work(), _limit()])
+    assert _pending(loop_env)["usage_waits"] == 1, "有一輪跑完了卻沒有歸零"
 
 
 def test_output_silence_retries_before_giving_up(loop_env):
@@ -714,37 +807,67 @@ def test_an_abort_during_a_quota_wait_ends_the_loop_quietly(loop_env):
     assert _slot(loop_env)["loop_pending"].get("live") is False
 
 
-def test_messages_added_during_a_quota_wait_are_folded_into_the_next_round(
-        loop_env):
-    """一次數小時的等待是最可能有人插話的窗口，直接丟掉會讓那些話等到下一輪邊界。
+def _limit_with_note(note="順便看一下設定檔", session_id="cc-mid"):
+    """擁有者的補充還在注入緩衝裡（還沒到回合邊界），這一輪就撞上了用量上限。"""
+    def _step(st):
+        st.injections.append(note)
+        return _limit(session_id=session_id)
+    return _step
 
-    2026-09-19 實測：擁有者在等待期間補了一句，只收到「下一輪會帶進去」，而下一輪
-    在兩小時後。等完要先 drain 再重跑，而且要說一聲帶進去了幾則。
-    """
-    loop_env.inject_during_wait = ["順便看一下設定檔"]
-    loop_env.rounds = [b._DorossiUsageLimitError("limit", None), _finished(),
-                       _finished()]
+
+def test_notes_waiting_in_the_buffer_are_saved_and_lead_the_resumed_round(loop_env):
+    """收掉迴圈就沒有注入緩衝了——還沒帶入的補充要跟著存下來，接回來當第一輪（跟原地
+    等待那一版等完之後一樣：有補充就用補充，取代重跑）。一則都不能掉，也不能被當成收尾
+    時的殘留（「最後的補充未帶入」）丟掉。"""
+    loop_env.rounds = [_limit_with_note()]
     _run(loop_env)
-    assert "順便看一下設定檔" in loop_env.played[1][0], (
-        "等待期間補的話沒有折進等完之後那一輪")
-    assert "已帶入你補充的 1 則訊息" in _said(loop_env)
+    assert _pending(loop_env)["resume_inject"] == ["順便看一下設定檔"]
+    said = _said(loop_env)
+    assert "你補充的 1 則訊息" in said and "未帶入" not in said, said
+    _resume(loop_env, [_finished(), _finished()])
+    assert "順便看一下設定檔" in loop_env.played[0][0], "存下的補充沒有帶進接回來的那一輪"
+
+
+def test_a_limit_before_any_context_restarts_the_task_and_keeps_the_notes(loop_env):
+    """撞上限時後端還沒給過工作階段（脈絡不在）：接回來用原任務重新起跑，存下的補充排到
+    第一輪之後的回合邊界，不能因為走了「重新起跑」那條路就丟掉。"""
+    _slot(loop_env).pop("cc_session_id")
+    loop_env.rounds = [_limit_with_note("補一句", session_id=None)]
+    _run(loop_env)
+    loop_env.played.clear()
+    loop_env.rounds = [_work(), _finished(), _finished()]
+    _run(loop_env, resuming=True)
+    assert "整理測試" in loop_env.played[0][0], "沒有用原任務重新起跑"
+    assert "補一句" in loop_env.played[1][0], "存下的補充在重新起跑之後掉了"
+
+
+def test_a_new_task_on_the_same_session_does_not_rerun_the_old_round(loop_env):
+    """存下的接續內容只給「接續」那一條路。同一個對話上起一個**新**任務（或自判轉進）
+    是別的請求，重跑上一個任務撞到上限的那一輪是錯的。"""
+    loop_env.rounds = [_limit_with_note()]
+    _run(loop_env)
+    loop_env.played.clear()
+    loop_env.rounds = [_finished(), _finished()]
+    _run(loop_env)
+    assert "順便看一下設定檔" not in loop_env.played[0][0]
+    assert "整理測試" in loop_env.played[0][0]
 
 
 def test_the_owner_can_cap_how_many_times_it_waits_for_quota(loop_env,
                                                              monkeypatch):
     """預設 0 ＝不設限（擁有者裁決：不得有回合／花費類上限；等待本身不花錢）。
 
-    設定檔開了保底上限才會走到這條路，而走到的時候要留著標記——這是「暫停」，
-    不是「做完了」。
+    設定檔開了保底上限才會走到這條路：次數跨接續累加，超過時記成 `usage`（不自動接），
+    標記要留著——這是「暫停」，不是「做完了」。
     """
     monkeypatch.setattr(b, "DOROSSI_USAGE_WAIT_MAX_CONSECUTIVE", 1)
-    loop_env.rounds = [b._DorossiUsageLimitError("limit", None),
-                       b._DorossiUsageLimitError("limit", None),
-                       _finished()]
+    loop_env.rounds = [_limit()]
     _run(loop_env)
-    assert not loop_env.halted
-    assert len(loop_env.played) == 2, "超過上限之後還繼續等"
-    assert isinstance(_slot(loop_env).get("loop_pending"), dict)
+    assert _pending(loop_env)["stop"] == "usage_wait"
+    _resume(loop_env, [_limit()])
+    marker = _pending(loop_env)
+    assert marker["stop"] == "usage", "超過上限之後還排了自動接續"
+    assert not db._dorossi_loop_marker_wants_autoresume(marker)
 
 
 def test_transient_failures_give_up_after_the_configured_streak(loop_env):

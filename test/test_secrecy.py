@@ -155,6 +155,12 @@ _BANNED_WORDS = [
     # 在那兩處出現通用用法的機率低到可以接受；真的誤報了，處置是改那句話，不是
     # 把字從這裡拿掉。
     "opus", "sonnet", "haiku", "fable",
+    # The third conversation backend (added 2026-10-01): its alias and the names of
+    # the service / CLI behind it. The alias is sanctioned in
+    # `_ALLOWED_BACKEND_ALIASES` (a legal value of `/dorossi ai`); the service and CLI
+    # names are not -- they belong only in owner-only detail (`_owner_detail`) and
+    # stderr.
+    "gemini", "antigravity",
 ]
 
 # 允許清單。每一筆都要寫「為什麼這不是洩漏」或「為什麼現在不改」。
@@ -168,7 +174,7 @@ _BANNED_WORDS = [
 # 2026-07-02 對 `/model` 開的窄範圍例外同一性質（功能面需要讓使用者打得出合法
 # 值），但那條例外寫明「僅此一處，不得外推」，所以同樣列管在這裡而不是擴大解釋。
 _ALLOWED_COMMAND_NAME_WORDS = {"booru", "safebooru", "e621", "iqdb"}
-_ALLOWED_BACKEND_ALIASES = {"claude", "codex"}
+_ALLOWED_BACKEND_ALIASES = {"claude", "codex", "gemini"}
 # `/model` 的合法值。與上一份同屬 2026-07-02 的窄範圍例外，但**是兩份而不是一份**：
 # `/dorossi ai` 收後端別名、`/model` 收模型別名，兩邊的合法值來源不同，反查也要各查
 # 各的來源。

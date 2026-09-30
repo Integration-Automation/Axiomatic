@@ -450,7 +450,6 @@ def test_a_loop_shows_its_round_and_its_own_cap(registry, monkeypatch):
 
 
 @pytest.mark.parametrize("setup, expect", [
-    (lambda st: setattr(st, "usage_waiting", True), "正在等方案用量重設"),
     (lambda st: setattr(st, "wait_deadline", time.monotonic() + 90), "等待自動重試"),
     (lambda st: setattr(st, "compacting", True), "壓縮"),
     (lambda st: setattr(st, "abort", True), "中止中"),
@@ -732,3 +731,22 @@ def test_a_power_failure_never_stops_the_work(power, monkeypatch):
     b._dorossi_work_started("turn", (UID, "s1"))
     b._dorossi_work_finished("turn", (UID, "s1"))
     assert b._dorossi_power_holds == {}
+
+
+def test_a_task_saved_for_the_quota_is_listed_with_its_resume_time(registry):
+    """撞到方案用量上限而存檔停下的自走任務不在跑，但到點會自己接回來——跟停放的提問同一個
+    性質，所以要列出來（哪個對話、幾點），否則 `/dorossi running` 看起來是空的，幾小時後
+    卻憑空冒出一個自走任務。別種停下來的任務不列。"""
+    now = time.time()
+    state = _report_state()
+    sessions = state[UID]["sessions"]
+    sessions["s7"] = {"loop_pending": {"ts": now, "task": "t", "live": True}}
+    db._dorossi_mark_loop_usage_wait(sessions["s7"], resume_at=now + 3600, usage_waits=1,
+                                     resume_prompt="p", injections=[])
+    sessions["s8"] = {"loop_pending": {"ts": now, "task": "t", "live": False,
+                                       "stop": "network"}}
+    text = b._dorossi_running_report(state, _msg(), now=now)
+    line = next(line for line in text.splitlines() if "等方案用量重設" in line)
+    assert "自走任務" in line and "1 件" in line and "`s7`" in line, line
+    assert b._dorossi_reset_clock(now + 3600, now=now) in line, line
+    assert "`s8`" not in text, text

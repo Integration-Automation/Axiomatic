@@ -112,7 +112,10 @@ bot runtime 設定，**啟動時讀一次**，改了要 `/sys restart` 才生效
   失敗（每輪跑很久卻毫無產出）由後者擋
 - `dorossi_*` — Dorossi 問答功能的整組設定（後端選擇、工具模式、看門狗
   上限、後端回合與自走任務的並行上限等），完整清單與各鍵語意見 README /
-  COMMANDS.md
+  COMMANDS.md。選用 Gemini 時須安裝並登入 Antigravity CLI（`agy`），且設
+  `dorossi_cc_tools=full`；`off` 模式不能保證工具隔離，因此會拒絕 Gemini 回合。
+  自走任務遇到方案用量上限會把進度與續跑時刻寫進工作階段狀態，釋放並行名額，
+  到時由自動接續機制恢復；bot 重啟後須能從平台找回原訊息，否則需手動接續。
 - `gui_control` — `launch_whitelist`（exe 名稱 / 路徑）與 `launch_aliases`
   （自訂名稱 → 目標），`/proc launch` 用。兩者皆空時 `/proc launch` 停用（防 token 外洩）
 

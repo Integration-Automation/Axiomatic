@@ -1,10 +1,10 @@
 # 工作進度
 
-本檔只列未完成工作；跨專案順序見 `../progress.md`。
+本檔只列未完成工作；跨專案順序見 `../progress.md`（X-20 同步、X-25 Redis、X-26 2026-10-01 這一批）。
 
 ## 待辦
 
-- 2026-10-01 **（擁有者交辦的一批：本筆與下面十筆，和 Jeffrey_RPA `Progress.md` 同日那批一一對應；跨專案順序見根目錄 `progress.md` X-26）先收掉主工作樹裡沒提交的兩批移植，並把本機 `main` 接上 `origin/main`。** 一批是 `rewrite_command_hints`（2026-09-25 起，`axiomatic/_chat_platform.py`、`axiomatic/discord_bot.py`、`test/test_bot_helpers.py`、`test/test_platform_transports.py`、`CLAUDE.md`、`docs/platforms.md` 等），一批是第三個對話後端（2026-09-28，未追蹤的 `axiomatic/_dorossi_gemini.py`、`test/test_dorossi_gemini.py`，連帶 `dorossi_backend.py`、`gen_command_docs.py`、四份 README、`architecture.md`、`commands/dorossi.md`）。本機 `main` 還落後 `origin/main` 一個提交（`5fcd721`），而它改的 `dorossi_backend.py` 正在上面那批裡，所以現在連快轉都做不了。下面多筆都要改同一批檔。完成條件：兩批各自提交、接上 `origin/main` 後推送，`git status` 乾淨。
+- 2026-10-01 **第三個對話後端把提示整段放在命令列，長提示會超過 Windows 的上限。** `axiomatic/_dorossi_gemini.py` 的 `gemini_argv` 用 `-p <prompt>`，命令列上限是 32,767 字元；與 Jeffrey_RPA `Progress.md` 同名那筆一起做（改成從 stdin 送，先實測 `--input-format stream-json` 的訊息格式）。完成條件：超過 32k 的提示跑得動；`test_dorossi_gemini.py` 釘住 argv 裡不再出現提示本文。
 - 2026-10-01 **（移植）`/dorossi model` 顯示完整的模型版本號。** 等 Jeffrey_RPA 做完再移植。Axiomatic 的差異：模型目錄是逐平台的（`DOROSSI_MODEL_CATALOG_FILE` 經 `_platform_state` 落在 `state/<平台>/`），完整 id 從**這個平台行程**的目錄讀；露出規則一樣經 `_owner_detail()`，每個平台的擁有者由 `_chat_platform.resolve_identity()` 映射。完成條件：每個後端各測一次查詢與設定；四份 README、三語 help、`COMMANDS.md`、`docs/commands_*.md` 跟著改，`commands/*.md` 用產生器重產。
 - 2026-10-01 **（移植）新增列出所有支援模型的指令（暫定 `/dorossi model_list`，名稱跟 Jeffrey_RPA 定案的一致）。** Axiomatic 的差異：目錄逐平台，列出的「目錄新增的別名」與最後檢查時間都是這個平台行程自己的；兩個平台的目錄可能不同步，回覆要標明是哪個平台看到的。完成條件同上一筆，測試另涵蓋兩個平台目錄內容不同的情形。
 - 2026-10-01 **（移植・UI 重新設計之一）重做本機儀表板網頁。** Axiomatic 的差異：`axiomatic/dashboard_server.py` 一次只看一個平台（`--platform`／`AXIOMATIC_PLATFORM`，狀態經 `_platform_state`），新版面要能切換平台或並列所有開著的平台；全機共用的批次只有一份，不要按平台重複顯示。完成條件：兩個平台同時開著時實際開過；`test_dashboard_server.py` 綠；四份 README 的儀表板段落更新。
@@ -15,3 +15,5 @@
 - 2026-10-01 **（移植）Bot 的桌面自動化完全改走 AutoControlGUI（je_auto_control）。** Axiomatic 的差異：它用套件庫上的 je_auto_control，Jeffrey_RPA 那邊補進函式庫的功能要先發版，再拉 `requirements.txt` 的下限；`axiomatic/_gui_control.py` 的盤點照 Jeffrey_RPA 那張表，但要另外核對已翻成英文的 `GuiError` 訊息仍然泛用（不帶主機路徑、服務名、原始例外）。完成條件：`test_gui_control.py`、`test_gui_facade.py` 綠；`architecture.md` 記盤點結果。
 - 2026-10-01 **（移植）儀表板內嵌指令主控台。** Axiomatic 的差異最大：一個平台一個受監督的行程，所以主控台在這裡是一個新平台（`dashboard`），由 `start_platforms.py` 起它自己的行程、狀態放在 `state/dashboard/`。但 `_platform_runtime.py` 的第 3 點規定「沒填 `<平台>_bot_token.md` 的平台視為不存在」，而本機主控台沒有憑證可填——要先決定它的啟用訊號（例如設定鍵），並把那條約定改寫成涵蓋這個例外，不能讓啟動器對它每次抱怨或安靜地不起。CSRF 防護、只綁 loopback、預設關閉照 Jeffrey_RPA 那筆。完成條件：擁有者從網頁下指令成功、沒列在 `platforms.dashboard.owner_user_ids` 的身分被擋；跨站表單被拒的測試；`docs/platforms.md`、四份 README、`architecture.md`（含 §6 若影響跨專案約定）更新。
 - 2026-10-01 **補充完整文件。** 現況量測（2026-10-01）：`bot_config.example.json` 的 24 個鍵裡有 9 個沒出現在 `docs/config.md`；`docs/` 同樣缺儀表板、桌面自動化與巨集、Dorossi 的專頁。要做：補齊設定鍵說明並加一支兩向對帳的測試（範例檔的每個鍵都要在 `docs/config.md` 出現）；補專頁接進 toctree，四份 README 章節對齊。完成條件：新測試綠、Sphinx 建置沒有新警告、四份 README 結構一致。
+
+- 2026-09-27 **規劃導入 Redis，先選可恢復的 Dorossi 工作佇列試點。** 盤點 `axiomatic/discord_bot.py` 的佇列讀寫與還原、`axiomatic/_platform_runtime.py` 的逐平台狀態路徑、`axiomatic/dashboard_server.py` 的佇列計數，以及批次側 `axiomatic/_queue_consume.py` 的檔案契約；記錄跨平台並行、重啟、重試、取消與停放到期的現況和基準量測。儲存介面須以平台身分隔離鍵名，讓每個平台行程只領自己的工作；全機共用批次維持唯一擁有者。試點定義工作 ID、租約、確認、重試上限、死信與冪等鍵，完成舊 NDJSON 匯入、雙讀核對、切換與回退演練。完成條件：多平台並行、行程重啟、重複領取及 Redis 中斷時沒有漏單或重複提交，指令與儀表板數字一致；測試涵蓋平台隔離和舊資料，並同步更新架構、設定、安裝與使用文件。四個可人工編輯的批次佇列與續跑檢查點另行評估。

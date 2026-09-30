@@ -74,6 +74,7 @@ from _bot_prompts import load_prompt
 # round; without dedup an unchanged environment variable would wash out the whole
 # log with the same line.
 from _warn_dedup import warn_once as _warn_once
+from _dorossi_gemini import find_gemini_executable, via_gemini as _gemini_turn
 # This process's platform identity. The sessions, usage log, model catalogue and
 # working directory are all **this process's own** state, so they always land
 # under `state/<platform>/` -- one process per platform, sharing no mutable state
@@ -217,6 +218,19 @@ DOROSSI_CODEX_MODEL_CHOICES = {
     "sol": "sol",
     "sol-5.6": "gpt-5.6-sol",
 }
+DOROSSI_GEMINI_MODEL_CHOICES = {
+    "gemini-3.8-flash-high": "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium": "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low": "gemini-3.8-flash-low",
+    "gemini-3.7-flash-high": "gemini-3.7-flash-high",
+    "gemini-3.7-flash-medium": "gemini-3.7-flash-medium",
+    "gemini-3.7-flash-low": "gemini-3.7-flash-low",
+    "gemini-3.6-flash-high": "gemini-3.6-flash-high",
+    "gemini-3.6-flash-medium": "gemini-3.6-flash-medium",
+    "gemini-3.6-flash-low": "gemini-3.6-flash-low",
+    "gemini-3.1-pro-high": "gemini-3.1-pro-high",
+    "gemini-3.1-pro-low": "gemini-3.1-pro-low",
+}
 
 # backend id -> its model table. `/model` offers and accepts only values the
 # current backend can take.
@@ -224,20 +238,22 @@ DOROSSI_BACKEND_MODEL_CHOICES = {
     "claude_code": DOROSSI_MODEL_CHOICES,
     "api": DOROSSI_MODEL_CHOICES,
     "codex": DOROSSI_CODEX_MODEL_CHOICES,
+    "gemini": DOROSSI_GEMINI_MODEL_CHOICES,
 }
 # Model-catalogue namespaces: the two backends share the claude table, so they
 # also share the same discovery results.
 DOROSSI_MODEL_NAMESPACES = {
     "claude_code": "claude", "api": "claude", "codex": "codex",
+    "gemini": "gemini",
 }
-# **Only this backend's own CLI understands a bare alias** (`--model opus` = "the
-# current newest in this family"). The other two need a full id: api passes the
-# string straight through as the model parameter into the SDK, and codex sends it
-# straight to the server (measured: an unrecognised name is not dropped to the
-# default but returns a 400). So a bare alias must first be turned into a
-# concrete id by the model catalogue for those two backends -- the second reason
-# the daily check exists.
-DOROSSI_BACKENDS_RESOLVING_ALIASES = frozenset({"claude_code"})
+# **Only these backends' own CLIs understand a bare alias** (`--model opus` = "the
+# current newest in this family"; the third backend's aliases are its full ids).
+# The other two need a full id: api passes the string straight through as the
+# model parameter into the SDK, and codex sends it straight to the server
+# (measured: an unrecognised name is not dropped to the default but returns a
+# 400). So a bare alias must first be turned into a concrete id by the model
+# catalogue for those two backends -- the second reason the daily check exists.
+DOROSSI_BACKENDS_RESOLVING_ALIASES = frozenset({"claude_code", "gemini"})
 
 # ---- Runtime model catalogue (written by the daily check, merged back into the
 # built-in table at load) ----------------------------------------------------
@@ -393,6 +409,7 @@ def _dorossi_rebuild_all_model_choices() -> None:
     DOROSSI_ALL_MODEL_CHOICES.clear()
     DOROSSI_ALL_MODEL_CHOICES.update(DOROSSI_MODEL_CHOICES)
     DOROSSI_ALL_MODEL_CHOICES.update(DOROSSI_CODEX_MODEL_CHOICES)
+    DOROSSI_ALL_MODEL_CHOICES.update(DOROSSI_GEMINI_MODEL_CHOICES)
 
 
 def dorossi_merge_model_catalog(catalog: dict) -> list:
@@ -429,6 +446,13 @@ def dorossi_merge_model_catalog(catalog: dict) -> list:
                 continue
             table[alias] = str(model_id)
             added.append(alias)
+    gemini_found = resolved.get("gemini")
+    if isinstance(gemini_found, dict):
+        for slug in sorted(gemini_found):
+            if (isinstance(slug, str) and re.fullmatch(r"gemini-[a-z0-9.-]+", slug)
+                    and gemini_found[slug] == slug and slug not in DOROSSI_GEMINI_MODEL_CHOICES):
+                DOROSSI_GEMINI_MODEL_CHOICES[slug] = slug
+                added.append(slug)
     _dorossi_rebuild_all_model_choices()
     return added
 
@@ -465,8 +489,8 @@ def dorossi_session_backend(sess: dict) -> str:
     `discord_bot` used to write the same ternary in four places; model resolution
     and display both ask the same question, so it is extracted here.
     """
-    if isinstance(sess, dict) and sess.get("ai_provider") == "codex":
-        return "codex"
+    if isinstance(sess, dict) and sess.get("ai_provider") in ("codex", "gemini"):
+        return sess["ai_provider"]
     return DOROSSI_BACKEND
 
 
@@ -618,13 +642,13 @@ DOROSSI_LOOP_SILENCE_LIMIT_SEC = BOT_CONFIG["dorossi_loop_silence_limit_sec"]
 # loop and leave a loop_pending for the owner to manually `/dorossi session
 # continue` later; since the plan usage **resets on a rolling 5-hour window**,
 # that meant several manual resumptions a day, and a long unattended task
-# effectively never finished. It now "sleeps until the quota returns and resumes
-# itself".
+# effectively never finished. It now saves the resume point, frees its slot, and
+# is brought back automatically when the time comes.
 #   fallback -- when no machine-readable reset time is available, the seconds to
 #               wait the first time; each further consecutive hit doubles it
 #               (backoff probing), up to max. Default 900s (15 minutes).
 #   max      -- the ceiling for a single wait. Even if the backend says "resets in
-#               three days", it sleeps at most this long and then probes again --
+#               three days", it waits at most this long and then probes again --
 #               probing is cheap, and "oversleeping" is irreversible waste.
 #               Default 21600s (6 hours), slightly larger than the 5-hour rolling
 #               window, so a single wait suffices to cover a full window.
@@ -2658,7 +2682,7 @@ def _dorossi_reset_session(sess: dict) -> None:
     `cc_usage_mark` (the cumulative-usage baseline of the dropped backend session,
     see `_dorossi_cc_account_round`) goes too: it is keyed to that session id and
     would never match again."""
-    for k in ("cc_session_id", "codex_session_id", "cc_cwd", "cc_extra_dir", "api_history",
+    for k in ("cc_session_id", "codex_session_id", "gemini_session_id", "gemini_usage_mark", "cc_cwd", "cc_extra_dir", "api_history",
               "tune_effort", "tune_model", "loop_pending", "cc_usage_mark"):
         sess.pop(k, None)
     sess["last_used"] = time.time()
@@ -2713,6 +2737,11 @@ def _dorossi_mark_loop_pending(sess: dict, task: str, *,
     tries = prev.get("auto_tries")
     if isinstance(tries, int) and not isinstance(tries, bool) and tries > 0:
         marker["auto_tries"] = tries
+    # Carry over every known backend -- miss one and switching away from it never
+    # shows the "take over the task in progress" preamble (`_dorossi_run_loop`
+    # relies on this to notice the backend changed).
+    if prev.get("last_backend") in DOROSSI_BACKEND_MODEL_CHOICES:
+        marker["last_backend"] = prev["last_backend"]
     sess["loop_pending"] = marker
 
 
@@ -2735,14 +2764,16 @@ DOROSSI_LOOP_STOP_REASONS = frozenset({
     "error",        # any other error (including fatal ones)
     "deleted",      # slot deleted (the marker is gone with it, nothing to write; kept for completeness)
     "paused",       # the owner's `/dorossi yield`: commit, yield editing rights, pause until someone takes over
+    "usage_wait",   # hit the plan usage limit: saved, loop closed, resumed automatically at `resume_at`
 })
-# Only these two count as "not a stop it chose" and are brought back
-# **automatically** on reconnect / restart. `paused` is deliberately not
-# included: the whole point of yielding is "another editor is changing the same
-# set of files", and automatically calling the loop back on restart to touch that
-# same set of files is exactly what it is meant to avoid -- so paused always waits
-# for the owner's own `continue`.
-_DOROSSI_AUTORESUMABLE_STOPS = frozenset({"network", "interrupted"})
+# Only these three count as "not a stop it chose" and are brought back
+# **automatically** (`usage_wait` only once `resume_at` has passed, see
+# `_dorossi_loop_autoresume_plan`). `paused` is deliberately not included: the
+# whole point of yielding is "another editor is changing the same set of files",
+# and automatically calling the loop back on restart to touch that same set of
+# files is exactly what it is meant to avoid -- so paused always waits for the
+# owner's own `continue`.
+_DOROSSI_AUTORESUMABLE_STOPS = frozenset({"network", "interrupted", "usage_wait"})
 
 
 def _dorossi_touch_loop_pending(sess: dict, *, reset_tries: bool = False) -> None:
@@ -2789,6 +2820,105 @@ def _dorossi_mark_loop_stopped(sess: dict, reason: str | None = None) -> None:
             marker.pop("stop", None)
 
 
+def _dorossi_mark_loop_usage_wait(sess: dict, *, resume_at: float, usage_waits: int,
+                                  resume_prompt: str | None, injections, after=(),
+                                  paused: bool = False) -> None:
+    """The self-loop hit the plan usage limit: store "where to pick up later" in the
+    marker (in place); the loop ends right after.
+
+    Before 2026-09-26 the loop **waited in place**: an `asyncio` wait of several
+    hours, holding this conversation's per-session lock the whole time (every
+    question on the same conversation queued behind it), one of the
+    `DOROSSI_MAX_PARALLEL_LOOPS` slots (default 3) and a power request (the host
+    could not sleep). It now saves, closes the loop, and is resumed when due:
+
+    * `resume_at` -- when to resume (**wall clock**: it has to survive a restart,
+      for the same reason as a parked row's `run_at`);
+    * `usage_waits` -- how many consecutive waits this stretch has had; the resumed
+      loop continues the backoff multiplier from here;
+    * `resume_prompt` -- the prompt of the round that hit the limit, re-run on
+      resume (a compaction round passes None and the resume uses the ordinary
+      continue prompt instead);
+    * `resume_inject` -- mid-task additions not yet folded in (the injection buffer
+      lives in memory and would be lost when the loop closes). On resume they are
+      handled as the in-place wait did after waking: if there are additions, they
+      become the first round instead of the re-run;
+    * `resume_after` -- instructions to queue **after** the first round (the commit
+      instruction held back by a yield: the interrupted round has to finish first).
+
+    `paused` true = the owner had asked to yield before this (`/dorossi yield`):
+    record `paused`, do not auto-resume, and still bring the three items above back
+    on a manual resume. `auto_tries` is cleared: the loop stopped cleanly by itself,
+    which proves the previous resume did not kill the bot, so the circuit breaker
+    starts over. Never creates a marker. Never raises."""
+    marker = sess.get("loop_pending")
+    if not isinstance(marker, dict):
+        return
+    marker["live"] = False
+    marker["stop"] = "paused" if paused else "usage_wait"
+    marker["stopped_ts"] = time.time()
+    marker["resume_at"] = float(resume_at)
+    marker["usage_waits"] = max(0, int(usage_waits))
+    if isinstance(resume_prompt, str) and resume_prompt:
+        marker["resume_prompt"] = resume_prompt
+    else:
+        marker.pop("resume_prompt", None)
+    for key, items in (("resume_inject", injections), ("resume_after", after)):
+        kept = [item for item in (items or ()) if isinstance(item, str) and item]
+        if kept:
+            marker[key] = kept
+        else:
+            marker.pop(key, None)
+    marker.pop("auto_tries", None)
+
+
+def _dorossi_loop_usage_resume_at(marker) -> float | None:
+    """The resume time scheduled by a usage-reset marker (`stop == "usage_wait"`);
+    None for any other marker or when the time is broken (not a finite number).
+    Pure function, never raises."""
+    if not isinstance(marker, dict) or marker.get("stop") != "usage_wait":
+        return None
+    at = marker.get("resume_at")
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or not math.isfinite(at):
+        return None
+    return float(at)
+
+
+def _dorossi_loop_usage_wait_due(marker, *, now: float | None = None) -> bool:
+    """Is a usage-reset marker due? False when it is not that kind of marker.
+
+    A broken time (hand-edited) counts as due -- blocking a task the owner asked for
+    forever is worse than probing once too early; the same trade-off as a parked row
+    with no `run_at`. Pure function, never raises."""
+    if not isinstance(marker, dict) or marker.get("stop") != "usage_wait":
+        return False
+    at = _dorossi_loop_usage_resume_at(marker)
+    return at is None or at <= (time.time() if now is None else now)
+
+
+def _dorossi_take_loop_resume(sess: dict) -> tuple[str | None, list, list, int]:
+    """On resume, take back what was saved when the usage limit hit:
+    `(prompt to re-run, additions not yet folded in, instructions to queue after the
+    first round, consecutive wait count)`, or `(None, [], [], 0)` when there is
+    nothing. Only the "resume" path calls it (`_dorossi_run_loop` with
+    `resuming=True`): a new task or a self-judged hand-over must not re-run the
+    previous task's prompt. Fields of the wrong shape are skipped. Read once and
+    removed. Never raises."""
+    marker = sess.get("loop_pending")
+    if not isinstance(marker, dict):
+        return None, [], [], 0
+    prompt = marker.pop("resume_prompt", None)
+    lists = [marker.pop(key, None) for key in ("resume_inject", "resume_after")]
+    waits = marker.pop("usage_waits", None)
+    marker.pop("resume_at", None)
+    prompt = prompt if isinstance(prompt, str) and prompt else None
+    inject, after = ([item for item in items if isinstance(item, str) and item]
+                     if isinstance(items, list) else [] for items in lists)
+    waits = waits if isinstance(waits, int) and not isinstance(waits, bool) \
+        and waits > 0 else 0
+    return prompt, inject, after, waits
+
+
 def _dorossi_mark_loop_aborted(sess: dict) -> None:
     """The owner pressed abort on a task that is **not running but waiting to be
     resumed automatically** (in place).
@@ -2803,6 +2933,25 @@ def _dorossi_mark_loop_aborted(sess: dict) -> None:
     if isinstance(marker, dict):
         marker["live"] = False
         marker["stop"] = "abort"
+        marker["stopped_ts"] = time.time()
+
+
+def _dorossi_mark_loop_paused(sess: dict) -> None:
+    """The owner pressed `/dorossi yield` on a task that is **not running but will come
+    back by itself** (in place).
+
+    While the loop runs, the yield is written as `stop: paused` by the loop itself at
+    a round boundary; this one is for the tasks that already stopped and would be
+    brought back automatically when due (waiting for the usage reset), when the
+    network returns or when the bot restarts. The point of yielding is "another
+    editor is about to change the same files"; if these were not held they would
+    come back mid-hand-over and edit files themselves. What was saved when the
+    usage limit hit (the round to re-run, the additions) is kept and brought back on
+    a manual resume. Never creates a marker. Never raises."""
+    marker = sess.get("loop_pending")
+    if isinstance(marker, dict):
+        marker["live"] = False
+        marker["stop"] = "paused"
         marker["stopped_ts"] = time.time()
 
 
@@ -2825,8 +2974,8 @@ def _dorossi_loop_marker_wants_autoresume(marker) -> bool:
 
 
 def _dorossi_loop_autoresume_plan(sess: dict, *, now=None):
-    """Should the bot, on start-up, bring this slot's self-loop task back by
-    itself? (pure function, never raises)
+    """Should this slot's self-loop task be brought back automatically?
+    (pure function, never raises)
 
     Returns `(channel_id, message_id, tries)` or None. Non-None only when all four
     conditions pass:
@@ -2834,26 +2983,36 @@ def _dorossi_loop_autoresume_plan(sess: dict, *, now=None):
     1. There is a well-formed `loop_pending` with `live` True -- i.e. the previous
        process was killed; **or** the loop stopped by itself but for a reason in
        `_DOROSSI_AUTORESUMABLE_STOPS` (the network dropped, the task was
-       cancelled). The owner's own abort / the silence backstop / an exception /
-       giving up are not among them.
+       cancelled, it is waiting for the plan usage to reset). The owner's own
+       abort / the silence backstop / an exception / giving up are not among them.
     2. There are `channel_id` and `message_id` anchors (old markers lack these two
        keys, so they can only be resumed by hand -- deliberate backward-compatible
        behaviour, not a hole).
     3. The heartbeat is within `DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC` (0 = feature
        off). A "future heartbeat" caused by the clock going backwards is always
-       treated as expired; a negative age does not get to sneak through.
+       treated as expired; a negative age does not get to sneak through. A task
+       waiting for the usage reset is aged from **the moment it is due**
+       (`resume_at`): five hours of waiting is not "too old", and **not yet due =
+       negative age**, caught by the same gate (only that one; a second "is it due
+       yet" check would be completely shadowed by it). A broken timestamp falls
+       back to the heartbeat, i.e. counts as due. It is also not affected by
+       "feature off": the in-place wait it replaces never looked at that setting,
+       and saving to disk should not give it an extra switch.
     4. `auto_tries` has not reached `DOROSSI_LOOP_AUTORESUME_MAX_TRIES` (0 = no
        limit).
 
     **No permission check happens here.** The owner gate is always re-verified by
     the caller against "the message actually fetched back"; an id stored on disk is
     not grounds for authorisation."""
+    now = time.time() if now is None else now
     max_age = DOROSSI_LOOP_AUTORESUME_MAX_AGE_SEC
-    if not isinstance(max_age, (int, float)) or isinstance(max_age, bool) \
-            or max_age <= 0 or max_age != max_age:  # NaN also counts as off
-        return None
+    enabled = (isinstance(max_age, (int, float)) and not isinstance(max_age, bool)
+               and max_age > 0 and max_age == max_age)  # NaN also counts as off
     marker = sess.get("loop_pending")
     if not _dorossi_loop_marker_wants_autoresume(marker):
+        return None
+    usage_wait = marker.get("stop") == "usage_wait"
+    if not enabled and not usage_wait:
         return None
     cid, mid = marker.get("channel_id"), marker.get("message_id")
     if not all(isinstance(v, int) and not isinstance(v, bool) and v > 0
@@ -2862,8 +3021,11 @@ def _dorossi_loop_autoresume_plan(sess: dict, *, now=None):
     ts = marker.get("ts")
     if not isinstance(ts, (int, float)) or isinstance(ts, bool) or ts != ts:
         return None
-    age = (time.time() if now is None else now) - ts
-    if not 0 <= age <= max_age:
+    if usage_wait:
+        due_at = _dorossi_loop_usage_resume_at(marker)
+        ts = ts if due_at is None else due_at
+    age = now - ts
+    if age < 0 or (enabled and age > max_age):
         return None
     tries = marker.get("auto_tries")
     tries = tries if isinstance(tries, int) and not isinstance(tries, bool) \
@@ -2908,7 +3070,11 @@ def _dorossi_loop_resume_plan(sess: dict):
     pending = sess.get("loop_pending")
     if not isinstance(pending, dict):
         return None
-    if sess.get("cc_session_id") or sess.get("codex_session_id"):
+    backend = dorossi_session_backend(sess)
+    selected_id = (sess.get("codex_session_id") if backend == "codex"
+                   else sess.get("gemini_session_id") if backend == "gemini"
+                   else sess.get("cc_session_id"))
+    if selected_id:
         return ("continue", None)
     task = pending.get("task")
     if isinstance(task, str) and task.strip():
@@ -3670,6 +3836,9 @@ def dorossi_abandoned_loops(state: dict, *, now: float | None = None) -> list:
                 continue
             if _dorossi_loop_autoresume_plan(sess, now=now) is not None:
                 continue          # can still be brought back, so not abandoned
+            if (marker.get("stop") == "usage_wait"
+                    and not _dorossi_loop_usage_wait_due(marker, now=now)):
+                continue          # still waiting for the usage reset; comes back by itself
             ts = marker.get("ts")
             age = ((now if now is not None else time.time()) - float(ts)
                    if isinstance(ts, (int, float)) and not isinstance(ts, bool)
@@ -4271,6 +4440,16 @@ def _dorossi_record_usage(info: dict) -> None:
                          if isinstance(info.get("cost_usd"), (int, float))
                          and not isinstance(info.get("cost_usd"), bool) else 0.0),
         }
+        backend = info.get("backend")
+        if backend == "gemini":
+            rec["backend"] = backend
+            if info.get("cost_estimated"):
+                rec["cost_estimated"] = True
+            if info.get("cost_unknown"):
+                rec["cost_unknown"] = True
+            model = info.get("model")
+            if isinstance(model, str) and model.startswith("gemini-"):
+                rec["model"] = model[:64]
         kind = info.get("kind")
         if isinstance(kind, str) and kind:
             # The marker for a maintenance round (a CLI slash command). Written only
@@ -4391,7 +4570,7 @@ def dorossi_local_usage_totals(now: float, path=DOROSSI_USAGE_FILE) -> dict:
     (counted into no cell), and reading line by line never loads the whole ledger
     into memory (append-only NDJSON can get large)."""
     def _blank():
-        return {"tokens": 0, "usd": 0.0}
+        return {"tokens": 0, "usd": 0.0, "unpriced": 0}
 
     def _num(value):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -4432,12 +4611,15 @@ def dorossi_local_usage_totals(now: float, path=DOROSSI_USAGE_FILE) -> dict:
                 cost = float(_num(rec.get("cost_usd")) or 0.0)
                 lifetime["tokens"] += tok
                 lifetime["usd"] += cost
+                lifetime["unpriced"] += int(bool(rec.get("cost_unknown")))
                 if ts >= week_start:
                     last7d["tokens"] += tok
                     last7d["usd"] += cost
+                    last7d["unpriced"] += int(bool(rec.get("cost_unknown")))
                 if ts >= day_start:
                     today["tokens"] += tok
                     today["usd"] += cost
+                    today["unpriced"] += int(bool(rec.get("cost_unknown")))
     except Exception as exc:  # pylint: disable=broad-except
         print(f"[dorossi] local usage totals failed: {exc!r}", file=sys.stderr)
     return {"today": today, "last7d": last7d, "lifetime": lifetime}
@@ -5331,7 +5513,51 @@ async def dorossi_probe_model_catalog(
         family, _version = _dorossi_split_model_id(model_id)
         if family and model_id:
             resolved["codex"] = {family: str(model_id)}
+    agy_exe = find_gemini_executable()
+    if agy_exe:
+        found = await _dorossi_probe_gemini_models(
+            agy_exe, str(_dorossi_model_probe_dir()), timeout_sec)
+        if found:
+            resolved["gemini"] = found
     return resolved
+
+
+async def _dorossi_probe_gemini_models(exe: str, cwd: str,
+                                       timeout_sec: float) -> dict:
+    """Run the third backend's `models` subcommand once; return `{slug: slug}`
+    (its aliases are its full ids).
+
+    Nothing readable, a timeout or a non-zero exit all return an empty dict (the
+    built-in table stands for the day). The teardown has the same shape as the
+    other two probes: `finally` kills (tolerating a process that already exited)
+    and hands over to `_dorossi_reap_proc` -- **never** `await proc.communicate()`
+    after a kill, which waits for pipe EOF and never returns while a grandchild
+    still holds the write end.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        exe, "models", stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL, cwd=cwd)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout_sec)
+        if proc.returncode != 0:
+            return {}
+        slugs = [line.split(None, 1)[0].decode("ascii") for line in out.splitlines()
+                 if line.startswith(b"gemini-")]
+        return {slug: slug for slug in slugs
+                if re.fullmatch(r"gemini-[a-z0-9.-]+", slug)}
+    except (asyncio.TimeoutError, TimeoutError):
+        print("[dorossi] model probe timed out for the third backend", file=sys.stderr)
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"[dorossi] model probe failed for the third backend: {exc!r}",
+              file=sys.stderr)
+        return {}
+    finally:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await _dorossi_reap_proc(proc)
 
 
 def dorossi_model_catalog_due(interval_hours: float,
@@ -5788,6 +6014,38 @@ async def _dorossi_via_codex(
         "usage": state.usage,
         "images": _collect_codex_images(state.thread_id, invocation_started_ns),
     }
+
+
+async def _dorossi_via_gemini(
+        prompt: str, session_id: str | None, on_text=None,
+        extra_dir: str | None = None, workdir: str | None = None,
+        on_proc=None, abort_check=None, silence_limit: float | None = None,
+        loop_system_guidance: str | None = None,
+        model: str | None = None, effort: str | None = None,
+        previous_usage: dict | None = None) -> tuple:
+    """Run one Antigravity CLI turn through the shared Dorossi lifecycle."""
+    effective_cwd = workdir or str(DOROSSI_CC_WORKDIR)
+    cwd_path = Path(effective_cwd)
+    if _dorossi_cwd_is_managed(cwd_path):
+        cwd_path.mkdir(parents=True, exist_ok=True)
+    _dorossi_require_workdir(effective_cwd)
+    return await _gemini_turn(
+        prompt, session_id, on_text=on_text, workdir=effective_cwd,
+        extra_dir=extra_dir, previous_usage=previous_usage,
+        model=model, effort=effort, full=DOROSSI_CC_TOOLS == "full", on_proc=on_proc,
+        abort_check=abort_check, silence_limit=silence_limit,
+        loop_system_guidance=loop_system_guidance,
+        system_prompt=DOROSSI_SYSTEM_PROMPT,
+        hard_limit=_dorossi_cc_hard_limit_sec(),
+        reap=_dorossi_reap_proc, drain=_read_stream_all,
+        drain_stderr=_dorossi_drain_stderr,
+        readline_watched=_dorossi_readline_watched,
+        clock_factory=_DorossiWatchClock,
+        record=_dorossi_record_usage,
+        usage_error=_DorossiUsageLimitError,
+        transient_error=_DorossiTransientError,
+        resume_error=_DorossiResumeError,
+        silence_error=_DorossiLoopSilence)
 
 
 class _ClaudeStreamState:
