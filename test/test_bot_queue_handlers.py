@@ -6,7 +6,8 @@
 以及沒有動作時檔案一個位元組都沒變，不只是「回了一句話」。
 
 `/config show` 唯讀，但它是使用者判斷「我設的值有沒有生效」的唯一入口，所以要釘住每一個
-可設定的鍵都列出來、預設與覆寫分得開。
+可設定的鍵都列出來，以及 `(default)` 標的是「目前生效的值等於預設值」（擁有者裁定
+2026-10-01）——檔案裡沒寫、寫了等於預設的值、寫了被載入器退回預設的值，三種都標。
 
 所有佇列檔、`.backup/`、undo 堆疊與設定檔都換到 `tmp_path`，一個正式檔都不碰。
 """
@@ -275,7 +276,7 @@ def _config_rows(sent) -> dict[str, str]:
 
 def test_config_show_lists_every_settable_key_and_flags_the_defaults(
         batch_config, monkeypatch):
-    """寫在檔案裡的鍵沒有 `(default)`，沒寫的有；值的寫法跟 `/config set` 收的一樣
+    """生效值不等於預設的鍵沒有 `(default)`，沒寫的有；值的寫法跟 `/config set` 收的一樣
     （區間用 en dash、布林小寫），使用者才能照抄回去。"""
     batch_config.write_text(json.dumps({
         "images_per_character": 50,
@@ -308,6 +309,55 @@ def test_config_show_without_a_file_shows_every_default(batch_config, monkeypatc
         expected = b._fmt_cfg_value(bc._DEFAULT_BATCH_CONFIG[key])
         assert rest == f"{expected}  (default)", (key, rest)
     assert not batch_config.exists(), "唯讀的指令建立了設定檔"
+
+
+def test_config_show_marks_a_rejected_override_as_default(batch_config, monkeypatch):
+    """檔案裡寫了一個載入器不收的值：生效的是預設值，所以要標 `(default)`。
+
+    舊的讀法看「檔案裡有沒有這個鍵」，於是這三個鍵畫面上顯示預設值卻不標，使用者會以為
+    自己的值生效了。三種被拒的形狀各一：型別錯、超出範圍、區間的兩端反過來。"""
+    batch_config.write_text(json.dumps({
+        "rest_hours": "six",
+        "images_per_character": -5,
+        "inter_image_delay_sec": [9, 3],
+    }), encoding="utf-8")
+    sent = _replies(monkeypatch)
+    _run(b.cmd_config(_STRANGER))
+    rows = _config_rows(sent)
+    for key in ("rest_hours", "images_per_character", "inter_image_delay_sec"):
+        expected = b._fmt_cfg_value(bc._DEFAULT_BATCH_CONFIG[key])
+        assert rows[key] == f"{expected}  (default)", (key, rows[key])
+
+
+def test_config_show_marks_an_explicit_default_value_and_nothing_else(
+        batch_config, monkeypatch):
+    """明寫一個剛好等於預設的值也標 `(default)`；只要差一點就不標——兩個方向都要釘。
+
+    區間那一格特別要緊：檔案寫 `[20, 30]`，載入器正規化成 `(20.0, 30.0)`，預設表寫的是
+    `(20, 30)`——比型別或比 list 的寫法都會把它判成「不是預設」。"""
+    defaults = bc._DEFAULT_BATCH_CONFIG
+    lo, hi = defaults["inter_image_delay_sec"]
+    batch_config.write_text(json.dumps({
+        "rest_hours": defaults["rest_hours"],
+        "inter_image_delay_sec": [lo, hi],
+        "debug_screenshots": defaults["debug_screenshots"],
+        "min_save_ratio": defaults["min_save_ratio"],
+        # 差一點點的那一組：都合法、都不是預設。
+        "schedule_limit_hours": defaults["schedule_limit_hours"] + 0.5,
+        "generate_retry_delay_sec": [defaults["generate_retry_delay_sec"][0],
+                                     defaults["generate_retry_delay_sec"][1] + 1],
+        "restart_chrome_every_n_characters":
+            defaults["restart_chrome_every_n_characters"] + 1,
+    }), encoding="utf-8")
+    sent = _replies(monkeypatch)
+    _run(b.cmd_config(_STRANGER))
+    rows = _config_rows(sent)
+    flagged = {key for key, rest in rows.items() if rest.endswith("(default)")}
+    assert flagged == set(b._BATCH_SETTERS) - {
+        "schedule_limit_hours", "generate_retry_delay_sec",
+        "restart_chrome_every_n_characters"}, flagged
+    assert rows["inter_image_delay_sec"] == (
+        f"{b._fmt_cfg_value(defaults['inter_image_delay_sec'])}  (default)")
 
 
 def test_config_show_never_writes_the_file(batch_config, monkeypatch):

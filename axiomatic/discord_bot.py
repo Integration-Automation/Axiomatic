@@ -73,10 +73,10 @@ except Exception:  # pragma: no cover - optional dependency
     AsyncAnthropic = None
 
 from _batch_config import (
+    _DEFAULT_BATCH_CONFIG as _BATCH_DEFAULTS,
     _REJECTED as _BATCH_REJECTED,
     _coerce_int as _batch_coerce_int,
     load_batch_config,
-    read_raw_batch_config,
     reset_batch_config_keys,
     save_batch_config,
 )
@@ -2203,15 +2203,27 @@ def _fmt_cfg_value(val) -> str:
     return _fmt_num(val)
 
 
+def _cfg_is_default(key: str, effective) -> bool:
+    """`effective` 等不等於 `key` 的內建預設值——`/config show` 的 `(default)` 標記。
+
+    擁有者裁定 2026-10-01：標記回答「目前生效的是不是預設值」，不是「檔案裡有沒有這個鍵」。
+    所以檔案裡寫了一個載入器不收的值（退回預設）要標，明寫一個剛好等於預設的值也要標。
+    比對的是值不是型別：載入器把區間正規化成 float 的 tuple（`(20.0, 30.0)`），而預設表
+    寫的是 `(20, 30)`，兩者在 Python 裡相等。`effective` 必須是 `load_batch_config()`
+    給的值（區間一定是 tuple、布林鍵一定是 bool），不要拿檔案裡的原值來比。"""
+    return effective == _BATCH_DEFAULTS[key]
+
+
 async def cmd_config(message: discord.Message) -> None:
-    """Show the effective batch_config.json (defaults-merged), flagging which
-    keys are using the built-in default vs an on-disk override."""
+    """Show the effective batch_config.json (defaults-merged), marking every key
+    whose effective value equals its built-in default with `(default)` — whether
+    the key is absent from the file, written with the default value, or written
+    with a value the loader rejected and replaced by the default."""
     cfg = load_batch_config()
-    raw = read_raw_batch_config()
     lines = []
     for key in _BATCH_SETTERS:
         shown = _fmt_cfg_value(cfg[key])
-        origin = "" if key in raw else "  (default)"
+        origin = "  (default)" if _cfg_is_default(key, cfg[key]) else ""
         lines.append(f"{key:<34} {shown}{origin}")
     body = "\n".join(lines)
     embed = discord.Embed(
