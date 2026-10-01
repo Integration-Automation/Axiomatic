@@ -468,6 +468,11 @@ class _FakeUiBackend:
         return dict(cls.state)
 
     @staticmethod
+    def control_type_name(code):
+        return {50000: "Button", 50004: "Edit", 50032: "Window"}.get(
+            code, f"ControlType_{code}")
+
+    @staticmethod
     def humanize_role(role):
         return {"ControlType_50000": "Button",
                 "ControlType_50004": "Edit"}.get(role, role)
@@ -478,6 +483,7 @@ def _stub_ui(monkeypatch, elements=(), state=None):
     _FakeUiBackend.elements = list(elements)
     _FakeUiBackend.state = dict(state or {})
     monkeypatch.setattr(gui, "load_ac", lambda: _FakeUiBackend)
+    monkeypatch.setattr(gui, "_UI_TYPE_CODES", {})
     return _FakeUiBackend
 
 
@@ -494,6 +500,28 @@ def test_ui_find_maps_fields_and_humanises_the_type(monkeypatch):
     assert kwargs["window_title"] == "記事本 - 未命名"
     assert kwargs["role"] == "button"
     assert kwargs["contains"] is True          # 名稱常帶快捷鍵標記與後綴
+
+
+def test_ui_type_names_come_from_the_real_library(monkeypatch):
+    """名稱表是函式庫的 `control_type_name` 建的：本模組以前抄的那份少了 50039／50040，
+    而且函式庫加型別時不會跟著長。"""
+    real = pytest.importorskip(
+        "je_auto_control", reason="je-auto-control 沒安裝（requirements.txt 有列，正常不該發生）")
+    monkeypatch.setattr(gui, "load_ac", lambda: real)
+    monkeypatch.setattr(gui, "_UI_TYPE_CODES", {})
+    codes = gui._ui_type_codes()
+    assert codes["button"] == 50000 and codes["separator"] == 50038, codes
+    assert {"semanticzoom", "appbar"} <= set(codes), sorted(codes)
+    assert gui.parse_ui_type("Button") == "button"
+
+
+def test_ui_types_without_the_library_lookup_say_ui_is_unavailable(monkeypatch):
+    class Old:
+        pass
+    monkeypatch.setattr(gui, "load_ac", lambda: Old)
+    monkeypatch.setattr(gui, "_UI_TYPE_CODES", {})
+    with pytest.raises(GuiError, match="UI element location is unavailable in this environment"):
+        gui.parse_ui_type("button")
 
 
 def test_ui_find_separates_match_cap_from_scan_cap(monkeypatch):
@@ -3045,15 +3073,6 @@ def test_an_override_name_wins_even_when_it_is_the_longer_name(monkeypatch):
     assert gui._vk_to_name(0x28) == "arrowdown"
 
 
-def test_a_failing_hotkey_releases_the_oem_key_by_keycode(key_library):
-    key_library.fail_press_at = 2
-    with pytest.raises(GuiError):
-        gui.press_hotkey(gui.parse_hotkey_tokens("ctrl+oem_2"))
-    undone = [key for op, key in key_library.raw if op == "release"]
-    assert undone == [0xBF, "control"], key_library.raw
-    assert type(undone[0]) is int
-
-
 def test_a_background_key_post_sends_the_oem_keycode(key_library, monkeypatch):
     monkeypatch.setattr(gui, "match_windows",
                         lambda needle: [(9, "Untitled - Editor")])
@@ -3122,8 +3141,9 @@ def test_every_key_handed_to_the_library_goes_through_library_key():
         sites, unwrapped = _unwrapped_key_sends(tree)
         total += len(sites)
         problems += [f"{filename}:{line}" for line in unwrapped]
-    # 量到的是 7 處（`_gui_control` 裡）；少於這個數代表掃描自己壞了。
-    assert total >= 7, total
+    # 量到的是 5 處（`_gui_control` 裡；2026-10-01 補救放開那兩處隨函式庫的 finally
+    # 拿掉之後）；少於這個數代表掃描自己壞了。
+    assert total >= 5, total
     assert not problems, f"這些送鍵點沒有經過 `_library_key`：{problems}"
 
 
@@ -3152,261 +3172,169 @@ if __name__ == "__main__":
 
 
 # --------------------------------------------------------------------------
-# 組合鍵送到一半失敗：不能把修飾鍵留在按下的狀態
+# 組合鍵／打字送到一半失敗：放開由函式庫負責
 #
-# 底層 `je_auto_control.hotkey` 是「for 按下 → for 放開」而中間沒有 finally。
-# 2026-08-30 實測（把底層 press/release 換成假的記錄器，不碰真實桌面）：三鍵組合
-# 在第二個鍵按下時丟例外，呼叫序列只有兩次 press、**一次 release 都沒有**。
+# 2026-08-30／09-05 那時函式庫的 `hotkey`／`type_keyboard` 是「按下 → 放開」而中間
+# 沒有 finally，本模組只好自己補一輪放開（`_undo_hotkey_press`／`_undo_write_press`）。
+# 函式庫後來把放開寫進 `finally`（`_release_still_held`，只放真的按下去的鍵），本模組
+# 的補救就拿掉了——同一件事只留一份。這一段因此分兩半：
 #
-# 這條路徑繞過本模組的三層保險——那三層只掛在 `key_down` / `key_up` 上，組合鍵
-# 全程不登記 `_HELD_INPUTS`，所以 `/input key status` 說沒東西按著、
-# `/input key clear` 放不掉、也沒有逾時計時器。alt 卡住之後每個按鍵都變成選單
-# 快捷鍵，而下指令的人不在電腦前面。
+#   * 對**真的函式庫**釘住那個前提（最後兩支）。函式庫哪天拿掉 finally，紅的是它們，
+#     而不是某個人的鍵盤。
+#   * 對本模組只釘「失敗照樣以泛用訊息浮上來、原因保留、成功與失敗都不自己多送放開」。
+#
+# 這條路徑繞過本模組的三層保險（`_HELD_INPUTS` 登記、`release_all_inputs`、逾時自動
+# 放開只掛在 `key_down` / `key_up` 上），所以放開**只能**靠函式庫那個 finally。
 # --------------------------------------------------------------------------
 
-class _HotkeyBackend:
-    """記錄 press / release 呼叫序列的假後端；`fail_at` 指定第幾次 press 炸掉。"""
+class _LibraryLikeBackend:
+    """照現在的函式庫行為做的假後端：按下途中失敗時，在 finally 裡倒著放開已按下的鍵。
 
-    def __init__(self, fail_at=None, release_fails=()):
+    `release_keyboard_key` 若被呼叫就記成 `("extra", key)`——本模組不該再自己送放開。
+    """
+
+    def __init__(self, fail_at=None):
         self.calls = []
         self.fail_at = fail_at
-        self.release_fails = set(release_fails)
         self._presses = 0
 
+    def _sequence(self, keys):
+        held = []
+        try:
+            for key in keys:
+                self._presses += 1
+                if self.fail_at is not None and self._presses == self.fail_at:
+                    raise OSError("SendInput failed")
+                self.calls.append(("press", key))
+                held.append(key)
+            for key in reversed(keys):
+                self.calls.append(("release", key))
+                held.pop()
+        finally:
+            for key in reversed(held):
+                self.calls.append(("release", key))
+
     def hotkey(self, tokens, is_shift=False):
-        # 與底層同構：先依序按下，再反向放開，中間沒有 finally。
-        for token in tokens:
-            self._presses += 1
-            self.calls.append(("press", token))
-            if self.fail_at is not None and self._presses == self.fail_at:
-                raise OSError("SendInput failed")
-        for token in reversed(tokens):
-            self.calls.append(("release", token))
+        self._sequence(list(tokens))
         return "", ""
 
-    def release_keyboard_key(self, token, is_shift=False, skip_record=False):
-        self.calls.append(("undo", token))
-        if token in self.release_fails:
-            raise OSError("SendInput failed")
-        return str(token)
+    def write(self, text, is_shift=False):
+        for char in text:
+            self._sequence([char])
+        return text
+
+    def release_keyboard_key(self, key, is_shift=False, skip_record=False):
+        self.calls.append(("extra", key))
+        return str(key)
 
 
-def _hotkey_env(monkeypatch, backend):
+def _library_like_env(monkeypatch, backend):
     monkeypatch.setattr(gui, "load_ac", lambda: backend)
     monkeypatch.setattr(gui, "input_desktop_available", lambda: True)
+    monkeypatch.setattr(gui, "_require_input_desktop", lambda: None)
 
 
-def test_a_hotkey_that_fails_midway_releases_what_it_pressed(monkeypatch):
-    """三鍵組合在第二次按下時失敗 → 三個鍵都要被倒著放開一次。
-
-    不去猜「失敗前按到第幾個」：放開一個沒按住的鍵在作業系統層是 no-op，全部倒著
-    放一輪最安全。順序是反向的，跟按下的順序對稱。
-    """
-    backend = _HotkeyBackend(fail_at=2)
-    _hotkey_env(monkeypatch, backend)
-    with pytest.raises(GuiError):
-        gui.press_hotkey(["ctrl", "shift", "a"])
-    undone = [name for kind, name in backend.calls if kind == "undo"]
-    assert undone == ["a", "shift", "ctrl"], (
-        f"補放開的順序是 {undone}；應該是按下順序的反向。空的話代表 ctrl / shift "
-        "留在按下的狀態——整台電腦會像壞掉一樣，而下指令的人不在電腦前面。")
-
-
-def test_the_hotkey_failure_still_surfaces_and_says_the_keys_are_free(
-        monkeypatch):
-    """補放開之後**照樣**要丟 GuiError，而且訊息要讓人知道鍵盤沒卡住。
-
-    順帶釘住 Secrecy：原始例外文字不得出現在使用者看得到的字串裡。
-    """
-    backend = _HotkeyBackend(fail_at=1)
-    _hotkey_env(monkeypatch, backend)
+@pytest.mark.parametrize("call", [
+    lambda: gui.press_hotkey(["ctrl", "shift", "a"]),
+    lambda: gui.type_text("abc"),
+])
+def test_a_failed_send_surfaces_generically_and_keeps_its_cause(monkeypatch, call):
+    """失敗照樣丟 `GuiError`、訊息讓人知道鍵盤沒卡住、原始例外文字不外洩（Secrecy）、
+    `__cause__` 是原本那個失敗。"""
+    _library_like_env(monkeypatch, _LibraryLikeBackend(fail_at=2))
     with pytest.raises(GuiError) as caught:
-        gui.press_hotkey(["alt", "f4"])
+        call()
     text = str(caught.value)
-    assert "released" in text, (
-        f"訊息沒說鍵已經放開了：{text!r}。使用者收到「組合鍵失敗」時最想知道的"
-        "就是鍵盤現在是不是卡住的。")
+    assert "released" in text, text
     assert "SendInput" not in text, f"原始例外文字外洩：{text!r}"
+    assert isinstance(caught.value.__cause__, OSError), caught.value.__cause__
 
 
-def test_the_hotkey_undo_keeps_going_when_one_release_also_fails(monkeypatch):
-    """補放開時其中一個又失敗，剩下的還是要試——重點是盡量把桌面解鎖。
-
-    而且往上丟的必須是原本那個失敗，不是補救過程的失敗：把復原路徑的錯誤蓋到
-    前面去，就再也看不出真正的原因了。
-    """
-    backend = _HotkeyBackend(fail_at=3, release_fails={"shift"})
-    _hotkey_env(monkeypatch, backend)
-    with pytest.raises(GuiError) as caught:
-        gui.press_hotkey(["ctrl", "shift", "s"])
-    undone = [name for kind, name in backend.calls if kind == "undo"]
-    assert undone == ["s", "shift", "ctrl"], (
-        f"其中一個放開失敗就停了：{undone}。ctrl 是最後一個、也是最該放掉的。")
-    assert isinstance(caught.value.__cause__, OSError), (
-        f"往上丟的原因變成 {caught.value.__cause__!r}——補救路徑的錯誤蓋掉了"
-        "真正的失敗原因。")
-
-
-def test_a_successful_hotkey_sends_no_extra_releases(monkeypatch):
-    """成功時不得多補放開。
-
-    底層自己已經反向放開過了；再送一輪會踩到「使用者在跑完之後自己按住同一個鍵」
-    的情況，把他的鍵放掉——那正是 `release_added_since` 存在的理由。
-    """
-    backend = _HotkeyBackend()
-    _hotkey_env(monkeypatch, backend)
-    gui.press_hotkey(["ctrl", "c"])
-    assert [kind for kind, _ in backend.calls].count("undo") == 0, (
-        f"成功路徑補送了放開：{backend.calls}")
-    assert backend.calls == [("press", "ctrl"), ("press", "c"),
-                             ("release", "c"), ("release", "ctrl")]
+@pytest.mark.parametrize("fail_at", [None, 2])
+def test_this_module_sends_no_releases_of_its_own(monkeypatch, fail_at):
+    """成功與失敗都不自己多送放開：放開只在函式庫的 finally。多送一輪會踩到「使用者在
+    跑完之後自己按住同一個鍵」的情況，把他的鍵放掉。"""
+    backend = _LibraryLikeBackend(fail_at=fail_at)
+    _library_like_env(monkeypatch, backend)
+    for call in (lambda: gui.press_hotkey(["ctrl", "c"]), lambda: gui.type_text("xy")):
+        try:
+            call()
+        except GuiError:
+            pass
+    assert not [entry for entry in backend.calls if entry[0] == "extra"], backend.calls
+    pressed = [key for kind, key in backend.calls if kind == "press"]
+    released = [key for kind, key in backend.calls if kind == "release"]
+    assert sorted(pressed) == sorted(released), backend.calls
 
 
-def test_paste_inherits_the_hotkey_undo(monkeypatch):
-    """`paste_text` 走的是同一個 `press_hotkey`，所以 ctrl 不會卡住。
-
-    貼上是最常用的那條路（中日文只能靠剪貼簿），失敗機率不低而 ctrl 又是最糟的
-    那顆鍵，所以明確釘一次而不是相信「反正它呼叫同一個函式」。
-    """
-    backend = _HotkeyBackend(fail_at=2)
-    _hotkey_env(monkeypatch, backend)
+def test_paste_goes_through_the_same_hotkey(monkeypatch):
+    """`paste_text` 走同一個 `press_hotkey`：失敗照樣以泛用訊息浮上來，ctrl 由函式庫放開。"""
+    backend = _LibraryLikeBackend(fail_at=2)
+    _library_like_env(monkeypatch, backend)
     monkeypatch.setattr(gui, "set_clipboard", lambda _text: None)
     monkeypatch.setattr(gui.time, "sleep", lambda _s: None)
     with pytest.raises(GuiError):
         gui.paste_text("測試")
-    undone = [name for kind, name in backend.calls if kind == "undo"]
-    # 放開的是**函式庫認得的**名字 `control`：2026-09-21 以前這裡斷言 `ctrl`，
-    # 也就是把「貼上送出一個函式庫查不到的鍵名」釘成了預期行為。
-    assert undone == ["v", "control"], f"貼上失敗後沒放開 ctrl：{backend.calls}"
+    assert ("release", "control") in backend.calls, backend.calls
 
 
-# ---------------------------------------------------------------------------
-# `write()` 送到一半失敗時也要把鍵放開（2026-09-05）
-#
-# `press_hotkey` 2026-08-30 就補了防禦性的反向放開，`type_text` 一直沒有——而根因
-# 是同一個：底層的 `type_keyboard` 是「按下 → 放開」中間**沒有 finally**，按下之後
-# 放開那一步失敗，鍵就留在按下的狀態。
-#
-# **這一側比組合鍵更難自己恢復**：卡住的是一般字元鍵，Windows 會持續自動重複，
-# 畫面上就是那個字被無限打出來；而本模組宣稱的三層保險（`_HELD_INPUTS` 登記、
-# `release_all_inputs`、逾時自動放開）只掛在 `key_down`／`key_up` 上，這條路徑
-# 完全繞過，所以 `/input key status` 會說什麼都沒按住、`/input key clear` 也放不掉。
-# ---------------------------------------------------------------------------
+def _real_keyboard_module(monkeypatch):
+    """真的 `je_auto_control.wrapper.auto_control_keyboard`，底層按鍵原語換成記錄器。
+
+    只換那兩支原語（`press_keyboard_key`／`release_keyboard_key`），被測的是函式庫自己的
+    `hotkey`／`type_keyboard` 本體——前提要對**真的程式碼**問，假後端問不出來。
+    """
+    if not sys.platform.startswith("win"):
+        pytest.skip("這裡的鍵名是 Win32 虛擬鍵")
+    keyboard = pytest.importorskip(
+        "je_auto_control.wrapper.auto_control_keyboard",
+        reason="je-auto-control 沒安裝（requirements.txt 有列，正常不該發生）")
+    calls = []
+    state = {"presses": 0, "fail_at": None, "fail_first_release": False}
+
+    def press(key, is_shift=False, skip_record=False):
+        state["presses"] += 1
+        if state["presses"] == state["fail_at"]:
+            raise OSError("SendInput failed")
+        calls.append(("press", key))
+        return str(key)
+
+    def release(key, is_shift=False, skip_record=False):
+        calls.append(("release", key))
+        if state["fail_first_release"]:
+            state["fail_first_release"] = False
+            raise OSError("SendInput failed")
+        return str(key)
+
+    monkeypatch.setattr(keyboard, "press_keyboard_key", press)
+    monkeypatch.setattr(keyboard, "release_keyboard_key", release)
+    exceptions = pytest.importorskip(
+        "je_auto_control.utils.exception.exceptions",
+        reason="je-auto-control 沒安裝（requirements.txt 有列，正常不該發生）")
+    state["error"] = exceptions.AutoControlKeyboardException
+    return keyboard, calls, state
 
 
-class _WriteAC:
-    """假的後端：只記錄呼叫，完全不碰真實鍵盤。"""
-    keyboard_keys_table = {"a": 65, "b": 66, "A": 65, "1": 49,
-                           "tab": 9, "return": 13, "space": 32}
-    WRITE_CONTROL_KEYS = {"\n": "return", "\r": "return", "\t": "tab"}
-
-    def __init__(self, fail=True):
-        self.released = []
-        self.fail = fail
-
-    def release_keyboard_key(self, key):
-        self.released.append(key)
-
-    def write(self, text):
-        if self.fail:
-            raise RuntimeError("backend refused mid-string")
+def test_the_library_releases_what_a_failed_hotkey_pressed(monkeypatch):
+    """`press_hotkey` 拿掉自己的補救，靠的就是這一支：三鍵組合在第三個鍵上失敗，函式庫
+    要把前兩個倒著放開。這一支紅了，代表函式庫拿掉了 finally，鍵會卡在按下的狀態。"""
+    keyboard, calls, state = _real_keyboard_module(monkeypatch)
+    state["fail_at"] = 3
+    with pytest.raises(state["error"]):
+        keyboard.hotkey(["control", "shift", "a"])
+    assert calls == [("press", "control"), ("press", "shift"),
+                     ("release", "shift"), ("release", "control")], calls
 
 
-def test_a_failed_write_releases_the_keys_it_could_have_pressed(monkeypatch):
-    ac = _WriteAC()
-    monkeypatch.setattr(gui, "load_ac", lambda: ac)
-    monkeypatch.setattr(gui, "_require_input_desktop", lambda: None)
-    with pytest.raises(GuiError):
-        gui.type_text("ab")
-    assert ac.released == [65, 66], (
-        "失敗後沒有把鍵放開——卡住的一般字元鍵會被 Windows 無限自動重複，"
-        "而三層保險都掛在 key_down/key_up 上，這條路徑碰不到。")
-
-
-def test_a_successful_write_releases_nothing(monkeypatch):
-    """**反面**：正常成功時不可以亂送放開事件。"""
-    ac = _WriteAC(fail=False)
-    monkeypatch.setattr(gui, "load_ac", lambda: ac)
-    monkeypatch.setattr(gui, "_require_input_desktop", lambda: None)
-    gui.type_text("ab")
-    assert ac.released == []
-
-
-def test_control_characters_map_to_real_keys():
-    """`write()` 把換行／Tab 轉成真正的按鍵，不是打出那個控制字元——回收也要對齊。"""
-    ac = _WriteAC()
-    assert gui.keys_a_write_could_press(ac, "a\tb\n") == [65, "tab", 66, "return"]
-
-
-def test_characters_typed_via_unicode_are_not_listed():
-    """表裡沒有的字元走 Unicode 事件，**不按任何鍵**，所以不該出現在回收清單裡。
-    列進去雖然無害（放開沒按住的鍵是 no-op），但會讓清單與實際行為對不上。"""
-    ac = _WriteAC()
-    keys = gui.keys_a_write_could_press(ac, "a,b")   # ',' 不在表裡、也不是空白
-    assert keys == [65, 66]
-
-
-def test_whitespace_missing_from_the_table_is_released_as_space():
-    """表裡沒有、但是空白的字元，`write()` 會按 `space`——回收清單也要有它，否則送到一半失敗時
-    空白鍵可能一直按著（2026-09-23 分支覆蓋率：這一格從來沒跑過）。假後端的表裡沒有 `" "`。"""
-    ac = _WriteAC()
-    assert gui.keys_a_write_could_press(ac, "a b\u3000") == [65, "space", 66]
-
-
-def test_the_list_is_deduplicated_and_capped():
-    ac = _WriteAC()
-    assert gui.keys_a_write_could_press(ac, "aaabbb") == [65, 66]
-    # 上限要真的被踩到才測得出來——`"ab" * 500` 只有 **2 個相異字元**，上限拿掉
-    # 也照樣通過（2026-09-05 變異測試實測存活）。這裡造一份相異鍵遠多於上限的表。
-    class Wide:
-        keyboard_keys_table = {chr(c): c for c in range(33, 33 + 200)}
-        WRITE_CONTROL_KEYS = {}
-    wide_text = "".join(chr(c) for c in range(33, 33 + 200))
-    big = gui.keys_a_write_could_press(Wide(), wide_text)
-    assert len(big) == gui._UNDO_WRITE_MAX_KEYS, (
-        f"上限沒有生效（回了 {len(big)} 個鍵）——一段病態的長字串會把「補救」"
-        "本身變成幾百次輸入事件。")
-
-
-def test_the_undo_only_touches_keys_this_text_could_press():
-    """與 `_undo_hotkey_press` 同一個立場：不做「順手把所有修飾鍵放掉」的大掃除
-    ——使用者可能正握著 ctrl 站在鍵盤前面，替他放開是另一種靜默的錯。"""
-    ac = _WriteAC()
-    gui._undo_write_press(ac, "ab")
-    for modifier in ("ctrl", "alt", "shift", "win"):
-        assert modifier not in ac.released, (
-            f"回收時順手放開了 {modifier}——那不是這次呼叫按下的鍵。")
-
-
-def test_the_undo_survives_a_backend_that_cannot_release():
-    """補救本身不可以再丟例外——那會蓋掉真正的失敗原因。"""
-    class Hostile(_WriteAC):
-        def release_keyboard_key(self, key):
-            raise OSError("release failed")
-    assert gui._undo_write_press(Hostile(), "ab") == []
-
-
-def test_the_undo_survives_a_backend_with_no_key_table():
-    class Bare:
-        def release_keyboard_key(self, key):
-            pass
-    assert gui._undo_write_press(Bare(), "ab") == []
-
-
-def test_both_typing_paths_now_have_an_undo():
-    """`press_hotkey` 與 `type_text` 是同一個根因的兩個現場；補一邊漏一邊就是
-    2026-08-30 到 09-05 之間的狀態。用 AST 釘住兩邊都有補救。"""
-    import ast
-    with open(gui.__file__, encoding="utf-8") as handle:
-        src = handle.read()
-    tree = ast.parse(src)
-    for fname, undo in (("press_hotkey", "_undo_hotkey_press"),
-                        ("type_text", "_undo_write_press")):
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef) and n.name == fname)
-        called = {c.func.id for c in ast.walk(fn)
-                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-        assert undo in called, f"`{fname}` 失敗後沒有補一輪放開（少了 {undo}）"
+def test_the_library_releases_what_a_failed_write_pressed(monkeypatch):
+    """`type_text` 那一半的前提：`write()` 逐字呼叫 `type_keyboard`，而它是「按下 → 放開」。
+    放開那一步失敗時，鍵還按著——函式庫的 finally 要再放一次。舊的函式庫在這裡什麼都
+    不做，字元鍵會被作業系統一直自動重複。"""
+    keyboard, calls, state = _real_keyboard_module(monkeypatch)
+    state["fail_first_release"] = True
+    with pytest.raises(state["error"]):
+        keyboard.type_keyboard("a")
+    assert calls == [("press", "a"), ("release", "a"), ("release", "a")], calls
 
 
 # ==========================================================================
@@ -4751,21 +4679,6 @@ def test_every_mouse_button_points_at_a_real_backend_button(real_ac_tables):
     missing = _targets_missing_from(mouse, gui.MOUSE_BUTTONS)
     assert not missing, (
         "`MOUSE_BUTTONS` 這些目標在後端滑鼠鍵表裡不存在：%s" % missing)
-
-
-def test_the_write_control_key_fallback_names_real_keys(real_ac_tables):
-    """`write()` 的控制字元備援表也是後端鍵名，一樣會漂。
-
-    這一份**有**優雅降級（`_write_control_keys` 讀得到後端的真表就用真表），
-    所以漂掉的代價比上面兩張小；但降級只在後端**還有**那個常數時成立，常數被拿
-    掉之後就只剩這份備援，而那正是最需要它是對的時候。
-    """
-    keys, _ = real_ac_tables
-    fallback = gui._WRITE_CONTROL_KEYS_FALLBACK
-    assert len(fallback) >= 3, "備援表空了，這一筆會永遠通過"
-    missing = _targets_missing_from(keys, fallback)
-    assert not missing, (
-        "`_WRITE_CONTROL_KEYS_FALLBACK` 這些鍵名後端不認得：%s" % missing)
 
 
 def test_every_alias_survives_parse_key_name_against_the_real_table(

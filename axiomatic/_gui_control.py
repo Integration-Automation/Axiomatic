@@ -573,8 +573,9 @@ def capture(dest: Path, *, region: list[int] | None = None,
 def pixel_color(x: int, y: int) -> tuple[int, int, int]:
     """Read a single pixel's colour, returning `(r, g, b)`.
 
-    The low level returns inconsistent types across platforms (a COLORREF int on
-    Windows, a tuple elsewhere), so this normalises it before returning.
+    The library's `get_pixel` returns `(r, g, b)` on every backend (the Windows one
+    unpacks the COLORREF itself), so this only checks the shape. A COLORREF-int
+    branch used to live here; it became dead code once the library was unified.
     """
     ac = load_ac()
     try:
@@ -583,9 +584,6 @@ def pixel_color(x: int, y: int) -> tuple[int, int, int]:
         raise GuiError("Failed to read the pixel colour.") from error
     if isinstance(raw, (tuple, list)) and len(raw) >= 3:
         return int(raw[0]), int(raw[1]), int(raw[2])
-    if isinstance(raw, int):
-        # A Win32 COLORREF is 0x00BBGGRR
-        return raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF
     raise GuiError("Failed to read the pixel colour.")
 
 
@@ -759,6 +757,14 @@ def type_text(text: str) -> None:
     re-implemented in this project**—the same thing should have only one
     implementation, and it belongs to the desktop-automation library, not to this
     bot.
+
+    If sending fails part-way, the library itself releases what it pressed:
+    `type_keyboard` releases in a `finally`
+    (`je_auto_control.wrapper.auto_control_keyboard._release_still_held`). This
+    module used to run its own round of releases; it was removed once the library
+    gained that `finally` (one implementation of one thing), and the premise is
+    pinned against the real library by
+    `test_the_library_releases_what_a_failed_write_pressed`.
     """
     _require_input_desktop()
     if not text:
@@ -767,187 +773,31 @@ def type_text(text: str) -> None:
     try:
         ac.write(text)
     except Exception as error:  # pylint: disable=broad-except
-        # On failure, run one round of releases, for exactly the same reason as
-        # `press_hotkey`: the low-level `type_keyboard` is "press → release" with
-        # **no finally** in between, so if the release step fails after the press,
-        # that key stays pressed. This path also bypasses the three layers of
-        # safety this module claims (the `_HELD_INPUTS` registry /
-        # `release_all_inputs` / the timed auto-release only hang off `key_down` /
-        # `key_up`), so `/input key status` would say nothing is held and
-        # `/input key clear` could not release it either.
-        #
-        # This side is harder to recover from on its own than a key combination:
-        # what gets stuck is an **ordinary character key**, which Windows keeps
-        # auto-repeating, so that character gets typed on screen endlessly while
-        # the person who issued the command is not at the computer.
-        # (The combination path gets a modifier stuck; this
-        # `write(is_shift=False)` does not touch shift.)
-        stuck = _undo_write_press(ac, text)
         raise GuiError(
             "Keyboard input failed (this text contains characters that cannot be typed directly); "
-            f"the {len(stuck)} key(s) this text would use have been released again, "
-            "so the keyboard will not get stuck."
+            "every key that was pressed has been released, so the keyboard will not get stuck."
         ) from error
-
-
-# `write()` turns newline / Tab / backspace into real key presses rather than
-# typing that control character. This mapping must match the low-level
-# `WRITE_CONTROL_KEYS`; use that one when it can be read, and only fall back to
-# this copy when it cannot (it is an internal constant, not guaranteed to stay,
-# but even if it drifts, the worst case is releasing one key too few).
-_WRITE_CONTROL_KEYS_FALLBACK = {"\n": "return", "\r": "return",
-                                "\t": "tab", "\x08": "back"}
-
-# The most distinct keys to reclaim for one piece of text. Ordinary ASCII text has
-# far fewer distinct characters than this; the cap only stops a pathological long
-# string from turning the "remedy" itself into hundreds of input events.
-_UNDO_WRITE_MAX_KEYS = 64
-
-
-def _write_control_keys(ac: Any) -> dict:
-    """The low level's "control character → key name" mapping, or the fallback
-    copy when it cannot be read. Never raises."""
-    for holder in (ac, getattr(ac, "wrapper", None)):
-        table = getattr(holder, "WRITE_CONTROL_KEYS", None)
-        if isinstance(table, dict) and table:
-            return table
-    try:
-        from je_auto_control.wrapper.auto_control_keyboard import (  # type: ignore
-            WRITE_CONTROL_KEYS,
-        )
-        if isinstance(WRITE_CONTROL_KEYS, dict) and WRITE_CONTROL_KEYS:
-            return WRITE_CONTROL_KEYS
-    except Exception:  # pylint: disable=broad-except  # nosec B110
-        pass
-    return _WRITE_CONTROL_KEYS_FALLBACK
-
-
-def keys_a_write_could_press(ac: Any, text: str) -> list:
-    """The keys that **may get pressed** when this text is handed to `write()`
-    (deduplicated, capped).
-
-    Pure table lookup, sending no input events, so it can be tested. The order
-    follows each key's first appearance in the text, so failure messages and logs
-    read predictably.
-
-    It mirrors the branches of the low-level `write()`: control character →
-    `WRITE_CONTROL_KEYS`; a character in the table → its key code; one not in the
-    table → a Unicode event (**presses no key**, so it is not listed); whitespace
-    that still does not fit → `space`.
-    """
-    control = _write_control_keys(ac)
-    table = getattr(ac, "keyboard_keys_table", None)
-    if not isinstance(table, dict):
-        table = {}
-    out: list = []
-    seen = set()
-
-    def _add(key):
-        if key is None or key in seen:
-            return
-        seen.add(key)
-        out.append(key)
-
-    for char in text or "":
-        if len(out) >= _UNDO_WRITE_MAX_KEYS:
-            break
-        mapped = control.get(char)
-        if mapped is not None and mapped in table:
-            _add(mapped)
-        elif char in table:
-            _add(table[char])
-        elif char.isspace():
-            # The Unicode path presses no key, so only "not in the table, but
-            # whitespace" goes through space.
-            _add("space")
-    return out
-
-
-def _undo_write_press(ac: Any, text: str) -> list:
-    """When `write()` fails partway, run one round of releases for the keys this
-    text may still be holding down. Returns the ones actually released.
-
-    Same stance as `_undo_hotkey_press`: **release only the keys this one call may
-    itself have pressed**, with no "release every modifier while we are at it"
-    sweep—the user may be standing at the keyboard holding ctrl. Releasing a key
-    that is not held is safe (the OS does nothing for a key already up; `key_up`'s
-    docstring takes the same stance), so there is no need to know how many
-    characters were typed before the failure.
-    """
-    released: list = []
-    try:
-        candidates = keys_a_write_could_press(ac, text)
-    except Exception as error:  # pylint: disable=broad-except
-        print(f"[gui] write undo: cannot resolve keys: {error!r}",
-              file=sys.stderr)
-        return released
-    for key in candidates:
-        try:
-            ac.release_keyboard_key(_library_key(key))
-            released.append(key)
-        except Exception as error:  # pylint: disable=broad-except
-            print(f"[gui] write undo release {key!r} failed: {error!r}",
-                  file=sys.stderr)
-    return released
-
-
-def _undo_hotkey_press(ac: Any, tokens: list[str]) -> list[str]:
-    """When a key combination fails partway, run one round of releases in reverse
-    for the keys that may still be held. Returns which ones were actually
-    released.
-
-    Release **only the keys we ourselves asked to press**, with no "release every
-    modifier while we are at it" sweep—the user may be at the keyboard holding
-    ctrl, and releasing it for them is another kind of silent error.
-
-    Releasing a key that is not held is safe: the low level sends a release event,
-    and the OS does nothing for a key that is already up (`key_up`'s docstring
-    takes the same stance). So there is no need to know how far the presses got
-    before the failure; releasing them all once in reverse is enough.
-    """
-    released: list[str] = []
-    for token in reversed(tokens):
-        try:
-            ac.release_keyboard_key(_library_key(token))
-            released.append(token)
-        except Exception as error:  # pylint: disable=broad-except
-            print(f"[gui] hotkey undo release {token!r} failed: {error!r}",
-                  file=sys.stderr)
-    return released
 
 
 def press_hotkey(tokens: list[str]) -> None:
     """Send a key combination (press in order, then release in reverse).
 
-    **On failure, always run one round of reverse releases.** The low-level
-    `je_auto_control.hotkey` is "for press → for release" with **no finally** in
-    between. Measured on this machine on 2026-08-30 (with the low-level
-    press/release swapped for fake recorders, never touching the real desktop): a
-    three-key combination raising on the second key press produced a call
-    sequence of only `press ctrl` / `press shift`, **without a single
-    release**—ctrl and shift were simply left pressed.
-
-    This path bypasses the three layers of safety this module claims, because
-    those three layers (the `_HELD_INPUTS` registry, `release_all_inputs`, the
-    timed auto-release) only hang off `key_down` / `key_up`: a key combination is
-    never registered from start to finish, so `/input key status` would say
-    nothing is held, `/input key clear` could not release it, and there is no
-    timeout timer at all. The result is the whole computer acting broken (with alt
-    stuck, every key press becomes a menu shortcut) while the person who issued
-    the command is not at the computer.
-
-    Nor does this only happen with a mistyped key name: key names go through
-    `parse_key_name` first, and the real trigger is the OS layer failing between
-    two presses (a UAC screen cutting in, input blocked by the secure desktop).
+    If it fails part-way, the library's `hotkey` releases the pressed keys in a
+    `finally`, in reverse and only the ones actually pressed. This path bypasses
+    this module's three layers of safety (the `_HELD_INPUTS` registry,
+    `release_all_inputs` and the timed auto-release only hang off `key_down` /
+    `key_up`), so the release can **only** come from that library `finally`—pinned
+    against the real library by
+    `test_the_library_releases_what_a_failed_hotkey_pressed`, which goes red the
+    day the library drops it.
     """
     _require_input_desktop()
     ac = load_ac()
     try:
         ac.hotkey(_library_keys(tokens))
     except Exception as error:  # pylint: disable=broad-except
-        _undo_hotkey_press(ac, tokens)
         raise GuiError("Sending the key combination failed (possibly a key name that does not exist); "
-                       "the keys have been released again, so the keyboard will not get stuck.") from error
+                       "every key that was pressed has been released, so the keyboard will not get stuck.") from error
 
 
 # --------------------------------------------------------------------------
@@ -2487,21 +2337,30 @@ UI_SCAN_LIMIT = 1500
 
 # Type names are only used for validation and hints; the actual matching is done
 # by the library (it accepts both `button` and the low-level `ControlType_50000`
-# spelling).
-UI_CONTROL_TYPES = {
-    50000: "button", 50001: "calendar", 50002: "checkbox", 50003: "combobox",
-    50004: "edit", 50005: "hyperlink", 50006: "image", 50007: "listitem",
-    50008: "list", 50009: "menu", 50010: "menubar", 50011: "menuitem",
-    50012: "progressbar", 50013: "radiobutton", 50014: "scrollbar",
-    50015: "slider", 50016: "spinner", 50017: "statusbar", 50018: "tab",
-    50019: "tabitem", 50020: "text", 50021: "toolbar", 50022: "tooltip",
-    50023: "tree", 50024: "treeitem", 50025: "custom", 50026: "group",
-    50027: "thumb", 50028: "datagrid", 50029: "dataitem", 50030: "document",
-    50031: "splitbutton", 50032: "window", 50033: "pane", 50034: "header",
-    50035: "headeritem", 50036: "table", 50037: "titlebar",
-    50038: "separator",
-}
-_UI_TYPE_CODES = {name: code for code, name in UI_CONTROL_TYPES.items()}
+# spelling). The name table is the library's too: `control_type_name` is its
+# exported mapping. This module used to carry a copy, which lacked the library's
+# later 50039 / 50040. UI features need the library anyway, so the table is built
+# on first use and cached.
+_UI_TYPE_ID_RANGE = range(50000, 50100)
+_UI_TYPE_CODES: dict = {}
+
+
+def _ui_type_codes() -> dict:
+    """`{lower-case type name: ControlType id}`, built from the library's
+    `control_type_name` and cached.
+
+    A library without that mapping (too old) raises the generic `GuiError`, the
+    same sentence as UI features being unavailable.
+    """
+    if not _UI_TYPE_CODES:
+        name_of = getattr(load_ac(), "control_type_name", None)
+        if not callable(name_of):
+            raise GuiError("UI element location is unavailable in this environment.")
+        for code in _UI_TYPE_ID_RANGE:
+            name = str(name_of(code))
+            if not name.startswith("ControlType_"):
+                _UI_TYPE_CODES[name.lower()] = code
+    return _UI_TYPE_CODES
 
 
 def ui_status() -> tuple[bool, str]:
@@ -2530,9 +2389,10 @@ def parse_ui_type(raw: str) -> str:
     key = (raw or "").strip().lower()
     if not key:
         return ""
-    if key in _UI_TYPE_CODES:
+    codes = _ui_type_codes()
+    if key in codes:
         return key
-    listed = " / ".join(sorted(_UI_TYPE_CODES)[:12])
+    listed = " / ".join(sorted(codes)[:12])
     raise GuiError(f"Unknown element type. Common ones are: {listed} …")
 
 
