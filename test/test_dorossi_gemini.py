@@ -268,3 +268,111 @@ def test_a_long_prompt_goes_over_stdin_not_the_command_line(monkeypatch):
     assert proc.stdin.closed
     sent = json.loads(proc.stdin.data)
     assert sent["event"] == "user" and prompt in sent["message"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-01 覆蓋率盤點：壓縮、中止、stdin 斷掉、沉默、會丟例外的回呼
+# ---------------------------------------------------------------------------
+
+def _answer(sid, text, tokens_in=10, tokens_out=2):
+    return [
+        f'{{"event":"init","conversation_id":"{sid}","init":{{"model":"gemini-3.8-flash-medium"}}}}',
+        f'{{"event":"result","result":{{"conversation_id":"{sid}","status":"SUCCESS",'
+        f'"response":"{text}","usage":{{"input_tokens":{tokens_in},"output_tokens":{tokens_out}}}}}}}',
+    ]
+
+
+def _queue(*procs):
+    """依序交出事先排好的假子行程（每一次 spawn 一個）。"""
+    pending = list(procs)
+
+    def make():
+        return pending.pop(0)()
+    return make
+
+
+def test_compact_summarises_then_seeds_a_new_conversation(monkeypatch):
+    """沒有文件記載的 headless /compact：先請它摘要，再用摘要開一段新對話，回新的 id，用量兩段相加。"""
+    (answer, sid, info), spawned, recorded = _run(
+        monkeypatch,
+        _queue(lambda: _FakeProc(_answer("sid-old", "the summary", 100, 20)),
+               lambda: _FakeProc(_answer("sid-new", "OK", 30, 1))),
+        prompt="/compact keep the todo list", session_id="sid-old",
+        previous_usage={"input_tokens": 60, "output_tokens": 5})
+    assert (answer, sid) == ("", "sid-new")
+    first, second = json.loads(spawned[1].stdin.data), json.loads(spawned[3].stdin.data)
+    assert first["message"]["content"].startswith(
+        "Summarize the current conversation and unfinished work concisely.  keep the todo list")
+    assert "compacted summary" in second["message"]["content"]
+    assert "the summary" in second["message"]["content"]
+    assert "--conversation" in spawned[0] and "--conversation" not in spawned[2]
+    assert len(recorded) == 2
+    # 摘要那一輪按基準只算新增（100-60、20-5），種子那一輪全算（30、1）；回傳的是兩段相加。
+    # `recorded[1]` 與回傳的 info 是同一個 dict，所以拿具體數字比，不拿紀錄相加。
+    assert (info["in"], info["out"]) == (70, 16)
+
+
+def test_compact_with_an_empty_summary_keeps_the_old_conversation(monkeypatch):
+    (answer, sid, _info), spawned, _recorded = _run(
+        monkeypatch, lambda: _FakeProc(_answer("sid-old", "")),
+        prompt="/compact", session_id="sid-old")
+    assert (answer, sid) == ("", "sid-old") and len(spawned) == 2
+
+
+def test_compact_without_a_conversation_is_an_ordinary_turn(monkeypatch):
+    (answer, sid, _info), spawned, _recorded = _run(
+        monkeypatch, lambda: _FakeProc(_answer("sid-1", "nothing to compact")),
+        prompt="/compact")
+    assert (answer, sid) == ("nothing to compact", "sid-1") and len(spawned) == 2
+
+
+def test_an_abort_requested_at_spawn_kills_the_child_and_tolerates_it_being_gone(monkeypatch):
+    made = []
+
+    def make():
+        made.append(_FakeProc([], rc=1))
+        return made[-1]
+
+    with pytest.raises(RuntimeError):
+        _run(monkeypatch, make, abort_check=lambda: True)
+    assert made[0].kills >= 1
+
+
+@pytest.mark.parametrize("hook", ["on_proc", "abort_check"])
+def test_a_raising_callback_does_not_break_the_turn(monkeypatch, hook):
+    def boom(*_args):
+        raise ValueError("callback bug")
+
+    (answer, _sid, _info), _spawned, _recorded = _run(
+        monkeypatch, lambda: _FakeProc(_OK), **{hook: boom})
+    assert answer == "done"
+
+
+def test_a_child_that_closed_stdin_is_reported_and_classified(monkeypatch, capsys):
+    class _BrokenStdin(_FakeStdin):
+        def write(self, data):
+            raise BrokenPipeError("pipe closed")
+
+    def make():
+        proc = _FakeProc(['{"event":"error","error":{"message":"startup crash"}}'], rc=1)
+        proc.stdin = _BrokenStdin()
+        return proc
+
+    with pytest.raises(RuntimeError):
+        _run(monkeypatch, make)
+    assert "agy stdin failed" in capsys.readouterr().err
+
+
+def test_silence_raises_the_callers_silence_error(monkeypatch):
+    class _Silence(Exception):
+        pass
+
+    made = []
+
+    def make():
+        made.append(_FakeProc([], hang=True))
+        return made[-1]
+
+    with pytest.raises(_Silence):
+        _run(monkeypatch, make, silence_limit=0.05, silence_error=_Silence)
+    assert made[0].kills >= 1
