@@ -5381,11 +5381,14 @@ class _DorossiLoopState:
         self.injections.append(commit_instruction)
 
 
-# --- 進行中的單輪回合（`/dorossi running` 讀這一份）-------------------------------
+# --- 進行中的單輪回合（`/dorossi running` 與 `/dorossi abort` 讀這一份）-------------
 # 自走迴圈早就有自己的 registry（`_dorossi_loops`），單輪回合沒有：`_dorossi_process_turn`
 # 在跑的那一輪只存在於 per-session 鎖與號誌的內部狀態裡，外面看不出「哪個對話、跑多久、
 # 是在等空位還是真的在跑」。這份登記只補那一塊；迴圈、排隊與號誌照舊讀既有的狀態
 # （`_dorossi_loops`、`_dorossi_waiters`、`_dorossi_backend_sem`），不另存第二份。
+#
+# `/dorossi abort` 也靠它找到正在跑的單輪回合：full 工具模式的單輪上限是好幾個小時，
+# 在那之前擁有者要有辦法叫停一個跑偏的回合，而不是重啟整個 bot。
 #
 # 登記／移除全部在事件迴圈上同步進行，移除寫在 `_dorossi_process_turn` 的 `finally`：
 # 回合丟例外或被取消（`CancelledError` 是 BaseException，`except Exception` 接不到）
@@ -5405,10 +5408,15 @@ class _DorossiTurnState:
       答案送出後要靜默壓縮時再走 `"compact_wait"` → `"compact"`；轉進自走迴圈時是
       `"loop"`，之後由 `_dorossi_loops` 裡的那個迴圈代表這一輪。
     * `backend`：這一輪實際用的後端 id（決定之後才有值，對外一律走 `_backend_display`）。
-    * `proc`：後端子行程（`on_proc` 回呼記下），只用來給擁有者看 PID。
-    * `abort`／`offline_since`／`offline_target`：後端連不上伺服器時這一輪會停在
-      `"offline"` 等網路回來（沒有上限），那段期間 `/dorossi abort <id>` 可以中止它
-      （`request_abort`）；等待的起點與對象給 `/dorossi running` 看。
+    * `proc`：後端子行程（`on_proc` 回呼記下）。給擁有者看 PID，也是 `request_abort`
+      要砍的對象。
+    * `abort`：`/dorossi abort` 對這一輪要求中止（`request_abort` 設）。任何階段都可以：
+      後端在跑就當場砍掉它，那次呼叫不論以什麼樣子失敗都收成「已中止」，不重試、不停進
+      用量佇列、不開新對話重跑；還沒起後端（準備中、等空位、等網路回來）就不再起；
+      後端剛好自己跑完的話，推進照存、答案不送、不轉進自走、不做背景壓縮。判斷全部在
+      `_dorossi_turn_backend` 與 `_dorossi_run_turn`。
+    * `offline_since`／`offline_target`：後端連不上伺服器時這一輪會停在 `"offline"`
+      等網路回來（沒有上限）；等待的起點與對象給 `/dorossi running` 看。
     所有欄位只在事件迴圈內同步讀寫。"""
 
     __slots__ = ("uid", "sid", "kind", "phase", "backend", "started_ts", "proc",
@@ -5431,9 +5439,12 @@ class _DorossiTurnState:
         self.proc = proc
 
     def request_abort(self) -> None:
-        """`/dorossi abort` 對一個正在等網路的單輪回合：設旗標，等待在下一次輪詢時結束。
-        後端行程此時多半已經結束（等待是在兩次呼叫之間）；還在的話一併 kill，與
-        `_DorossiLoopState.request_abort` 同一個形狀（行程可能剛好在這一刻結束）。"""
+        """`/dorossi abort` 對這一輪：設旗標，後端行程還活著就當場 kill。
+
+        與 `_DorossiLoopState.request_abort` 同一個形狀（行程可能剛好在這一刻結束）。
+        砍掉之後後端的讀取迴圈讀到 EOF、以非零結束碼收尾，那個失敗由
+        `_dorossi_turn_backend` 依旗標收成 `_DorossiTurnAborted`。沒有行程可砍時（準備中、
+        等空位、等網路、沒有子行程的後端）只有旗標，由下一個檢查點接手。同步、不得 raise。"""
         self.abort = True
         proc = self.proc
         if proc is not None and getattr(proc, "returncode", None) is None:
@@ -5537,16 +5548,17 @@ async def _dorossi_backend_slot(turn: _DorossiTurnState | None = None, *,
 
 
 def _dorossi_select_abort_target(running: list, arg: str, active_key):
-    """純函式：決定 `/dorossi abort [<arg>]` 要中止哪些自走任務（可測）。
+    """純函式：決定 `/dorossi abort [<arg>]` 要中止哪些工作（可測）。
 
-    `running`＝進行中迴圈的 key 清單 [(uid, sid), …]；`arg`＝已 strip/lower 的
-    參數（"" / "all"／"全部" / session id）；`active_key`＝擁有者 active session
-    的 key（可能為 None）。回傳 (kind, payload)：
+    `running`＝進行中工作的 key 清單 [(uid, sid), …]——自走迴圈與單輪回合都算，一個
+    session 一筆（`/dorossi yield` 與停放列的取消也用這一支，傳的是各自的清單）；
+    `arg`＝已 strip/lower 的參數（"" / "all"／"全部" / session id）；`active_key`＝
+    擁有者 active session 的 key（可能為 None）。回傳 (kind, payload)：
       * ("all", keys)  ── 全部中止。
       * ("one", key)   ── 中止這一個：指名的 id；未指名時優先 active session 的
-                          迴圈，只有一個迴圈時就是它。
-      * ("ask", keys)  ── 未指名且有多個、active 又沒有迴圈 → 要求指定。
-      * ("none", None) ── 沒有符合的迴圈（清單空、或指名的 id 沒在跑）。"""
+                          那一件，只有一件在跑時就是它。
+      * ("ask", keys)  ── 未指名且有多件、active 又沒有 → 要求指定。
+      * ("none", None) ── 沒有符合的（清單空、或指名的 id 沒在跑）。"""
     if not running:
         return ("none", None)
     if arg in ("all", "全部"):
@@ -6791,24 +6803,52 @@ async def _dorossi_loop_platform(st, factory):
 
 
 class _DorossiTurnAborted(Exception):
-    """單輪回合在等網路回來時被 `/dorossi abort` 中止。"""
+    """單輪回合被 `/dorossi abort` 中止（`_DorossiTurnState.abort`）。
+
+    `offline`＝中止時這一輪正在等網路回來：那一題根本沒有送出去，收尾講的是另一句。"""
+
+    def __init__(self, *, offline: bool = False) -> None:
+        super().__init__()
+        self.offline = offline
 
 
 _DOROSSI_OFFLINE_TURN_TEXT = "⏸️ 網路中斷了，連線恢復後會自動接著處理這一題…"
+# 被中止的單輪回合那則訊息最後的內容。泛用句（Layer 1）：不帶例外文字、路徑或 PID。
+_DOROSSI_TURN_ABORTED_TEXT = "⏹️ 已中止。"
+_DOROSSI_TURN_ABORTED_OFFLINE_TEXT = "⏹️ 已中止：網路中斷期間這一題沒有送出。"
+
+
+def _dorossi_turn_aborted_text(exc: _DorossiTurnAborted) -> str:
+    """被中止的那一輪要顯示哪一句（見 `_DorossiTurnAborted.offline`）。"""
+    return (_DOROSSI_TURN_ABORTED_OFFLINE_TEXT if exc.offline
+            else _DOROSSI_TURN_ABORTED_TEXT)
 
 
 async def _dorossi_turn_backend(turn: "_DorossiTurnState", live, factory):
     """單輪回合的一次後端呼叫：連不上伺服器（`_DorossiOfflineError`）時等網路回來，
-    再用**同一個**工作階段重跑——`factory` 每次都帶同一組引數。沒有上限；等待中被
-    `/dorossi abort <id>` 中止就丟 `_DorossiTurnAborted`。
+    再用**同一個**工作階段重跑——`factory` 每次都帶同一組引數。沒有上限。
+
+    `/dorossi abort` 的判斷也集中在這裡（`turn.abort`），丟 `_DorossiTurnAborted`：
+
+    * 旗標已經設了就**不再起後端**——準備中、等空位、等網路回來之後、以及「工作階段
+      過舊、開新對話重跑」那一次，都會先經過這個檢查；
+    * 後端在跑的時候被砍掉，那次呼叫會以各種失敗的樣子回來（非零結束碼會被判成工作
+      階段過舊、用量上限、暫時性故障或泛用錯誤）。旗標設著時一律收成中止，呼叫端那些
+      「再跑一次」「停進佇列之後再跑」的退路一條都不會接手。
+
+    後端剛好自己跑完（正常回傳）時這裡照樣回傳，由呼叫端存完推進之後再看旗標。
 
     等待期間這一輪的階段是 `"offline"`，後端空位照樣佔著：斷網時別的回合也一樣跑不動，
     放掉空位只會讓排在後面的那幾輪各自再撞一次同一面牆。"""
     attempt = 0
     while True:
+        if turn.abort:
+            raise _DorossiTurnAborted()
         try:
             return await factory()
         except _DorossiOfflineError as exc:
+            if turn.abort:
+                raise _DorossiTurnAborted() from exc
             attempt += 1
             print(f"[dorossi] {turn.sid}: backend unreachable (attempt {attempt}); "
                   "waiting for the network, same session", file=sys.stderr)
@@ -6824,8 +6864,12 @@ async def _dorossi_turn_backend(turn: "_DorossiTurnState", live, factory):
             finally:
                 turn.phase = previous
             if not ok:
-                raise _DorossiTurnAborted() from exc
+                raise _DorossiTurnAborted(offline=True) from exc
             live.update("⏳ 處理中…")
+        except Exception as exc:  # pylint: disable=broad-except
+            if turn.abort:
+                raise _DorossiTurnAborted() from exc
+            raise
 
 
 def _dorossi_owner_only(message: discord.Message) -> bool:
@@ -7031,7 +7075,10 @@ def _dorossi_running_parts(state: dict, source, *,
         bits = [kind]
         if turn.backend:
             bits.append(f"後端 {_backend_display(turn.backend)}")
-        if turn.offline_since is not None:
+        if turn.abort:
+            # 已經被要求中止、還沒收尾（例如排在空位上，輪到它才會結束）。
+            bits.append("中止中")
+        elif turn.offline_since is not None:
             bits.append(_offline_text(turn.offline_since, turn.offline_target))
         else:
             bits.append(_DOROSSI_TURN_PHASE_TEXT.get(turn.phase, turn.phase))
@@ -9562,17 +9609,26 @@ async def _dorossi_maybe_compact_single_turn(uid: str, sid: str,
     （回寫只是把 `/compact` 產生的 cc_session_id 存回同一 slot，並更新 last_used）。
 
     `turn` 是呼叫端那一輪的登記（`_dorossi_turns`）：壓縮期間它在 `/dorossi running`
-    上顯示成「背景壓縮」，排在號誌上時是「等候空位」——壓縮也佔一個後端空位。"""
+    上顯示成「背景壓縮」，排在號誌上時是「等候空位」——壓縮也佔一個後端空位。
+    那一輪被 `/dorossi abort` 中止之後（`turn.abort`）就不再起這次壓縮：開始前看一次、
+    等到空位之後再看一次；壓縮跑到一半被砍掉則照「壓縮失敗」處理（當作沒壓）。"""
+    def _aborted() -> bool:
+        return turn is not None and turn.abort
+
     try:
         # 脈絡大小＝本輪**最後一次** API 呼叫的前綴（`info["ctx"]`），不是整輪加總——
         # 後者在 full 模式等於前綴 × 工具呼叫次數，每一輪都會過門檻（見
         # `_dorossi_context_tokens`）。
         if not _dorossi_context_compaction_due(_dorossi_context_tokens(info)):
             return
+        if _aborted():
+            return
         # 後端號誌內執行（與單輪主回合一致地壓住同時在跑的後端數）；答案已送出，此處
         # 稍等取號誌不影響使用者體驗。全程無任何 Discord 動作（連 typing 指示都不發），
         # 徹底靜默——on_text 為 no-op，不串流、不貼訊息。
         async with _dorossi_backend_slot(turn, compact=True):
+            if _aborted():
+                return
             # 累計基準＝主回合剛回報的原始值（它的 `usage_mark` 屬於 `cc_session_id`，
             # 也就是這裡要 resume 的那一個）。
             _ans, compact_sid, _cinfo = await _dorossi_via_claude_code(
@@ -9582,7 +9638,8 @@ async def _dorossi_maybe_compact_single_turn(uid: str, sid: str,
                 max_budget_usd=DOROSSI_MAX_BUDGET_USD,
                 model=snap.get("model"), effort=snap.get("effort"),
                 usage_baseline=(info or {}).get("usage_mark"),
-                on_proc=(turn.set_proc if turn is not None else None))
+                on_proc=(turn.set_proc if turn is not None else None),
+                abort_check=_aborted)
         if compact_sid:
             # fail-closed 回寫：slot 若在後端呼叫期間被刪就丟棄（見 _dorossi_persist_advance）。
             def _compact_save_mut(state: dict) -> None:
@@ -9808,6 +9865,13 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                 allowed_mentions=discord.AllowedMentions.none())
         except Exception:  # pylint: disable=broad-except  # nosec B110
             pass
+    # 準備階段就被 `/dorossi abort` 中止（後端還沒起來）：到此為止。單輪那條路之後還會
+    # 經過 `_dorossi_turn_backend` 的檢查，但下面的自走轉進不會——接手的迴圈看的是它
+    # 自己的旗標，少了這一道，擁有者收到「已中止」之後一個自走任務照樣開跑。
+    if turn.abort:
+        _dorossi_event("turn_aborted", uid=uid, sid=sid, stage="prep")
+        await _preflight_fail(_DOROSSI_TURN_ABORTED_TEXT)
+        return
     # 自走模式：擁有者 ＋ full 工具模式 ＋ 提問帶「自主完成」意圖時，改走多輪自走
     # 迴圈（在本 session 的鎖內持續執行直到完成／被 abort），而非單輪問答。沿用排隊
     # 佔位訊息當作進入自走模式的 ack，不浪費單則 live。迴圈自己會用狀態 RMW 讀寫 slot。
@@ -9844,10 +9908,16 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
         # `_dorossi_backend_slot` 只多了登記的階段切換（同步），持有範圍與直接
         # `async with _dorossi_backend_sem` 相同。
         async with _dorossi_backend_slot(turn):
+            if turn.abort:
+                # 等空位的期間被 `/dorossi abort` 中止：空位馬上還回去，不起後端。
+                raise _DorossiTurnAborted()
             if slot_busy:
                 # 換回「處理中」用非阻塞的 update（背景送出），**不**在拿著空位時 await
                 # 一次訊息編輯——空位只該花在後端上。
                 live.update("⏳ 處理中…")
+            # 每一個會起子行程的後端都帶 `abort_check`：abort 落在「起行程」那一瞬間時
+            # （`request_abort` 當下還沒有行程可砍），行程一起來就自己結束。
+            abort_check = lambda: turn.abort  # noqa: E731 (small predicate)
             async with message.channel.typing():
                 if backend == "claude_code":
                     # 自判路徑：turn-1 注入自判指示，並改用會剝除哨符的 on_text，避免開場
@@ -9872,7 +9942,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                                 max_budget_usd=DOROSSI_MAX_BUDGET_USD,
                                 model=snap["model"], effort=snap["effort"],
                                 usage_baseline=snap["cc_usage_mark"],
-                                on_proc=turn.set_proc))
+                                on_proc=turn.set_proc, abort_check=abort_check))
                     except _DorossiResumeError:
                         # Stored session vanished (expired/cleaned) — start fresh.
                         # Reset the live preview so stale partial text from the
@@ -9886,7 +9956,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                                 extra_dir=extra_dir, workdir=workdir,
                                 max_budget_usd=DOROSSI_MAX_BUDGET_USD,
                                 model=snap["model"], effort=snap["effort"],
-                                on_proc=turn.set_proc))
+                                on_proc=turn.set_proc, abort_check=abort_check))
                     new_hist = None
                     codex_sid = None
                     gemini_sid = None
@@ -9897,7 +9967,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                                 prompt, snap["codex_session_id"], on_text=live.update,
                                 extra_dir=snap["cc_extra_dir"], workdir=snap["cc_cwd"],
                                 model=snap["model"],
-                                on_proc=turn.set_proc))
+                                on_proc=turn.set_proc, abort_check=abort_check))
                     except _DorossiResumeError:
                         await live.finalize("⏳ 重新整理對話中…")
                         live.reopen()
@@ -9906,7 +9976,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                                 prompt, None, on_text=live.update,
                                 extra_dir=snap["cc_extra_dir"], workdir=snap["cc_cwd"],
                                 model=snap["model"],
-                                on_proc=turn.set_proc))
+                                on_proc=turn.set_proc, abort_check=abort_check))
                     new_sid = None
                     new_hist = None
                     gemini_sid = None
@@ -9921,7 +9991,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                                 turn_prompt, snap["gemini_session_id"], on_text=on_text,
                                 extra_dir=snap["cc_extra_dir"], workdir=snap["cc_cwd"],
                                 model=snap["model"], effort=snap["effort"],
-                                on_proc=turn.set_proc,
+                                on_proc=turn.set_proc, abort_check=abort_check,
                                 previous_usage=snap["gemini_usage_mark"]))
                     except _DorossiResumeError:
                         await live.finalize("⏳ 重新整理對話中…")
@@ -9931,7 +10001,7 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                                 turn_prompt, None, on_text=on_text,
                                 extra_dir=snap["cc_extra_dir"], workdir=snap["cc_cwd"],
                                 model=snap["model"], effort=snap["effort"],
-                                on_proc=turn.set_proc))
+                                on_proc=turn.set_proc, abort_check=abort_check))
                     new_sid = None
                     codex_sid = None
                     new_hist = None
@@ -9960,6 +10030,12 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                                      usage_mark=(_info or {}).get("usage_mark"),
                                      gemini_usage_mark=(_info or {}).get("gemini_usage_mark"))
         await _dorossi_state_rmw(_save_mut)
+        if turn.abort:
+            # `/dorossi abort` 落地的同一刻後端自己跑完了（行程已經結束，沒有東西可砍）。
+            # 那一輪是真的做完了，所以上面的推進照存——後端那一側已經包含這一輪，不存的話
+            # 下一輪接的是舊的工作階段。但擁有者已經收到「已中止」：答案不送，也**不得**
+            # 因為答案帶著開場哨符就轉進自走、或接著做背景壓縮。
+            raise _DorossiTurnAborted()
         generated_images = (_info or {}).get("images", [])
         sent_image_count = await _dorossi_send_images(message, generated_images)
         # 自判轉進：turn-1 帶開場哨符 → 把 turn-1 當「第一輪」呈現，再轉進自走迴圈，從
@@ -9976,6 +10052,14 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
                     # turn-1 只有哨符、沒有正文——先收掉這則 live（停掉串流背景任務），
                     # 進迴圈的 ack 由迴圈另發一則。
                     await live.finalize("🔁 收到，開始持續推進…")
+                if turn.abort:
+                    # 第一輪的答案送出的期間被 `/dorossi abort` 中止：到此為止，不轉進自走
+                    # （接手的迴圈看的是它自己的旗標）。已經送出的答案留著；只有哨符、
+                    # 沒有正文的那一種，把那句「開始持續推進」改掉。
+                    _dorossi_event("turn_aborted", uid=uid, sid=sid, stage="handover")
+                    if not chunks:
+                        await live.finalize(_DOROSSI_TURN_ABORTED_TEXT)
+                    return
                 turn.phase = "loop"   # 之後由 `_dorossi_loops` 裡的迴圈代表這一輪
                 await _dorossi_run_loop(
                     message, prompt, None, uid, sid,
@@ -9999,10 +10083,14 @@ async def _dorossi_run_turn(message: discord.Message, prompt: str,
         if backend == "claude_code" and new_sid:
             await _dorossi_maybe_compact_single_turn(uid, sid, new_sid, snap, _info,
                                                      turn=turn)
-    except _DorossiTurnAborted:
-        # 等網路回來的期間被 `/dorossi abort` 中止了。abort 自己會回一句確認，這裡只把
-        # 這一輪的那則訊息收掉，不當成失敗（不附診斷摘要）。
-        await live.finalize("⏹️ 已中止：網路中斷期間這一題沒有送出。")
+    except _DorossiTurnAborted as exc:
+        # 被 `/dorossi abort` 中止了（後端在跑、在等空位、在等網路回來都會到這裡）。abort
+        # 自己會回一句確認，這裡只把這一輪的那則訊息收掉：不當成失敗（不附診斷摘要）、
+        # 不停進用量佇列、不重跑。存著的工作階段沒有被動到——被砍掉的那一輪沒有可信的
+        # 新 id，下一輪照舊接原本那一個。
+        _dorossi_event("turn_aborted", uid=uid, sid=sid,
+                       stage="offline" if exc.offline else "turn")
+        await live.finalize(_dorossi_turn_aborted_text(exc))
     except _DorossiUsageLimitError as exc:
         # Usage / quota limit. 先**停進佇列**（磁碟，帶牆上時鐘的 `run_at`），時間到了由
         # `_dorossi_parked_watch_loop`／開機還原重跑——跟斷網那條路同一個形狀，擁有者不必
@@ -13708,28 +13796,39 @@ async def _dorossi_abort_reply_pending(message, uid: str, arg: str) -> bool:
 
 
 async def mcmd_abort(message: discord.Message, rest: str = "") -> None:
-    """`/dorossi abort [<session id>|all]` — 中止進行中的工作（自走迴圈優先，其次產圖）。
+    """`/dorossi abort [<session id>|all]` — 中止進行中的工作（Dorossi 的工作優先，其次產圖）。
 
-    自走迴圈已可多個並行（每 session 一個，狀態在 `_dorossi_loops`），所以 abort
-    有了「指誰」的語意（純函式 `_dorossi_select_abort_target` 決定，可測）：
-      * `/dorossi abort`        → 預設中止 **active session** 的迴圈；active 沒有迴圈
-                              而只有一個迴圈在跑時就中止那一個；有多個且 active
-                              沒有 → 泛用提示請指定（列出 session id）。
-      * `/dorossi abort <id>`   → 中止該 session 的迴圈（id＝s1/s2…）。
-      * `/dorossi abort all`    → 中止所有進行中的迴圈（`全部` 同義）。
-    中止＝對目標 state `request_abort()`（設旗標＋kill 該迴圈當前回合的後端行程）；
-    該迴圈會在當前回合解開後 return，其 per-session 鎖隨之釋放；**其他迴圈與其他
-    session 的互動回合完全不受影響**。被中止的 session 會留著「未完成任務」標記，
-    之後可用 `/dorossi session continue <id>` 接續。（與產圖完全獨立——只動 claude
-    後端，不碰 webrunner／Chrome。）
+    能被中止的 Dorossi 工作有兩種，都以工作階段為單位：
 
-    沒有任何迴圈在跑時：
+    * **自走迴圈**（每 session 一個，狀態在 `_dorossi_loops`）；
+    * **正在進行的單輪回合**（`_dorossi_turns` 裡還沒交給迴圈的那些：準備中、等空位、
+      後端在跑、等網路回來、收尾與回覆之後的背景壓縮）。完整工具模式的單輪上限是好幾個
+      小時，在那之前這是擁有者叫停一個跑偏的回合唯一的出口（2026-10-01）。
+
+    同一個 session 同時有迴圈與單輪登記時以迴圈為準（那一輪是由迴圈在跑的）。指誰由
+    純函式 `_dorossi_select_abort_target` 決定（可測），兩種工作共用同一套語意：
+      * `/dorossi abort`        → 預設中止 **active session** 的那一件；active 沒有
+                              而只有一件在跑時就中止那一件；有多件且 active 沒有
+                              → 泛用提示請指定（列出 session id）。
+      * `/dorossi abort <id>`   → 中止該 session 的那一件（id＝s1/s2…）。
+      * `/dorossi abort all`    → 中止所有進行中的（`全部` 同義）。
+    中止＝對目標 state `request_abort()`（設旗標＋kill 它當前的後端行程），這裡不等它
+    收尾：
+      * 迴圈在當前回合解開後 return；那個 session 會留著「未完成任務」標記，之後可用
+        `/dorossi session continue <id>` 接續。
+      * 單輪回合把那則訊息收成「已中止」就結束（`_dorossi_run_turn`）：不重試、不停進
+        用量佇列、不開新對話重跑、不轉進自走；存著的工作階段不動，下一題照常接。沒有
+        未完成標記——單輪沒有東西可接續。
+    兩種都會放掉自己的 per-session 鎖，排在後面的提問照常輪到；**其他 session 的迴圈
+    與回合完全不受影響**。（與產圖完全獨立——只動對話後端，不碰 webrunner／Chrome。）
+
+    沒有任何 Dorossi 工作在跑時：
       B. 若有產圖工作進行中（`_generate_inflight`）→ 只動 currently-inflight 那
          一筆：把它從佇列狀態移除（清 `_generate_inflight` ＋ correlation map ＋ 刪
          磁碟請求檔），終止正在服務它的背景程式，再讓 `_generate_pump` 把「下一筆」
          推上去。**不會**清空其餘佇列（清空整條佇列是 `/stop` 的行為）。
 
-    自走迴圈與產圖佇列是兩套獨立子系統，理論上可同時存在；此處刻意「自走優先」，
+    Dorossi 與產圖佇列是兩套獨立子系統，理論上可同時存在；此處刻意「Dorossi 優先」，
     一次 abort 處理一件——若兩者皆在跑，再下一次 `/dorossi abort` 處理產圖那邊。
 
     Owner-only（與 `/gen image` 同 gating）：它會終止背景行程、操作同一條
@@ -13757,15 +13856,17 @@ async def mcmd_abort(message: discord.Message, rest: str = "") -> None:
 
     arg = rest.strip().lower()
 
-    # 2. Dorossi 自走迴圈優先：用純函式挑出目標（active 優先／指名 id／all），對
-    #    目標 state request_abort()（設旗標＋kill 該迴圈當前行程）。各迴圈會自行
-    #    解開並釋放自己的 per-session 鎖（abort 不需等待）；其餘迴圈不受影響。
-    #    與產圖完全獨立，故有命中就在這裡收尾、不往下走。
-    # 能被中止的：每一個自走迴圈，加上**正在等網路回來**的單輪回合（那段等待沒有
-    # 上限，abort 是唯一的出口；一般在跑的單輪回合有看門狗，不在這裡）。
+    # 2. Dorossi 的工作優先：用純函式挑出目標（active 優先／指名 id／all），對目標
+    #    state request_abort()（設旗標＋kill 它當前的後端行程）。迴圈與回合各自收尾並
+    #    放掉自己的 per-session 鎖（abort 不需等待）；其餘的不受影響。與產圖完全獨立，
+    #    故有命中就在這裡收尾、不往下走。
+    # 能被中止的：每一個自走迴圈，加上每一個**正在進行的單輪回合**。完整工具模式的單輪
+    # 上限是好幾個小時，那段期間這裡是唯一的出口。迴圈先放進去，所以同一個 session 兩種
+    # 都有時 `setdefault` 留下的是迴圈；階段是 `loop` 的登記已經交給迴圈了（迴圈那一筆
+    # 不在的話，上面也沒有東西可以中止），不算。
     abortable = dict(_dorossi_loops)
     for _turn in list(_dorossi_turns):
-        if _turn.offline_since is not None:
+        if _turn.phase != "loop":
             abortable.setdefault(_dorossi_session_key(_turn.uid, _turn.sid), _turn)
     if abortable:
         uid = str(message.author.id)
@@ -13779,6 +13880,8 @@ async def mcmd_abort(message: discord.Message, rest: str = "") -> None:
                 target = abortable.get(k)
                 if target is not None:
                     target.request_abort()
+            _dorossi_event("abort", uid=uid, scope="all", count=len(payload),
+                           loops=sum(1 for k in payload if k in _dorossi_loops))
             cancelled = await _dorossi_cancel_autoresume(uid, None)
             parked = _dorossi_drop_parked_rows(uid, None)
             extra = (f"，另外取消了 {len(cancelled)} 個等著自動接續的任務"
@@ -13791,7 +13894,12 @@ async def mcmd_abort(message: discord.Message, rest: str = "") -> None:
         if kind == "one":
             target = abortable.get(payload)
             if target is not None:
+                # 事件記下中止的當下它在做什麼（迴圈，或單輪回合的哪個階段）。
+                phase = ("loop" if payload in _dorossi_loops
+                         else getattr(target, "phase", "?"))
                 target.request_abort()
+                _dorossi_event("abort", uid=uid, scope="one", sid=payload[1],
+                               phase=phase)
             parked = _dorossi_drop_parked_rows(uid, [payload[1]])
             tail = (f"（另取消 {len(parked)} 筆等方案用量重設的提問）"
                     if parked else "")
@@ -13805,7 +13913,7 @@ async def mcmd_abort(message: discord.Message, rest: str = "") -> None:
                 "或 `/dorossi abort all` 全部中止。")
             return
         # kind == "none"：指名的 id 沒有在跑 → 泛用提示，不往產圖路徑走（指名
-        # 形式只針對自走任務）。等著被自動接續的，取消它的自動接續。
+        # 形式只針對 Dorossi 的工作）。等著被自動接續的，取消它的自動接續。
         if await _dorossi_abort_reply_pending(message, uid, arg):
             return
         await safe_reply(message, "該對話沒有進行中的任務。")
@@ -13843,7 +13951,7 @@ async def mcmd_abort(message: discord.Message, rest: str = "") -> None:
                     "用 `/dorossi abort <id>` 指定，或 `/dorossi abort all` 全部取消。")
                 return
 
-    # 指名了 id 但沒有任何迴圈在跑 → 泛用提示（指名形式只針對自走任務）。
+    # 指名了 id 但那裡沒有東西在跑 → 泛用提示（指名形式只針對 Dorossi 的工作）。
     if arg and arg not in ("all", "全部"):
         await safe_reply(message, "該對話沒有進行中的任務。")
         return

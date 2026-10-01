@@ -22,6 +22,7 @@
 """
 import ast
 import asyncio
+import json
 import os
 import sys
 import time
@@ -1293,3 +1294,545 @@ def test_an_offline_turn_can_be_aborted(turn_env, online):
     assert any("已中止" in str(x) for x in turn_env.live), turn_env.live
     assert "DIAG" not in _said(turn_env)
     assert b._dorossi_turns == []
+
+
+# --------------------------------------------------------------------------
+# 十二、`/dorossi abort` 中止正在跑的單輪回合（2026-10-01）
+# --------------------------------------------------------------------------
+#
+# 事故：擁有者問了一句話，走的是這條單輪路徑；後端把它當成「繼續做」，在完整工具模式下
+# 自己去改 repo。擁有者下了 `/dorossi abort`，沒有停住——可中止的集合只收自走迴圈與
+# 「正在等網路」的回合。這一段釘的是另一半：被中止的那一輪怎麼收尾。
+#
+# 被砍掉的後端行程會以**各種失敗的樣子**回來（非零結束碼 → 工作階段過舊、用量上限、
+# 暫時性故障、泛用錯誤…），而每一種失敗在這支函式裡都有一條「再跑一次」或「停進佇列
+# 之後再跑」的退路。中止的那一輪一條都不能走。
+
+_REAL_COMPACT = b._dorossi_maybe_compact_single_turn    # 夾具會把模組上的那一個換掉
+ABORTED = "⏹️ 已中止。"
+
+
+class _KillableProc:
+    """後端子行程的替身：被 kill 之後 `dead` 會被放開（正式的讀取迴圈這時讀到 EOF）。"""
+
+    def __init__(self):
+        self.pid = 4321
+        self.returncode = None
+        self.kills = 0
+        self.dead = None
+
+    def kill(self):
+        self.kills += 1
+        self.returncode = 1
+        if self.dead is not None:
+            self.dead.set()
+
+
+class _PowerHold:
+    def __init__(self, book):
+        self.book = book
+        book["held"] += 1
+
+    def release(self):
+        self.book["released"] += 1
+
+
+@pytest.fixture
+def abortable(turn_env, monkeypatch):
+    """乾淨的登記表，並讓 `mcmd_abort` 讀得到夾具的狀態。"""
+    turn_env.power = {"held": 0, "released": 0}
+    monkeypatch.setattr(b, "_dorossi_turns", [])
+    monkeypatch.setattr(b, "_dorossi_loops", {})
+    monkeypatch.setattr(b, "_dorossi_power_holds", {})
+    monkeypatch.setattr(b, "bot_power_hold",
+                        lambda _reason: _PowerHold(turn_env.power))
+    monkeypatch.setattr(b, "_dorossi_load_state", lambda: turn_env.state)
+    return turn_env
+
+
+def _abort_then(outcome):
+    """腳本步驟：後端呼叫「進行中」被要求中止，然後那次呼叫以 `outcome` 收尾。"""
+    def step(_env):
+        b._dorossi_turns[0].request_abort()
+        return outcome
+    return step
+
+
+def _install_gemini(env, monkeypatch):
+    async def fake_gemini(prompt, session_id, **kwargs):
+        env.calls.append(("gemini", prompt, session_id, kwargs))
+        env.order.append("backend")
+        step = env.script.pop(0) if env.script else ("答案", "gm-new", {})
+        if callable(step) and not isinstance(step, BaseException):
+            step = step(env)
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    monkeypatch.setattr(b, "_dorossi_via_gemini", fake_gemini)
+    monkeypatch.setattr(b, "find_gemini_executable", lambda: "/usr/bin/agy")
+
+
+def _use_backend(env, monkeypatch, backend):
+    monkeypatch.setattr(b, "DOROSSI_BACKEND", backend)
+    if backend == "gemini":
+        _install_gemini(env, monkeypatch)
+
+
+def _event_rows():
+    """事件檔（夾具已導到 tmp）裡的每一列。事故當天就是靠這個檔還原經過的。"""
+    path = b.DOROSSI_EVENTS_FILE
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in
+            path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _ended_as_aborted(env):
+    """被中止的那一輪共同的收尾：一句泛用的「已中止」，其他什麼都沒有。"""
+    said = _said(env)
+    assert env.live[-1] == ABORTED, env.live
+    assert "DIAG" not in said, "中止被當成失敗，附了診斷摘要"
+    assert "暫時無法回應" not in said, said
+    assert "重新整理對話中" not in said, "中止之後還去開新對話重跑"
+    assert "會自動重跑" not in said, "中止的那一題被停進佇列等重跑"
+    assert b._dorossi_queue_read() == [], "中止的那一題被停進了佇列"
+    assert env.final_chunks == [] and env.image_paths == [], "中止了還把答案送出去"
+    assert env.loop_calls == [], "中止了還轉進自走"
+    assert env.compact_calls == [], "中止了還做背景壓縮"
+    assert b._dorossi_turns == [], "登記沒有清掉"
+    assert b._dorossi_power_holds == {} and env.power["held"] == env.power["released"]
+
+
+def test_abort_stops_a_single_turn_whose_backend_is_running(abortable, monkeypatch):
+    """重現事故的那一支：後端在跑，擁有者下 `/dorossi abort`。修正前這一輪不會停。
+
+    後端替身跟正式的一樣——行程被 kill 之前不會回來，被 kill 之後以「resume 的那個
+    工作階段失敗了」的樣子收尾（非零結束碼 ＋ 有工作階段 id，正是被砍掉的 resume）。
+    """
+    env = abortable
+    proc = _KillableProc()
+
+    async def stuck_backend(prompt, session_id, **kwargs):
+        env.calls.append(("claude_code", prompt, session_id, kwargs))
+        proc.dead = asyncio.Event()
+        kwargs["on_proc"](proc)
+        await proc.dead.wait()
+        raise db._DorossiResumeError("claude -p exited 1")
+
+    monkeypatch.setattr(b, "_dorossi_via_claude_code", stuck_backend)
+
+    async def scenario():
+        task = asyncio.ensure_future(b._dorossi_process_turn(
+            env.message, "查一下", env.placeholder, UID, SID))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(env.calls) == 1, "後端應該已經在跑了"
+        await b.mcmd_abort(env.message, "")
+        try:
+            # 有上限：修正前這一輪不會自己結束，沒有上限的話這支測試會掛住而不是變紅。
+            await asyncio.wait_for(task, 3)
+        finally:
+            if proc.dead is not None:
+                proc.dead.set()
+
+    asyncio.run(scenario())
+    assert proc.kills == 1, "後端行程沒有被砍掉"
+    assert len(env.calls) == 1, "被砍掉的那一輪又開新對話重跑了一次"
+    assert f"已中止〔{SID}〕的任務。" in env.replies
+    assert _slot(env)["cc_session_id"] == "cc-old", "中止的那一輪動到了存著的工作階段"
+    assert env.order.index("/sem") > env.order.index("sem"), "後端空位沒有放掉"
+    _ended_as_aborted(env)
+    # 事件檔要留得下這兩件事：誰在什麼階段被要求中止、那一輪真的收成了中止。
+    rows = _event_rows()
+    assert [(r["type"], r.get("sid"), r.get("phase")) for r in rows
+            if r["type"] == "abort"] == [("abort", SID, "run")], rows
+    assert [(r["type"], r.get("sid"), r.get("stage")) for r in rows
+            if r["type"] == "turn_aborted"] == [("turn_aborted", SID, "turn")], rows
+
+
+@pytest.mark.parametrize("killed_as", [
+    db._DorossiResumeError("claude -p exited 1"),
+    RuntimeError("claude -p exited 1: D:\\secret\\workdir"),
+    db._DorossiUsageLimitError("limit reached", session_id="cc-partial"),
+    db._DorossiTransientError("529 overloaded", status=529, session_id="cc-partial"),
+    db._DorossiOfflineError("ENOTFOUND", backend="claude_code"),
+    TimeoutError("claude -p idle"),
+], ids=lambda e: type(e).__name__)
+def test_whatever_shape_the_killed_backend_fails_in_the_turn_is_just_aborted(
+        abortable, monkeypatch, killed_as):
+    """六種失敗各有一條自己的退路（開新對話重跑、停進佇列、等網路、泛用錯誤…）。
+
+    旗標設了之後，哪一種都只是「已中止」：只呼叫一次後端、不停進佇列、不附診斷、
+    原始例外文字不外送、存著的工作階段不動。
+    """
+    waits = []
+
+    async def never_wait_online(st, target, *, attempt=1):
+        waits.append(target)
+        return False
+
+    monkeypatch.setattr(b, "_dorossi_wait_online", never_wait_online)
+    abortable.script = [_abort_then(killed_as)]
+    _turn(abortable)
+    assert len(abortable.calls) == 1, "中止之後又呼叫了一次後端"
+    assert waits == [], "中止之後還去等網路"
+    assert "secret" not in _said(abortable), "原始例外文字不得進入對外訊息（Layer 1）"
+    assert _slot(abortable)["cc_session_id"] == "cc-old"
+    _ended_as_aborted(abortable)
+
+
+@pytest.mark.parametrize("backend, stored_key", [
+    ("claude_code", "cc_session_id"), ("codex", "codex_session_id"),
+    ("gemini", "gemini_session_id"), ("api", "api_history")])
+def test_every_backend_ends_an_aborted_turn_the_same_way(abortable, monkeypatch,
+                                                         backend, stored_key):
+    """四個後端各走自己的分支（各有一條 resume 重試），中止的收尾必須是同一個。"""
+    _use_backend(abortable, monkeypatch, backend)
+    stored = [{"role": "user"}] if backend == "api" else "stored-id"
+    _slot(abortable)[stored_key] = stored
+    abortable.script = [_abort_then(db._DorossiResumeError("exited 1"))]
+    _turn(abortable)
+    assert len(abortable.calls) == 1, backend
+    assert _slot(abortable)[stored_key] == stored, "中止的那一輪動到了存著的工作階段"
+    _ended_as_aborted(abortable)
+
+
+@pytest.mark.parametrize("backend", ["claude_code", "codex", "gemini"])
+def test_every_spawned_backend_is_told_how_to_ask_about_the_abort(abortable,
+                                                                  monkeypatch, backend):
+    """`abort_check`：abort 落在「起行程」那一瞬間時，行程一起來就自己結束。
+
+    `request_abort` 那一刻還沒有行程可砍（`on_proc` 還沒回呼），所以這個述詞是那個
+    空檔唯一的防線。重開新對話的那一次也要帶。
+    """
+    _use_backend(abortable, monkeypatch, backend)
+    seen = []
+
+    def probe(env):
+        check = env.calls[-1][3].get("abort_check")
+        seen.append(check() if callable(check) else "missing")
+        if len(env.calls) == 1:
+            return db._DorossiResumeError("gone")
+        b._dorossi_turns[0].request_abort()
+        seen.append(check() if callable(check) else "missing")
+        return RuntimeError("killed")
+
+    abortable.script = [probe, probe]
+    _turn(abortable)
+    assert seen == [False, False, True], seen
+
+
+@pytest.mark.parametrize("prompt", ["查一下這個函式", "整理測試，不要問我"],
+                         ids=["plain", "self-drive-phrase"])
+def test_a_turn_aborted_while_preparing_never_starts_a_backend(abortable, monkeypatch,
+                                                               prompt):
+    """準備階段（狀態讀寫、前置檢查）就被中止：不起後端，**也不進自走**。
+
+    第二個提問帶著自走片語——少了這一道，旗標設在單輪的登記上，而接手的迴圈看的是
+    它自己的旗標，於是擁有者收到「已中止」之後一個自走任務照樣開跑。
+    """
+    inner = b._dorossi_state_rmw
+
+    async def rmw_then_abort(mutate):
+        result = await inner(mutate)
+        if getattr(mutate, "__name__", "") == "_prep_mut":
+            b._dorossi_turns[0].request_abort()
+        return result
+
+    monkeypatch.setattr(b, "_dorossi_state_rmw", rmw_then_abort)
+    _turn(abortable, prompt)
+    assert abortable.calls == [], "設了旗標之後還起了後端"
+    _ended_as_aborted(abortable)
+    assert [r.get("stage") for r in _event_rows()
+            if r["type"] == "turn_aborted"] == ["prep"]
+
+
+def test_a_turn_aborted_while_waiting_for_a_slot_never_starts_a_backend(abortable,
+                                                                       monkeypatch):
+    """排在後端空位上的時候被中止：輪到它時不起後端，空位馬上還回去。"""
+    async def scenario():
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()                      # 唯一的空位被別人拿著
+        monkeypatch.setattr(b, "_dorossi_backend_sem",
+                            _RealSem(abortable.order, sem))
+        task = asyncio.ensure_future(b._dorossi_process_turn(
+            abortable.message, "查一下", abortable.placeholder, UID, SID))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert [t.phase for t in b._dorossi_turns] == ["wait"]
+        await b.mcmd_abort(abortable.message, SID)
+        sem.release()                            # 別人的回合結束了
+        await asyncio.wait_for(task, 3)
+        assert not sem.locked(), "被中止的那一輪沒有把空位還回去"
+
+    asyncio.run(scenario())
+    assert abortable.calls == [], "設了旗標之後還起了後端"
+    assert "typing" not in abortable.order, "已經中止了還去送打字指示"
+    assert "<update>⏳ 處理中…" not in abortable.live, "已經中止了還先改口說「處理中」"
+    _ended_as_aborted(abortable)
+
+
+@pytest.mark.parametrize("answer", ["答案", f"這是大工程{OPEN}"],
+                         ids=["plain", "open-sentinel"])
+def test_a_backend_that_finished_in_the_same_instant_is_kept_but_not_delivered(
+        abortable, answer):
+    """abort 落地的同一刻後端自己跑完了（行程已經結束，沒有東西可砍）。
+
+    那一輪是真的做完了，所以推進照存——後端那一側已經包含這一輪，不存的話下一輪
+    resume 的是舊的工作階段。但擁有者已經收到「已中止」：答案不送、不做背景壓縮，
+    而且**不得**因為答案帶著開場哨符就轉進自走。
+    """
+    abortable.script = [_abort_then((answer, "cc-new", {"usage_mark": {"sid": "cc-new"}}))]
+    _turn(abortable)
+    assert _slot(abortable)["cc_session_id"] == "cc-new", "跑完的那一輪沒有存檔"
+    assert _slot(abortable)["cc_usage_mark"] == {"sid": "cc-new"}
+    assert OPEN not in _said(abortable)
+    _ended_as_aborted(abortable)
+
+
+@pytest.mark.parametrize("answer, has_text", [(f"先看一下{OPEN}", True), (OPEN, False)],
+                         ids=["with-text", "sentinel-only"])
+def test_an_abort_while_the_first_answer_goes_out_does_not_start_the_loop(
+        abortable, monkeypatch, answer, has_text):
+    """自判轉進：第一輪帶著開場哨符，答案（或那句「開始持續推進」）送出的期間被中止。
+
+    旗標設在單輪的登記上，而接手的迴圈只看它自己的——少了轉進前的那一道檢查，擁有者
+    收到「已中止」之後一個無人值守的自走任務照樣開跑。已經送出去的答案不被蓋掉；只有
+    哨符、沒有正文的那一種，那句「開始持續推進」要改口。
+    """
+    real_finalize = _FakeLive.finalize
+
+    async def deliver_then_abort(_message, _live, chunks, **_kwargs):
+        abortable.final_chunks.append(list(chunks))
+        b._dorossi_turns[0].request_abort()
+
+    async def finalize_then_abort(self, content):
+        await real_finalize(self, content)
+        if str(content).startswith("🔁"):
+            b._dorossi_turns[0].request_abort()
+
+    monkeypatch.setattr(b, "_dorossi_reply_final", deliver_then_abort)
+    monkeypatch.setattr(_FakeLive, "finalize", finalize_then_abort)
+    abortable.script = [(answer, "cc-new", {})]
+    _turn(abortable)
+    assert abortable.loop_calls == [], "擁有者已經收到「已中止」，自走任務卻照樣開跑"
+    assert _slot(abortable)["cc_session_id"] == "cc-new"
+    assert [r.get("stage") for r in _event_rows()
+            if r["type"] == "turn_aborted"] == ["handover"]
+    if has_text:
+        assert [c[0] for c in abortable.final_chunks] == ["先看一下"]
+        assert ABORTED not in abortable.live, "已經送出的答案被蓋成「已中止」"
+    else:
+        assert abortable.live[-1] == ABORTED, abortable.live
+    assert b._dorossi_turns == []
+
+
+def test_an_abort_during_the_fresh_session_retry_stops_there(abortable):
+    """第一次失敗是真的工作階段過舊（還沒中止）→ 開新對話重跑；中止落在重跑那一次。"""
+    abortable.script = [db._DorossiResumeError("gone"),
+                        _abort_then(RuntimeError("killed"))]
+    _turn(abortable)
+    assert len(abortable.calls) == 2
+    assert _slot(abortable)["cc_session_id"] == "cc-old", (
+        "中止的那一輪沒有可信的新工作階段，存著的不該被動到")
+    # 這一支會看到那句「重新整理對話中」——那是中止**之前**的事。
+    assert abortable.live[-1] == ABORTED
+    assert "DIAG" not in _said(abortable)
+    assert abortable.final_chunks == [] and b._dorossi_turns == []
+
+
+def test_an_abort_between_the_failed_resume_and_the_retry_starts_nothing(abortable,
+                                                                        monkeypatch):
+    """工作階段過舊 → 正要開新對話重跑的那一刻被中止：重跑的那一次不得起後端。
+
+    這時沒有任何行程在跑（上一個已經結束、下一個還沒起），旗標是唯一的依據。
+    """
+    real_finalize = _FakeLive.finalize
+
+    async def finalize_then_abort(self, content):
+        await real_finalize(self, content)
+        if "重新整理" in str(content):
+            b._dorossi_turns[0].request_abort()
+
+    monkeypatch.setattr(_FakeLive, "finalize", finalize_then_abort)
+    abortable.script = [db._DorossiResumeError("gone")]
+    _turn(abortable)
+    assert len(abortable.calls) == 1, "旗標設了之後還開新對話重跑了一次"
+    assert abortable.live[-1] == ABORTED
+    assert _slot(abortable)["cc_session_id"] == "cc-old"
+
+
+def test_an_abort_while_the_network_is_out_keeps_its_own_wording(abortable, monkeypatch):
+    """等網路回來的期間被中止，那一題根本沒有送出去——講的是另一句，而且一直都是。"""
+    async def wait_then_abort(st, target, *, attempt=1):
+        st.request_abort()
+        return False
+
+    monkeypatch.setattr(b, "_dorossi_wait_online", wait_then_abort)
+    abortable.script = [db._DorossiOfflineError("ENOTFOUND", backend="claude_code")]
+    _turn(abortable)
+    assert len(abortable.calls) == 1
+    assert abortable.live[-1] == "⏹️ 已中止：網路中斷期間這一題沒有送出。"
+    assert [r.get("stage") for r in _event_rows()
+            if r["type"] == "turn_aborted"] == ["offline"]
+
+
+def test_an_abort_after_the_answer_went_out_only_skips_the_compaction(abortable,
+                                                                      monkeypatch):
+    """答案已經在送了才中止：答案照送（已經做完的事不收回），之後不再起後端。"""
+    async def deliver_then_abort(_message, _live, chunks, **_kwargs):
+        abortable.final_chunks.append(list(chunks))
+        b._dorossi_turns[0].request_abort()
+
+    calls = []
+
+    async def fake_cc(prompt, session_id, **kwargs):
+        calls.append(prompt)
+        return ("答案", session_id or "cc-new", {"ctx": 10 ** 9})
+
+    monkeypatch.setattr(b, "_dorossi_reply_final", deliver_then_abort)
+    monkeypatch.setattr(b, "_dorossi_via_claude_code", fake_cc)
+    monkeypatch.setattr(b, "_dorossi_maybe_compact_single_turn", _REAL_COMPACT)
+    monkeypatch.setattr(b, "_dorossi_context_compaction_due", lambda _tokens: True)
+    _turn(abortable)
+    assert abortable.final_chunks == [["答案"]]
+    assert len(calls) == 1, "中止之後還起了一次後端去壓縮"
+
+
+@pytest.mark.parametrize("when", ["before", "while-waiting"])
+def test_background_compaction_does_not_start_once_the_turn_is_aborted(
+        abortable, monkeypatch, when):
+    """回覆之後的背景壓縮也是一次後端呼叫：旗標設了就不起，等到空位之後再看一次。"""
+    calls = []
+
+    async def fake_cc(prompt, session_id, **kwargs):
+        calls.append(prompt)
+        return ("", session_id, {})
+
+    monkeypatch.setattr(b, "_dorossi_via_claude_code", fake_cc)
+    monkeypatch.setattr(b, "_dorossi_context_compaction_due", lambda _tokens: True)
+
+    async def scenario():
+        sem = asyncio.Semaphore(1)
+        monkeypatch.setattr(b, "_dorossi_backend_sem", sem)
+        turn = b._dorossi_turn_register(UID, SID, "問題")
+        turn.phase = "finish"
+        try:
+            if when == "before":
+                # 空位被別人拿著：已經中止的那一輪若還去排空位，這裡就回不來（有上限）。
+                await sem.acquire()
+                turn.request_abort()
+                await asyncio.wait_for(
+                    _REAL_COMPACT(UID, SID, "cc-1", {}, {"ctx": 10 ** 9}, turn=turn), 2)
+                assert turn.phase == "finish", "已經中止了還去排後端空位"
+                sem.release()
+            else:
+                await sem.acquire()
+                task = asyncio.ensure_future(
+                    _REAL_COMPACT(UID, SID, "cc-1", {}, {"ctx": 10 ** 9}, turn=turn))
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                assert turn.phase == "compact_wait"
+                turn.request_abort()
+                sem.release()
+                await asyncio.wait_for(task, 3)
+            assert not sem.locked()
+        finally:
+            b._dorossi_turn_unregister(turn)
+
+    asyncio.run(scenario())
+    assert calls == [], "旗標設了之後還起了後端去壓縮"
+
+
+def test_background_compaction_passes_the_abort_predicate_and_a_control_runs(
+        abortable, monkeypatch):
+    """對照組：沒被中止時壓縮照跑，而且帶著 `abort_check`（起行程那一瞬間的防線）。"""
+    seen = []
+
+    async def fake_cc(prompt, session_id, **kwargs):
+        check = kwargs.get("abort_check")
+        seen.append(check() if callable(check) else "missing")
+        return ("", session_id, {})
+
+    monkeypatch.setattr(b, "_dorossi_via_claude_code", fake_cc)
+    monkeypatch.setattr(b, "_dorossi_context_compaction_due", lambda _tokens: True)
+    monkeypatch.setattr(b, "_dorossi_backend_sem", asyncio.Semaphore(1))
+    turn = b._dorossi_turn_register(UID, SID, "問題")
+    try:
+        asyncio.run(_REAL_COMPACT(UID, SID, "cc-1", {}, {"ctx": 10 ** 9}, turn=turn))
+    finally:
+        b._dorossi_turn_unregister(turn)
+    assert seen == [False], seen
+
+
+def test_an_aborted_turn_frees_the_conversation_for_the_question_behind_it(
+        abortable, monkeypatch):
+    """從 `mcmd_dorossi` 一路走到底：中止之後 per-session 鎖、鎖的參照數、排隊的那一列、
+    後端空位、電源要求全部放掉，排在後面的提問照常輪到。
+
+    三題：第一題在跑、第二題排在後面。中止第一題 → 第二題開始跑（它排過隊，所以佇列檔
+    裡有它的那一列）→ 再中止 → 第三題正常回答。
+    """
+    env = abortable
+    procs = []
+    sem = asyncio.Semaphore(1)
+    monkeypatch.setattr(b, "_dorossi_session_locks", {})
+    monkeypatch.setattr(b, "_dorossi_session_lock_refs", {})
+    monkeypatch.setattr(b, "_dorossi_waiters", {})
+    monkeypatch.setattr(b, "_dorossi_queue_live", set())
+    monkeypatch.setattr(b, "_dorossi_state_lock", asyncio.Lock())
+    monkeypatch.setattr(b, "_dorossi_backend_sem", _RealSem(env.order, sem))
+
+    async def backend(prompt, session_id, **kwargs):
+        env.calls.append(("claude_code", prompt, session_id, kwargs))
+        if len(env.calls) == 3:
+            return ("第三題的答案", "cc-new", {})
+        proc = _KillableProc()
+        proc.dead = asyncio.Event()
+        procs.append(proc)
+        kwargs["on_proc"](proc)
+        await proc.dead.wait()
+        raise db._DorossiResumeError("claude -p exited 1")
+
+    monkeypatch.setattr(b, "_dorossi_via_claude_code", backend)
+    seen = {}
+
+    async def spin():
+        for _ in range(40):
+            await asyncio.sleep(0)
+
+    async def scenario():
+        first = asyncio.ensure_future(b.mcmd_dorossi(env.message, "第一題"))
+        await spin()
+        second = asyncio.ensure_future(b.mcmd_dorossi(env.message, "第二題"))
+        await spin()
+        assert len(env.calls) == 1, "第二題應該排在第一題後面"
+        seen["queued"] = [r["status"] for r in b._dorossi_queue_read()]
+        try:
+            await b.mcmd_abort(env.message, "")
+            await asyncio.wait_for(first, 3)
+            await spin()
+            assert len(env.calls) == 2, "中止第一題之後，排在後面的那一題沒有輪到"
+            seen["running"] = [r["status"] for r in b._dorossi_queue_read()]
+            await b.mcmd_abort(env.message, "")
+            await asyncio.wait_for(second, 3)
+        finally:
+            for proc in procs:
+                proc.dead.set()
+        seen["after"] = b._dorossi_queue_read()
+        await asyncio.wait_for(b.mcmd_dorossi(env.message, "第三題"), 3)
+
+    asyncio.run(scenario())
+    assert [p.kills for p in procs] == [1, 1]
+    assert seen["queued"] == ["queued"] and seen["running"] == ["running"]
+    assert seen["after"] == [], "被中止的那一題還留在佇列檔裡（重啟後會被重跑）"
+    assert b._dorossi_failed_queue_read() == [], "中止被記成了失敗"
+    assert env.final_chunks == [["第三題的答案"]]
+    assert b._dorossi_session_locks == {} and b._dorossi_session_lock_refs == {}, (
+        "per-session 鎖沒有回收")
+    assert not any(b._dorossi_waiters.values())
+    assert not sem.locked(), "後端空位沒有放掉"
+    assert b._dorossi_turns == []
+    assert b._dorossi_power_holds == {}
+    assert env.power["held"] == env.power["released"] == 3

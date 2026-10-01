@@ -758,12 +758,17 @@ def test_abort_reaches_a_single_turn_waiting_for_the_network(abort_env):
     assert abort_env.replies == ["已中止〔s4〕的任務。"]
 
 
-def test_a_single_turn_that_is_simply_running_is_not_an_abort_target(abort_env):
-    """一般在跑的單輪回合有看門狗；只有「等網路」那段沒有上限的等待歸 abort 管。"""
+def test_a_single_turn_that_is_simply_running_is_an_abort_target_too(abort_env):
+    """2026-10-01 之前這裡釘的是相反的事：「一般在跑的單輪回合有看門狗，不歸 abort 管」。
+
+    完整工具模式的那道看門狗是好幾個小時，一個跑偏的單輪回合在那之前沒有任何出口
+    （擁有者裁定：`/dorossi abort` 也要中止得了）。收尾那一半在 `test_dorossi_turn.py`。
+    """
     turn = b._DorossiTurnState(UID, "s4")
     b._dorossi_turns.append(turn)
     asyncio.run(b.mcmd_abort(_owner_msg(), "s4"))
-    assert turn.abort is False
+    assert turn.abort is True
+    assert abort_env.replies == ["已中止〔s4〕的任務。"]
 
 
 # ---------------------------------------------------------------------------

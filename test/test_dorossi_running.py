@@ -513,6 +513,18 @@ def test_the_real_background_compaction_moves_the_turn_through_its_phases(
     assert turn.phase == "finish", "壓縮結束、空位放掉之後要回到「收尾中」"
 
 
+def test_a_turn_that_was_told_to_abort_says_so_until_it_is_gone(registry):
+    """被要求中止、還沒收尾的單輪回合（例如排在空位上，輪到它才會結束）標成「中止中」，
+    跟自走任務同一個說法——否則擁有者看到的是一輪照常「等候空位」的回合。"""
+    turn = _turn("s2", "wait", started=time.time())
+    before = b._dorossi_running_report(_report_state(), _msg())
+    turn.request_abort()
+    after = b._dorossi_running_report(_report_state(), _msg())
+    line = next(line for line in after.splitlines() if "`s2`" in line)
+    assert "中止中" in line and "等候空位" not in line, line
+    assert "中止中" not in before, "還沒被要求中止就標成中止中"
+
+
 def test_a_manual_compaction_is_labelled_as_one(registry):
     _turn("s2", "wait", started=time.time(), kind="compact")
     line = next(line for line in

@@ -21,6 +21,7 @@ docstring 寫了 38 行，其中一整段是 **blast-radius 取捨**——同一
 斷言封印有生效（`test_the_fixture_really_seals_the_live_files`）。
 """
 import asyncio
+import json
 import os
 import sys
 import types
@@ -50,7 +51,7 @@ class _FakeLoop:
 def abort_env(tmp_path, monkeypatch):
     """把 `mcmd_abort` 會碰到的每一個外部動作換成替身並記帳。"""
     env = types.SimpleNamespace(
-        replies=[], loops={}, state={}, pumped=0, terminated=[], cleared=0,
+        replies=[], loops={}, turns=[], state={}, pumped=0, terminated=[], cleared=0,
         request_file=tmp_path / "single_image_request.json",
         alive=True,
     )
@@ -68,6 +69,12 @@ def abort_env(tmp_path, monkeypatch):
     monkeypatch.setattr(b, "OWNER_USER_ID", OWNER)
     monkeypatch.setattr(b, "safe_reply", fake_safe_reply)
     monkeypatch.setattr(b, "_dorossi_loops", env.loops)
+    # 單輪回合的登記也換成這個夾具自己的（正式那一份是模組全域，別的測試留下的殘影
+    # 會讓「沒有東西在跑」的那幾支變成看運氣）。停放列的佇列檔指到 tmp：中止某個對話時
+    # 會順手清掉它的停放列，那是一次對佇列檔的讀寫。
+    monkeypatch.setattr(b, "_dorossi_turns", env.turns)
+    monkeypatch.setattr(b, "DOROSSI_QUEUE_FILE", tmp_path / "dorossi_queue.ndjson")
+    monkeypatch.setattr(b, "DOROSSI_EVENTS_FILE", tmp_path / "dorossi_events.ndjson")
     monkeypatch.setattr(b, "_dorossi_load_state", lambda: env.state)
     monkeypatch.setattr(b, "_generate_pump", fake_pump)
     monkeypatch.setattr(b, "_terminate_all_webrunner_instances", fake_terminate)
@@ -225,6 +232,157 @@ def test_a_running_loop_takes_priority_over_an_image_job(abort_env):
     assert loops["s1"].aborted == 1
     assert b._generate_inflight == "rid-1", "順手把產圖那一筆也中止了"
     assert abort_env.pumped == 0
+
+
+# --------------------------------------------------------------------------
+# 單輪回合：正在跑的一般提問也中止得了（2026-10-01）
+# --------------------------------------------------------------------------
+#
+# 事故：擁有者標記 bot 問了一句話，走的是單輪路徑；後端的對話裡塞滿先前自走任務的
+# 紀錄，把那句話當成「繼續做」，在完整工具模式下自己去改 repo。擁有者 21 秒後下
+# `/dorossi abort`——沒有停住，因為可中止的集合只收自走迴圈與「正在等網路」的回合。
+# 完整工具模式的單輪上限是好幾個小時，那段期間唯一的出口是重啟整個 bot。
+
+class _FakeProc:
+    """後端子行程的替身：記下被 kill 幾次。`vanish`＝kill 的那一刻行程剛好已經被收掉
+    （asyncio 的子行程在這種時候丟 `ProcessLookupError`，Windows 上也一樣）。"""
+
+    def __init__(self, returncode=None, vanish=False):
+        self.pid = 4321
+        self.returncode = returncode
+        self.vanish = vanish
+        self.kills = 0
+
+    def kill(self):
+        self.kills += 1
+        if self.vanish:
+            raise ProcessLookupError()
+
+
+def _turn(env, sid, phase="run", proc=None):
+    """讓 `sid` 有一個進行中的單輪回合（真的 `_DorossiTurnState`），回傳它。"""
+    turn = b._DorossiTurnState(str(OWNER), sid)
+    turn.phase = phase
+    turn.proc = proc
+    env.turns.append(turn)
+    env.state.setdefault(str(OWNER), {"active": None})
+    return turn
+
+
+def test_abort_reaches_a_single_turn_that_is_simply_running(abort_env):
+    """這一支在修正前是紅的：回覆是「目前沒有正在進行的工作」，行程沒被動到。"""
+    proc = _FakeProc()
+    turn = _turn(abort_env, "s4", proc=proc)
+    _abort("s4")
+    assert turn.abort is True, "在跑的單輪回合沒有被要求中止"
+    assert proc.kills == 1, "後端行程沒有被砍掉"
+    assert abort_env.replies == ["已中止〔s4〕的任務。"]
+
+
+@pytest.mark.parametrize("phase", ["prep", "wait", "run", "offline", "finish",
+                                   "compact_wait", "compact"])
+def test_a_single_turn_can_be_aborted_in_every_phase_it_owns(abort_env, phase):
+    """登記在案、而且還沒交給自走迴圈的每一個階段都中止得了。
+
+    `prep`／`wait` 時後端還沒起來（沒有行程可砍），靠的是旗標：設了之後不得再起後端
+    ——那一半在 `test_dorossi_turn.py`。這裡釘的是「指令找得到它」。
+    """
+    turn = _turn(abort_env, "s4", phase=phase)
+    _abort("s4")
+    assert turn.abort is True, phase
+    assert "已中止〔s4〕的任務。" in _said(abort_env)
+
+
+def test_a_turn_already_handed_to_a_loop_is_not_a_second_target(abort_env):
+    """轉進自走之後由 `_dorossi_loops` 裡那一筆代表；登記上的 `loop` 只是殘影。
+
+    迴圈那一筆不在（名額滿了被拒、或正在收尾）時，這個殘影上沒有任何東西可以中止
+    ——回「已中止」會是一句假話。
+    """
+    turn = _turn(abort_env, "s4", phase="loop", proc=_FakeProc())
+    _abort("s4")
+    assert turn.abort is False
+    assert turn.proc.kills == 0
+    assert "已中止" not in _said(abort_env)
+
+
+def test_a_loop_outranks_the_turn_registered_for_the_same_session(abort_env):
+    """同一個對話同時有迴圈與單輪登記時以迴圈為準——那一輪是由迴圈在跑的。"""
+    loops = _running(abort_env, "s1", active="s1")
+    turn = _turn(abort_env, "s1", phase="run", proc=_FakeProc())
+    _abort("s1")
+    assert loops["s1"].aborted == 1
+    assert turn.abort is False and turn.proc.kills == 0, "同一件事被中止了兩次"
+
+
+def test_no_argument_with_one_running_turn_aborts_it(abort_env):
+    """沒指名、而且只有一件事在跑 → 就是它（與自走任務同一支挑選函式）。"""
+    turn = _turn(abort_env, "s3")
+    abort_env.state[str(OWNER)] = {"active": "s9"}
+    _abort()
+    assert turn.abort is True
+
+
+def test_no_argument_prefers_the_active_session_among_turns(abort_env):
+    mine = _turn(abort_env, "s2")
+    other = _turn(abort_env, "s1")
+    abort_env.state[str(OWNER)] = {"active": "s2"}
+    _abort()
+    assert mine.abort is True and other.abort is False
+
+
+def test_an_ambiguous_abort_among_turns_and_loops_asks(abort_env):
+    """一個迴圈、一個單輪回合，active 兩個都不是 → 問，一個都不動。"""
+    loops = _running(abort_env, "s1", active="s9")
+    turn = _turn(abort_env, "s2")
+    abort_env.state[str(OWNER)] = {"active": "s9"}
+    _abort()
+    assert loops["s1"].aborted == 0 and turn.abort is False, "含糊時猜了一個"
+    said = _said(abort_env)
+    assert "s1" in said and "s2" in said
+
+
+def test_all_aborts_loops_and_single_turns_together(abort_env):
+    loops = _running(abort_env, "s1", active="s1")
+    turn = _turn(abort_env, "s2", proc=_FakeProc())
+    _abort("all")
+    assert loops["s1"].aborted == 1 and turn.abort is True and turn.proc.kills == 1
+    assert "2 個" in _said(abort_env)
+    rows = [json.loads(line) for line in
+            b.DOROSSI_EVENTS_FILE.read_text(encoding="utf-8").splitlines()]
+    assert [(r["type"], r["scope"], r["count"], r["loops"]) for r in rows] == [
+        ("abort", "all", 2, 1)], rows
+
+
+def test_a_running_turn_takes_priority_over_an_image_job(abort_env):
+    """有 Dorossi 的工作在跑時，這一次 abort 只處理它，不往產圖那條路走。"""
+    turn = _turn(abort_env, "s1")
+    b._generate_inflight = "rid-1"
+    _abort()
+    assert turn.abort is True
+    assert b._generate_inflight == "rid-1" and abort_env.pumped == 0
+
+
+def test_a_stranger_cannot_abort_a_single_turn(abort_env):
+    turn = _turn(abort_env, "s1", proc=_FakeProc())
+    _abort("s1", author_id=STRANGER)
+    assert turn.abort is False and turn.proc.kills == 0
+    assert "s1" not in _said(abort_env)
+
+
+@pytest.mark.parametrize("proc, expect_kills", [
+    (_FakeProc(), 1),                      # 活著 → 砍
+    (_FakeProc(returncode=0), 0),          # 已經結束 → 不碰
+    (_FakeProc(vanish=True), 1),           # 砍的那一刻剛好不見了 → 吞掉，不往外拋
+    (None, 0),                             # 後端還沒起來
+])
+def test_requesting_an_abort_never_raises_whatever_the_process_is_doing(proc,
+                                                                        expect_kills):
+    turn = b._DorossiTurnState(str(OWNER), "s1")
+    turn.proc = proc
+    turn.request_abort()                   # 不得往外拋
+    assert turn.abort is True
+    assert (proc.kills if proc is not None else 0) == expect_kills
 
 
 # --------------------------------------------------------------------------
