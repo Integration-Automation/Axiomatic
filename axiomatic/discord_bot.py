@@ -254,6 +254,9 @@ from dorossi_backend import (
     # 不是行程結束（`_dorossi_reap_proc` 的 docstring 有實測），孫行程握著寫端
     # 時它永遠不返回。`/dorossi tokens` 的兩個用量查詢就是這樣。
     _dorossi_reap_proc,
+    # `/dorossi abort` 的砍殺點：後端連同它已經起的子孫行程。兩支 `request_abort`
+    # 都只呼叫它，不要各自再寫一次 `proc.kill()`。
+    _dorossi_kill_backend_tree,
     # --- session-scoped tuning directives (`/effort`・`/model`) ----------------
     DOROSSI_EFFORT_LEVELS,
     # 兩張表的聯集。**這裡刻意只 import 聯集，不 import 個別那兩張**：
@@ -5315,7 +5318,7 @@ class _DorossiLoopState:
       邊界停住並保留 `loop_pending`（stop 記成 `paused`）。所以它一定在「當前回合＋
       提交輪」都跑完之後才生效，中途不會把提交弄丟；擁有者之後用
       `/dorossi session continue` 接回來。abort 與 paused 同時被設時 abort 優先。
-    * `proc`：這個迴圈目前回合的後端子行程（abort 用來即時 kill）。
+    * `proc`：這個迴圈目前回合的後端子行程（abort 即時砍掉它，連同它已經起的子孫）。
     * `injections`：這個迴圈的中途注入緩衝——自走進行中，擁有者對「同一個
       session」新送的提問（`/dorossi ask`）收進來，於下一輪邊界 drain 折進 prompt。
     * `round_no`／`compacting`／`backend`：現在是第幾輪（每次呼叫後端前 +1，重試也
@@ -5358,16 +5361,10 @@ class _DorossiLoopState:
         return drained
 
     def request_abort(self) -> None:
-        """要求停止這個迴圈：設旗標 ＋ kill 目前回合的後端行程（若有）。"""
+        """要求停止這個迴圈：設旗標，目前回合的後端行程（若有）連同它已經起的子孫
+        一起砍（`_dorossi_kill_backend_tree`，與單輪回合共用）。同步、不得 raise。"""
         self.abort = True
-        proc = self.proc
-        if proc is not None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            except Exception:  # pylint: disable=broad-except  # nosec B110
-                pass
+        _dorossi_kill_backend_tree(self.proc)
 
     def request_pause(self, commit_instruction: str) -> None:
         """要求這個迴圈「提交後暫停、讓出編輯權」（`/dorossi yield`）。
@@ -5410,7 +5407,7 @@ class _DorossiTurnState:
       `"loop"`，之後由 `_dorossi_loops` 裡的那個迴圈代表這一輪。
     * `backend`：這一輪實際用的後端 id（決定之後才有值，對外一律走 `_backend_display`）。
     * `proc`：後端子行程（`on_proc` 回呼記下）。給擁有者看 PID，也是 `request_abort`
-      要砍的對象。
+      要砍的對象（連同它已經起的子孫行程）。
     * `abort`：`/dorossi abort` 對這一輪要求中止（`request_abort` 設）。任何階段都可以：
       後端在跑就當場砍掉它，那次呼叫不論以什麼樣子失敗都收成「已中止」，不重試、不停進
       用量佇列、不開新對話重跑；還沒起後端（準備中、等空位、等網路回來）就不再起；
@@ -5440,21 +5437,15 @@ class _DorossiTurnState:
         self.proc = proc
 
     def request_abort(self) -> None:
-        """`/dorossi abort` 對這一輪：設旗標，後端行程還活著就當場 kill。
+        """`/dorossi abort` 對這一輪：設旗標，後端行程還活著就當場砍掉，連同它已經
+        起的子孫（`_dorossi_kill_backend_tree`，與 `_DorossiLoopState.request_abort`
+        共用同一支）。
 
-        與 `_DorossiLoopState.request_abort` 同一個形狀（行程可能剛好在這一刻結束）。
         砍掉之後後端的讀取迴圈讀到 EOF、以非零結束碼收尾，那個失敗由
         `_dorossi_turn_backend` 依旗標收成 `_DorossiTurnAborted`。沒有行程可砍時（準備中、
         等空位、等網路、沒有子行程的後端）只有旗標，由下一個檢查點接手。同步、不得 raise。"""
         self.abort = True
-        proc = self.proc
-        if proc is not None and getattr(proc, "returncode", None) is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            except Exception:  # pylint: disable=broad-except  # nosec B110
-                pass
+        _dorossi_kill_backend_tree(self.proc)
 
 
 # 佔著一個後端空位的階段、排在號誌上的階段。兩個集合是 `/dorossi running` 算
@@ -10218,7 +10209,7 @@ async def _dorossi_run_loop(message: discord.Message, task_prompt: str,
         沉默／abort／例外）都必須 return，靠 `finally` 把自己從 registry 移除，鎖才
         會在呼叫端返回時釋放。
       * abort 與本迴圈協同：`mcmd_abort` 挑出「目標那個」state 呼叫
-        `request_abort()`（設旗標＋kill 該迴圈當前行程）；本迴圈在回合間與每個例外
+        `request_abort()`（設旗標＋砍掉該迴圈當前的後端行程與它已經起的子孫）；本迴圈在回合間與每個例外
         路徑都先檢查**自己的** `st.abort` → 直接 return（abort 自己貼確認訊息）。
       * resume 重試在 abort 時必須跳過（見 _dorossi_loop_one_round），否則會 spawn
         新行程跟 abort 競賽。
@@ -13813,8 +13804,8 @@ async def mcmd_abort(message: discord.Message, rest: str = "") -> None:
                               → 泛用提示請指定（列出 session id）。
       * `/dorossi abort <id>`   → 中止該 session 的那一件（id＝s1/s2…）。
       * `/dorossi abort all`    → 中止所有進行中的（`全部` 同義）。
-    中止＝對目標 state `request_abort()`（設旗標＋kill 它當前的後端行程），這裡不等它
-    收尾：
+    中止＝對目標 state `request_abort()`（設旗標＋砍掉它當前的後端行程，連同那個行程
+    已經起的子孫——`dorossi_backend._dorossi_kill_backend_tree`），這裡不等它收尾：
       * 迴圈在當前回合解開後 return；那個 session 會留著「未完成任務」標記，之後可用
         `/dorossi session continue <id>` 接續。
       * 單輪回合把那則訊息收成「已中止」就結束（`_dorossi_run_turn`）：不重試、不停進
@@ -13858,7 +13849,7 @@ async def mcmd_abort(message: discord.Message, rest: str = "") -> None:
     arg = rest.strip().lower()
 
     # 2. Dorossi 的工作優先：用純函式挑出目標（active 優先／指名 id／all），對目標
-    #    state request_abort()（設旗標＋kill 它當前的後端行程）。迴圈與回合各自收尾並
+    #    state request_abort()（設旗標＋砍掉它當前的後端行程與子孫）。迴圈與回合各自收尾並
     #    放掉自己的 per-session 鎖（abort 不需等待）；其餘的不受影響。與產圖完全獨立，
     #    故有命中就在這裡收尾、不往下走。
     # 能被中止的：每一個自走迴圈，加上每一個**正在進行的單輪回合**。完整工具模式的單輪

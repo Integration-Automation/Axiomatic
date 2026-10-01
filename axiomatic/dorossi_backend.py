@@ -5245,6 +5245,159 @@ async def _dorossi_drain_stderr(task, timeout: float | None = None) -> str:
         await asyncio.gather(task, return_exceptions=True)
 
 
+# ---------------------------------------------------------------------------
+# `/dorossi abort`：後端連同它已經起的子孫行程一起砍（擁有者裁定 2026-10-01）
+#
+# `proc.kill()` 在 Windows 上是 TerminateProcess，只帶走那一個行程。完整工具模式下
+# 後端起的 shell 指令（跑到一半的測試、提交、長時間的腳本）在回合被中止之後照樣跑完
+# ——擁有者按了中止、收到「已中止」，repo 還在被改。
+#
+# 做法是三步，順序是規則：
+#   1. **先列**：後端一死，函式庫就再也問不到它底下有誰（Windows 上子孫記著的父 pid
+#      不會變，但那個 pid 從此可以被別的行程拿去用）。
+#   2. **砍後端**：先停掉發號施令的那一個，免得它看到指令「結束」就接著起下一個。
+#   3. **砍子孫**，父先於子。
+#
+# 全部同步、在呼叫當下做完（`request_abort` 的合約），所以事件迴圈會停這麼久——量到的
+# 數字（2026-10-01，本機約 460–520 個行程，兩個直譯器，連同真的砍掉一棵 1–26 個行程的
+# 樹）：通常 15–60 毫秒，主機忙的時候量過 250 毫秒。幾乎全花在那一次全系統的
+# pid→父 pid 快照上，與樹的大小無關；砍後端 0.1 毫秒，每砍一個子孫 0.1–0.8 毫秒。
+# 逐層呼叫函式庫的 `children()` 是每個節點一次快照（3 個節點 72–92 毫秒、25 個節點
+# 約 0.5 秒），所以這裡自己拿一次快照走完。丟到執行緒裡做不行：列舉必須在砍後端
+# **之前**，而砍後端必須在呼叫當下。
+#
+# 只砍得到「這一輪的後端起的、而且中間每一層都還活著」的行程。中間那一層先結束
+# 的話，底下的行程就接不回這棵樹；快照之後才起的行程也不在名單上。要連那些都收，
+# 得在起後端的那一刻就把它放進作業系統的工作物件（job object），那是另一件事。
+# ---------------------------------------------------------------------------
+
+def _dorossi_backend_descendants(psutil, root_pid: int) -> list:
+    """`root_pid`——**這個行程自己起的**後端——目前活著的子孫，父先於子。
+
+    回行程函式庫的行程物件（建立時記下了出生時間，`kill()` 靠它擋 pid 換人）。
+    丟例外＝這一次列不成，由呼叫端決定怎麼說；單一行程在列舉途中不見是常態，
+    跳過它（連同它底下的）就好。
+
+    三條規則，每一條擋的是不同的東西：
+
+    * **後端必須是這個行程的直接子行程**（對照表裡它的父 pid 是我們）。它是我們自己
+      起的，所以這一條成立；不成立就代表那個 pid 指的不是我們以為的行程。
+    * **每一條父子邊都要求「子不比父早出生」**。行程記著的父 pid 不會跟著父行程的
+      死活更新：別的行程留下的孤兒，它記的那個 pid 後來可能被我們的某個子孫拿去用，
+      在對照表上就成了那個子孫的「子行程」。孤兒一定比後來拿到那個 pid 的行程早
+      出生，所以逐邊比對就排除得掉；只拿整棵樹的根來比（函式庫自己的遞迴列舉是
+      這樣做的）排除不掉。
+    * **也不得比快照晚出生**。快照拍完到替某個 pid 建立行程物件之間，那個行程可能
+      已經結束、pid 被一個新行程拿走；新行程一定是在快照開始之後才出生的。
+    * **這個行程自己永遠不在名單上**，不論對照表怎麼說。
+
+    出生時間是牆上時鐘：系統時間被調動的那一刻有可能誤排除——方向是少砍。
+
+    讀不到出生時間的行程（權限不足）不列：證明不了它是後端起的。
+    """
+    root = psutil.Process(root_pid)
+    asked_at = time.time()
+    parent_of = psutil._ppid_map()  # 一次全系統快照；逐一問 ppid 是每個行程一次
+    own_pid = os.getpid()
+    if parent_of.get(root_pid) != own_pid:
+        raise LookupError("the backend is not a child of this process")
+    children_of: dict[int, list[int]] = {}
+    for pid, parent_pid in parent_of.items():
+        children_of.setdefault(parent_pid, []).append(pid)
+    found: list = []
+    stack = [(root_pid, root.create_time())]
+    while stack:
+        parent_pid, parent_born = stack.pop()
+        for pid in children_of.get(parent_pid, ()):
+            if pid == own_pid:
+                continue
+            try:
+                child = psutil.Process(pid)
+                born = child.create_time()
+            except psutil.Error:
+                continue
+            if not parent_born <= born <= asked_at:
+                continue
+            found.append(child)
+            stack.append((pid, born))
+    return found
+
+
+def _dorossi_started_by(proc) -> tuple[list, str | None]:
+    """回 `(後端的子孫, 列不成的原因)`；原因是 None 表示這份名單問得出來。永不 raise。
+
+    「沒有子孫」與「列不成」要分得開（後者只砍得到後端自己，得留一行），所以原因走在
+    回傳值上。後端剛好已經不在、或 `proc` 沒有可用的 pid（測試替身）都不算列不成。
+    """
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return [], None
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return [], "the process library is not installed"
+    try:
+        return _dorossi_backend_descendants(psutil, pid), None
+    except psutil.NoSuchProcess:
+        return [], None
+    except Exception as error:  # pylint: disable=broad-except
+        # 中止不得因為列舉失敗而失敗；只留型別名（stderr 有對話平台那個出口）。
+        return [], type(error).__name__
+
+
+def _dorossi_kill_started(started: list) -> int:
+    """照順序砍掉 `started`（`_dorossi_started_by` 給的行程物件），回沒砍掉的個數。
+
+    行程函式庫的 `kill()` 動手前會比對（pid, 出生時間），那個 pid 已經換人就丟
+    `NoSuchProcess`、不動手——從列出來到這裡之間的 pid 重用靠這一點擋；所以這裡
+    絕不拿裸 pid 去砍。行程已經不在也是 `NoSuchProcess`（後端一死，它底下的常常
+    自己就結束了），兩種都不算沒砍掉。永不 raise。
+    """
+    if not started:
+        return 0
+    import psutil  # type: ignore  # 名單非空＝剛剛匯入得到
+    refused = 0
+    for child in started:
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            continue
+        except Exception:  # pylint: disable=broad-except
+            refused += 1
+    return refused
+
+
+def _dorossi_kill_backend_tree(proc) -> None:
+    """`/dorossi abort` 的砍殺點：後端行程，連同它已經起、還活著的子孫。
+
+    **同步、不得 raise、不等任何行程收尾**——旗標由呼叫端先設，這裡回來時後端的
+    `kill()` 已經送出（單輪回合的收尾保證靠這一點）。`proc` 是 None 或結束碼已經
+    出來時什麼都不做：行程結束之後那個 pid 可能已經換人，連問都不問。
+
+    砍得到與砍不到的範圍、順序的理由、量到的成本見上面那段說明。少了行程函式庫或
+    列舉失敗時只砍後端自己並留一行；被砍掉的包含後端刻意放在背景的行程（擁有者
+    接受這一點）。stderr 那一行只有個數，沒有 pid 與行程名。
+    """
+    if proc is None or getattr(proc, "returncode", None) is not None:
+        return
+    started, problem = _dorossi_started_by(proc)
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass  # 剛好在這一刻結束：事件迴圈的子行程在收掉之後丟這個（Windows 上也是）
+    except Exception as error:  # pylint: disable=broad-except
+        print(f"[dorossi] abort: stopping the backend process failed "
+              f"({type(error).__name__})", file=sys.stderr)
+    refused = _dorossi_kill_started(started)
+    if problem is not None:
+        print(f"[dorossi] abort: could not list what the backend had started "
+              f"({problem}); only the backend process itself was stopped",
+              file=sys.stderr)
+    elif started:
+        print(f"[dorossi] abort: stopped the backend and {len(started) - refused} "
+              f"of the {len(started)} process(es) it had started", file=sys.stderr)
+
+
 def find_codex_executable() -> str | None:
     """Locate Codex even when a long-running supervisor has a stale PATH.
 

@@ -690,7 +690,7 @@ _CAN_CATCH_LOOKUP = {"ProcessLookupError", "OSError", "Exception", "BaseExceptio
 # 這份豁免會安靜地不再指向任何東西。
 _INDIRECT_KILL_SITES = (
     ("dorossi_backend.py", "_dorossi_reap_proc"),
-    ("discord_bot.py", "request_abort"),
+    ("dorossi_backend.py", "_dorossi_kill_backend_tree"),
     ("discord_bot.py", "_reap_usage_query_proc"),
     ("verify_dorossi_cli.py", "_kill"),
 )

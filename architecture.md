@@ -109,7 +109,8 @@
    bot 送出下一筆。
 3. **Dorossi 對話（`/dorossi ask`；沒有斜線選單的平台是一段不是指令的文字）**：解析開頭的微調 token → 決定工作
    階段 slot → 取 per-session 鎖 → `dorossi_backend.py` 串流叫用後端並套兩段式看門狗 →
-   即時更新單一訊息 → 記錄用量、存 `dorossi_session.json`。
+   即時更新單一訊息 → 記錄用量、存 `dorossi_session.json`。`/dorossi abort` 中止進行中的單輪回合或自走
+   迴圈：設旗標，當場砍掉後端行程與它已經起的子孫行程（`dorossi_backend._dorossi_kill_backend_tree`）。
 4. **回覆版面**：狀態類回覆（`/sys health`、`/gen plan`、`/dorossi running`、`/out stats`）由
    `_reply_card.card(title, status=, description=, fields=, footer=)` 組成卡片——狀態決定顏色
    （`ok`／`warn`／`bad`／`info`／`idle`），平台的長度上限在這裡一次處理，放不下的欄位不送、頁尾講
