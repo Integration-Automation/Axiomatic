@@ -19611,9 +19611,9 @@ def test_eta_with_nothing_queued_says_so(monkeypatch):
 
 
 def test_eta_adds_work_the_rests_ahead_and_the_rest_in_progress(monkeypatch):
-    """3 對 × 10 張 × 60 秒 ＝ 30 分鐘工作；每小時工作要休 2 小時，30 分鐘用不滿一個
-    週期，所以沒有未來的休息。此刻若正在休息（還剩 1 小時），那一小時要加進總時間——
-    少了它 ETA 會短報整段休息。"""
+    """3 對 × 10 張 × 60 秒，每個角色 10 分鐘；上限 1 小時的工作段放得下 6 個，所以 3 個
+    角色之間沒有未來的休息。此刻若正在休息（還剩 1 小時），那一小時要加進總時間——少了它
+    ETA 會短報整段休息。"""
     queues = (["p1", "p2", "p3"], ["a", "b", "c"], [], [])
     _content, fields, _ = _eta(monkeypatch, queues)
     assert fields["pairs"] == "3" and fields["rest periods"] == "0 × 2.0h"
@@ -19623,13 +19623,151 @@ def test_eta_adds_work_the_rests_ahead_and_the_rest_in_progress(monkeypatch):
     assert resting["total wall time"] != resting["raw work"]
 
 
-def test_eta_counts_one_rest_per_full_work_window(monkeypatch):
-    """6 對 × 10 張 × 60 秒 ＝ 1 小時；`schedule_limit_hours` 是 0.25 → 4 個完整窗口、4 次休息。"""
+@pytest.mark.parametrize("limit_hours, rests, old_rests", [
+    # 角色 10 分鐘、上限 15 分鐘：一段只放得下一個，6 個角色之間休 5 次。
+    (0.25, 5, 4),
+    # 上限 30 分鐘：一段放 3 個，6 個角色分兩段、中間休 1 次。
+    (0.5, 1, 2),
+])
+def test_eta_counts_rests_the_way_the_batch_takes_them(monkeypatch, limit_hours,
+                                                       rests, old_rests):
+    """6 對 × 10 張 × 60 秒 ＝ 1 小時工作，走真的 `cmd_eta`：休息次數是產圖批次那條規則的
+    次數（`_eta_rest_count`），不是「每做滿上限休息一次」的 `int(1h // 上限)`。
+
+    兩格刻意各站一邊：舊公式在第一格**少算**、在第二格**多算**，所以把 `cmd_eta` 改回
+    舊公式，哪一格都不會碰巧對。"""
+    assert int(3600 // (limit_hours * 3600)) == old_rests, "前提：這一格分得出新舊公式"
+    queues = ([f"p{i}" for i in range(6)], [f"c{i}" for i in range(6)], [], [])
+    _content, fields, _ = _eta(monkeypatch, queues,
+                               cfg={"schedule_limit_hours": limit_hours})
+    assert fields["rest periods"] == f"{rests} × 2.0h", fields
+    assert fields["raw work"] == b._format_duration(3600), fields
+    assert fields["total wall time"] == b._format_duration(3600 + rests * 2 * 3600), fields
+
+
+def test_eta_hands_the_rest_count_to_the_helper_and_renders_its_answer(monkeypatch):
+    """接線：`cmd_eta` 把「對數、每個角色幾小時、上限」交給 `_eta_rest_count`，欄位與總時間
+    用的都是它的答案。替身回一個不可能自己算出來的數字，所以 `cmd_eta` 另外算一份會露餡。"""
+    calls: list = []
+
+    def _spy(pairs, per_character_hours, limit_hours):
+        calls.append((pairs, per_character_hours, limit_hours))
+        return 7
+
+    monkeypatch.setattr(b, "_eta_rest_count", _spy)
     queues = ([f"p{i}" for i in range(6)], [f"c{i}" for i in range(6)], [], [])
     _content, fields, _ = _eta(monkeypatch, queues, cfg={"schedule_limit_hours": 0.25})
-    assert fields["rest periods"] == "4 × 2.0h", fields
-    assert fields["raw work"] == b._format_duration(3600), fields
-    assert fields["total wall time"] == b._format_duration(3600 + 4 * 2 * 3600), fields
+    assert len(calls) == 1, calls
+    pairs, per_char, limit = calls[0]
+    assert (pairs, limit) == (6, 0.25), calls
+    assert math.isclose(per_char, 10 * 60 / 3600), f"每個角色應該是 10 分鐘，拿到 {per_char} 小時"
+    assert fields["rest periods"] == "7 × 2.0h", fields
+    assert fields["total wall time"] == b._format_duration(3600 + 7 * 2 * 3600), fields
+
+
+@pytest.mark.parametrize("pairs, per_char, limit, expected", [
+    (10, 9.5, 16, 9),     # 休息後第一個角色的長度：一段一個，10 個角色之間休 9 次
+    (20, 9.5, 16, 19),
+    (2, 9.5, 16, 1),
+    (3, 20, 16, 2),       # 角色比上限還長：一段仍然是一個，不是零個
+    (10, 5, 16, 3),       # 一段 3 個：3 + 3 + 3 + 1，休 3 次
+    (9, 5, 16, 2),        # 剛好整除：最後一段收工後沒有下一個角色，不多休一次
+    (4, 8, 16, 1),        # 剛好等於上限不算跨過：8 + 8 = 16，一段放兩個
+    (17, 1, 16, 1),
+    (16, 1, 16, 0),
+    (3, 1, 16, 0),        # 全部放得進一段
+    (1, 20, 16, 0),       # 單一角色：收工時沒有下一個可開
+])
+def test_the_eta_rest_count_follows_the_batch_rule(pairs, per_char, limit, expected):
+    """`k = max(1, floor(L / d))` 個角色一段，休 `ceil(P / k) - 1` 次。"""
+    assert b._eta_rest_count(pairs, per_char, limit) == expected
+
+
+def test_the_eta_rest_count_no_longer_undercounts_long_characters():
+    """待套分支 §8.213 第 7 項量到的情形：休息後第一個角色約 9.5 小時、上限 16，一個工作段
+    只跑得了一個角色。舊的 `int(總工時 // 上限)` 在這裡少算約四成——10 個角色它說休 5 次，
+    批次實際休 9 次，預計完成時間提早 24 小時（4 × 6h）。"""
+    old = int(10 * 9.5 // 16)
+    new = b._eta_rest_count(10, 9.5, 16)
+    assert (old, new) == (5, 9), (old, new)
+    assert (new - old) / new > 0.4
+
+
+@pytest.mark.parametrize("pairs, per_char, limit, expected", [
+    (0, 9.5, 16, 0), (-3, 9.5, 16, 0),
+    # 沒有排程：上限不是正的有限數一律當作不休息。
+    (10, 9.5, None, 0), (10, 9.5, 0, 0), (10, 9.5, -1, 0),
+    (10, 9.5, math.nan, 0), (10, 9.5, math.inf, 0), (10, 9.5, True, 0),
+    # 不知道一個角色要多久：數不出來，而不是假裝是 0 次。
+    (10, None, 16, None), (10, math.nan, 16, None), (10, math.inf, 16, None),
+    (10, -1.0, 16, None), (10, True, 16, None),
+    # 不必知道角色長度也答得出來的兩種：只有一個角色、沒有排程。
+    (1, None, 16, 0), (10, None, math.inf, 0),
+    # 零長度的角色永遠跨不過上限；短到 `L / d` 溢位的也一樣（不能丟 OverflowError）。
+    (10, 0.0, 16, 0), (10, 5e-324, 16, 0),
+])
+def test_the_eta_rest_count_edges(pairs, per_char, limit, expected):
+    assert b._eta_rest_count(pairs, per_char, limit) == expected
+
+
+def test_the_eta_rest_count_can_ignore_a_non_positive_limit():
+    """`_eta_rest_count` 把 0 與負的上限當作「沒有排程」，而批次的 `schedule_rest_due` 遇到它們
+    會每個角色都休息——兩邊在那裡分岔。分岔安全的前提是載入器送不進那些值，這裡釘住前提：
+    哪天有人讓 `schedule_limit_hours` 收 0（例如當成「關掉」），這支會紅，逼人回頭決定兩邊
+    該怎麼對齊。"""
+    import _batch_config
+    coerce, kwargs = _batch_config._COERCERS["schedule_limit_hours"]
+    default = _batch_config._DEFAULT_BATCH_CONFIG["schedule_limit_hours"]
+    for bad in (0, 0.0, -1, -0.5, math.nan, math.inf):
+        assert coerce(bad, default, **kwargs) == default, bad
+    assert coerce(8, default, **kwargs) == 8, "正面對照：合法的上限要原樣收下"
+
+
+def _batch_rest_count(pairs: int, per_char: float, limit: float) -> int:
+    """照產圖批次 `run_batch` 的收工流程走一遍，數它休息幾次。
+
+    用的是批次自己的兩支純函式：`estimate_next_character_hours`（從第 1 張開始的角色，估計就是
+    它自己的時數）與 `schedule_rest_due`。「佇列裡還有沒有下一個角色」（`_another_character_pending`
+    要讀佇列檔）在這裡是 `i < pairs`。休息之後計時器歸零，跟 `run_batch` 一樣。"""
+    elapsed = 0.0
+    rests = 0
+    for i in range(1, pairs + 1):
+        elapsed += per_char
+        next_char = ws.estimate_next_character_hours(per_char, 240, 0)
+        if ws.schedule_rest_due(elapsed, limit, next_char) and i < pairs:
+            rests += 1
+            elapsed = 0.0
+    return rests
+
+
+def test_the_eta_rest_count_matches_the_batch_rest_rule():
+    """對拉守門：bot 的 `_eta_rest_count` 是批次休息規則的手寫鏡像（模組邊界不准 bot import
+    `schedule_rest_due`），所以同一組情境餵給兩邊，答案必須一樣。任何一邊改了規則都會紅。
+
+    網格的時數全是二進位精確的值，所以「剛好等於上限」那種邊界兩邊算的是同一個數，比得到
+    `>` 與 `>=` 的差別；另外加一批固定種子的亂數情境。上限含 `inf`／`nan`（兩邊都不休息）；
+    0 與負數刻意不放，理由見 `test_the_eta_rest_count_can_ignore_a_non_positive_limit`。"""
+    per_chars = (0.0, 0.25, 0.5, 1, 2.5, 4, 5, 7.5, 8, 9.5, 12, 15.5, 16, 17, 24, 40)
+    limits = (1, 4, 8, 12, 16, 24, math.inf, math.nan)
+    cases = [(p, d, lim) for p in range(0, 13) for d in per_chars for lim in limits]
+    rng = random.Random(20260926)
+    cases += [(rng.randint(0, 40), rng.uniform(0.05, 30.0), rng.uniform(0.5, 30.0))
+              for _ in range(2000)]
+    drift = [(p, d, lim, b._eta_rest_count(p, d, lim), _batch_rest_count(p, d, lim))
+             for p, d, lim in cases
+             if b._eta_rest_count(p, d, lim) != _batch_rest_count(p, d, lim)]
+    assert not drift, f"DRIFT (pairs, d, L, bot, batch)：{drift[:10]}"
+    # 正面對照：情境裡要真的有休息、有「一段一個」與「一段好幾個」，也要有舊公式答錯的格——
+    # 否則全是 0 的網格兩邊當然一致，這支就只是在比兩個零。下限取實測的一半左右
+    # （2026-09-26：3664 格裡 2603 格有休息、其中 2135 格舊公式答錯）。
+    resting = [(p, d, lim) for p, d, lim in cases
+               if math.isfinite(lim) and _batch_rest_count(p, d, lim) > 0]
+    assert len(resting) > 1300, len(resting)
+    assert any(d > lim for _p, d, lim in resting), "沒有「角色比上限長」的休息格"
+    assert any(0 < d and 2 * d <= lim for _p, d, lim in resting), "沒有「一段好幾個」的休息格"
+    old_wrong = [c for c in resting
+                 if int(c[0] * c[1] // c[2]) != _batch_rest_count(*c)]
+    assert len(old_wrong) > 1000, len(old_wrong)
 
 
 def test_eta_says_where_an_end_marker_caps_the_estimate(monkeypatch):

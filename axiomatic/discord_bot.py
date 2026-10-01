@@ -1987,6 +1987,61 @@ async def cmd_queue(message: discord.Message) -> None:
     await safe_reply(message, embed=embed)
 
 
+def _eta_rest_count(pairs: int, per_character_hours: float | None,
+                    limit_hours: float | None) -> int | None:
+    """`/eta` 用：剩下的 `pairs` 個角色做完之前，產圖批次會排程休息幾次；數不出來回 None。
+
+    **這是產圖批次休息規則的 bot 側鏡像，刻意手寫一份。** 批次在角色收工時問
+    `_webrunner_shared.schedule_rest_due(已工作時數, 上限, 下一個角色的估計)`——「再開一個
+    角色，收工時會不會跨過 `schedule_limit_hours`」——而且佇列裡沒有下一個角色時不休息
+    （`_another_character_pending`）。那幾支屬於批次的動態消耗決策，模組邊界不准 bot
+    import（`CLAUDE.md`〈Module boundaries〉只放行快照原語），所以這裡把同一條規則寫成封閉
+    公式。兩邊由 `test_bot_helpers.test_the_eta_rest_count_matches_the_batch_rest_rule`
+    拿同一組情境對拉，改了任何一邊都會紅。
+
+    每個角色 `d` 小時、上限 `L`：一個工作段做完第 `j` 個角色時已工作 `j·d`，
+    `(j + 1)·d > L` 就休息，所以一段放得下 `k = max(1, floor(L / d))` 個角色（剛好等於上限
+    不算跨過；角色比上限還長時一段只有一個）。`pairs` 個角色分成 `ceil(pairs / k)` 段，
+    最後一段收工時沒有下一個角色可開、不休息：`ceil(pairs / k) - 1 == (pairs - 1) // k`。
+
+    舊版是 `int(總工作時數 // L)`，也就是「每做滿 `L` 小時休息一次」的連續近似。休息後
+    第一個角色 9～10 小時、上限 16 時（`k = 1`），它會把休息次數少算約四成，預計完成時間
+    因此提早好幾十個小時。
+
+    邊界：
+
+    * `pairs <= 1` → 0：一個角色以下，收工時沒有下一個角色可開。
+    * `limit_hours` 不是正的有限數（`None`、`bool`、0、負數、`nan`、`inf`）→ 0，當作沒有
+      排程。`inf`／`nan` 跟批次一致（那個比較永遠不成立）；0 與負數時批次其實每個角色都會
+      休息，但載入器送不進來（`_batch_config._coerce_positive_num` 退回預設值），這個前提
+      由 `test_the_eta_rest_count_can_ignore_a_non_positive_limit` 釘住。
+    * `per_character_hours` 不知道（`None`、`bool`、`nan`、`inf`、負數）→ None：不知道一個
+      角色要多久，就數不出休息幾次。`cmd_eta` 走不到這一格——`_seconds_per_image` 一定回
+      正的有限數（沒有樣本時是預設值）。
+    * `per_character_hours == 0` → 0：工作時數不會增加，永遠跨不過上限。
+    * 角色短到 `L / d` 溢位成 `inf` → 0：一段放得下任意多個角色。
+
+    刻意的簡化（舊版也一樣）：假設這 `pairs` 個角色從一個**新的**工作段開始，不管目前這
+    一段已經做了幾個。`k = 1`（目前的常態）時幾乎沒有誤差，`k >= 2` 時最多差一次。有限性
+    的判準沿用 `_finite_event_number`（擋 `bool`、`nan`／`inf` 與轉不成 float 的超大整數）。
+    """
+    if pairs <= 1:
+        return 0
+    limit = _finite_event_number(limit_hours)
+    if limit is None or limit <= 0:
+        return 0
+    per_char = _finite_event_number(per_character_hours)
+    if per_char is None or per_char < 0:
+        return None
+    if per_char == 0:
+        return 0
+    ratio = limit / per_char
+    if not math.isfinite(ratio):
+        return 0
+    per_period = max(1, math.floor(ratio))
+    return (pairs - 1) // per_period
+
+
 async def cmd_eta(message: discord.Message) -> None:
     p1 = read_todo_entries(TODO_PROMPT_FILE)
     c1 = read_todo_entries(TODO_FILE_1)
@@ -2010,11 +2065,13 @@ async def cmd_eta(message: discord.Message) -> None:
     spi, measured, basis, verified = _seconds_per_image()
     secs_per_pair = imgs_per_pair * spi
     total_work = pairs * secs_per_pair
-    work_window = work_hours * 3600
     rest_window = rest_hours * 3600
-    full_cycles = int(total_work // work_window)
-    total_wall = total_work + full_cycles * rest_window
-    # `full_cycles` 只數**未來**會發生的休息。如果此刻正在休息，剩下的那一段是
+    # 休息次數照產圖批次的規則數：不開一個做完會跨過上限的角色，最後一個角色之後不休息
+    # （規則與它為什麼是手寫的鏡像，見 `_eta_rest_count`）。`_seconds_per_image` 一定回
+    # 正的有限數，所以這裡一定數得出來。
+    rest_count = _eta_rest_count(pairs, secs_per_pair / 3600, work_hours)
+    total_wall = total_work + rest_count * rest_window
+    # `rest_count` 只數**未來**會發生的休息。如果此刻正在休息，剩下的那一段是
     # 已經確定要等、但一張圖都不會產的時間——不加進去，ETA 就會少報最多
     # `rest_hours`（預設 6 小時）。
     resting_until = _scheduled_rest_until()
@@ -2032,7 +2089,7 @@ async def cmd_eta(message: discord.Message) -> None:
     embed.add_field(name="raw work", value=_format_duration(int(total_work)), inline=True)
     # 現在正在休息的那一段也要顯示出來，否則欄位加不回總時間（raw work +
     # rest periods != total wall），使用者會以為總時間算錯了。
-    rest_value = f"{full_cycles} × {rest_hours}h"
+    rest_value = f"{rest_count} × {rest_hours}h"
     if rest_left > 0:
         rest_value += f" + {_format_duration_short(rest_left)} (resting now)"
     embed.add_field(
