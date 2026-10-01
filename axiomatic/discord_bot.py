@@ -11873,8 +11873,9 @@ async def mcmd_version(message: discord.Message) -> None:
             ).strip()
         except Exception:  # pylint: disable=broad-except
             return None
-    sha = _run(["rev-parse", "--short", "HEAD"])
-    branch = _run(["rev-parse", "--abbrev-ref", "HEAD"])
+    # 兩次查詢各自最多 5 秒，丟執行緒：在事件迴圈上等它們會讓心跳與其他人的指令一起停住。
+    sha = await asyncio.to_thread(_run, ["rev-parse", "--short", "HEAD"])
+    branch = await asyncio.to_thread(_run, ["rev-parse", "--abbrev-ref", "HEAD"])
     if not sha:
         await safe_reply(message, "git query failed")
         return
