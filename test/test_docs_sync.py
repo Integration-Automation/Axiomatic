@@ -669,6 +669,34 @@ def test_every_citation_target_exists():
         assert (REPO_ROOT / doc).is_file(), f"文件不存在：{doc}"
 
 
+# 搬家前的測試路徑：`axiomatic` ＋ 分隔符 ＋ `test_*.py`／`conftest.py`。刻意拆開寫，
+# 免得這一行自己被自己掃到。
+_STALE_TEST_PATH = re.compile(re.escape("axiomatic") + r"[/\\](test_\w+|conftest)\.py")
+
+
+def test_no_code_points_at_a_test_file_inside_the_package():
+    """程式碼裡指到測試檔的路徑要寫 `test/…`，不是搬家前的套件路徑。
+
+    測試從套件搬到 `test/` 之後，三段正式碼的 docstring 還指著舊路徑
+    `test_pid_file_readers.py`——指錯的路徑不會讓任何東西變紅，只會讓下一個照著找的人找不到
+    檔案。`test_docs_sync` 另一支守的是「檔案不能放回套件」，這一支守的是「文字不能指回套件」。
+    只掃 `.py`：`docs/updates/` 裡的舊路徑是當時的紀錄，照規則不回頭改寫。"""
+    control = "見 `axiomatic" + "/test_pid_file_readers.py`"
+    assert _STALE_TEST_PATH.search(control), "樣式本身壞了，下面的零命中不能信"
+    scanned, hits = 0, []
+    for folder in (PKG_ROOT, TEST_ROOT, REPO_ROOT):
+        for path in sorted(folder.glob("*.py")):
+            scanned += 1
+            for lineno, line in enumerate(
+                    path.read_text(encoding="utf-8").splitlines(), 1):
+                if _STALE_TEST_PATH.search(line):
+                    hits.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{lineno}")
+    assert scanned > 100, f"只掃到 {scanned} 支 `.py`——掃描範圍壞了"
+    assert not hits, (
+        f"這些地方還指著搬家前的測試路徑：{hits}。測試住在 `test/`，"
+        "改成 `test/<檔名>`。")
+
+
 def test_commands_docs_are_generated():
     """`commands/*.md` 必須就是產生器的輸出。
 

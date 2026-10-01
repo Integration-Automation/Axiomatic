@@ -51,7 +51,9 @@ bot（``discord_bot.py``）與獨立的瀏覽器驗證器（``verify_browser.py`
 from __future__ import annotations
 
 import json
+import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -154,14 +156,51 @@ def _holder_from_mtime() -> dict:
     return {"pid": None, "owner": "?", "label": "?", "acquired_at": mtime}
 
 
+_FLOAT_MAX = sys.float_info.max
+
+
+def _is_finite_number(value: object) -> bool:
+    """不是 bool、是 int/float、而且落在有限 float 的範圍內。
+
+    與 `_batch_config` / `_bot_config` / `discord_rpc` 的同名述詞同義（被動模組之間不互相
+    import，所以各一份，由 `test_config_numbers` 的全專案掃描扛著）。用**範圍比較**、不用
+    `float()` 或 `math.isfinite()`：`nan` 的比較全是假、`inf` 過不了上界，而幾百位數的
+    整數（`json.loads` 收）用比較不會像那兩支一樣丟 `OverflowError`。"""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return -_FLOAT_MAX <= value <= _FLOAT_MAX
+    return False
+
+
+def _acquired_at(holder: dict) -> float | None:
+    """持有者的取得時刻（epoch 秒）。讀不到可用的值回 None。
+
+    欄位不是有限數字（缺欄位、字串、`null`、`true`、`NaN`／`Infinity`、幾百位數的整數——
+    `json.loads` 都收）時改用鎖檔的 mtime，跟 JSON 解不開的同一個檔（`_holder_from_mtime`）
+    走同一條路。
+    2026-09-26 之前這裡直接回「不 stale」，於是外部改過、少了這個欄位的鎖檔**永遠不會過期**：
+    `try_acquire` 永遠搶不到、`held_by_live_other` 永遠是 True，`/run` 與單張產圖一直回忙線中，
+    直到有人手動刪檔——而內容整個壞掉的檔反而照常過期，兩種壞法結果相反。`bool` 要排除是因為
+    它是 `int` 的子類別：`true` 會被讀成 1970 年、當場過期。本專案自己的寫入端（`_write_meta`）
+    一定寫這個欄位，所以只有外部改過的檔會走到退路。"""
+    started = holder.get("acquired_at")
+    if _is_finite_number(started):
+        return float(started)
+    try:
+        return LOCK_PATH.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _is_stale(holder: dict, stale_after: float) -> bool:
     pid = holder.get("pid")
     if pid is not None and not _pid_alive(pid):
         return True
-    started = holder.get("acquired_at")
-    if not isinstance(started, (int, float)):
+    started = _acquired_at(holder)
+    if started is None:
         return False
-    return (time.time() - float(started)) > float(stale_after)
+    return (time.time() - started) > float(stale_after)
 
 
 def _write_meta(fd: int, owner: str, label: str) -> None:
@@ -192,7 +231,16 @@ def _same_holder(a: dict, b: dict) -> bool:
     """兩份 metadata 是否指向同一次持有。`acquired_at` 是搶佔判定的關鍵——同一個 pid
     重新取得一次鎖也算換了持有者，因為那份 stale 判定已經不適用了。"""
     return (a.get("pid") == b.get("pid")
-            and a.get("acquired_at") == b.get("acquired_at"))
+            and _same_stamp(a.get("acquired_at"), b.get("acquired_at")))
+
+
+def _same_stamp(x: object, y: object) -> bool:
+    """`==`，但 NaN 對 NaN 也算相同。`json.loads` 收 `NaN`，而 `nan != nan`——沒有這一條，
+    `acquired_at` 是 `NaN` 的鎖檔會在 `_steal` 重讀時被當成「已經換人」，判定過期了也永遠
+    搶不下來（2026-09-26 補 mtime 退路時由測試抓到）。"""
+    if isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y):
+        return True
+    return x == y
 
 
 def _clear_stale_steal_marker() -> None:

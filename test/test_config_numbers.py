@@ -1451,12 +1451,10 @@ def test_a_different_bad_bot_key_still_gets_through(tmp_path, monkeypatch,
 _FINITE_TOKENS = frozenset({"isfinite", "isinf", "isnan", "_is_finite_number"})
 
 # 已知且暫時接受的。每一筆都要寫「壞值進來會被誤讀成什麼」。
-_FINITENESS_EXEMPT = {
-    "_chrome_slot.py:_is_stale":
-        "`acquired_at` 是本專案自己寫進 `chrome_slot.lock` 的，不是手編值；而且 "
-        "`inf` 只會讓『時間過期』這一條永遠不成立，pid 已死那一條仍然照常判定 "
-        "stale，所以槽不會被永久卡住。要收緊是 `_chrome_slot` 那一側的事。",
-}
+# 2026-09-26 `_chrome_slot._is_stale` 那一筆收掉：`acquired_at` 改走 `_is_finite_number`，
+# 用不了就退回鎖檔 mtime（原本的理由「pid 已死那一條仍會判 stale」擋不住 pid 還活著、
+# 值是 `inf` 的那一種——槽永遠卡住）。
+_FINITENESS_EXEMPT: dict[str, str] = {}
 
 _FINITENESS_MODULE_FLOOR = 8
 

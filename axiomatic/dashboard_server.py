@@ -120,7 +120,7 @@ def _read_pid() -> tuple[int | None, bool]:
     `_webrunner_shared.release_liveness_signal`，問的是「檔案裡還記著我寫的那個 pid
     嗎」）。後面那四支刻意不是三分法，各自都寫了理由——錯的不是它們，是這句話連同
     另外三處文件都在說「第五個要遵守同樣的三分法」，而第五到第八個早就在了。
-    分類與雙向對帳現在住在 `axiomatic/test_pid_file_readers.py`：掃到卻沒分類會紅，
+    分類與雙向對帳現在住在 `test/test_pid_file_readers.py`：掃到卻沒分類會紅，
     清單裡留著已經不讀這個檔的函式也會紅，四支把關讀取端還會被放到同一組檔案狀態
     語料上對拉。
 

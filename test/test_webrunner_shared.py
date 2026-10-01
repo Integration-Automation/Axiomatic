@@ -8770,6 +8770,8 @@ def test_the_pause_wait_never_touches_the_browser():
         '_read_pause',
         '_run_progress.atomic_write_text',
         '_write_pause',
+        # 認不得的 mode 印那一行 stderr 時，把來自檔案的值轉成純 ASCII（純字串運算）。
+        'ascii',
         'emit_event',
         'isinstance',
         'json.dumps',
@@ -9026,29 +9028,48 @@ def test_a_failed_marker_write_disarms_the_after_pairs_countdown():
     print("  PASS\n")
 
 
-def test_an_unknown_pause_mode_does_not_pause():
-    """認不得的 `mode` ＝ 不暫停。這是 bot 側新增模式時必須一起改這裡的耦合。
+def test_an_unknown_pause_mode_pauses_immediately():
+    """認不得的 `mode` ＝ **立刻暫停**，不是不暫停（2026-09-26 起）。
 
-    bot 目前只寫三種（`now`／`after_current`／`after_pairs`，見
-    `discord_bot.cmd_pause`），所以這條路今天走不到。釘它是因為那個耦合從程式碼
-    上完全看不出來：bot 加第四種模式，webrunner 這側不會報錯、不會警告，只是
-    暫停安靜地失效。
+    標記檔存在就代表有人要求停。這支在 2026-09-26 之前釘的是反方向（認不得就 `break`），
+    理由是「bot 加第四種模式時這側不會報錯、只是暫停安靜地失效」——那個
+    耦合是真的，但 fail-open 的代價是使用者被告知已經暫停、批次卻照跑。現在改成 fail-closed
+    並印一行 stderr；bot 寫的三種由
+    `test_bot_helpers.test_every_pause_the_bot_writes_is_one_the_batch_understands` 接起來驗。
+
+    四件事一起釘：認不得的值會停住、同一次等待只印一行（不是每個切片一行）、那一行在 cp950
+    的 stderr 上印得出來（值來自檔案，可以是任何字元；stderr 接到管線時走地區編碼），以及
+    認得的值照舊——最後這一格是必要的，少了它「一律當成 now」的變異會存活。
     """
-    print("test_an_unknown_pause_mode_does_not_pause")
+    print("test_an_unknown_pause_mode_pauses_immediately")
     with tempfile.TemporaryDirectory() as td:
         marker = Path(td) / "webrunner.pause"
-        marker.write_text(
-            json.dumps({"mode": "after_the_heat_death_of_the_universe"}),
-            encoding="utf-8")
+        marker.write_text(json.dumps({"mode": "暫停⏸️"}), encoding="utf-8")
+        raw = io.BytesIO()
+        err = io.TextIOWrapper(raw, encoding="cp950", errors="strict")
         with _pause_marker_at(marker), _captured_events() as events:
+            with _fake_clock() as clk:
+                clk.on_sleep = _release_after(marker, 3)
+                with (contextlib.redirect_stderr(err),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    ws.wait_if_paused("between images")
+            err.flush()
+            warned = raw.getvalue().decode("cp950").splitlines()
+            assert len(clk.slept) == 3, (
+                f"認不得的 mode 沒有停住（睡了 {len(clk.slept)} 次）")
+            assert len(warned) == 1 and "unknown mode" in warned[0], warned
+            assert [kind for kind, _ in events] == ["paused", "resumed"], events
+
+            marker.write_text(json.dumps({"mode": "after_current"}),
+                              encoding="utf-8")
             saved_clock = ws.time
-            ws.time = _ExplodingClock("認不得的 mode 不該睡")
+            ws.time = _ExplodingClock("認得的 after_current 在圖與圖之間不該睡")
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
-                    ws.wait_if_paused("pair boundary")
+                    ws.wait_if_paused("between images")
             finally:
                 ws.time = saved_clock
-            assert events == []
+            assert marker.exists(), "沒停的那一次不該動到標記檔"
     print("  PASS\n")
 
 

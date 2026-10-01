@@ -298,6 +298,55 @@ def test_a_fresh_undecodable_lock_reads_as_busy(slot, monkeypatch):
         "而 `try_acquire` 同時一直失敗，兩句話互相矛盾。")
 
 
+# 外部改過的鎖檔：`acquired_at` 缺、或不是有限數字。本專案自己的寫入端一定寫這個欄位，
+# 所以只有手改過的檔會長這樣——而它們曾經**永遠不會過期**（2026-09-26 修）。
+_UNUSABLE_ACQUIRED_AT = [
+    pytest.param(None, id="missing"),
+    pytest.param('"yesterday"', id="string"),
+    pytest.param("null", id="null"),
+    pytest.param("true", id="bool"),
+    pytest.param("NaN", id="nan"),
+    pytest.param("Infinity", id="infinity"),
+    pytest.param("-Infinity", id="minus-infinity"),
+    pytest.param("1" + "0" * 400, id="huge-int"),
+    pytest.param("-1" + "0" * 400, id="huge-negative-int"),
+]
+
+
+def _hold_without_a_usable_time(cs, raw, *, age: float) -> None:
+    """寫一份 `acquired_at` 缺或不能用的鎖檔（pid 是**這個**行程，保證活著），mtime 往回撥 `age` 秒。"""
+    body = f'{{"pid": {os.getpid()}, "owner": "hand-edited", "label": ""'
+    if raw is not None:
+        body += f', "acquired_at": {raw}'
+    cs.LOCK_PATH.write_text(body + "}", encoding="utf-8")
+    old = time.time() - age
+    os.utime(cs.LOCK_PATH, (old, old))
+
+
+@pytest.mark.parametrize("raw", _UNUSABLE_ACQUIRED_AT)
+def test_a_lock_without_a_usable_acquired_at_expires_by_mtime(slot, monkeypatch, raw):
+    """`acquired_at` 用不了就改看鎖檔的 mtime：過了 `stale_after` 要搶得到。
+
+    修之前 `_is_stale` 對這些形狀直接回 False，槽永遠卡住、要人手動刪檔；而內容整個
+    壞掉的同一個檔反而照常過期（`test_a_corrupt_lock_still_expires_on_time`）。"""
+    _hold_without_a_usable_time(slot, raw, age=1200.0)
+    _as_pid(monkeypatch, 4242)
+    assert slot.try_acquire("bot", stale_after=600.0) is True, (
+        "`acquired_at` 用不了的鎖檔過了期限還是搶不到——槽會永遠卡住")
+    assert _holder(slot)["owner"] == "bot"
+
+
+@pytest.mark.parametrize("raw", _UNUSABLE_ACQUIRED_AT)
+def test_a_fresh_lock_without_a_usable_acquired_at_is_still_busy(slot, monkeypatch, raw):
+    """反方向：mtime 還新就照樣是有人持有。少了這一支，「用不了就一律算 stale」也會讓上面
+    那支通過——那等於把鎖拿掉。`true` 那一格專門殺「忘了排除 `bool`」：它會被讀成 1970 年。"""
+    _hold_without_a_usable_time(slot, raw, age=10.0)
+    _as_pid(monkeypatch, 4242)
+    assert slot.try_acquire("bot", stale_after=600.0) is False, "剛寫下的鎖檔就被搶走了"
+    assert slot.held_by_live_other("bot") is True
+    assert _holder(slot)["owner"] == "hand-edited"
+
+
 def test_a_json_scalar_is_not_a_holder(slot, monkeypatch):
     """合法 JSON 但不是 dict（例如 `null`）也要走 mtime 退路，不能讓 `.get` 炸掉。"""
     slot.LOCK_PATH.write_text("null", encoding="utf-8")

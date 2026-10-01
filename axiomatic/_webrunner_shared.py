@@ -1175,7 +1175,7 @@ def claim_liveness_signal() -> int | None:
     number is no longer cited here, only the **gatekeeping** kind is described.
     The full classification (four using the three-way test / four deliberately not
     using it, each with its reason) and its two-way reconciliation live in
-    `axiomatic/test_pid_file_readers.py`: a function scanned but not classified
+    `test/test_pid_file_readers.py`: a function scanned but not classified
     goes red, and a function left in the list that no longer reads this file goes
     red too.
 
@@ -1318,8 +1318,17 @@ def emit_event(event_type: str, **data) -> None:
         print(f"emit_event({event_type}) failed: {error!r}", file=sys.stderr)
 
 
+# The legal values of the pause marker's `mode` (the bot's `cmd_pause` writes it,
+# `wait_if_paused` reads it). Any value not listed here is treated as "now" — see
+# `wait_if_paused`.
+PAUSE_MODES = frozenset({"now", "after_current", "after_pairs"})
+
+
 def wait_if_paused(label: str = "") -> None:
-    """Block at safe batch boundaries while the bot's pause marker exists."""
+    """Block at safe batch boundaries while the bot's pause marker exists.
+
+    A marker whose ``mode`` is not in ``PAUSE_MODES`` pauses immediately (one stderr line
+    per call), so a renamed mode fails closed instead of silently not pausing."""
     def _read_pause() -> dict | None:
         try:
             raw = WEBRUNNER_PAUSE_FILE.read_text(encoding="utf-8").strip()
@@ -1339,11 +1348,23 @@ def wait_if_paused(label: str = "") -> None:
 
     is_pair_boundary = "pair" in (label or "").lower()
     announced = False
+    warned_unknown = False
     while True:
         marker = _read_pause() if WEBRUNNER_PAUSE_FILE.exists() else None
         if marker is None:
             break
         mode = str(marker.get("mode") or "now").lower()
+        if mode not in PAUSE_MODES:
+            # An unrecognised mode means "pause now", not "no pause": the marker existing
+            # means somebody asked to stop, and failing open when the bot renames a mode (or
+            # a new bot meets an old batch) tells the user the batch is paused while it keeps
+            # running. `ascii()` because the value comes from a file, and stderr on a pipe
+            # uses the locale codec — an unencodable character would make this line raise.
+            if not warned_unknown:
+                print(f"  pause marker has unknown mode {ascii(mode[:40])}; "
+                      "treating it as an immediate pause", file=sys.stderr)
+                warned_unknown = True
+            mode = "now"
         if mode == "after_current":
             if is_pair_boundary:
                 marker["mode"] = "now"
@@ -1365,8 +1386,6 @@ def wait_if_paused(label: str = "") -> None:
                 mode = "now"
             else:
                 break
-        if mode != "now":
-            break
         if not announced:
             print(f"  paused by bot{f' ({label})' if label else ''}; "
                   f"waiting for resume marker removal")

@@ -6810,9 +6810,10 @@ def test_the_grid_says_so_when_nothing_could_be_downloaded(monkeypatch):
 
 def test_every_pause_the_bot_writes_is_one_the_batch_understands(monkeypatch, tmp_path):
     """The pause marker is a cross-process contract: the bot writes it, the batch reads it. The
-    batch treats a `mode` it does **not** recognise as no pause at all, so once the two sides
-    disagree on a name, `/gen pause` silently does nothing. This feeds the markers the real
-    `cmd_pause` writes to the real `wait_if_paused` (every side effect redirected to tmp)."""
+    batch treats a `mode` it does **not** recognise as an immediate pause (until 2026-09-26 it
+    treated it as no pause at all), so once the two sides disagree on a name, "stop after this
+    pair" turns into "stop now". This feeds the markers the real `cmd_pause` writes to the real
+    `wait_if_paused` (every side effect redirected to tmp)."""
     marker = tmp_path / "webrunner.pause"
     monkeypatch.setattr(b, "WEBRUNNER_PAUSE_FILE", marker)
     monkeypatch.setattr(ws, "WEBRUNNER_PAUSE_FILE", marker)
