@@ -357,7 +357,7 @@ command detail is in [`COMMANDS.md`](COMMANDS.md), in
   **do not consult `user_roles`**.
 
 > 🔑 **Host control is owner-only, always.** `/input`, `/screen`, `/win`,
-> `/clip`, `/locate`, `/macro`, `/watch`, `/proc` and `/host` are gated as
+> `/clip`, `/locate`, `/macro`, `/watch`, `/proc`, `/host`, `/schedule` and `/launcher` are gated as
 > **whole groups** (so a new sub-command is protected automatically), plus
 > scattered commands such as `/sys restart`. The gate runs **before** dispatch
 > and **before** the role gate — with all three `user_roles` lists empty (the

@@ -298,7 +298,8 @@ def _int_constants(tree: ast.Module) -> dict:
             continue
         target = node.targets[0]
         value = _const(node.value)
-        if isinstance(target, ast.Name) and isinstance(value, int)                 and not isinstance(value, bool):
+        if (isinstance(target, ast.Name) and isinstance(value, int)
+                and not isinstance(value, bool)):
             found[target.id] = value
     return found
 

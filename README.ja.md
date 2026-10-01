@@ -354,7 +354,7 @@ py -3 install_autostart.py --remove
   **`user_roles` は参照しません**。
 
 > 🔑 **ホスト操作は常にオーナー限定です。** `/input`、`/screen`、`/win`、`/clip`、
-> `/locate`、`/macro`、`/watch`、`/proc`、`/host` は**グループごと**ゲートされ
+> `/locate`、`/macro`、`/watch`、`/proc`、`/host`、`/schedule`、`/launcher` は**グループごと**ゲートされ
 > （新しいサブコマンドも自動的に保護されます）、加えて `/sys restart` のような
 > 個別のコマンドも対象です。ゲートはディスパッチの**前**、かつロールゲートの
 > **前**にあります——`user_roles` の 3 つのリストが空（既定）ならロールゲートは

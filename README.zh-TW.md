@@ -325,7 +325,7 @@ py -3 install_autostart.py --remove
 - 🔑 **限擁有者**：操作 bot 那台機器的指令，**不看 `user_roles`**。
 
 > 🔑 **主機控制一律只有擁有者能用。** `/input`、`/screen`、`/win`、`/clip`、
-> `/locate`、`/macro`、`/watch`、`/proc`、`/host` **整群**受閘（新增子指令自動受
+> `/locate`、`/macro`、`/watch`、`/proc`、`/host`、`/schedule`、`/launcher` **整群**受閘（新增子指令自動受
 > 保護），另加 `/sys restart` 這類會動到主機的零散指令。閘門在派發**之前**、而且排
 > 在角色閘**之前**——`user_roles` 三份清單都空時（預設）角色閘等於停用，把桌面控制
 > 掛在它下面等於沒有保護。
