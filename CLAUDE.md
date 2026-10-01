@@ -93,8 +93,11 @@ Every change MUST satisfy these before commit:
    for phone typing, multi-line pastes and reply context — things an option
    box cannot do. Two consequences, both guarded: a new `!` / `@bot` handler
    MUST have a slash equivalent (declared via `extras={"bang": "!x"}`), and
-   **no user doc may teach `!cmd` or `@bot <sub-command>`** (the sole
-   exception is the `@bot <文字>` free-question entry point). Do not
+   **no user doc may teach `!cmd` or anything written after `@bot`** — not a
+   sub-command and not a question either: a mention is
+   not a question entry on the slash platform
+   (non-command text only gets the default picture; questions go through
+   `/dorossi ask`). Do not
    "re-document" the text surface — that is the drift this guard exists to
    stop. The same ban applies to strings the bot sends: never tell a user to
    type `!cmd`.
@@ -476,8 +479,9 @@ help 語料是靜態字串、沒有提問者可判定，所以照舊一律泛用
 **窄範圍例外（功能面）**：`/model` 微調指令的**功能面**
 （help 合法值清單、無效值提示、`/dorossi session list` 的模型顯示）可露出後端
 模型**別名**（`DOROSSI_MODEL_CHOICES` 的 key），由 `_model_alias_for()` 把不認得
-的值降級成泛用字串。注意 `/effort`・`/model` **不是斜線指令**，是打在
-`@bot <文字>` 開頭的微調 token，所以指令樹的守門掃不到它們。**僅此一處**，不得
+的值降級成泛用字串。注意 `/effort`・`/model` **不是斜線指令**，是打在提問開頭
+（`/dorossi ask` 的 `prompt`；沒有斜線選單的平台是提問文字的開頭）的微調 token，
+所以指令樹的守門掃不到它們。**僅此一處**，不得
 外推——CLI 佈線、路徑、原始錯誤、其他服務名照舊全禁。後端 id 本身
 （`claude_code` / `codex` / `api`）不在例外內，對外一律走 `_backend_display()`
 的中性代號。
