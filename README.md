@@ -423,13 +423,14 @@ command detail is in [`COMMANDS.md`](COMMANDS.md), in
 | **Info and metadata** | `/info avatar\|channel\|ping\|server\|uptime\|version` |
 | **Public data lookups** | `/web anime\|cat\|crypto\|dict\|dog\|fact\|github\|joke\|quote\|wiki\|xkcd` |
 
-### `@bot <text>` — free questions
+### Asking questions, and mentioning the bot
 
-A mention with no sub-command is the free-question entry point. It is
-**deliberately kept as a mention** rather than turned into a slash command: one
-message can carry multiple lines, attachments and reply context, which an
-option box cannot, and an interaction token expires long before a long round
-does.
+Questions have one entry point: `/dorossi ask`. An autonomous loop starts from
+it too, and a question sent to a session whose loop is running is taken as a
+mid-task note and carried into the next round. **Mentioning the bot is not a
+question**: a mention, with or without text after it, only gets a random
+default gallery picture (general rating). Replying to one of its messages with
+the ping left on counts as a mention too.
 
 ### Reactions
 
@@ -526,17 +527,17 @@ picked up at the next pair), mark where to stop, preview, then start and watch:
 /gen pause                # and /gen resume — the checkpoint is kept
 ```
 
-**Ask the answering backend.** A mention with free text is the question entry
-point; the rest is owner-only session management:
+**Ask the answering backend.** `/dorossi ask` is the question entry point; the
+rest is owner-only session management:
 
 ```
-@bot <your question, e.g. summarise the last run and flag anything odd>
+/dorossi ask prompt:<your question, e.g. summarise the last run and flag anything odd>
 ```
 
 `/dorossi session continue all` resumes every interrupted autonomous loop at
 once — **including ones you aborted**; archive a session with
 `/dorossi session delete` to keep it out. `/dorossi ai` switches provider and
-`@bot /model <alias> …` switches model for one session. A turn that hits the
+`/dorossi model` switches model for one session. A turn that hits the
 plan usage limit **parks itself** in the queue with a wall-clock re-run time and
 comes back on its own — `/dorossi queue show` lists parked turns and
 `/dorossi queue remove` (by id) cancels one.

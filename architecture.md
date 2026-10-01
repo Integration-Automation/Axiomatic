@@ -71,7 +71,8 @@
 對外介面：
 
 - **斜線指令樹**是唯一對外宣傳的介面；逐群參考在 `commands/*.md`。`!` 與 `@bot` 是隱藏
-  相容層，唯一對外的 mention 用法是 `@bot <文字>` 自由提問。
+  相容層。標記 bot **不是**提問入口（不是控制字的文字只回一張預設圖），提問只留
+  `/dorossi ask`；沒有斜線選單的平台上，不是指令的文字就是提問。
 - **磁碟契約**：四條佇列檔（換行分隔，格式見 `CLAUDE.md`「todo file format」）、`single_image_request.json`、
   `dom_request.json`、`webrunner.pause`、`webrunner.pid`、`events.ndjson`、
   `webrunner_progress.json`。
@@ -106,7 +107,7 @@
    （單槽）→ 正在跑的批次帶內服務、既有單圖伺服器接手，或 bot 以
    `SINGLE_IMAGE_SERVER_FLAG` spawn 新的單圖伺服器 → 發 `single_image_done` 並刪除請求檔 →
    bot 送出下一筆。
-3. **Dorossi 對話（`/dorossi ask`、`@bot Dorossi <提問>`）**：解析開頭的微調 token → 決定工作
+3. **Dorossi 對話（`/dorossi ask`；沒有斜線選單的平台是一段不是指令的文字）**：解析開頭的微調 token → 決定工作
    階段 slot → 取 per-session 鎖 → `dorossi_backend.py` 串流叫用後端並套兩段式看門狗 →
    即時更新單一訊息 → 記錄用量、存 `dorossi_session.json`。
 4. **回覆版面**：狀態類回覆（`/sys health`、`/gen plan`、`/dorossi running`、`/out stats`）由

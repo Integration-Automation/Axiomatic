@@ -17,28 +17,28 @@
 - `/nsfw <tags>` — 圖庫搜圖 NSFW 捷徑（自動補 rating:explicit）
 - `/safebooru <tags>` — 全站 SFW 圖庫隨機一張
 
-## `@bot <文字>` — 自由提問
+## 提問與標記 bot
 
-不接子指令的 mention 是自由提問入口。它**刻意**保留 mention 形式：一則訊息帶
-得動多行內容、附件與回覆脈絡，斜線的選項輸入框帶不動；而且互動 token 只有 15
-分鐘，一個回合的上限卻可以到 10800 秒，用斜線撐長回合會在中途斷掉。
+對 Dorossi 提問只有一個入口：`/dorossi ask`。自走任務也從這裡開始；任務進行中再對
+同一個工作階段提問，會被收成中途補充、下一輪帶進去。開新對話是在 `prompt` 最前面打
+重置字（`/dorossi ask /new`），或用 `/dorossi session new`。
 
-空 mention 會回一張預設圖庫圖片。
+**標記 bot 不是提問。** 在訊息裡標記 bot，不管後面接不接文字，都只會回一張隨機的預設
+圖庫圖片（普遍級）。用回覆功能回它的訊息、而且有通知它時，也算標記。
 
-提問文字的**最前面**可以加兩個微調 token。它們不是斜線指令，送出前會被剝掉，
-剩下的才是真正送出去的問題：
+提問文字（`prompt`）的**最前面**可以加兩個微調 token。它們不是斜線指令，送出前會被
+剝掉，剩下的才是真正送出去的問題：
 
-- `@bot /model <opus|sonnet|haiku|fable|default> <提問>` — 指定這個工作階段用哪個模型
-- `@bot /effort <low|medium|high|xhigh|max> <提問>` — 指定思考力度
+- `/dorossi ask /model <opus|sonnet|haiku|fable|default> <提問>` — 指定這個工作階段用哪個模型
+- `/dorossi ask /effort <low|medium|high|xhigh|max> <提問>` — 指定思考力度
 
 兩個都是**工作階段層級**：設過之後同一個工作階段每一輪都沿用，`default` 清除
 覆寫；要釘住版本就照同樣寫法指定，例如 `<opus-5|sonnet-4.6>`。順序不拘、大小寫不拘，
 兩個可以同時給，但必須連續放在最前面——句中出現的同名字樣會原樣保留。只打
 token 不接問題就只是改設定，不會送出一輪。
 
-同一串寫法貼進 `/dorossi ask` 的 `prompt` 欄位開頭也一樣有效；「改設定」與
-「提問」在同一次送出裡完成是 token 形式唯一做得到的事。只想改設定不提問的
-話，用 `/dorossi model`、`/dorossi effort` 這兩個斜線指令。
+「改設定」與「提問」可以在同一次送出裡完成。只想改設定不提問的話，用
+`/dorossi model`、`/dorossi effort` 這兩個斜線指令。
 
 ### `/dorossi` — 對話後端
 

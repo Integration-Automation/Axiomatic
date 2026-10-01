@@ -95,8 +95,6 @@ DELIBERATE: tuple[tuple[str, str, str], ...] = (
      "同一張對照表的下一行"),
     ("discord_bot.py", "_DOROSSI_CONTINUE_VERBS",
      "使用者會打的指令動詞別名"),
-    ("test_docs_sync.py", "@bot <",
-     "zh-CN help 語料的預期值"),
     ("test_docs_sync.py", "# zh-CN 引用樣式",
      "四語 README 的簡體版引用樣式，行尾標記讓整組只要一筆豁免"),
     ("README.md", "简体中文",

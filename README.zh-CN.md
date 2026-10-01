@@ -388,11 +388,11 @@ py -3 install_autostart.py --remove
 | **信息与元数据** | `/info avatar\|channel\|ping\|server\|uptime\|version` |
 | **公开数据查询** | `/web anime\|cat\|crypto\|dict\|dog\|fact\|github\|joke\|quote\|wiki\|xkcd` |
 
-### `@bot <问题>`——自由提问
+### 提问与标记 bot
 
-不接子命令的 mention 是自由提问入口。**刻意保留 mention 形式**而不是改成斜杠命令：
-一条消息带得动多行内容、附件与回复上下文，选项输入框带不动；而且交互 token 的寿命
-远短于一个长回合。
+提问只有一个入口：`/dorossi ask`。自走任务也从这里开始；任务进行中再对同一个会话
+提问，会被收成中途补充、下一轮带进去。**标记 bot 不是提问**：不管后面接不接文字，都只会
+回一张随机的默认图库图片（全年龄）。用回复功能回它的消息、而且有通知它时，也算标记。
 
 ### 表情回应
 
@@ -475,15 +475,15 @@ id 都是占位值。
 /gen pause                # 以及 /gen resume——检查点会留着
 ```
 
-**问对话后端。** 带自由文字的 mention 就是提问入口，其余是限拥有者的会话管理：
+**问对话后端。** `/dorossi ask` 是提问入口，其余是限拥有者的会话管理：
 
 ```
-@bot <你的问题，例如：帮我总结上一次批处理产出了什么、有没有哪里奇怪>
+/dorossi ask prompt:<你的问题，例如：帮我总结上一次批处理产出了什么、有没有哪里奇怪>
 ```
 
 `/dorossi session continue all` 会一次接回所有中断的自走任务——**包含你自己中止过
 的**；要让某个会话连这个都不接，用 `/dorossi session delete` 把它归档。
-`/dorossi ai` 换后端，`@bot /model <别名> …` 换这个会话的模型。撞到套餐用量上限
+`/dorossi ai` 换后端，`/dorossi model` 换这个会话的模型。撞到套餐用量上限
 的那一轮会**自己停进队列**、带一个墙上时钟的重跑时刻，时间到自动回来——
 `/dorossi queue show` 看得到停放中的提问，`/dorossi queue remove`（用 id）取消其中一条。
 

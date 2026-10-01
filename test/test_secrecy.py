@@ -2197,8 +2197,9 @@ def test_the_generic_half_of_the_wiki_failure_says_nothing_internal():
 # 指令清單從 `test_docs_sync` 匯入而不是抄一份：指令改名時這道守門要跟著改，
 # 抄一份的話它會變成一個永遠對不上任何東西的字串，而測試照樣全綠。
 #
-# 不設豁免清單是刻意的。規則沒有例外（`@bot <文字>` 那個唯一例外是 `@bot` 那一
-# 條，不是 `!`），而豁免清單一開就會越積越多——這正是 DoD #3 存在的理由。
+# 不設豁免清單是刻意的。規則沒有例外——`@bot` 那一條也一樣：標記 bot 在斜線平台上
+# 不是提問入口，所以連「`@bot` 加一段文字」都不教（那一半由 `test_docs_sync` 看著）
+# ——而豁免清單一開就會越積越多，這正是 DoD #3 存在的理由。
 
 _BANG_IN_TEXT_RE = re.compile(r"!([A-Za-z0-9_]+)")
 # A `!` followed directly by an interpolation: the command name is composed, so the name list

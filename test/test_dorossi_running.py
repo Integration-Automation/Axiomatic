@@ -786,3 +786,190 @@ def test_a_task_saved_for_the_quota_is_listed_with_its_resume_time(registry):
     assert "自走任務" in line and "1 件" in line and "`s7`" in line, line
     assert b._dorossi_reset_clock(now + 3600, now=now) in line, line
     assert "`s8`" not in text, text
+
+
+# ---------------------------------------------------------------------------
+# 七、標記不再是提問入口；那些事現在只經 `/dorossi ask` 到得了（2026-10-01）
+# ---------------------------------------------------------------------------
+# 這一段跑的是**真的** `mcmd_dorossi`（上面那個 `env` 夾具，只有 `_dorossi_process_turn`
+# 是記錄器），所以「沒有開一輪」不是替身說的，是磁碟上的事件檔、佇列檔、存放檔與記憶體
+# 裡的鎖一起說的。派發層那一半（回的是哪一張圖、控制字照舊）在 `test_slash_gate.py`。
+BOT_ID = 777_000_777
+SELF_DRIVE = "持續推進直到做完，不要問我"
+
+
+@pytest.fixture
+def surfaces(env, monkeypatch):
+    """`env` 之上再加：bot 自己的身分、回圖那支換成記錄器、完整工具模式。"""
+    env.pictures = []
+    env.messages = []
+
+    async def fake_picture(_message, tags):
+        env.pictures.append(tags)
+
+    inner = b._dorossi_process_turn
+
+    async def turn_keeping_the_message(message, *args, **kwargs):
+        env.messages.append(message)
+        await inner(message, *args, **kwargs)
+
+    monkeypatch.setattr(b, "client", types.SimpleNamespace(
+        user=types.SimpleNamespace(id=BOT_ID)))
+    monkeypatch.setattr(b, "_send_danbooru_image", fake_picture)
+    monkeypatch.setattr(b, "_dorossi_process_turn", turn_keeping_the_message)
+    monkeypatch.setattr(b, "DOROSSI_CC_TOOLS", "full")
+    return env
+
+
+def _mentioned(text: str):
+    """既有平台上一則標記了 bot 的訊息（擁有者發的）。"""
+    return types.SimpleNamespace(
+        id=21, content=f"<@{BOT_ID}> {text}".strip(), guild=None, attachments=[],
+        mentions=[types.SimpleNamespace(id=BOT_ID)],
+        author=types.SimpleNamespace(id=b.DOROSSI_USER_ID),
+        channel=types.SimpleNamespace(id=0))
+
+
+def _from_another_platform(text: str):
+    return types.SimpleNamespace(
+        id=22, content=text, guild=None, attachments=[], mentions=[],
+        author=types.SimpleNamespace(id=b.DOROSSI_USER_ID, is_owner=True),
+        channel=types.SimpleNamespace(id=0, is_direct=True, is_command_chat=True))
+
+
+def _event_types() -> list:
+    import json
+    path = b.DOROSSI_EVENTS_FILE
+    if not path.exists():
+        return []
+    return [json.loads(line)["type"] for line in
+            path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+class _SlashInteraction:
+    """`_slash_run` ＋ `_InteractionMessageProxy` 真正碰得到的那幾個屬性。"""
+
+    def __init__(self, uid=None):
+        self.extras: dict = {}
+        self.id = 31
+        self.guild = None
+        self.user = types.SimpleNamespace(
+            id=b.DOROSSI_USER_ID if uid is None else uid)
+        self.sent: list = []
+        outer = self
+
+        class _Response:
+            def is_done(self):
+                return False
+
+            async def defer(self, **_kwargs):
+                return None
+
+        class _Followup:
+            async def send(self, content=None, **_kwargs):
+                outer.sent.append(content)
+                return _Placeholder(content)
+
+        class _Channel:
+            id = 0
+
+            async def send(self, content=None, **_kwargs):
+                outer.sent.append(content)
+                return _Placeholder(content)
+
+        self.response = _Response()
+        self.followup = _Followup()
+        self.channel = _Channel()
+
+
+def _slash_ask(prompt: str, session: str = "", uid=None) -> _SlashInteraction:
+    interaction = _SlashInteraction(uid)
+    asyncio.run(b.slash_dorossi_ask.callback(interaction, prompt, session))
+    return interaction
+
+
+@pytest.mark.parametrize("text", [
+    "幫我看這個", "dorossi 幫我看這個", "/new", "/effort high 幫我看這個",
+    "/session s2 幫我看這個", SELF_DRIVE,
+], ids=["plain", "keyword", "reset-word", "tuning-token", "session-token",
+        "self-drive-phrase"])
+def test_a_mention_from_the_owner_opens_no_turn_at_all(surfaces, text):
+    """擁有者標記 bot 打一段字：不開一輪、不記 `prompt_received`、不佔那個對話的鎖、
+    不排隊、不動存放檔（`/new` 沒有多開 slot、微調沒有被寫進去）——只回那張預設圖。"""
+    before = _disk_record()
+    asyncio.run(b.on_message(_mentioned(text)))
+    assert surfaces.turns == [], f"標記 bot 還是開了一輪：{surfaces.turns}"
+    assert "prompt_received" not in _event_types()
+    assert b._dorossi_session_lock_refs == {} and b._dorossi_waiters == {}
+    assert b._dorossi_queue_read() == []
+    assert _disk_record() == before, "標記 bot 動到了存放檔"
+    assert surfaces.pictures == ["rossi_(arknights)"], surfaces.pictures
+
+
+def test_a_mention_no_longer_steers_a_running_task(surfaces):
+    """自走任務進行中：標記 bot 打的字不再被收成中途補充。"""
+    loop = b._DorossiLoopState(UID, "s1")
+    b._dorossi_loops[(UID, "s1")] = loop
+    asyncio.run(b.on_message(_mentioned("順便補這個")))
+    assert loop.injections == []
+    assert surfaces.replies == [], surfaces.replies
+    assert surfaces.pictures == ["rossi_(arknights)"]
+
+
+@pytest.mark.parametrize("text, prompt", [
+    ("幫我看這個", "幫我看這個"), ("dorossi 幫我看這個", "幫我看這個"),
+], ids=["plain", "keyword"])
+def test_the_same_text_from_a_platform_without_a_slash_menu_still_opens_a_turn(
+        surfaces, text, prompt):
+    """對照組：同一段字從沒有斜線選單的平台進來，照舊是提問。少了這一支，上面那兩支
+    在「提問那條路整個壞掉」時也會是綠的。"""
+    asyncio.run(b.dispatch_external_message(_from_another_platform(text)))
+    assert [(t["sid"], t["prompt"]) for t in surfaces.turns] == [("s1", prompt)]
+    assert "prompt_received" in _event_types()
+    assert surfaces.pictures == []
+
+
+def test_the_slash_command_opens_a_turn(surfaces):
+    interaction = _slash_ask("幫我看這個")
+    assert [(t["sid"], t["prompt"]) for t in surfaces.turns] == [("s1", "幫我看這個")]
+    assert interaction.sent and "已收下" in interaction.sent[0], interaction.sent
+
+
+def test_the_slash_command_steers_a_running_task(surfaces):
+    """中途補充：自走任務在跑時，`/dorossi ask` 的提問進它的注入緩衝，不另開一輪。"""
+    loop = b._DorossiLoopState(UID, "s1")
+    b._dorossi_loops[(UID, "s1")] = loop
+    _slash_ask("順便補這個")
+    assert loop.injections == ["順便補這個"]
+    assert surfaces.turns == []
+    assert surfaces.replies == ["📨 已加入目前任務，下一輪會帶進去。"], surfaces.replies
+
+
+def test_the_slash_command_takes_the_reset_word(surfaces):
+    """`/new` 打在 `prompt` 開頭：開一個新的工作階段並切過去，這一輪送進新的那一個。"""
+    before = set(_disk_record()["sessions"])
+    _slash_ask("/new")
+    after = _disk_record()
+    opened = sorted(set(after["sessions"]) - before)
+    assert len(opened) == 1, opened
+    assert after["active"] == opened[0]
+    assert [(t["sid"], t["prompt"]) for t in surfaces.turns] == [(opened[0], "/new")]
+
+
+def test_the_slash_command_takes_the_tuning_tokens(surfaces):
+    """`/effort`／`/model` 打在 `prompt` 開頭：從送出去的提問剝掉，帶進這一輪。"""
+    _slash_ask("/effort high 幫我看這個")
+    assert [(t["prompt"], t["effort"]) for t in surfaces.turns] == [("幫我看這個", "high")]
+
+
+def test_the_slash_command_can_start_a_self_driving_task(surfaces):
+    """自走的入口在提問那一輪裡面（片語 ＋ 擁有者 ＋ 完整工具模式）。斜線那條路交進去的
+    是代理物件，所以要確認閘門認得它的發問者——而且提問原封不動交到那一輪手上。"""
+    _slash_ask(SELF_DRIVE)
+    assert [t["prompt"] for t in surfaces.turns] == [SELF_DRIVE]
+    proxy = surfaces.messages[0]
+    assert b._dorossi_should_loop(proxy, "claude_code", SELF_DRIVE) is True
+    # 對照：同一句話、不是擁有者 → 閘門不開（否則上面那一句只是在測片語比對）。
+    stranger = _SlashInteraction(uid=STRANGER)
+    assert b._dorossi_should_loop(
+        b._InteractionMessageProxy(stranger), "claude_code", SELF_DRIVE) is False

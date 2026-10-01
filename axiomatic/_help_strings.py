@@ -5,9 +5,10 @@ dependency. It holds data only: do not put an f-string, `.format()`, or anything
 executable here.
 
 The command surface is **slash commands**; `!` and `@bot` are kept only as
-unadvertised compat paths, so they are not mentioned here. The one exception is
-the `@bot <text>` free-question entry point, which deliberately keeps the
-mention form.
+unadvertised compat paths, so they are not mentioned here. The question entry is
+`/dorossi ask`. Mentioning the bot is **not** a question (text that is not a
+control word only gets a default picture), so nothing written after `@bot` is
+taught here either.
 
 **The zh-CN sections deliberately use Simplified** (for Mainland China users),
 and must not be "corrected" to Traditional — CLAUDE.md's Language hard rule has
@@ -420,7 +421,7 @@ MENTION_HELP_SECTIONS: list[str] = [
     (
         "# Cross-channel commands\n"
         "These work in any channel the bot can see.\n"
-        "`@bot <text>` (no subcommand) is the free-text question entry — it stays a mention because a chat message can carry multi-line text, attachments and reply context that a slash option box cannot.\n"
+        "Questions go through `/dorossi ask`. Mentioning the bot is not a question: a mention, with or without text after it, only gets a random default gallery picture (general rating).\n"
         "Replies are always generic: no service names, no host paths, no raw error text. Full detail goes to the log only.\n"
     ),
     (
@@ -440,7 +441,7 @@ MENTION_HELP_SECTIONS: list[str] = [
         "- `/dorossi allowdir add|list|remove`\n"
         "- `/dorossi queue clear|detail|failed_clear|move|remove|retry_failed|show|undo`\n"
         "- `/dorossi session archive|continue|delete|export|list|new|rename|reset|switch`\n"
-        "- Session-level tuning tokens at the start of a question (set once, reused by every later turn of that session): `@bot /model <opus|sonnet|haiku|fable|default> <text>`, `@bot /effort <low|medium|high|xhigh|max> <text>`; pinned versions are written the same way, e.g. `<opus-5|sonnet-4.6>`\n"
+        "- Session-level tuning tokens at the start of a question (set once, reused by every later turn of that session): `/dorossi ask /model <opus|sonnet|haiku|fable|default> <text>`, `/dorossi ask /effort <low|medium|high|xhigh|max> <text>`; pinned versions are written the same way, e.g. `<opus-5|sonnet-4.6>`\n"
     ),
     (
         "## `/tag` — Gallery tag tools\n"
@@ -474,7 +475,7 @@ MENTION_HELP_SECTIONS_ZH_TW: list[str] = [
     (
         "# 跨頻道指令\n"
         "在 bot 看得到的任何頻道都能用。\n"
-        "`@bot <文字>`（不接子指令）是自由提問入口——它保留 mention 形式，因為一則訊息帶得動多行內容、附件與回覆脈絡，斜線的選項輸入框帶不動。\n"
+        "提問一律用 `/dorossi ask`。標記 bot 不是提問：不管後面接不接文字，都只會回一張隨機的預設圖庫圖片（普遍級）。\n"
         "回覆一律泛用：不提服務名稱、不露出主機路徑、不回傳原始錯誤字串，完整細節只進 log。\n"
     ),
     (
@@ -494,7 +495,7 @@ MENTION_HELP_SECTIONS_ZH_TW: list[str] = [
         "- `/dorossi allowdir add|list|remove`\n"
         "- `/dorossi queue clear|detail|failed_clear|move|remove|retry_failed|show|undo`\n"
         "- `/dorossi session archive|continue|delete|export|list|new|rename|reset|switch`\n"
-        "- 提問開頭可加微調 token（工作階段層級，設一次之後同一個工作階段每一輪都沿用）：`@bot /model <opus|sonnet|haiku|fable|default> <提問>`、`@bot /effort <low|medium|high|xhigh|max> <提問>`；要釘住版本就照同樣寫法指定，例如 `<opus-5|sonnet-4.6>`\n"
+        "- 提問開頭可加微調 token（工作階段層級，設一次之後同一個工作階段每一輪都沿用）：`/dorossi ask /model <opus|sonnet|haiku|fable|default> <提問>`、`/dorossi ask /effort <low|medium|high|xhigh|max> <提問>`；要釘住版本就照同樣寫法指定，例如 `<opus-5|sonnet-4.6>`\n"
     ),
     (
         "## `/tag` — 圖庫 tag 工具\n"
@@ -528,7 +529,7 @@ MENTION_HELP_SECTIONS_ZH_CN: list[str] = [
     (
         "# 跨频道命令\n"
         "在 bot 能看到的任何频道都能用。\n"
-        "`@bot <文字>`（不接子命令）是自由提问入口——它保留 mention 形式，因为一条消息带得动多行内容、附件与回复上下文，斜杠的选项输入框带不动。\n"
+        "提问一律用 `/dorossi ask`。标记 bot 不是提问：不管后面接不接文字，都只会回一张随机的默认图库图片（全年龄）。\n"
         "回复一律通用：不提服务名称、不暴露主机路径、不返回原始错误字符串，完整细节只进日志。\n"
     ),
     (
@@ -548,7 +549,7 @@ MENTION_HELP_SECTIONS_ZH_CN: list[str] = [
         "- `/dorossi allowdir add|list|remove`\n"
         "- `/dorossi queue clear|detail|failed_clear|move|remove|retry_failed|show|undo`\n"
         "- `/dorossi session archive|continue|delete|export|list|new|rename|reset|switch`\n"
-        "- 提问开头可加微调 token（会话层级，设一次之后同一个会话每一轮都沿用）：`@bot /model <opus|sonnet|haiku|fable|default> <问题>`、`@bot /effort <low|medium|high|xhigh|max> <问题>`；要钉住版本就照同样写法指定，例如 `<opus-5|sonnet-4.6>`\n"
+        "- 提问开头可加微调 token（会话层级，设一次之后同一个会话每一轮都沿用）：`/dorossi ask /model <opus|sonnet|haiku|fable|default> <问题>`、`/dorossi ask /effort <low|medium|high|xhigh|max> <问题>`；要钉住版本就照同样写法指定，例如 `<opus-5|sonnet-4.6>`\n"
     ),
     (
         "## `/tag` — 图库 tag 工具\n"

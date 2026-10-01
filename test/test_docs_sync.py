@@ -6,7 +6,8 @@
 1. **覆蓋率**——每個斜線指令（含群內子指令）都要在三語 help ＋ `README.md` ＋
    `COMMANDS.md` ＋ `docs/commands_*.md` ＋ `commands/*.md`（產生出來的）出現，
    也就是 `CLAUDE.md` DoD #2 的五份語料；反向也驗孤兒條目。
-2. **隱藏面不得外洩**——使用者文件裡不得再出現 `!cmd` 或 `@bot <子指令>`。少了
+2. **隱藏面不得外洩**——使用者文件裡不得再出現 `!cmd`，`@bot` 後面也什麼都不得
+   教（子指令、提問、微調 token；標記 bot 在斜線平台上不是提問入口）。少了
    這一條，`!` 會慢慢爬回文件裡，三個表面又變成三份要維護的東西。
 3. **相容面不得斷**——`!` 與 `@bot` 的派發表必須還在，而且**每一個**都要有對應
    的斜線指令（靠宣告上的 `extras={"bang": …}` 比對）。漏掉一個就代表有功能只
@@ -323,28 +324,112 @@ def test_no_orphan_slash_command_in_docs(corpus_name):
 # --------------------------------------------------------------------------
 # 隱藏面不得外洩到使用者文件
 # --------------------------------------------------------------------------
-# `@bot <文字>` 是唯一保留下來的 mention 用法（自由提問入口），文件要講得到它。
-_ALLOWED_MENTION_PHRASES = ("@bot <文字>", "@bot <text>", "@bot <提問>",
-                            "@bot <问题>")
+# 斜線平台上，標記 bot **不是**提問入口（擁有者裁定 2026-10-01）：不是控制字的文字只會
+# 換來一張預設圖，提問只留 `/dorossi ask`。在那之前這裡有一份放行名單，讓文件可以教
+# 「`@bot` 加一段文字就是提問」；前提沒了，名單也沒了。現在這幾份文件裡 `@bot` 後面
+# **什麼都不能教**——子指令、提問、打在提問開頭的微調 token 都一樣。唯一還能接在後面
+# 的，是泛指那條隱藏相容路徑的佔位符（「舊的 `@bot <子指令>` 仍然可用，但不寫進文件」）。
+# 這個 repo 的文件沒有任何一份用到佔位符，所以放行名單是空的；哪天有文件要泛指那條隱藏
+# 相容路徑，再把佔位符加進來（下面那支對帳會要求它真的有人在用）。
+_MENTION_PLACEHOLDERS: frozenset[str] = frozenset()
+# 同一行、`@bot` 加空白之後的那一段：角括號的佔位符整個取（裡面可以有空白），其餘取到
+# 下一個空白或反引號為止。`` `@bot` 指令 `` 這種反引號緊跟在後面的寫法不算——那是在講
+# 這個表面，不是在教怎麼用。
+_AFTER_MENTION_RE = re.compile(r"@bot[ \t]+(<[^>`\n]*>|[^\s`]+)")
+# 跨行也算的那一種只收英數開頭（子指令的形狀），免得把換行後的散文當成教學。
+_MENTION_SUBCOMMAND_RE = re.compile(r"@bot\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _taught_after_mention(text: str, allowed=_MENTION_PLACEHOLDERS) -> list[str]:
+    """文字裡 `@bot` 後面教了什麼（扣掉 `allowed` 的佔位符）。空清單＝沒有。"""
+    found = {token for token in _AFTER_MENTION_RE.findall(text)
+             if token not in allowed}
+    found |= {token.lower() for token in _MENTION_SUBCOMMAND_RE.findall(text)}
+    return sorted(token[:24] for token in found)
 
 
 @pytest.mark.parametrize("corpus_name", sorted(_coverage_corpora()))
 def test_hidden_surfaces_are_not_advertised(corpus_name):
-    """使用者文件不得再教 `!cmd` 或 `@bot <子指令>`。
+    """使用者文件不得再教 `!cmd`，`@bot` 後面也什麼都不得教。
 
     這是「三個表面收斂成一個」的機械保證。少了它，`!` 會一次一句地爬回文件
-    裡，而使用者又要面對兩套講法。
+    裡，而使用者又要面對兩套講法。標記那一半從 2026-10-01 起更嚴：以前放行
+    「`@bot` 加一段文字＝提問」，現在那句話是錯的（標記只會回一張圖），所以連它
+    也不得出現。
     """
     text = _coverage_corpora()[corpus_name]
-    for phrase in _ALLOWED_MENTION_PHRASES:
-        text = text.replace(phrase, "")
     bang = sorted(set(_BANG_TOKEN_RE.findall(text)))
-    mention = sorted({m.lower() for m in
-                      re.findall(r"@bot\s+([A-Za-z_][A-Za-z0-9_]*)", text)})
+    mention = _taught_after_mention(text)
     assert not bang and not mention, (
         f"{corpus_name} 還在教隱藏介面——`!` 指令：{bang}；"
-        f"`@bot` 子指令：{mention}。斜線指令是唯一對外介面；"
-        "相容路徑刻意不寫進文件。")
+        f"`@bot` 後面接的：{mention}。斜線指令是唯一對外介面（提問是 "
+        "`/dorossi ask`）；相容路徑刻意不寫進文件，標記 bot 不是提問。")
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("用 `@bot <文字>` 提問", ["<文字>"]),
+    ("`@bot <text>` is the question entry", ["<text>"]),
+    ("`@bot /model <opus|sonnet> <提問>`", ["/model"]),
+    ("打 @bot 今天天氣如何 就好", ["今天天氣如何"]),
+    ("`@bot restart` 會重啟", ["restart"]),
+    ("@bot\nrestart", ["restart"]),
+    # 必須放行的：講這個表面、不教怎麼用。
+    ("空 mention（`@bot` 後面什麼都不接）會回一張圖", []),
+    ("新 `@bot` 指令必須同步寫進三語 help", []),
+    ("舊的 `!` 前綴與 `@bot <子指令>` 仍然可用", []),
+])
+def test_the_mention_scan_tells_teaching_from_naming(text, expected):
+    """正反對照：掃描器看得到每一種教法，而只是提到這個表面的句子不會被誤報。
+
+    這個 repo 的放行名單是空的，所以放行機制本身用一份明給的名單來驗——否則最後那一格
+    （佔位符要放行）沒有東西可以對。"""
+    assert _taught_after_mention(
+        text, allowed=frozenset({"<子指令>"})) == expected
+
+
+def test_with_no_allowance_even_the_placeholder_is_reported():
+    """反方向：沒有放行名單時，佔位符照樣算教法。少了這一格，「不管名單、一律放行角括號」
+    的掃描器在這個 repo 裡每一支都是綠的。"""
+    assert _taught_after_mention("舊的 `@bot <子指令>` 仍然可用") == ["<子指令>"]
+
+
+# 主 README 的翻譯不在上面那五份語料裡（它們沒有指令覆蓋率可對），但「標記 bot 加
+# 一段文字就是提問」那一節當初每一份都有。同一條規則照樣適用；放行的只有各語言對
+# 「隱藏的子指令」的那個佔位符。
+_TRANSLATED_MENTION_PLACEHOLDERS: frozenset[str] = frozenset()
+
+
+def _readme_translations() -> dict[str, str]:
+    return {path.name: path.read_text(encoding="utf-8")
+            for path in sorted(REPO_ROOT.glob("README.*.md"))}
+
+
+def test_no_readme_translation_teaches_asking_by_mention():
+    translations = _readme_translations()
+    assert len(translations) >= 3, (
+        f"只找到 {len(translations)} 份翻譯——glob 壞了，這支等於沒在檢查。")
+    offenders = {name: hits for name, text in translations.items()
+                 if (hits := _taught_after_mention(
+                     text, allowed=_TRANSLATED_MENTION_PLACEHOLDERS))}
+    assert not offenders, (
+        f"這些翻譯還在教接在 `@bot` 後面的寫法：{offenders}。提問是 `/dorossi ask`，"
+        "標記 bot 只會回一張圖；主 README 改了，每一份翻譯要一起改。")
+    used = set()
+    for text in translations.values():
+        used |= set(_AFTER_MENTION_RE.findall(text)) & _TRANSLATED_MENTION_PLACEHOLDERS
+    assert used == _TRANSLATED_MENTION_PLACEHOLDERS, (
+        "這些佔位符已經沒有任何翻譯在用："
+        f"{sorted(_TRANSLATED_MENTION_PLACEHOLDERS - used)}")
+
+
+def test_the_mention_placeholder_allowance_is_not_stale():
+    """放行的佔位符要真的有文件在用；一個對不上任何東西的豁免會安靜地留在那裡。"""
+    used = set()
+    for text in _coverage_corpora().values():
+        used |= set(_AFTER_MENTION_RE.findall(text)) & _MENTION_PLACEHOLDERS
+    assert used == _MENTION_PLACEHOLDERS, (
+        f"這些佔位符已經沒有任何文件在用：{sorted(_MENTION_PLACEHOLDERS - used)}，"
+        "從 `_MENTION_PLACEHOLDERS` 拿掉。")
 
 
 # --------------------------------------------------------------------------
@@ -384,8 +469,6 @@ def _user_doc_corpora() -> dict[str, str]:
 
 
 def _text_commands_taught(text: str) -> list[str]:
-    for phrase in _ALLOWED_MENTION_PHRASES:
-        text = text.replace(phrase, "")
     known = set(BANG_PRIMARY) | set(BANG_ALIASES)
     return sorted({token for token in _BANG_TOKEN_RE.findall(text)
                    if token in known})
@@ -514,11 +597,15 @@ def test_slash_names_are_platform_legal():
 
 
 def test_no_send_site_advertises_a_text_command():
-    """送出去的字串不得再教使用者打 `!cmd` 或 `@bot cmd`。
+    """送出去的字串不得再教使用者打 `!cmd`，也不得教任何接在 `@bot` 後面的東西。
 
     這批「用法：…」提示是 `!` 時代寫的，數量約 158 處。斜線成為唯一介面之後，
     它們會教使用者一個文件上查不到的寫法。掃的是送出點底下的字串常數，跟
     `test_secrecy.py` 同一套判斷送出點的方法。
+
+    標記那一半沒有任何放行（2026-10-01 之前放行「`@bot` 加一段文字＝提問」）：
+    標記 bot 在這個平台上只會換來一張圖，所以教人「標記我來問」的句子一律要寫成
+    `/dorossi ask`。沒有斜線選單的平台由送出時的改寫負責，原始碼只寫斜線形式。
     """
     senders = {"reply", "send", "send_message"}
     violations: list[str] = []
@@ -538,9 +625,8 @@ def test_no_send_site_advertises_a_text_command():
                         and isinstance(sub.value, str)):
                     continue
                 text = sub.value
-                for phrase in _ALLOWED_MENTION_PHRASES:
-                    text = text.replace(phrase, "")
-                if re.search(r"`!\w|^!\w|@bot\s+[A-Za-z_]", text):
+                if (re.search(r"`!\w|^!\w", text)
+                        or _taught_after_mention(text, allowed=frozenset())):
                     violations.append(
                         f"discord_bot.py:{node.lineno} → {sub.value[:70]!r}")
     assert not violations, (

@@ -43,6 +43,7 @@
 """
 import ast
 import asyncio
+import inspect
 import os
 import sys
 import types
@@ -426,13 +427,197 @@ def test_a_refused_mention_is_not_counted(armed):
     assert b._METRICS_CMD_COUNTS == Counter(), b._METRICS_CMD_COUNTS
 
 
-def test_free_text_mentions_still_reach_the_question_entry_point(armed):
-    """`@bot <文字>` 是公開入口（權限閘在 handler 內），不得被這道閘掃到。"""
+def test_free_text_mentions_are_public_and_never_reach_the_question_entry_point(armed,
+                                                                                gallery):
+    """2026-10-01 之前這一支釘的是相反的事：標記 bot 加一段文字＝提問，「不得被擁有者閘
+    掃到」的理由是它要進 `mcmd_dorossi`（權限閘在那裡面）。
+
+    擁有者裁定之後，這個平台上標記不再是提問入口：非指令的文字跟「只標記不打字」是同一個
+    動作，回一張預設圖。所以現在釘的是兩件事——它**仍然是公開的**（陌生人在任何頻道都
+    得到那張圖，不是擁有者閘的那句拒絕），而且**一次都不會**走到提問那支。
+    """
     message = _mention("今天天氣如何", STRANGER, OTHER_CHANNEL)
     _deliver(message)
-    assert armed.touched == ["mcmd_dorossi"], armed.touched
-    assert message.replies == []
-    assert b._METRICS_CMD_COUNTS["@dorossi"] == 1
+    assert armed.touched == [], armed.touched
+    assert b.OWNER_ONLY_DENIED not in message.replies
+    assert len(message.replies) == 1 and _PICTURE_URL in message.replies[0], message.replies
+    assert b._METRICS_CMD_COUNTS == Counter({"@(text)": 1}), b._METRICS_CMD_COUNTS
+
+
+# ---------------------------------------------------------------------------
+# B2. 標記不是提問入口（擁有者裁定 2026-10-01）
+# ---------------------------------------------------------------------------
+# 事故（同日 16:41）：擁有者標記 bot 問了一句話，走的是單輪提問；那個對話的後端紀錄裡塞滿
+# 先前自走任務的內容，後端把那句話當成「繼續做」，在完整工具模式下自己去改 repo。裁定：
+# 提問只留斜線的那一個入口；這個平台上標記 bot 加任何「不是控制字」的文字，一律回一張
+# 隨機的預設圖（跟只標記不打字同一個動作）。別的平台（沒有斜線選單）不變——那一半的對照
+# 在 `test_platform_transports.py`。
+_PICTURE_URL = "https://img.example/5.png"
+_DEFAULT_PICTURE_QUERY = "rossi_(arknights) rating:general"
+
+# 會進提問那支的 mention 鍵——從派發表推出來，不手寫：哪天多一個同樣會進提問的鍵，它自己
+# 就在這裡。
+QUESTION_KEYS = sorted(key for key, names in MENTION_ROUTES.items()
+                       if "mcmd_dorossi" in names)
+
+_NOT_A_CONTROL_WORD = [
+    "今天天氣如何",
+    "幫我看一下這段\n第二行",
+    "dorossi 幫我看一下這個函式",
+    "Dorossi 幫我看一下",
+    "/new",
+    "/new D:/Codes/Elsewhere",
+    "/effort high 你好",
+    "/session s3 接著做",
+    "持續推進直到做完，不要問我",
+    # 使用者打的字**不是**圖庫查詢：裡面的旗標與分級一個都不得生效。
+    "rossi_(arknights) --latest --grid rating:explicit",
+    "```\n整段包在程式碼區塊裡\n```",
+]
+
+
+@pytest.fixture
+def gallery(monkeypatch):
+    """圖庫那一側換成記錄器：查了什麼、走的是隨機還是最新、有沒有改成拼圖。"""
+    seen = types.SimpleNamespace(random=[], latest=[], grid=[], fuzzy=[])
+
+    async def fake_random(tags):
+        seen.random.append(tags)
+        return {"id": 5, "file_url": _PICTURE_URL}
+
+    async def fake_latest(tags):
+        seen.latest.append(tags)
+        return {"id": 6, "file_url": "https://img.example/latest.png"}
+
+    async def fake_grid(_message, tags, **_kwargs):
+        seen.grid.append(tags)
+
+    async def fake_fuzzy(_api, tags):
+        seen.fuzzy.append(tags)
+        return None
+
+    monkeypatch.setattr(b, "_fetch_danbooru_post", fake_random)
+    monkeypatch.setattr(b, "_fetch_danbooru_post_latest", fake_latest)
+    monkeypatch.setattr(b, "_send_danbooru_grid", fake_grid)
+    monkeypatch.setattr(b, "_resolve_fuzzy_tags", fake_fuzzy)
+    return seen
+
+
+def _got_the_default_picture(message, gallery) -> None:
+    """共同的收尾：一張**隨機**的預設圖，查詢是固定的那一句（含普遍級），沒有別的。"""
+    assert gallery.random == [_DEFAULT_PICTURE_QUERY], (
+        f"查的不是固定的那一句：{gallery.random}——使用者打的字被當成圖庫查詢了，"
+        "或是分級沒有補上")
+    assert gallery.latest == [], "走的是「最新一張」，不是隨機"
+    assert gallery.grid == [], "變成拼圖了"
+    assert len(message.replies) == 1 and _PICTURE_URL in message.replies[0], message.replies
+
+
+def test_the_question_keys_were_actually_derived():
+    """正面對照：推不出任何鍵的話，下面每一支都會空轉通過。"""
+    assert QUESTION_KEYS, "派發表裡找不到任何會進提問的鍵——抽取壞了，或那個鍵被拿掉了"
+    assert "dorossi" in QUESTION_KEYS, (
+        "這個鍵不能從表裡拿掉：沒有斜線選單的平台還靠它（`dorossi <提問>`），"
+        "而 `/dorossi ask` 宣告的對應 mention 也是它")
+    assert sorted(b._MENTION_QUESTION_KEYS) == QUESTION_KEYS, (
+        "`_MENTION_QUESTION_KEYS` 與派發表對不上："
+        f"{sorted(b._MENTION_QUESTION_KEYS)} vs {QUESTION_KEYS}。這份集合是列舉的，"
+        "少列一個＝那個鍵在這個平台上照樣進提問，而且沒有任何症狀")
+
+
+@pytest.mark.parametrize("uid", [STRANGER, b.OWNER_USER_ID], ids=["stranger", "owner"])
+@pytest.mark.parametrize("text", _NOT_A_CONTROL_WORD,
+                         ids=[f"text{n}" for n in range(len(_NOT_A_CONTROL_WORD))])
+def test_a_mention_with_anything_but_a_control_word_gets_the_default_picture(
+        text, uid, armed, gallery):
+    """自由文字、`dorossi <提問>`、重置字、微調 token、帶自走片語的句子——全部回圖。
+
+    擁有者也一樣（這個入口對誰都關了），陌生人不再收到「僅限特定使用者」。提問那支
+    一次都沒有被呼叫：`prompt_received`、per-session 鎖、排隊與後端全在那一支裡面，
+    所以「沒被呼叫」就是「什麼都沒發生」。
+    """
+    message = _mention(text, uid, OTHER_CHANNEL)
+    _deliver(message)
+    assert armed.touched == [], f"`@bot {text}` 進了：{armed.touched}"
+    _got_the_default_picture(message, gallery)
+    assert "僅限" not in message.replies[0]
+
+
+@pytest.mark.parametrize("key", QUESTION_KEYS)
+def test_every_mention_key_that_asks_is_closed_on_this_surface(key, armed, gallery):
+    message = _mention(f"{key} 這是一個問題", b.OWNER_USER_ID, b.CHANNEL_ID)
+    _deliver(message)
+    assert armed.touched == [], armed.touched
+    _got_the_default_picture(message, gallery)
+
+
+def test_a_bare_mention_still_gets_the_same_picture(armed, gallery):
+    """只標記不打字：一直都是這個動作，現在兩條路共用同一支。這一條不計數（照舊）。"""
+    message = _mention("", STRANGER, OTHER_CHANNEL)
+    _deliver(message)
+    assert armed.touched == []
+    _got_the_default_picture(message, gallery)
+    assert b._METRICS_CMD_COUNTS == Counter()
+
+
+def test_the_picture_path_is_counted_under_its_own_key(armed, gallery):
+    """以前這一條算在 `@dorossi` 底下；現在它不是提問，另用一個不可能撞到控制字的鍵。"""
+    _deliver(_mention("今天天氣如何", b.OWNER_USER_ID, b.CHANNEL_ID))
+    _deliver(_mention("dorossi 問題", b.OWNER_USER_ID, b.CHANNEL_ID))
+    assert b._METRICS_CMD_COUNTS == Counter({"@(text)": 2}), b._METRICS_CMD_COUNTS
+
+
+_CONTROL_KEYS = sorted(key for key in MENTION_ROUTES
+                       if key not in QUESTION_KEYS and key not in LOCKED_MENTIONS)
+# 在匯入當下量（夾具還沒把任何一支換成記錄器）：替身要跟本尊同一種——協程函式換成回
+# 協程的，一般函式換成一般的。
+_IS_COROUTINE = {name: inspect.iscoroutinefunction(getattr(b, name))
+                 for names in MENTION_ROUTES.values() for name in names}
+
+
+@pytest.mark.parametrize("key", _CONTROL_KEYS)
+def test_every_control_word_still_reaches_its_handler_from_a_mention(
+        key, armed, gallery, monkeypatch):
+    """必須放行的那一半：少了它，「標記一律回圖」的實作也會讓上面每一支全綠。
+
+    控制字照派發表逐一推導（公開的 ping／help、各自在處理函式裡擋人的 abort／status／
+    session／ai／tokens…），每一個都要從標記進得去，而且**沒有**回圖。被鎖的那幾個
+    （擁有者閘在派發層）由上面 B 段的四支看著。
+    """
+    reached: list[str] = []
+    for name in MENTION_ROUTES[key]:
+        if _IS_COROUTINE[name]:
+            def _record(*_args, _name=name, **_kwargs):
+                async def _noop():
+                    reached.append(_name)
+                return _noop()
+        else:
+            def _record(*_args, _name=name, **_kwargs):
+                reached.append(_name)
+                return ""
+        monkeypatch.setattr(b, name, _record)
+    message = _mention(key, b.OWNER_USER_ID, OTHER_CHANNEL)
+    _deliver(message)
+    assert set(reached) == set(MENTION_ROUTES[key]), (key, reached)
+    assert gallery.random == [] and message.replies == [], (
+        f"`@bot {key}` 是控制字，卻被當成一般文字回了圖")
+    assert b._METRICS_CMD_COUNTS == Counter({f"@{key}": 1})
+
+
+def test_the_control_words_were_actually_derived():
+    assert len(_CONTROL_KEYS) >= 12, _CONTROL_KEYS
+    for expected in ("ping", "help", "abort", "status", "session", "ai", "tokens"):
+        assert expected in _CONTROL_KEYS, expected
+
+
+def test_a_mention_that_starts_with_a_bang_is_still_a_bang_command(armed, gallery):
+    """標記 bot 又以 `!` 開頭的訊息走的是文字指令那條路，不是標記那條——照舊。"""
+    bot_user = types.SimpleNamespace(id=BOT_UID)
+    message = _FakeMessage(UNLOCKED_BANG, b.OWNER_USER_ID, b.CHANNEL_ID,
+                           mentions=[bot_user])
+    _deliver(message)
+    assert armed.touched == BANG_ROUTES[UNLOCKED_BANG]
+    assert gallery.random == []
 
 
 # ---------------------------------------------------------------------------

@@ -1239,7 +1239,9 @@ def _dispatch(monkeypatch, *, text, is_owner, is_direct, is_command_chat=True):
     async def _on_message(message):
         routed.append(("bang", message.content))
 
-    async def _mention(message):
+    async def _mention(message, *, question_entry):
+        # 這條路是提問入口，呼叫端必須明講（見檔尾那一段）。
+        assert question_entry is True
         routed.append(("ask", message.content))
 
     monkeypatch.setattr(b, "on_message", _on_message)
@@ -1757,3 +1759,125 @@ def test_the_external_entry_point_has_its_own_conversation_gate():
     `@bot restart` 當年那個缺口同一個形狀。"""
     body = ast.unparse(_bot_function("dispatch_external_message"))
     assert "is_command_chat" in body and "is_owner" in body
+
+
+# --------------------------------------------------------------------------
+# 提問入口只在這條路上還開著（擁有者裁定 2026-10-01）
+# --------------------------------------------------------------------------
+# 既有平台上，標記 bot 加一段文字不再是提問（回一張預設圖，見 `test_slash_gate.py`）。
+# **這裡是必須放行的那一半**：沒有斜線選單的平台上，不是指令的文字仍然是提問，
+# `dorossi <提問>` 這個文字指令也還在。少了這一半，「不管哪個平台一律回圖」的實作會讓
+# 那邊每一支都是綠的——而這些平台就此沒有任何提問入口。
+#
+# 分岔點由**呼叫端**講清楚自己是不是提問入口（`_handle_mention(..., question_entry=)`），
+# 派發器自己不猜訊息是哪個平台來的。
+_BOT_ID = 777_000_777
+
+
+def _external_entry(monkeypatch):
+    """真的 `dispatch_external_message` → 真的 `_handle_mention`；提問那支與回圖那支換成
+    記錄器（提問那支真的跑起來會去起後端）。"""
+    import types as _types
+    import discord_bot as b
+    seen = _types.SimpleNamespace(asked=[], pictures=[], mention_calls=[])
+
+    async def _ask(message, text, *args, **kwargs):
+        seen.asked.append(text)
+
+    async def _picture(message, tags):
+        seen.pictures.append(tags)
+
+    real_mention = b._handle_mention
+
+    async def _spy_mention(message, **kwargs):
+        seen.mention_calls.append(kwargs)
+        await real_mention(message, **kwargs)
+
+    monkeypatch.setattr(b, "mcmd_dorossi", _ask)
+    monkeypatch.setattr(b, "_send_danbooru_image", _picture)
+    monkeypatch.setattr(b, "_handle_mention", _spy_mention)
+    monkeypatch.setattr(b, "client", _types.SimpleNamespace(
+        user=_types.SimpleNamespace(id=_BOT_ID)))
+    return b, seen
+
+
+def _external_message(b, text, *, mentions=()):
+    import types as _types
+    return _types.SimpleNamespace(
+        content=text, id=5, guild=None, attachments=[], mentions=list(mentions),
+        author=_types.SimpleNamespace(id=b.OWNER_USER_ID, is_owner=True),
+        channel=_types.SimpleNamespace(id=b.CHANNEL_ID, is_direct=True,
+                                       is_command_chat=True))
+
+
+@pytest.mark.parametrize("text, asked", [
+    ("幫我看一下這段", "幫我看一下這段"),
+    ("幫我看一下這段\n第二行", "幫我看一下這段\n第二行"),
+    ("/new", "/new"),
+    ("/effort high 你好", "/effort high 你好"),
+    ("持續推進直到做完，不要問我", "持續推進直到做完，不要問我"),
+    # 文字指令：關鍵字剝掉，後面才是提問。
+    ("dorossi 幫我看一下", "幫我看一下"),
+    ("Dorossi 幫我看一下", "幫我看一下"),
+], ids=["plain", "multi-line", "reset-word", "tuning-token", "self-drive-phrase",
+        "keyword", "keyword-caps"])
+def test_on_a_platform_without_a_slash_menu_plain_text_is_still_a_question(
+        monkeypatch, text, asked):
+    b, seen = _external_entry(monkeypatch)
+    asyncio.run(b.dispatch_external_message(_external_message(b, text)))
+    assert seen.asked == [asked], (
+        f"{text!r} 沒有進到提問——這個平台就此沒有任何提問入口：{seen}")
+    assert seen.pictures == [], "別的平台上的提問被當成既有平台的標記，回了一張圖"
+    assert seen.mention_calls == [{"question_entry": True}], seen.mention_calls
+
+
+def test_a_bang_command_from_another_platform_never_enters_the_mention_path(monkeypatch):
+    """`!` 開頭的轉給 `on_message`。那一支只在「訊息標記了 bot、而且不是 `!` 開頭」時才
+    走標記那條路，所以就算別的平台的訊息哪天帶著 `mentions`，也不會誤入「標記回圖」。"""
+    import types as _types
+    b, seen = _external_entry(monkeypatch)
+    bot_user = _types.SimpleNamespace(id=_BOT_ID)
+    for mentions in ((), (bot_user,)):
+        message = _external_message(b, "!zz_not_a_command", mentions=mentions)
+        asyncio.run(b.dispatch_external_message(message))
+    assert seen.mention_calls == [] and seen.pictures == [] and seen.asked == []
+
+
+def _calls_named(func, name: str) -> list:
+    return [node for node in ast.walk(func)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == name]
+
+
+def test_each_caller_states_whether_it_is_a_question_entry():
+    """`_handle_mention` 的兩個呼叫端各自明講：既有平台的標記不是提問入口，這條路是。
+
+    那個參數**沒有預設值**。有預設值的話，下一個呼叫端忘了講就會安靜地拿到其中一種
+    行為——預設成「是」，忘了講的那個表面會去起後端；預設成「不是」，一個新平台就沒有
+    提問入口，而且看起來像「沒設定」。
+    """
+    tree = ast.parse((PKG_ROOT / "discord_bot.py").read_text(encoding="utf-8"))
+    callers = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for call in _calls_named(func, "_handle_mention"):
+            callers.setdefault(func.name, []).append(call)
+    assert sorted(callers) == ["dispatch_external_message", "on_message"], (
+        f"`_handle_mention` 的呼叫端變了：{sorted(callers)}。新的呼叫端要先決定自己"
+        "是不是提問入口，再加進這裡。")
+    said = {}
+    for name, calls in callers.items():
+        assert len(calls) == 1, (name, len(calls))
+        keywords = {kw.arg: kw.value for kw in calls[0].keywords}
+        value = keywords.get("question_entry")
+        assert isinstance(value, ast.Constant) and isinstance(value.value, bool), (
+            f"`{name}` 沒有用字面值講清楚 `question_entry`")
+        said[name] = value.value
+    assert said == {"on_message": False, "dispatch_external_message": True}, said
+
+    handler = _bot_function("_handle_mention")
+    kwonly = [arg.arg for arg in handler.args.kwonlyargs]
+    assert "question_entry" in kwonly, kwonly
+    default = handler.args.kw_defaults[kwonly.index("question_entry")]
+    assert default is None, "`question_entry` 不該有預設值（見 docstring）"

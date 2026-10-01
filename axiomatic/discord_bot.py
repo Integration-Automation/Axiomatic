@@ -4743,8 +4743,9 @@ async def mcmd_nsfw(message: discord.Message, rest: str) -> None:
 
 async def mcmd_booru(message: discord.Message, rest: str) -> None:
     """`/booru <tag(s)>` — random Danbooru image for the given tags. This is
-    the explicit entry point for tag search; a bare `@bot <prompt>` no longer
-    falls through to Danbooru (it routes to Dorossi for the permitted user).
+    the explicit entry point for tag search: text typed after a mention is never
+    used as a tag query (a non-command mention gets the fixed default picture,
+    see `_mention_default_picture`).
 
     The tag string comes from `rest` (everything after the `booru` keyword), NOT
     `payload`. Empty `/booru` keeps the bare-`@bot` default (a random
@@ -5316,7 +5317,7 @@ class _DorossiLoopState:
       `/dorossi session continue` 接回來。abort 與 paused 同時被設時 abort 優先。
     * `proc`：這個迴圈目前回合的後端子行程（abort 用來即時 kill）。
     * `injections`：這個迴圈的中途注入緩衝——自走進行中，擁有者對「同一個
-      session」新打的 `@bot <提問>` 收進來，於下一輪邊界 drain 折進 prompt。
+      session」新送的提問（`/dorossi ask`）收進來，於下一輪邊界 drain 折進 prompt。
     * `round_no`／`compacting`／`backend`：現在是第幾輪（每次呼叫後端前 +1，重試也
       算一輪；自判轉進時從 1 起算，因為第一輪已經在單輪路徑跑過）、這一輪是不是壓縮
       維護輪、這一輪用的後端 id。`wait_deadline`：正在退避等待時的截止時刻
@@ -9198,7 +9199,7 @@ async def mcmd_dorossi(message: discord.Message, rest: str,
         return
     key = _dorossi_session_key(uid, sid)
 
-    # 自走模式進行中：只有當這則 `@bot <提問>` 針對「某個正在跑自走迴圈的 session」時，
+    # 自走模式進行中：只有當這則提問針對「某個正在跑自走迴圈的 session」時，
     # 才把它當「中途補充」收進**那個迴圈自己的**注入緩衝（不搶佇列鎖、不排 waiter）——
     # 下一輪邊界會自動 drain 並折進去 steer 當前任務。若擁有者已切到別的 slot（不同
     # session），該提問是不同 session，就不注入、照常並行跑（多迴圈並行下，registry 以
@@ -14103,8 +14104,43 @@ async def mcmd_yield(message: discord.Message, rest: str = "") -> None:
     await safe_reply(message, "該對話沒有進行中的自走任務。")
 
 
-async def _handle_mention(message: discord.Message) -> None:
-    """Parse the text after the @mention and dispatch to a sub-command."""
+# mention 表裡會進提問（`mcmd_dorossi`）的鍵。**不能從表裡拿掉**：沒有斜線選單的平台
+# 還靠它（文字指令 `dorossi <提問>`），`/dorossi ask` 宣告的對應 mention 也是它。但在
+# 不是提問入口的表面上（見 `_handle_mention` 的 `question_entry`），它跟任何非指令文字
+# 一樣不進提問。列舉會過期，所以 `test_slash_gate` 拿它跟派發表對帳。
+_MENTION_QUESTION_KEYS = frozenset({"dorossi"})
+# 「標記 bot、打了不是控制字的文字、而這個表面不是提問入口」的計數鍵。括號讓它不可能
+# 撞到任何控制字（那些是英數與底線）。
+_MENTION_TEXT_METRIC = "@(text)"
+
+
+async def _mention_default_picture(message: discord.Message) -> None:
+    """標記 bot 的預設動作：回一張預設圖庫圖片——隨機一張、普遍級。
+
+    查詢是**固定**的，使用者打的字不會進來：沒有分級字樣，所以 `_send_danbooru_single`
+    會補上普遍級；沒有旗標，所以走的是隨機那一支，不是最新、也不是拼圖。只標記不打字，
+    以及不是提問入口的表面上「標記＋非指令文字」，都是這一個動作。"""
+    await _send_danbooru_image(message, "rossi_(arknights)")
+
+
+async def _handle_mention(message: discord.Message, *, question_entry: bool) -> None:
+    """Parse the text after the @mention and dispatch to a sub-command.
+
+    `question_entry`＝這個表面上「不是控制字的文字」算不算對 Dorossi 的提問。呼叫端
+    必須明講，**沒有預設值**（猜錯的兩個方向都沒有症狀：一邊是多一個會起後端的入口，
+    另一邊是一個平台沒有任何提問入口）：
+
+    * `on_message`（這個平台原生的標記）傳 False——擁有者裁定 2026-10-01：提問只留
+      `/dorossi ask`。非指令文字與 `_MENTION_QUESTION_KEYS` 裡的鍵都改成回預設圖，
+      不呼叫 `mcmd_dorossi`（所以不記 `prompt_received`、不佔 Dorossi 的鎖與佇列、
+      不起後端）。自走任務的入口、進行中任務的中途補充、`/new` 之類的重置字、
+      `/effort`／`/model` 微調 token 都在 `mcmd_dorossi` 裡，因此在這個平台上同樣
+      只經 `/dorossi ask` 到得了。
+    * `dispatch_external_message`（沒有斜線選單的平台）傳 True——那裡文字是唯一的
+      入口，非指令文字照舊是提問。
+
+    控制字（ping、help、abort、status、session…）與擁有者閘在兩種表面上完全相同。
+    這裡**不**看訊息的型別來猜它是哪個平台來的。"""
     content = message.content
     if client.user:
         for m in (f"<@{client.user.id}>", f"<@!{client.user.id}>"):
@@ -14120,7 +14156,7 @@ async def _handle_mention(message: discord.Message) -> None:
     # 第一個半形空格）：使用者常把指令字後面接換行/Tab——尤其 `/gen image`
     # 把多行 prompt 貼在 code fence 裡（`generate\n```\n…`）。partition(" ") 會
     # 在 prompt 內部的第一個空格才切，head 變成 `generate\n```\n…` 比對不到任何
-    # handler，整段就誤落入 Dorossi fallback 然後逾時。split(None,1) 會吃掉指令
+    # handler，整段就誤落入非指令文字的 fallback。split(None,1) 會吃掉指令
     # 字後的整段前導空白、只切一次，head 乾淨拿到 `generate`，rest 是其餘內容
     # （再經 _strip_surrounding_code_fence 剝掉外圍 fence）。同行單空格的舊用法
     # （`/help tw`、`/dorossi session switch s2`）head/rest 完全不變。
@@ -14131,17 +14167,15 @@ async def _handle_mention(message: discord.Message) -> None:
     rest = _strip_surrounding_code_fence(rest)
 
     if not payload:
-        await _send_danbooru_image(message, "rossi_(arknights)")
+        await _mention_default_picture(message)
         return
     # built-in mention sub-commands
     #
     # ⚠️ 只保留「控制／高頻」指令。工具型子指令（趣味 / 免費 API / 圖庫搜圖 /
     # 編碼工具 / avatar 等 meta）已整批改成原生 slash 指令（見檔尾的
-    # 「公開跨頻道 slash 指令」區塊）：slash 有 Discord 原生自動補全，打錯
-    # 字不會再整段掉進 Dorossi fallback。因此 `@bot <文字>` 現在幾乎純粹是
-    # Dorossi 提問入口 —— 這裡任何一個 key 都「必須是已知 handler」，否則
-    # 該 mention 會被 Dorossi fallback 攔走（這正是移除工具指令後的預期行
-    # 為，但也代表新增控制指令時一定要記得掛進來）。
+    # 「公開跨頻道 slash 指令」區塊）。這裡任何一個 key 都「必須是已知
+    # handler」：對不到的文字一律落到下面的 fallback——提問入口上是 Dorossi
+    # 提問，其餘表面是預設圖——所以新增控制指令時一定要記得掛進來。
     handlers = {
         "ping":        lambda: _reply_ping(message),
         "uptime":      lambda: _reply_uptime(message),
@@ -14153,14 +14187,14 @@ async def _handle_mention(message: discord.Message) -> None:
         # 單張一次性產圖。`rest` 是提示詞（不含 `generate` 關鍵字）。實際產圖
         # 限擁有者（OWNER_USER_ID）、可在任意頻道使用；非擁有者一律泛用拒絕、
         # 不洩漏 pipeline（閘門在 mcmd_generate 內）。必須是已知 handler，否則
-        # 非指令 mention 會被 Dorossi fallback 攔走。
+        # 這個字會落到非指令文字的 fallback。
         "generate":    lambda: mcmd_generate(message, rest),
         # 中止進行中的工作：自走任務（可指定 session id／all）優先，其次產圖
         # inflight（owner-only，閘門在 mcmd_abort 內）。必須是已知 handler，
-        # 否則非指令 mention 會被 Dorossi fallback 攔走。
+        # 否則這個字會落到非指令文字的 fallback。
         "abort":       lambda: mcmd_abort(message, rest),
         # Claude／Codex 帳號即時用量（owner-only，閘門在 mcmd_tokens 內）。
-        # 必須是已知 handler，否則非指令 mention 會被 Dorossi fallback 攔走。
+        # 必須是已知 handler，否則這個字會落到非指令文字的 fallback。
         "tokens":      lambda: mcmd_tokens(message, rest),
         "status":      lambda: mcmd_status(message, rest),
         "queue":       lambda: mcmd_queue(message, rest),
@@ -14183,6 +14217,13 @@ async def _handle_mention(message: discord.Message) -> None:
         "restart":     lambda: mcmd_restart(message),
     }
     handler = handlers.get(head_lower)
+    # 不是提問入口的表面：非指令文字、以及表裡會進提問的那個鍵，都回預設圖。排在
+    # 擁有者閘與計數之前——這條路對誰都一樣，不是被擋下來的指令。
+    if not question_entry and (handler is None
+                               or head_lower in _MENTION_QUESTION_KEYS):
+        _METRICS_CMD_COUNTS[_MENTION_TEXT_METRIC] += 1
+        await _mention_default_picture(message)
+        return
     # 主機控制閘。⚠️ 這條路徑跑在 `on_message` 的**頻道閘之前**（mention 刻意
     # 不限頻道），而且原本完全沒有閘——`mcmd_restart` 內部也沒有擁有者檢查，
     # 所以 `@bot restart` 是「bot 看得到的任何伺服器、任何人」都叫得動的。
@@ -14194,22 +14235,22 @@ async def _handle_mention(message: discord.Message) -> None:
               % (head_lower, message.author.id), file=sys.stderr)
         await safe_reply(message, OWNER_ONLY_DENIED)
         return
-    # 指令計數：known handler 用 `@<name>`；非指令、非空的 `@bot <提問>` 一律
-    # 落入 Dorossi（計 `@dorossi`，與顯式 `/dorossi ask` 合併）。工具型子指令
-    # （booru 家族 / 趣味 / 免費 API / 編碼工具 / meta）已改成原生 slash 指令，
-    # 不再出現在這裡；slash 表面依既有慣例不計 _METRICS_CMD_COUNTS。
+    # 指令計數：known handler 用 `@<name>`；提問入口上非指令、非空的文字一律
+    # 落入 Dorossi（計 `@dorossi`，與文字指令 `dorossi <提問>` 合併）。不是提問
+    # 入口的表面在上面就回圖了（計 `_MENTION_TEXT_METRIC`），走不到這裡。slash
+    # 表面依既有慣例不計 _METRICS_CMD_COUNTS。
     global _METRICS_ERRORS
     try:
         if handler is not None:
             _METRICS_CMD_COUNTS[f"@{head_lower}"] += 1
             await handler()
         else:
-            # 非指令 → Dorossi，所有使用者都走這條（不再依 UID 分流）。
-            # 傳整段 `payload`（head＋rest），因為這條路徑的第一個字也是提問
-            # 的一部分（顯式 `/dorossi ask <x>` 才只送 `rest`）。權限閘在
-            # mcmd_dorossi 內：非權限者會收到「Dorossi 僅限特定使用者使用。」。
-            # `@bot /new`（權限者）走這條，payload=="/new"，mcmd_dorossi 會命中
-            # DOROSSI_RESET_KEYWORDS 重置。整段提問若被使用者用 code fence 整個
+            # 非指令 → Dorossi（只有提問入口走得到這裡），所有使用者都走這條
+            # （不依 UID 分流）。傳整段 `payload`（head＋rest），因為這條路徑的
+            # 第一個字也是提問的一部分（文字指令 `dorossi <x>` 才只送 `rest`）。
+            # 權限閘在 mcmd_dorossi 內：非權限者會收到「Dorossi 僅限特定使用者
+            # 使用。」。權限者單打 `/new` 走這條，payload=="/new"，mcmd_dorossi 會
+            # 命中 DOROSSI_RESET_KEYWORDS 重置。整段提問若被使用者用 code fence 整個
             # 包住（例如貼一段程式碼問問題），在此剝掉外圍 fence；內嵌的程式碼
             # 區塊（非整段包住）會被保留。
             _METRICS_CMD_COUNTS["@dorossi"] += 1
@@ -25330,10 +25371,12 @@ async def on_message(message: discord.Message) -> None:
     content = message.content
     is_mention = bool(client.user and client.user in message.mentions)
 
-    # @-mention triggers a small utility dispatcher (Danbooru / ping / uptime
-    # / help / roll). Works in any channel — not gated by CHANNEL_ID.
+    # @-mention triggers a small utility dispatcher (ping / uptime / help and
+    # the other control words). Works in any channel — not gated by CHANNEL_ID.
+    # 標記在這個平台上**不是**提問入口（擁有者裁定 2026-10-01）：不是控制字的文字
+    # 回一張預設圖，提問只留 `/dorossi ask`。
     if is_mention and not content.startswith("!"):
-        await _handle_mention(message)
+        await _handle_mention(message, question_entry=False)
         return
 
     # Everything else (!commands) is restricted to the configured channel —
@@ -25662,7 +25705,9 @@ async def on_message(message: discord.Message) -> None:
 #
 #   * `!` 開頭 → `on_message`，於是頻道閘、`_OWNER_ONLY_BANGS`、角色閘、指令計數、
 #     稽核、code fence 正規化、整個 `except` 收尾全部沿用同一份實作；
-#   * 其餘文字 → `_handle_mention`，也就是 `@bot <文字>` 那條自由提問／控制指令路。
+#   * 其餘文字 → `_handle_mention`（控制字，其餘當成提問）。**提問入口只在這條路上
+#     開著**：既有平台原生的標記從 2026-10-01 起不再是提問（`question_entry=False`，
+#     回一張預設圖），那裡的提問只留斜線的 `/dorossi ask`。
 #
 # **刻意不把派發鏈抄一份出來。** 抄一份的代價不是行數，是那四道閘會分叉：本 repo
 # 對 `_OWNER_ONLY_SLASH` / `_pid_alive` / 原子寫入清單都記過同一個形狀——第二份會
@@ -25692,7 +25737,8 @@ async def dispatch_external_message(message) -> None:
         # 群組裡的一句普通話不是對 bot 的提問。既有平台要 @ 到 bot 才算，這裡沒有那個
         # 訊號，照單全收的話群組裡每個非擁有者的每一句話都會換來一句「僅限特定使用者」。
         return
-    await _handle_mention(message)
+    # 沒有斜線選單的平台上，文字是唯一的入口：非指令文字就是提問。
+    await _handle_mention(message, question_entry=True)
 
 
 # 逐平台的 transport 與它們的背景任務。與既有那幾條長命迴圈同一個生命週期：啟動

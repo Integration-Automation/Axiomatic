@@ -388,11 +388,11 @@ py -3 install_autostart.py --remove
 | **資訊與元資料** | `/info avatar\|channel\|ping\|server\|uptime\|version` |
 | **公開資料查詢** | `/web anime\|cat\|crypto\|dict\|dog\|fact\|github\|joke\|quote\|wiki\|xkcd` |
 
-### `@bot <文字>`——自由提問
+### 提問與標記 bot
 
-不接子指令的 mention 是自由提問入口。**刻意保留 mention 形式**而不是改成斜線指令：
-一則訊息帶得動多行內容、附件與回覆脈絡，選項輸入框帶不動；而且互動 token 的壽命
-遠短於一個長回合。
+提問只有一個入口：`/dorossi ask`。自走任務也從這裡開始；任務進行中再對同一個工作階段
+提問，會被收成中途補充、下一輪帶進去。**標記 bot 不是提問**：不管後面接不接文字，都只會
+回一張隨機的預設圖庫圖片（普遍級）。用回覆功能回它的訊息、而且有通知它時，也算標記。
 
 ### 表情符號反應
 
@@ -475,15 +475,15 @@ id 都是佔位值。
 /gen pause                # 以及 /gen resume——檢查點會留著
 ```
 
-**問對話後端。** 帶自由文字的 mention 就是提問入口，其餘是限擁有者的工作階段管理：
+**問對話後端。** `/dorossi ask` 是提問入口，其餘是限擁有者的工作階段管理：
 
 ```
-@bot <你的問題，例如：幫我摘要上一次批次產出了什麼、有沒有哪裡怪>
+/dorossi ask prompt:<你的問題，例如：幫我摘要上一次批次產出了什麼、有沒有哪裡怪>
 ```
 
 `/dorossi session continue all` 會一次接回所有中斷的自走任務——**包含你自己中止過
 的**；要讓某個工作階段連這個都不接，用 `/dorossi session delete` 把它封存。
-`/dorossi ai` 換後端，`@bot /model <別名> …` 換這個工作階段的模型。撞到方案用量上限
+`/dorossi ai` 換後端，`/dorossi model` 換這個工作階段的模型。撞到方案用量上限
 的那一輪會**自己停進佇列**、帶一個牆上時鐘的重跑時刻，時間到自動回來——
 `/dorossi queue show` 看得到停放中的提問，`/dorossi queue remove`（用 id）取消其中一筆。
 
