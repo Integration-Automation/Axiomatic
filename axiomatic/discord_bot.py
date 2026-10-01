@@ -25875,9 +25875,27 @@ class _InteractionMessageProxy:
             send_kwargs["files"] = files
         if not self._sent_first:
             self._sent_first = True
-            return await self._interaction.followup.send(
-                content=content, wait=True, **send_kwargs,
-            )
+            try:
+                return await self._interaction.followup.send(
+                    content=content, wait=True, **send_kwargs,
+                )
+            except discord.NotFound as error:
+                # A reconnect can invalidate the deferred interaction's webhook
+                # before a short command replies (10015). The channel is still
+                # usable; send the answer there instead of losing it entirely.
+                # Ephemeral replies must never be published to the channel.
+                # 帶檔案的回覆也不退：剛才那次失敗的送出已經把上傳物用掉了——從路徑
+                # 開的檔被函式庫關掉，記憶體裡的檔停在結尾、而下一次送出的第一次嘗試
+                # 不會倒回去（discord.py 2.7.1 實測），重送只會丟另一種例外或送出
+                # 一個 0 位元組的附件。寧可照舊丟這個例外。
+                if (error.code != 10015 or send_kwargs.get("ephemeral")
+                        or "file" in send_kwargs or "files" in send_kwargs
+                        or self._interaction.channel is None):
+                    raise
+                send_kwargs.pop("ephemeral", None)
+                return await self._interaction.channel.send(
+                    content=content, **send_kwargs,
+                )
         return await self._interaction.channel.send(
             content=content, **send_kwargs,
         )

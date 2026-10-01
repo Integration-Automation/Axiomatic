@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import io
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -573,3 +575,124 @@ def test_an_alias_added_by_the_catalog_is_marked(store, monkeypatch):
     assert "目錄新增" in line, line
     builtin = next(row for row in text.splitlines() if "`gemini-3.8-flash-high`" in row)
     assert "目錄新增" not in builtin, builtin
+
+
+def test_model_list_survives_an_expired_slash_webhook(store):
+    """A lost interaction webhook must not discard the model list reply."""
+    sent = []
+
+    async def expired_followup(*_args, **_kwargs):
+        raise b.discord.NotFound(
+            types.SimpleNamespace(status=404, reason="Not Found"),
+            {"code": 10015, "message": "Unknown Webhook"})
+
+    async def channel_send(content=None, **kwargs):
+        sent.append((content, kwargs))
+
+    interaction = types.SimpleNamespace(
+        user=types.SimpleNamespace(id=b.DOROSSI_USER_ID),
+        channel=types.SimpleNamespace(send=channel_send), guild=None, id=123,
+        followup=types.SimpleNamespace(send=expired_followup))
+    _run(b.mcmd_model_list(b._InteractionMessageProxy(interaction)))
+    assert len(sent) == 1
+    assert "`claude`" in sent[0][0] and "`codex`" in sent[0][0]
+    assert sent[0][1] == {}
+
+
+def test_slash_reply_does_not_publish_an_ephemeral_reply_on_webhook_loss():
+    async def expired_followup(*_args, **_kwargs):
+        raise b.discord.NotFound(
+            types.SimpleNamespace(status=404, reason="Not Found"),
+            {"code": 10015, "message": "Unknown Webhook"})
+
+    sent = []
+
+    async def channel_send(*args, **kwargs):
+        sent.append((args, kwargs))
+
+    interaction = types.SimpleNamespace(
+        user=types.SimpleNamespace(id=b.DOROSSI_USER_ID),
+        channel=types.SimpleNamespace(send=channel_send), guild=None, id=123,
+        followup=types.SimpleNamespace(send=expired_followup))
+    with pytest.raises(b.discord.NotFound):
+        _run(b._InteractionMessageProxy(interaction).reply("private", ephemeral=True))
+    assert sent == []
+
+
+def _lost_webhook_proxy(code: int = 10015, *, channel: bool = True):
+    """一個 followup 會以 `NotFound`（`code`）失敗的斜線代理物件，加上頻道送出的紀錄。
+
+    `sent.webhook_attempts` 是 followup 被叫了幾次。"""
+    class _Sent(list):
+        webhook_attempts = 0
+
+    sent = _Sent()
+
+    async def lost_followup(*_args, **_kwargs):
+        sent.webhook_attempts += 1
+        raise b.discord.NotFound(
+            types.SimpleNamespace(status=404, reason="Not Found"),
+            {"code": code, "message": "gone"})
+
+    async def channel_send(content=None, **kwargs):
+        sent.append((content, kwargs))
+
+    interaction = types.SimpleNamespace(
+        user=types.SimpleNamespace(id=b.DOROSSI_USER_ID),
+        channel=types.SimpleNamespace(send=channel_send) if channel else None,
+        guild=None, id=123, followup=types.SimpleNamespace(send=lost_followup))
+    return b._InteractionMessageProxy(interaction), sent
+
+
+def test_after_the_webhook_is_lost_every_later_reply_goes_to_the_channel():
+    """退回頻道之後，後面的回覆照常走頻道，不再去碰那個已經不在的 webhook。"""
+    proxy, sent = _lost_webhook_proxy()
+    _run(proxy.reply("第一則"))
+    _run(proxy.reply("第二則"))
+    assert [content for content, _kwargs in sent] == ["第一則", "第二則"]
+    assert sent.webhook_attempts == 1, (
+        "第二則又去試了一次已經不在的 webhook——每一則回覆都會多等一次失敗")
+
+
+def test_the_channel_fallback_does_not_pass_on_the_ephemeral_option():
+    """`ephemeral=False` 是 followup 才認得的參數；原樣交給頻道送出會被函式庫拒絕。"""
+    proxy, sent = _lost_webhook_proxy()
+    _run(proxy.reply("答案", ephemeral=False))
+    assert sent == [("答案", {})]
+
+
+@pytest.mark.parametrize("upload", ["file", "files"])
+def test_a_reply_carrying_an_upload_is_not_resent_after_the_webhook_is_lost(upload):
+    """帶檔案的回覆不退回頻道：失敗的那次送出已經把上傳物用掉了，重送會送出空的附件
+    或丟另一種例外（理由由下面那支對函式庫的測試釘住）。照舊丟原本的例外。"""
+    proxy, sent = _lost_webhook_proxy()
+    attachment = b.discord.File(io.BytesIO(b"png-bytes"), filename="shot.png")
+    kwargs = {"file": attachment} if upload == "file" else {"files": [attachment]}
+    with pytest.raises(b.discord.NotFound):
+        _run(proxy.reply("截圖", **kwargs))
+    assert sent == [], "帶檔案的回覆被重送到頻道了——那個附件會是空的"
+
+
+@pytest.mark.parametrize("code, channel", [(10008, True), (10062, True), (10015, False)])
+def test_only_the_lost_webhook_falls_back_and_only_when_there_is_a_channel(code, channel):
+    """只有「webhook 不在了」（10015）才退；別的 404 是別的問題，沒有頻道也沒地方退。"""
+    proxy, sent = _lost_webhook_proxy(code, channel=channel)
+    with pytest.raises(b.discord.NotFound):
+        _run(proxy.reply("答案"))
+    assert sent == []
+
+
+def test_a_used_upload_cannot_simply_be_sent_again():
+    """上面那條「帶檔案不退」的前提，對真的函式庫量一次：一次送出之後，記憶體裡的上傳物
+    停在結尾，而下一次送出的第一次嘗試（`reset(seek=0)`）不會把它倒回去；從路徑開的則
+    已經被關掉。函式庫哪一版改了這件事，這支會紅——那時候才可以考慮讓帶檔案的回覆也退。"""
+    memory = b.discord.File(io.BytesIO(b"abc"), filename="a.png")
+    memory.reset(seek=0)                      # 一次送出的第一次嘗試
+    assert memory.fp.read() == b"abc"         # 請求本體把它讀完了
+    memory.close()                            # 送出收尾時函式庫做的事
+    memory.reset(seek=0)                      # 重送的第一次嘗試
+    assert memory.fp.read() == b"", "函式庫現在會把上傳物倒回去了"
+
+    from_disk = b.discord.File(str(Path(__file__)))
+    from_disk.close()
+    assert from_disk.fp.closed, "函式庫不再關掉自己開的檔了"
