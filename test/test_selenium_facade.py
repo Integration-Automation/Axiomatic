@@ -1098,8 +1098,6 @@ _EXCEPTION_REPR_EXEMPT: dict[tuple, tuple[int, str]] = {
         2, "桌面自動化函式庫的 import 與呼叫，跟 selenium 無關。"),
     ("_webrunner_shared.py", "reconcile_todo_with_disk", ("OSError",), "error"): (
         1, "只收得到 `OSError`；`str()` 會把備份目錄的完整主機路徑帶進 log。"),
-    ("_webrunner_shared.py", "acquire", ("Exception",), "error"): (
-        1, "`StayAwake.acquire` 的 try 裡只有 ctypes／WinDLL，碰不到 driver。"),
     ("_webrunner_shared.py", "_emit_serving_beat", ("Exception",), "error"): (
         1, "try 裡只有 `emit_event` 與設定檔算術。"),
     ("_webrunner_shared.py", "check_single_image_request",

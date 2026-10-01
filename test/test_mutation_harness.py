@@ -1027,12 +1027,20 @@ def test_the_risk_set_matches_the_batch_component_map():
     """
     import _process_control as pc   # noqa: PLC0415
 
-    script, deps = pc.STALE_COMPONENTS["batch"]
-    expected = {Path(d).stem for d in deps}
-    got = mh._import_closure(Path(script).stem)
-    assert len(expected) > 5, f"對照表只列了 {sorted(expected)}，前提壞了"
-    assert got == expected, (
-        f"變異防線少算：{sorted(expected - got)}；多算：{sorted(got - expected)}")
+    # 2026-10-01 起每一個批次進入點都有自己的一筆（je 變體是 "batch (je)"），
+    # 所以逐一比、而且先確認每一個進入點都在表上——少一筆的話這裡會安靜地只比一個。
+    batches = {Path(script).stem: deps
+               for script, deps in pc.STALE_COMPONENTS.values()
+               if Path(script).stem in mh._BATCH_ENTRY_POINTS}
+    assert set(batches) == set(mh._BATCH_ENTRY_POINTS), (
+        f"陳舊對照表沒有涵蓋每一個批次進入點：表上有 {sorted(batches)}，"
+        f"變異防線認的是 {sorted(mh._BATCH_ENTRY_POINTS)}")
+    for entry, deps in sorted(batches.items()):
+        expected = {Path(d).stem for d in deps}
+        got = mh._import_closure(entry)
+        assert len(expected) > 5, f"{entry}：對照表只列了 {sorted(expected)}，前提壞了"
+        assert got == expected, (
+            f"{entry}：變異防線少算 {sorted(expected - got)}；多算 {sorted(got - expected)}")
 
 
 def test_the_import_closure_reads_every_segment_of_a_dotted_import(

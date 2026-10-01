@@ -170,9 +170,8 @@ or vice versa — cross-process state stays on disk so a restart is harmless.
 `_connectivity`) — separate stdlib-only / driver-agnostic modules both sides may
 import. That is not a bot↔webrunner import. The last two were added 2026-09-22:
 `_power_request` is the one reference-counted power-request implementation (the
-bot holds it while supervising a batch; the batch's `StayAwake` is to delegate to
-it too, in a separate change applied only while no batch runs) — its only state
-is a process-local counter, never shared across processes;
+bot holds it while supervising a batch; the batch's `StayAwake` delegates to
+it) — its only state is a process-local counter, never shared across processes;
 `_connectivity` is a pure "can this host reach the internet" probe both batch
 supervisors use to tell a network outage from a crash. (`_external_apis`,
 `_help_strings`, `dorossi_backend`, `_dorossi_gemini`, `_reply_card`, `_reply_pager`, `discord_rpc` are bot-only helpers, not

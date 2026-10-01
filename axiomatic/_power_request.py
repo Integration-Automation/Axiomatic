@@ -1,10 +1,8 @@
 """行程層級的電源要求（Windows）——參考計數，其他平台是 no-op。
 
 被動共用模組：純 stdlib（`ctypes`），不 import 任何專案模組，也不碰瀏覽器或
-聊天平台。bot 在批次監督期間、以及 Dorossi 工作進行中經 `discord_bot.bot_power_hold` 持有它。批次的
-`_webrunner_shared.StayAwake` 用的是同一組要求型別，改成委派給這裡、讓整個專案
-只剩**一份**實作，是另一組變更——那個模組在正式批次的匯入閉包裡，只能在沒有批次
-在跑的時候套用。
+聊天平台。bot（批次監督期間與 Dorossi 工作進行中，`discord_bot.bot_power_hold`）與批次
+（`_webrunner_shared.StayAwake` 委派過來）共用這**一份**實作。
 
 ## 它保證什麼、不保證什麼
 

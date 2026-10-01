@@ -62,6 +62,10 @@ from _queue_consume import pair_todos  # noqa: F401  (re-exported single source)
 # count), and this is deliberately the copy whose "can't tell -> return True"
 # direction is what we want here, see `claim_liveness_signal`.
 import _chrome_slot  # noqa: E402
+# The power request held during a batch (`StayAwake` delegates to it). A passive shared
+# module, pure stdlib, reference-counted; the bot holds the same implementation while it
+# supervises a batch.
+import _power_request  # noqa: E402
 
 # This file lives at `<repo>/axiomatic/_webrunner_shared.py`, so `.parent.parent`
 # is the repo root; the same computation each variant uses for PROJECT_ROOT, with
@@ -2348,11 +2352,18 @@ def character_folder_name(prompt: str) -> str:
 # the batch stops moving, and nothing shows from the outside: the process is still alive, it
 # has not crashed, the log has simply stopped.
 #
+# **The implementation lives in `_power_request`.** That is a reference-counted passive shared
+# module, and the bot holds the same kind of request while it supervises a batch; with two
+# separate ctypes copies, "pin the types, `INVALID_HANDLE_VALUE` is not success, do not light
+# the screen" would each have to be guarded twice. This class keeps only its old face
+# (`acquire()` returns `active`, `release()` is idempotent, never raises), so `run_batch` and
+# the test doubles did not have to change.
+#
 # **Why not just `SetThreadExecutionState`.** That is an S3-era API; Microsoft's documentation
 # says outright that it **cannot block** Modern Standby transitions. S0ix machines need a power
 # request object (`PowerCreateRequest` + `PowerSetRequest`) with
 # `PowerRequestExecutionRequired` — that request type is itself "Modern standby only". So the
-# power request is the primary mechanism here, with `SetThreadExecutionState` as the fallback
+# power request is the primary mechanism, with `SetThreadExecutionState` as the fallback
 # (for older machines that still have S3).
 #
 # **Correction (2026-09-20, measured): the power request protects the "process", not the
@@ -2389,20 +2400,14 @@ def character_folder_name(prompt: str) -> str:
 # batches unattended, **keep it plugged in**; there is no fix for this on the code side, so it
 # is written here where the next person can find it.
 #
-# **Deliberately does not request that the display stay on** (no `ES_DISPLAY_REQUIRED` /
-# `PowerRequestDisplayRequired`): the batch needs no visible screen, and keeping someone
-# else's screen lit all night is rude.
+# **Deliberately does not request that the display stay on**: the batch needs no visible
+# screen, and keeping someone else's screen lit all night is rude. `_power_request` has no
+# display request type at all (its own tests guard that).
 #
-# **ctypes `argtypes` / `restype` must be written**, for exactly the same reason as the PID
-# liveness probe rule in CLAUDE.md: `PowerCreateRequest` returns a 64-bit HANDLE, the default
-# `c_int` truncates it, and **the truncated handle is still non-zero**, so `if not handle`
-# does not catch it and the whole feature quietly degrades into "thinks the request succeeded
-# but it did not".
-_POWER_REQUEST_CONTEXT_VERSION = 0
-_POWER_REQUEST_CONTEXT_SIMPLE_STRING = 0x1
-_POWER_REQUEST_EXECUTION_REQUIRED = 3      # protects "this process is not suspended by PLM"
-_ES_CONTINUOUS = 0x80000000
-_ES_SYSTEM_REQUIRED = 0x00000001
+# **What the reference count means for the batch**: inside the batch process `run_batch` is
+# the only holder today, so the behaviour is what it always was — `acquire()` asks the
+# operating system, `release()` lets go. The count only matters when one process has a second
+# holder (which is the bot's situation).
 
 
 class StayAwake:
@@ -2413,7 +2418,14 @@ class StayAwake:
     obtained, print one line and carry on — keeping a whole batch of image generation from
     starting over a power-saving setting would be backwards.
 
-    `active` tells what was actually obtained:
+    The implementation is delegated to `_power_request` (reference-counted, the bot uses the
+    same one); this class only keeps its old face so `run_batch` and the test doubles did not
+    have to change. One object holds at most one share: calling `acquire()` again while it
+    already holds one returns at once; only when the previous attempt got nothing does it
+    release that bookkeeping and retry.
+
+    `active` tells what was actually obtained (the literal values are
+    `_power_request.POWER_REQUEST` / `EXECUTION_STATE`):
 
     * `"power-request"` — `PowerRequestExecutionRequired`. It protects **this process**: not
       suspended or terminated by PLM during Modern Standby. It does **not** keep the system
@@ -2424,7 +2436,7 @@ class StayAwake:
     * `"execution-state"` — the old `SetThreadExecutionState` flag. It only blocks the old S3
       idle sleep; on a Modern Standby machine it neither blocks standby nor protects this
       process.
-    * `None` — neither was obtained.
+    * `None` — neither was obtained (or this is not Windows).
 
     To the batch the two may **look** the same (it keeps generating images), but what they
     guarantee differs, so those three log lines in `run_batch` print `active`'s literal value
@@ -2433,81 +2445,23 @@ class StayAwake:
 
     def __init__(self) -> None:
         self.active: str | None = None
-        self._handle = None
-        self._kernel32 = None
+        self._hold = None
 
     def acquire(self, reason: str = "axiomatic batch is generating") -> str | None:
-        if os.name != "nt":
-            return None
-        try:
-            import ctypes
-            import ctypes.wintypes as wt
-        except Exception:  # pylint: disable=broad-except
-            return None
-        try:
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            self._kernel32 = kernel32
-
-            class _Context(ctypes.Structure):
-                _fields_ = [("Version", wt.ULONG),
-                            ("Flags", wt.ULONG),
-                            ("SimpleReasonString", wt.LPWSTR)]
-
-            kernel32.PowerCreateRequest.argtypes = [ctypes.POINTER(_Context)]
-            kernel32.PowerCreateRequest.restype = wt.HANDLE   # truncation would break the probe
-            kernel32.PowerSetRequest.argtypes = [wt.HANDLE, ctypes.c_int]
-            kernel32.PowerSetRequest.restype = wt.BOOL
-
-            context = _Context(_POWER_REQUEST_CONTEXT_VERSION,
-                               _POWER_REQUEST_CONTEXT_SIMPLE_STRING, reason)
-            handle = kernel32.PowerCreateRequest(ctypes.byref(context))
-            # INVALID_HANDLE_VALUE is -1, not 0 — checking only for falsy would miss it.
-            if handle and handle != wt.HANDLE(-1).value:
-                if kernel32.PowerSetRequest(
-                        handle, _POWER_REQUEST_EXECUTION_REQUIRED):
-                    self._handle = handle
-                    self.active = "power-request"
-                    return self.active
-                kernel32.CloseHandle(handle)
-        except Exception as error:  # pylint: disable=broad-except
-            # `!r` is kept on purpose: the `try` holds only ctypes / WinDLL and cannot reach
-            # the driver.
-            print(f"  [power] could not obtain a power request ({error!r}); falling back to the "
-                  f"old API",
-                  file=sys.stderr)
-
-        # Fallback: on machines that still have S3 this is enough; on S0ix machines it neither
-        # blocks standby nor keeps the process from being suspended by PLM, but holding it does
-        # no harm.
-        try:
-            import ctypes
-            import ctypes.wintypes as wt
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.SetThreadExecutionState.argtypes = [wt.DWORD]
-            kernel32.SetThreadExecutionState.restype = wt.DWORD
-            if kernel32.SetThreadExecutionState(
-                    _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED):
-                self._kernel32 = kernel32
-                self.active = "execution-state"
-        except Exception:  # pylint: disable=broad-except  # nosec B110
-            pass
+        if self._hold is not None and self._hold.active is not None:
+            return self.active              # already holding: no second share, no release-then-take
+        if self._hold is not None:
+            self._hold.release()            # the last attempt got nothing: drop that share, retry
+        self._hold = _power_request.acquire(reason)
+        self.active = self._hold.active
         return self.active
 
     def release(self) -> None:
         """Idempotent, never raises (it is called from `finally` and may already be released)."""
-        kernel32, handle, active = self._kernel32, self._handle, self.active
-        self._handle, self.active = None, None
-        if kernel32 is None:
-            return
-        try:
-            if handle is not None:
-                kernel32.PowerClearRequest(handle,
-                                           _POWER_REQUEST_EXECUTION_REQUIRED)
-                kernel32.CloseHandle(handle)
-            elif active == "execution-state":
-                kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
-        except Exception:  # pylint: disable=broad-except  # nosec B110
-            pass
+        hold, self._hold = self._hold, None
+        self.active = None
+        if hold is not None:
+            hold.release()
 
 
 # ---------- timing / anti-bot pacing ----------------------------------------

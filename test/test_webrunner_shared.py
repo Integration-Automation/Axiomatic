@@ -8079,11 +8079,15 @@ def test_stay_awake_is_a_no_op_off_windows():
     得起來。
     """
     from unittest import mock
-    with mock.patch.object(ws.os, "name", "posix"):
+    # 換一個乾淨的計數器：共用的那一個若正被別人持有，`active` 會沿用那一份。
+    with mock.patch.object(ws.os, "name", "posix"), \
+            mock.patch.object(ws._power_request, "_MANAGER",
+                              ws._power_request._Manager()):
         awake = ws.StayAwake()
         assert awake.acquire() is None
         assert awake.active is None
         awake.release()      # 沒拿到也要能安全釋放
+        assert ws._power_request.status()["count"] == 0
 
 
 def test_stay_awake_release_is_idempotent_and_never_raises():
@@ -8106,27 +8110,65 @@ def test_stay_awake_does_not_keep_the_display_on():
             f"{banned} 被加進來了——批次不需要螢幕亮著。")
 
 
-def test_the_power_request_handle_is_not_truncated():
-    """`argtypes`／`restype` 一定要寫。
+def test_stay_awake_delegates_to_the_one_power_request_implementation():
+    """只准有一份 ctypes 實作，而且它住在 `_power_request`。
 
-    `PowerCreateRequest` 回的是 64 位元 HANDLE，預設 `c_int` 會截斷它，而**截斷
-    後的 handle 仍然非零**，所以 `if not handle` 抓不到——整個功能會安靜地退化成
-    「以為要求成功了、其實沒有」。這與 CLAUDE.md 那條 PID 存活探測是同一個坑。
+    2026-09-22 之前這裡自己寫了一份 `PowerCreateRequest`；bot 開始在批次監督期間
+    也持有電源要求之後，兩份實作要各自守「型別要釘（64 位元 HANDLE 被 c_int 截斷
+    後仍然非零）、`INVALID_HANDLE_VALUE` 不算成功、不要點亮螢幕」。那幾條現在只在
+    `test_power_request.py` 守一次，所以這支要釘住「這裡沒有長回第二份」。
     """
     import ast
-    src = Path(ws.__file__).read_text(encoding="utf-8")
-    fn = next(n for n in ast.walk(ast.parse(src))
-              if isinstance(n, ast.FunctionDef) and n.name == "acquire")
-    assigned = {ast.unparse(n.targets[0]) for n in ast.walk(fn)
-                if isinstance(n, ast.Assign) and len(n.targets) == 1}
-    for required in ("kernel32.PowerCreateRequest.argtypes",
-                     "kernel32.PowerCreateRequest.restype",
-                     "kernel32.PowerSetRequest.argtypes",
-                     "kernel32.SetThreadExecutionState.argtypes",
-                     "kernel32.SetThreadExecutionState.restype"):
-        assert required in assigned, (
-            f"少了 `{required}`——64 位元 HANDLE 會被預設的 c_int 截斷，"
-            "而截斷後仍然非零，探測抓不到。")
+    tree = ast.parse(Path(ws.__file__).read_text(encoding="utf-8"))
+    cls = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.ClassDef) and n.name == "StayAwake")
+    acquire = next(n for n in cls.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "acquire")
+    calls = {ast.unparse(n.func) for n in ast.walk(acquire)
+             if isinstance(n, ast.Call)}
+    assert "_power_request.acquire" in calls, calls
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    for banned in ("PowerCreateRequest", "PowerSetRequest",
+                   "SetThreadExecutionState", "WinDLL"):
+        assert banned not in names | attrs, (
+            f"`_webrunner_shared` 又出現了 `{banned}`——電源要求長回第二份實作了。"
+            "要改就改 `_power_request`。")
+
+
+def test_stay_awake_uses_the_shared_reference_count():
+    """外觀不變（`acquire()` 回 `active`、`release()` 冪等），計數走共用的那一份；
+    同一個物件重複 acquire 不會多拿一份。"""
+    from unittest import mock
+    import _power_request as pr
+
+    class _Backend:
+        def __init__(self):
+            self.acquires = 0
+            self.releases = 0
+
+        def acquire(self, reason):
+            self.acquires += 1
+            return "power-request"
+
+        def release(self):
+            self.releases += 1
+
+    backend = _Backend()
+    with mock.patch.object(pr, "_MANAGER",
+                           pr._Manager(backend_factory=lambda: backend)):
+        first, second = ws.StayAwake(), ws.StayAwake()
+        assert first.acquire() == "power-request" and first.active == "power-request"
+        first.acquire()                       # 同一個物件再叫一次：不得多一份
+        assert pr.status()["count"] == 1
+        second.acquire()
+        assert pr.status()["count"] == 2 and backend.acquires == 1
+        first.release()
+        first.release()                       # 冪等
+        assert pr.status()["count"] == 1 and backend.releases == 0
+        second.release()
+        assert pr.status()["count"] == 0 and backend.releases == 1
+        assert first.active is None and second.active is None
 
 
 def test_the_batch_asks_to_stay_awake_and_always_releases():
@@ -8176,12 +8218,14 @@ def _stay_awake_region() -> str:
     ——標題本身就是這次訂正改掉的東西之一。
     """
     lines = Path(ws.__file__).read_text(encoding="utf-8").splitlines()
-    const_at = next(i for i, ln in enumerate(lines)
-                    if ln.startswith("_POWER_REQUEST_CONTEXT_VERSION"))
-    start = max(i for i, ln in enumerate(lines[:const_at])
+    # 錨點原本是常數 `_POWER_REQUEST_CONTEXT_VERSION`；實作搬去 `_power_request`
+    # 之後常數也跟著走了（2026-09-22），改錨在類別本身。
+    class_at = next(i for i, ln in enumerate(lines)
+                    if ln.startswith("class StayAwake"))
+    start = max(i for i, ln in enumerate(lines[:class_at])
                 if ln.startswith("# ---------- "))
     end = next(i for i, ln in enumerate(lines)
-               if i > const_at and ln.startswith("# ---------- "))
+               if i > class_at and ln.startswith("# ---------- "))
     return "\n".join(lines[start:end])
 
 
@@ -8237,15 +8281,21 @@ def test_the_power_log_lines_name_the_active_value_they_branched_on():
        而這件事不能只靠註解請人記得。
     """
     import ast
-    tree = ast.parse(Path(ws.__file__).read_text(encoding="utf-8"))
-    acquire = next(n for n in ast.walk(tree)
+    import _power_request as pr
+    # 寫進 `active` 的值來自 `_power_request`（2026-09-22 起實作在那裡）。從它的
+    # `_WindowsBackend.acquire` 抽出**被指派的名字**，再解成實際的字串——兩步都要
+    # 有，否則常數改名或值改掉，其中一邊會安靜地對不上。
+    backend_tree = ast.parse(Path(pr.__file__).read_text(encoding="utf-8"))
+    backend = next(n for n in ast.walk(backend_tree)
+                   if isinstance(n, ast.ClassDef) and n.name == "_WindowsBackend")
+    acquire = next(n for n in backend.body
                    if isinstance(n, ast.FunctionDef) and n.name == "acquire")
-    assigned = {n.value.value for n in ast.walk(acquire)
+    assigned = {getattr(pr, n.value.id) for n in ast.walk(acquire)
                 if isinstance(n, ast.Assign) and len(n.targets) == 1
                 and isinstance(n.targets[0], ast.Attribute)
                 and n.targets[0].attr == "active"
-                and isinstance(n.value, ast.Constant)
-                and isinstance(n.value.value, str)}
+                and isinstance(n.value, ast.Name)}
+    tree = ast.parse(Path(ws.__file__).read_text(encoding="utf-8"))
     assert len(assigned) == 2, (
         f"`acquire()` 寫進 `active` 的字面值抽到 {sorted(assigned)}——預期兩個"
         "（`power-request` / `execution-state`）。抽取器壞了，或是多了一種狀態"

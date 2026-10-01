@@ -1252,6 +1252,13 @@ def _imported_project_modules(path: Path, known: dict) -> set:
     `import x` / `from x import a` / **`from axiomatic import x`**（最後這種的
     模組名在 `names` 裡，不在 `module` 裡——第一版就是漏了它，於是
     `start_webrunner.py` 的 `_chrome_slot` 整個看不到）。
+
+    第四種是**註冊表**：`_chat_platform.TRANSPORT_MODULES` 列的模組由
+    `import_transport_modules()` 用 `importlib` 逐一載入，bot 第一次 `on_ready` 就一律
+    載進來（不看那個平台開了沒有），所以對「改了要不要重啟」而言跟寫死的 import 一樣。
+    `import` 敘述裡看不到它們，只有讀那份清單才看得到——2026-09-26 之前漏讀，
+    `_telegram_transport.py` 改了不會被報成陳舊。只認這個名字，是因為 `CLAUDE.md`
+    把它定為平台模組**唯一**的註冊入口（`test_platform_transports` 兩個方向對帳）。
     """
     def resolve(dotted: str):
         parts = dotted.split(".")
@@ -1271,7 +1278,24 @@ def _imported_project_modules(path: Path, known: dict) -> set:
                 out.add(name)
             elif node.module.split(".")[0] == "axiomatic":
                 out |= {a.name for a in node.names if a.name in known}
+        elif _assigns_name(node, _DYNAMIC_IMPORT_REGISTRY):
+            out |= {elt.value for elt in ast.walk(node.value)
+                    if isinstance(elt, ast.Constant) and elt.value in known}
     return out
+
+
+# 以 `importlib` 逐一載入的模組清單（見 `_imported_project_modules` 的第四種）。
+_DYNAMIC_IMPORT_REGISTRY = "TRANSPORT_MODULES"
+
+
+def _assigns_name(node: ast.AST, name: str) -> bool:
+    """`node` 是不是 `name = …` 或 `name: T = …`（有值的那一種）。"""
+    if isinstance(node, ast.AnnAssign):
+        return (node.value is not None and isinstance(node.target, ast.Name)
+                and node.target.id == name)
+    if isinstance(node, ast.Assign):
+        return any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+    return False
 
 
 def _import_closure(root: Path, entry: str, known: dict) -> set:
@@ -1306,6 +1330,10 @@ def test_the_component_map_matches_the_real_import_closure():
     bot_closure = _import_closure(root, "discord_bot", known)
     assert len(bot_closure) > 10, (
         f"bot 的 import 閉包只算出 {sorted(bot_closure)}，解析器多半壞了。")
+    # 同一個理由的第四種寫法：註冊表那一條讀不到的話，下面兩個方向照樣綠，
+    # 只是平台模組從閉包裡安靜地消失。
+    assert "_telegram_transport" in bot_closure, (
+        "bot 的 import 閉包沒有讀到 `_chat_platform.TRANSPORT_MODULES` 列的平台模組。")
 
     for label, (script, deps) in pc.STALE_COMPONENTS.items():
         entry = Path(script).stem

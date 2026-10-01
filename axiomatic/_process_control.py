@@ -442,12 +442,12 @@ STALE_COMPONENTS = {
         "axiomatic/_warn_dedup.py",
         "axiomatic/_power_request.py",
         "axiomatic/_connectivity.py",
-        # 對話平台層。`_telegram_transport`（與之後每一個 `_*_transport.py`）**不在
-        # 這裡**，而那不是漏列：它們由 `_chat_platform.import_transport_modules()`
-        # 在執行期動態載入，AST 的傳遞閉包看不到那條邊。改一個 transport 不會被算成
-        # 「bot 陳舊」——這是這張表結構上看不見的一角，不是忘了。
+        # 對話平台層。逐平台的 `_*_transport.py` 是 `_chat_platform.TRANSPORT_MODULES`
+        # 列的、由 `importlib` 在第一次 `on_ready` 一律載入（不看平台開了沒有），所以
+        # 改了它一樣要重啟、一樣要列；對帳測試的 import 抽取器讀得到那份清單。
         "axiomatic/_chat_platform.py",
         "axiomatic/_platform_runtime.py",
+        "axiomatic/_telegram_transport.py",
         # 2026-09-28: the third conversation backend's CLI adapter; both
         # `dorossi_backend` and the bot import it at module level.
         "axiomatic/_dorossi_gemini.py",
@@ -482,6 +482,27 @@ STALE_COMPONENTS = {
         # 改掉四個元件裡某幾個的答案。
         "axiomatic/_chrome_slot.py",
         "axiomatic/_warn_dedup.py",
+        # 2026-09-22：`StayAwake` 委派給參考計數的電源要求。
+        "axiomatic/_power_request.py",
+    )),
+    # 2026-10-01：je 變體跑的批次。bot 的 `/run`、
+    # 單張與 `/launcher start` 預設就是 je，而這張表以前只認 `webrunner_novelai.py`——je
+    # 批次永遠不會被 `/sys health` 報成陳舊，改了共用模組也看不出它還跑著舊碼。依賴清單
+    # 與上一筆只差進入點本身（兩個變體都只經 `_webrunner_shared` 進其餘模組），一樣由
+    # 閉包對帳。標籤刻意不同：同一台機器上兩個都可能在跑（開發時、或刪掉 selenium
+    # 變體之前的過渡期），報表要分得出是哪一個。
+    "batch (je)": ("webrunner_je_only.py", (
+        "axiomatic/webrunner_je_only.py",
+        "axiomatic/_webrunner_shared.py",
+        "axiomatic/_batch_config.py",
+        "axiomatic/_queue_consume.py",
+        "axiomatic/_run_progress.py",
+        "axiomatic/_code_fingerprint.py",
+        "axiomatic/_process_control.py",
+        "axiomatic/_supervisor.py",
+        "axiomatic/_chrome_slot.py",
+        "axiomatic/_warn_dedup.py",
+        "axiomatic/_power_request.py",
     )),
 }
 
