@@ -38,6 +38,8 @@ commands_channel
 commands_mention
 platforms
 dashboard
+desktop
+dorossi
 config
 troubleshooting
 ```
@@ -49,5 +51,8 @@ troubleshooting
 - 全部限頻道斜線指令（佇列、批次、維運、桌面自動化） → {doc}`commands_channel`
 - 跨頻道斜線指令（圖庫／工具、Dorossi 問答） → {doc}`commands_mention`
 - 在 Discord 以外的平台上用這個 bot（一個平台一個行程） → {doc}`platforms`
+- 本機唯讀狀態儀表板 → {doc}`dashboard`
+- 桌面自動化（滑鼠鍵盤、視窗、截圖、定位）與巨集語法 → {doc}`desktop`
+- Dorossi 問答、工作階段、自走任務與用量上限 → {doc}`dorossi`
 - `batch_config.json` / `bot_config.json` / presence 設定 → {doc}`config`
 - 跑批卡住、Chrome 崩潰、登入失敗怎麼查 → {doc}`troubleshooting`

@@ -20,7 +20,7 @@
 | 選用 | 給哪個功能 | 怎麼裝 |
 |---|---|---|
 | 對話後端 CLI（`claude` 之類） | `/dorossi` 對話問答的 `claude_code` 後端 | 裝好它自己的 CLI 並登入；或改用 `api` 後端（`ANTHROPIC_API_KEY` 環境變數） |
-| Tesseract OCR | `/screen ocr`、`/locate text` 之類的畫面文字辨識 | 裝 Tesseract，或設 `TESSERACT_CMD` 指到它的 exe |
+| Tesseract OCR | `/screen text`、`/locate text` 之類的畫面文字辨識 | 裝 Tesseract，或設 `TESSERACT_CMD` 指到它的 exe |
 | Discord 桌面版 | 本機 Rich Presence（把你自己的狀態換成正在跑的遊戲／音樂） | 開著並登入，再填 `presence_rpc.json` |
 
 ## 1. 取得原始碼並安裝相依套件
@@ -115,7 +115,7 @@ password: your-password-here
 ### 佇列與提示詞檔（產圖才需要）
 
 四條佇列（`todo_prompt.md`、`todo_character1.md`、`todo_character2.md`、
-`todo_undesired.md`）通常由 bot 的 `/todo add` 寫，不必手動建立。每一條佇列空掉
+`todo_undesired.md`）通常由 bot 的 `/todo prompt add`、`/todo char1 add` 這類指令寫，不必手動建立。每一條佇列空掉
 時，webrunner 會退回同名的 fallback 檔（`prompt.md`、`character1.md`、
 `character2.md`、`undesired.md`）。想直接跑批次而不透過 bot，就把這幾個 fallback
 從範本複製過來再填：

@@ -524,6 +524,9 @@ py -3 start_platforms.py --list   # 哪些会起来、为什么
 | [`docs/setup.md`](docs/setup.md) | 第一次安装的逐步说明 |
 | [`docs/config.md`](docs/config.md) | 每一个配置键 |
 | [`docs/platforms.md`](docs/platforms.md) | 在没有斜杠菜单的平台上运行 |
+| [`docs/dashboard.md`](docs/dashboard.md) | 本机只读状态仪表板 |
+| [`docs/desktop.md`](docs/desktop.md) | 桌面自动化（鼠标键盘、窗口、截图、定位）与宏语法 |
+| [`docs/dorossi.md`](docs/dorossi.md) | Dorossi 问答、会话、自走任务与用量上限 |
 | [`docs/workflow.md`](docs/workflow.md) | 配对规则、fallback、终止标记 |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | 跑到一半卡住、浏览器崩溃、登录失败 |
 | [`COMMANDS.md`](COMMANDS.md) | 命令总表 |

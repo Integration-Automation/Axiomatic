@@ -697,6 +697,182 @@ def test_commands_docs_are_generated():
         "（編輯性質的補充說明寫進 `gen_command_docs.NOTES` / `COMMAND_NOTES`。）")
 
 
+# ---------------------------------------------------------------------------
+# docs/config.md ↔ bot_config.example.json ／ _bot_config 的預設
+# ---------------------------------------------------------------------------
+def _expected_config_keys() -> tuple[set, set, dict]:
+    """`(頂層鍵, 巢狀鍵的點號寫法, 預設)`。
+
+    頂層鍵是範本與載入器預設的聯集：範本是使用者真的會打開的那一份，載入器預設還多了
+    範本刻意不列的進階鍵（大部分 `dorossi_*`）。巢狀鍵只往下走一層（`platforms` 走兩層，
+    因為第一層是平台名）；`gui_control.launch_aliases` 底下是使用者自己取的別名，不是鍵。
+    """
+    import json  # noqa: PLC0415
+    import _bot_config  # noqa: PLC0415
+
+    defaults = _bot_config._DEFAULT_BOT_CONFIG
+    example = json.loads((REPO_ROOT / "bot_config.example.json").read_text(encoding="utf-8"))
+    example_keys = {k for k in example if not k.startswith("_")}
+    default_keys = {k for k in defaults if not k.startswith("_")}
+    assert len(example_keys) >= 20, sorted(example_keys)
+    assert example_keys <= default_keys, (
+        f"範本有載入器不認得的鍵（會被略過並警告）：{sorted(example_keys - default_keys)}")
+    nested = set()
+    for source in (example, defaults):
+        for key, value in source.items():
+            if key.startswith("_") or not isinstance(value, dict):
+                continue
+            for sub, inner in value.items():
+                if sub.startswith("_"):
+                    continue
+                if key == "platforms" and isinstance(inner, dict):
+                    nested |= {f"{key}.{sub}.{leaf}" for leaf in inner
+                               if not leaf.startswith("_")}
+                else:
+                    nested.add(f"{key}.{sub}")
+    return example_keys | default_keys, nested, defaults
+
+
+def _config_key_exists(dotted: str, defaults: dict) -> bool:
+    node = defaults
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def _bot_config_section(doc: str) -> str:
+    return doc.split("## bot_config.json", 1)[1].split("\n## ", 1)[0]
+
+
+def test_every_bot_config_key_is_documented_and_every_documented_key_exists():
+    """`docs/config.md` 與範本／載入器預設兩向對帳。
+
+    補這一支之前量到範本的 24 個頂層鍵裡有 9 個沒寫進 `docs/config.md`（載入器認得的 41 個
+    裡是 26 個）——那份文件把整組 `dorossi_*` 推給「見 README／COMMANDS.md」，而那兩份也
+    沒寫。少寫是安靜的：設定照樣能用，只是沒有人知道它在、預設是多少。反方向（文件寫了、
+    程式已經沒有）同樣安靜，所以兩個方向都查；兩邊各有一道下限，抽取壞掉時才不會空轉通過。
+    巢狀鍵用點號寫法（`webrunner_supervisor.fallback_window_sec`）對帳，同樣兩向。
+    """
+    top, nested, defaults = _expected_config_keys()
+    doc = (REPO_ROOT / "docs" / "config.md").read_text(encoding="utf-8")
+    missing = sorted(k for k in top | nested if f"`{k}`" not in doc)
+    assert not missing, f"`docs/config.md` 沒寫到這些 `bot_config.json` 鍵：{missing}"
+
+    section = _bot_config_section(doc)
+    named = set(re.findall(r"^\| `([a-z_]+)` \|", section, re.M))
+    named |= set(re.findall(r"^- `([a-z_]+)`", section, re.M))
+    assert len(named) >= 30, sorted(named)
+    stale = sorted(named - top)
+    assert not stale, f"`docs/config.md` 寫了程式裡已經沒有的鍵：{stale}"
+
+    dotted = set(re.findall(r"^\| `([a-z_]+(?:\.[a-z_]+)+)` \|", section, re.M))
+    assert len(dotted) >= 20, sorted(dotted)
+    stale_nested = sorted(k for k in dotted if not _config_key_exists(k, defaults))
+    assert not stale_nested, f"`docs/config.md` 寫了程式裡已經沒有的巢狀鍵：{stale_nested}"
+
+
+def test_the_config_reconciliation_sees_a_stale_key():
+    """正面對照：抽取規則真的認得一個不存在的鍵，否則上面那支的「沒有過期」永遠成立。"""
+    _top, _nested, defaults = _expected_config_keys()
+    section = _bot_config_section(
+        "## bot_config.json\n\n| `platforms.telegram.no_such_key` | 1 | x |\n"
+        "| `webrunner_supervisor.fallback_window_sec` | 300 | x |\n\n## next\n")
+    dotted = set(re.findall(r"^\| `([a-z_]+(?:\.[a-z_]+)+)` \|", section, re.M))
+    assert {k for k in dotted if not _config_key_exists(k, defaults)} == {
+        "platforms.telegram.no_such_key"}
+
+
+def test_the_host_control_table_matches_the_owner_gates():
+    """`docs/config.md`「主機控制」那張表與 `_OWNER_ONLY_GROUPS`／`_OWNER_ONLY_SLASH` 兩向對帳。
+
+    補這一支之前那張表已經過期：`/schedule` 早就升成整群受閘、`/launcher` 是新群，表上
+    卻還把 `/schedule` 的四個子指令逐一列在「零散指令」、`/launcher` 一個字都沒有，
+    `/sys backfill_paths` 與 `/out debug_show` 也漏了——讀文件的人會以為那些指令走角色閘。
+    """
+    import gen_command_docs  # noqa: PLC0415
+
+    surface = gen_command_docs.Surface()
+    doc = (REPO_ROOT / "docs" / "config.md").read_text(encoding="utf-8")
+    section = doc.split("## 主機控制：硬綁擁有者", 1)[1].split("\n## ", 1)[0]
+    rows = {}
+    for line in section.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) == 2 and "`/" in cells[1]:
+            rows[cells[0]] = set(re.findall(r"`/([a-z_ ]+)`", cells[1]))
+    groups = next(v for k, v in rows.items() if k.startswith("整群"))
+    singles = next(v for k, v in rows.items() if k.startswith("零散"))
+    assert len(surface.owner_groups) >= 5 and len(surface.owner_slash) >= 5
+    assert groups == set(surface.owner_groups), (
+        f"整群那一列少了 {sorted(set(surface.owner_groups) - groups)}、"
+        f"多了 {sorted(groups - set(surface.owner_groups))}")
+    assert singles == set(surface.owner_slash), (
+        f"零散指令那一列少了 {sorted(set(surface.owner_slash) - singles)}、"
+        f"多了 {sorted(singles - set(surface.owner_slash))}")
+
+
+# 使用文件裡反引號包起來、但**不是**這個 bot 的指令的斜線字樣。每一筆都寫理由；兩向對帳，
+# 不再出現的那一筆會被報成過期——一個永遠對不上任何東西的豁免會安靜失效。
+_NON_COMMAND_SLASH_WORDS = {
+    "login": "出圖服務網站的登入頁路徑，不是指令",
+    "newbot": "對話平台官方建 bot 的指令，寫在開通步驟裡",
+}
+
+
+def _user_doc_files() -> list:
+    return (sorted((REPO_ROOT / "docs").glob("*.md"))
+            + sorted(REPO_ROOT.glob("README*.md")) + [REPO_ROOT / "COMMANDS.md"])
+
+
+def _unknown_slash_references(text: str, qualified: set) -> list:
+    """`text` 裡反引號包起來的 `/指令 子指令…`，對不上任何指令或指令群的那些（只取名稱那幾個字）。"""
+    prefixes = {" ".join(q.split()[:i]) for q in qualified for i in range(1, len(q.split()) + 1)}
+    unknown = []
+    for span in re.findall(r"`(/[^`]+)`", text):
+        name = []
+        for word in span[1:].split():
+            if not re.fullmatch(r"[a-z_]+", word):
+                break
+            name.append(word)
+        if not name:
+            continue
+        known = next((i for i in range(len(name), 0, -1)
+                      if " ".join(name[:i]) in prefixes), 0)
+        if known == 0 or (known < len(name) and " ".join(name[:known]) not in qualified):
+            unknown.append(" ".join(name))
+    return unknown
+
+
+def test_every_slash_reference_in_the_user_docs_names_a_real_command():
+    """使用文件裡的 `/指令` 都要真的存在。
+
+    指令樹的對帳只管 `docs/commands_*.md` 與 `commands/`；其他頁面寫錯指令名不會有任何
+    症狀。補這一支時量到兩筆：安裝說明寫著 `/screen ocr`（實際是 `/screen text`）與
+    `/todo add`（實際要指定佇列，例如 `/todo prompt add`）。
+    """
+    import gen_command_docs  # noqa: PLC0415
+
+    qualified = {c["qualified"] for c in gen_command_docs.Surface().commands}
+    assert len(qualified) >= 250, f"只抽到 {len(qualified)} 個指令，抽取器多半壞了"
+    hits = {}
+    for path in _user_doc_files():
+        for word in _unknown_slash_references(path.read_text(encoding="utf-8"), qualified):
+            hits.setdefault(word, []).append(path.name)
+    unexpected = {w: files for w, files in hits.items() if w not in _NON_COMMAND_SLASH_WORDS}
+    assert not unexpected, f"這些 `/…` 不是任何指令或指令群：{unexpected}"
+    stale = sorted(set(_NON_COMMAND_SLASH_WORDS) - set(hits))
+    assert not stale, f"`_NON_COMMAND_SLASH_WORDS` 這幾筆已經沒有出現在任何使用文件裡：{stale}"
+
+
+def test_the_slash_reference_check_sees_a_wrong_command():
+    """正面對照：寫錯的子指令與不存在的指令群都要被認出來，對的寫法不能被誤報。"""
+    qualified = {"screen text", "todo prompt add", "gen plan"}
+    text = ("`/screen ocr` `/nosuch` `/todo add` `/screen text [region]` "
+            "`/todo prompt add` `/gen plan [n]` `/gen` `/todo`")
+    assert _unknown_slash_references(text, qualified) == ["screen ocr", "nosuch", "todo add"]
+
+
 def test_commands_json_is_the_same_tree_as_the_markdown():
     """`commands/commands.json` 跟 `.md` 是同一次抽取的產物，內容必須說同一件事。
 

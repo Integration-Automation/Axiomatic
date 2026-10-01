@@ -524,6 +524,9 @@ py -3 start_platforms.py --list   # 哪些會起來、為什麼
 | [`docs/setup.md`](docs/setup.md) | 第一次安裝的逐步說明 |
 | [`docs/config.md`](docs/config.md) | 每一個設定鍵 |
 | [`docs/platforms.md`](docs/platforms.md) | 在沒有斜線選單的平台上執行 |
+| [`docs/dashboard.md`](docs/dashboard.md) | 本機唯讀狀態儀表板 |
+| [`docs/desktop.md`](docs/desktop.md) | 桌面自動化（滑鼠鍵盤、視窗、截圖、定位）與巨集語法 |
+| [`docs/dorossi.md`](docs/dorossi.md) | Dorossi 問答、工作階段、自走任務與用量上限 |
 | [`docs/workflow.md`](docs/workflow.md) | 配對規則、fallback、終止標記 |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | 跑到一半卡住、瀏覽器崩潰、登入失敗 |
 | [`COMMANDS.md`](COMMANDS.md) | 指令總表 |

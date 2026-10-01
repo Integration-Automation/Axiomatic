@@ -574,6 +574,9 @@ py -3 start_platforms.py --list   # どれが起動するか、その理由
 | [`docs/setup.md`](docs/setup.md) | 初回インストールの手順 |
 | [`docs/config.md`](docs/config.md) | すべての設定キー |
 | [`docs/platforms.md`](docs/platforms.md) | スラッシュメニューが無いプラットフォームでの運用 |
+| [`docs/dashboard.md`](docs/dashboard.md) | ローカルの読み取り専用ステータスダッシュボード |
+| [`docs/desktop.md`](docs/desktop.md) | デスクトップ自動化（マウス・キーボード、ウィンドウ、画面、位置特定）とマクロ構文 |
+| [`docs/dorossi.md`](docs/dorossi.md) | Dorossi の質問、セッション、自律タスク、使用量上限 |
 | [`docs/workflow.md`](docs/workflow.md) | ペアリング規則、フォールバック、停止マーカー |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | 実行が止まる、ブラウザが落ちる、ログインに失敗する |
 | [`COMMANDS.md`](COMMANDS.md) | コマンド一覧 |

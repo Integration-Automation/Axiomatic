@@ -582,6 +582,9 @@ itself once the limit resets, so you never have to remember to ask again.
 | [`docs/setup.md`](docs/setup.md) | First-time install, step by step |
 | [`docs/config.md`](docs/config.md) | Every configuration key |
 | [`docs/platforms.md`](docs/platforms.md) | Running on platforms without a slash menu |
+| [`docs/dashboard.md`](docs/dashboard.md) | The local read-only status dashboard |
+| [`docs/desktop.md`](docs/desktop.md) | Desktop automation (mouse, keyboard, windows, screen, locating) and the macro syntax |
+| [`docs/dorossi.md`](docs/dorossi.md) | Dorossi questions, sessions, autonomous tasks, the usage limit |
 | [`docs/workflow.md`](docs/workflow.md) | Pairing rules, fallbacks, the stop marker |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | When a run stalls, the browser crashes, login fails |
 | [`COMMANDS.md`](COMMANDS.md) | The command index |

@@ -125,7 +125,7 @@
 | 要新增 | 動這些檔案 |
 | --- | --- |
 | 斜線指令 | `axiomatic/discord_bot.py` 指令樹；同步 `axiomatic/_help_strings.py`（三語）、`README.md`、`COMMANDS.md`、`docs/commands_*.md`；再跑 `py -3 axiomatic/gen_command_docs.py` 重建 `commands/*.md` 與機器可讀的 `commands/commands.json`（編輯說明放 `NOTES` / `COMMAND_NOTES`）。操作主機的指令歸入 `_OWNER_ONLY_GROUPS` 的群組 |
-| 批次設定鍵／bot 設定鍵 | `axiomatic/_batch_config.py` 或 `axiomatic/_bot_config.py` 的 `_COERCERS` |
+| 批次設定鍵／bot 設定鍵 | `axiomatic/_batch_config.py` 或 `axiomatic/_bot_config.py` 的 `_COERCERS`；bot 設定鍵同時寫進 `bot_config.example.json`（使用者會打開的那一份，常調的才放）與 `docs/config.md`（巢狀鍵用 `區段.鍵` 的寫法），`test_docs_sync` 兩向對帳文件與範本／載入器預設 |
 | webrunner 事件 | `_webrunner_shared.emit_event` 發出 ＋ `discord_bot._handle_event` 接住（`test_webrunner_shared.py` 兩邊對帳） |
 | DOM／產圖行為 | 共用的放 `axiomatic/_webrunner_shared.py`；driver 專屬的兩個變體都要改 |
 | 跨行程檔案 | 原子寫入，並同時加進 `CLAUDE.md` 原子寫入清單與 `test/test_atomic_writes.py` 的 `_CROSS_PROCESS_CONSTANTS`；新的根目錄檔案要分類為追蹤的專案資產或 gitignored 的執行期產物（`test/test_gitignore_coverage.py`） |
