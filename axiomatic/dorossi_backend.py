@@ -74,7 +74,8 @@ from _bot_prompts import load_prompt
 # round; without dedup an unchanged environment variable would wash out the whole
 # log with the same line.
 from _warn_dedup import warn_once as _warn_once
-from _dorossi_gemini import find_gemini_executable, via_gemini as _gemini_turn
+from _dorossi_gemini import (DEFAULT_GEMINI_MODEL, find_gemini_executable,
+                             via_gemini as _gemini_turn)
 # This process's platform identity. The sessions, usage log, model catalogue and
 # working directory are all **this process's own** state, so they always land
 # under `state/<platform>/` -- one process per platform, sharing no mutable state
@@ -470,6 +471,7 @@ _dorossi_rebuild_all_model_choices()
 # (tests) reads from here, not from the two tables that grow.
 _DOROSSI_BUILTIN_MODEL_CHOICES: dict = dict(DOROSSI_MODEL_CHOICES)
 _DOROSSI_BUILTIN_CODEX_MODEL_CHOICES: dict = dict(DOROSSI_CODEX_MODEL_CHOICES)
+_DOROSSI_BUILTIN_GEMINI_MODEL_CHOICES: dict = dict(DOROSSI_GEMINI_MODEL_CHOICES)
 _DOROSSI_MODEL_CATALOG = dorossi_load_model_catalog()
 dorossi_merge_model_catalog(_DOROSSI_MODEL_CATALOG)
 
@@ -554,6 +556,63 @@ def _dorossi_newest_pinned_in_family(table: dict, family: str) -> str | None:
     if not candidates:
         return None
     return table[max(candidates, key=_dorossi_version_sort_key)]
+
+
+# Backend id -> its built-in table before the catalogue was merged in (`dorossi_model_is_builtin`
+# uses it to tell "built-in" from "added by the catalogue").
+_DOROSSI_BUILTIN_TABLES = {
+    "claude_code": _DOROSSI_BUILTIN_MODEL_CHOICES,
+    "api": _DOROSSI_BUILTIN_MODEL_CHOICES,
+    "codex": _DOROSSI_BUILTIN_CODEX_MODEL_CHOICES,
+    "gemini": _DOROSSI_BUILTIN_GEMINI_MODEL_CHOICES,
+}
+
+
+def dorossi_model_is_builtin(backend: str | None, alias: str) -> bool:
+    """True if this alias is in the built-in table, False if the daily model-catalogue check added it."""
+    return alias in _DOROSSI_BUILTIN_TABLES.get(backend, _DOROSSI_BUILTIN_MODEL_CHOICES)
+
+
+def dorossi_model_catalog_checked_at() -> float | None:
+    """When the model catalogue was last checked (epoch); None if never checked or the file is broken. Never raises."""
+    value = _DOROSSI_MODEL_CATALOG.get("checked_at") if isinstance(
+        _DOROSSI_MODEL_CATALOG, dict) else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    return None
+
+
+def dorossi_model_full_id(backend: str | None, key=None) -> str | None:
+    """The **full model id** this backend actually uses for this alias; `key` None or
+    empty means the backend default.
+
+    For display (`/dorossi model`, `/dorossi model_list`). It differs from
+    `dorossi_resolve_model` on a bare alias: a CLI that resolves aliases itself gets
+    the alias verbatim (`opus`), but the display has to say which version that is --
+    today's newest from the daily model catalogue, else the newest pinned id of that
+    family in the built-in table. None when it cannot tell, and the caller says "the
+    backend decides": codex without `-m` uses the model in its own config, which this
+    process cannot see. Pure function, never raises.
+    """
+    normalised = dorossi_normalise_model_key(key)
+    if not normalised:
+        if backend == "api":
+            return DOROSSI_MODEL
+        if backend == "gemini":
+            return DEFAULT_GEMINI_MODEL
+        if backend == "codex":
+            return None
+        normalised = DOROSSI_CC_MODEL
+    table = dorossi_model_choices(backend)
+    if normalised not in table:
+        return None
+    value = table[normalised]
+    if value != normalised:
+        return value
+    return (_dorossi_catalog_family_id(backend, normalised)
+            or _dorossi_newest_pinned_in_family(table, normalised)
+            or (value if backend in DOROSSI_BACKENDS_RESOLVING_ALIASES
+                and backend != "claude_code" else None))
 
 
 def dorossi_resolve_model(backend: str | None, key) -> str | None:

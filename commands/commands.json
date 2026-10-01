@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "source": "axiomatic/discord_bot.py",
-  "count": 271,
+  "count": 272,
   "commands": [
     {
       "name": "/booru",
@@ -369,6 +369,15 @@
           "description": "留空 = 只顯示目前設定；「預設」= 清除覆寫"
         }
       ]
+    },
+    {
+      "name": "/dorossi model_list",
+      "group": "dorossi",
+      "description": "列出每個後端支援的模型",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
     },
     {
       "name": "/dorossi queue clear",

@@ -90,7 +90,7 @@
 
 | ファイル | 役割 |
 |---|---|
-| `axiomatic/discord_bot.py` | トップレベル 13 個のスラッシュコマンドと 25 個のコマンドグループ（合計 271 個のサブコマンド）、ID ゲート、デスクトップとホストの制御、バッチ監視、応答バックエンドの調停、単発生成キュー |
+| `axiomatic/discord_bot.py` | トップレベル 13 個のスラッシュコマンドと 25 個のコマンドグループ（合計 272 個のサブコマンド）、ID ゲート、デスクトップとホストの制御、バッチ監視、応答バックエンドの調停、単発生成キュー |
 | `axiomatic/_gui_control.py` | デスクトップ自動化のファサード（マウス、キーボード、ウィンドウ、クリップボード、文字認識、画像位置検出） |
 | `axiomatic/dorossi_backend.py` | 応答バックエンドとそのセッション——複数のバックエンドを 1 つのインターフェースの裏に |
 
@@ -340,7 +340,7 @@ py -3 install_autostart.py --remove
 テキスト面から使います（後述）。実装も権限ゲートも 1 組だけです。
 **13 個のトップレベルスラッシュコマンド**と **25 個のコマンドグループ**
 （トップレベル 37 枠、プラットフォームの上限は 100）があり、その下に
-**271 個のスラッシュサブコマンド**があります。
+**272 個のスラッシュサブコマンド**があります。
 
 グループはサブコマンドをいくつ抱えてもトップレベル 1 枠しか使わないので、使用頻度の
 低いコマンドをグループにまとめるのが長く拡張し続ける唯一の方法です。コマンドごとの
@@ -410,7 +410,7 @@ py -3 install_autostart.py --remove
 
 | ファミリ | サブコマンド |
 |---|---|
-| **応答バックエンド**（🔑 オーナー限定） | `/dorossi abort\|ai\|ask\|compact\|effort\|errors\|fullmode\|health\|logs\|model\|retry\|running\|status\|tokens\|workspace_clean\|yield`<br>`/dorossi allowdir add\|list\|remove`<br>`/dorossi queue clear\|detail\|failed_clear\|move\|remove\|retry_failed\|show\|undo`<br>`/dorossi session archive\|continue\|delete\|export\|list\|new\|rename\|reset\|switch` |
+| **応答バックエンド**（🔑 オーナー限定） | `/dorossi abort\|ai\|ask\|compact\|effort\|errors\|fullmode\|health\|logs\|model\|model_list\|retry\|running\|status\|tokens\|workspace_clean\|yield`<br>`/dorossi allowdir add\|list\|remove`<br>`/dorossi queue clear\|detail\|failed_clear\|move\|remove\|retry_failed\|show\|undo`<br>`/dorossi session archive\|continue\|delete\|export\|list\|new\|rename\|reset\|switch` |
 | **タグ用ツール** | `/tag autocomplete\|count\|suggest\|wiki` |
 | **お遊び／ランダム** | `/fun 8ball\|ascii\|calc\|choose\|coinflip\|rand\|reverse\|roll\|rps\|timer` |
 | **エンコードと小物** | `/tool base64\|color\|hash\|qr\|say\|unbase64\|urldecode\|urlencode` |

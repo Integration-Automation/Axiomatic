@@ -405,6 +405,7 @@ token 不接問題就只是改設定，不會送出一輪。
 - `/dorossi health` — 健康檢查
 - `/dorossi logs [n]` — 最近的執行期事件
 - `/dorossi model [model]` — 顯示或設定這個工作階段的模型
+- `/dorossi model_list` — 列出每個後端支援的模型（公開；擁有者另外看得到完整版本號、來源與每個後端沒指定時的預設）
 - `/dorossi retry [session]` — 重試上一個提問（可能跑很久）
 - `/dorossi running` — 正在執行的工作與同時執行上限（誰在跑、跑多久、在等空位、在等網路恢復還是在跑）
 - `/dorossi status` — 執行期狀態

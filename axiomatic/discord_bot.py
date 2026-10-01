@@ -262,6 +262,9 @@ from dorossi_backend import (
     dorossi_model_applies,
     dorossi_session_backend,
     dorossi_normalise_model_key,
+    dorossi_model_full_id,
+    dorossi_model_is_builtin,
+    dorossi_model_catalog_checked_at,
     _dorossi_parse_turn_flags,
     _dorossi_apply_turn_tuning,
     _dorossi_session_tuning,
@@ -8735,10 +8738,15 @@ async def _shared_dorossi_tune(message: discord.Message, rest: str, *,
                 choice if kind == "effort" else None,
                 choice if kind == "model" else None)
             sess["last_used"] = time.time()
-        return _dorossi_tuning_labels(sess)
+        return _dorossi_tuning_labels(sess) + (_dorossi_effective_model_id(sess),)
 
-    model_label, effort, unsupported = await _dorossi_state_rmw(_mut)
+    model_label, effort, unsupported, full_id = await _dorossi_state_rmw(_mut)
     shown = model_label if kind == "model" else (effort or "預設")
+    # 完整版本號只給擁有者（`_owner_detail`）；非擁有者看到的跟以前一樣只有別名。
+    version = "" if kind != "model" else _owner_detail(
+        message,
+        lambda: f"（完整版本：`{full_id}`）" if full_id else "（完整版本由後端決定）",
+        "")
     # 存著的值在目前的後端上用不到時一定要講，否則使用者只會看到「已更新，目前
     # 生效：後端預設模型」而以為指令壞了。值照樣留著，換回吃得下它的後端就生效。
     # 模型那半由 `_dorossi_tuning_labels` 判（按後端查表）；思考力度那半的判準沒變
@@ -8747,13 +8755,15 @@ async def _shared_dorossi_tune(message: discord.Message, rest: str, *,
     note = ("（這個工作階段目前的後端不吃這項設定，已記下，換個後端才會生效）"
             if inapplicable else "")
     if not choice:
-        await safe_reply(message, f"這段對話目前的{label_name}：`{shown}`。{note}")
+        await safe_reply(message, f"這段對話目前的{label_name}：`{shown}`{version}。{note}")
     elif choice == DOROSSI_TUNE_DEFAULT:
         await safe_reply(
-            message, f"✅ 這段對話的{label_name}已回到預設，目前生效：`{shown}`。{note}")
+            message,
+            f"✅ 這段對話的{label_name}已回到預設，目前生效：`{shown}`{version}。{note}")
     else:
         await safe_reply(
-            message, f"✅ 這段對話的{label_name}已更新，目前生效：`{shown}`。{note}")
+            message,
+            f"✅ 這段對話的{label_name}已更新，目前生效：`{shown}`{version}。{note}")
 
 
 async def mcmd_model(message: discord.Message, rest: str) -> None:
@@ -8762,6 +8772,76 @@ async def mcmd_model(message: discord.Message, rest: str) -> None:
         await safe_reply(message, "此指令僅限擁有者使用。")
         return
     await _shared_dorossi_tune(message, rest, kind="model")
+
+
+# `/dorossi model_list` 的列出順序：`/dorossi ai` 的三個合法值，各自對到實際的後端 id
+# （`claude` 那一家走模組設定的 `DOROSSI_BACKEND`，可能是 `claude_code` 也可能是 `api`）。
+_DOROSSI_MODEL_LIST_PROVIDERS = (("claude", None), ("codex", "codex"), ("gemini", "gemini"))
+# 非擁有者看到的別名若含服務名（`_SCRUB_VENDOR_RE`），不逐一列出，只報數量——別名本身就是
+# 完整 id 的後端（第三個）會整串露出服務名，那不在 2026-07-02 放行的範圍內。
+
+
+def _dorossi_model_list_text(message, sess: dict) -> str:
+    """`/dorossi model_list` 的內容：每個後端的模型別名，擁有者另外看得到完整版本號與來源。
+
+    資料只讀 `dorossi_backend` 的表與目錄（`dorossi_model_choices`、`dorossi_model_full_id`、
+    `dorossi_model_is_builtin`），不另抄一份。後端標題：擁有者看 `/dorossi ai` 的合法值，
+    其他人看 `_backend_display` 的中性代號。純函式（只讀），回一整段文字，呼叫端自己切段。
+    """
+    owner = _owner_unrestricted(message)
+    current_backend = dorossi_session_backend(sess or {})
+    current_id = _dorossi_effective_model_id(sess or {})
+    lines = ["**可用的模型**（`/dorossi model <別名>` 切換這個工作階段的模型；"
+             "`/dorossi ai` 換後端）"]
+    for provider, backend_id in _DOROSSI_MODEL_LIST_PROVIDERS:
+        backend = backend_id or DOROSSI_BACKEND
+        heading = (f"`{provider}`（後端 {_backend_display(backend)}）" if owner
+                   else f"後端 {_backend_display(backend)}")
+        marker = "　← 這個工作階段" if backend == current_backend else ""
+        lines.append(f"\n**{heading}**{marker}")
+        default_id = dorossi_model_full_id(backend, None)
+        hidden = 0
+        for alias in dorossi_model_choices(backend):
+            if not owner and _SCRUB_VENDOR_RE.search(alias):
+                hidden += 1
+                continue
+            row = f"・`{alias}`"
+            if owner:
+                full = dorossi_model_full_id(backend, alias)
+                row += f" → `{full}`" if full and full != alias else ""
+                if not dorossi_model_is_builtin(backend, alias):
+                    row += "（目錄新增）"
+            if backend == current_backend and current_id and \
+                    dorossi_model_full_id(backend, alias) == current_id:
+                row += "　← 目前生效"
+            lines.append(row)
+        if hidden:
+            lines.append(f"・另有 {hidden} 個（名稱含服務名，只對擁有者列出）")
+        if owner:
+            lines.append(f"・沒指定時：`{default_id}`" if default_id
+                         else "・沒指定時：由後端自己的設定決定")
+    checked = dorossi_model_catalog_checked_at()
+    clock = time.strftime("%m-%d %H:%M", time.localtime(checked)) if checked else None
+    lines.append("\n模型目錄最後檢查：" + (clock or "還沒檢查過（只有內建表）"))
+    return "\n".join(lines)
+
+
+async def mcmd_model_list(message: discord.Message, rest: str = "") -> None:
+    """`/dorossi model_list`（公開）：列出每個後端支援的模型。
+
+    擁有者裁定 2026-10-01：公開；非擁有者只看到別名（含服務名的別名只報數量），擁有者另外
+    看得到完整版本號、來源（內建或每日目錄檢查新增）與每個後端沒指定時的預設。目前這個工作
+    階段用的是哪一個也標出來（讀狀態是唯讀，不建立工作階段）。
+    """
+    del rest
+    uid = str(getattr(message.author, "id", ""))
+    state = _dorossi_load_state()
+    record = state.get(uid) if isinstance(state.get(uid), dict) else {}
+    sessions = record.get("sessions") if isinstance(record.get("sessions"), dict) else {}
+    sess = sessions.get(record.get("active")) if isinstance(
+        sessions.get(record.get("active")), dict) else {}
+    for chunk in _chunk_for_discord(_dorossi_model_list_text(message, sess)):
+        await safe_reply(message, chunk)
 
 
 async def mcmd_effort(message: discord.Message, rest: str) -> None:
@@ -10789,6 +10869,19 @@ def _dorossi_tuning_labels(sess: dict) -> tuple:
     effort = (tune_e if isinstance(tune_e, str) and tune_e in DOROSSI_EFFORT_LEVELS
               else None)
     return model_label, effort, unsupported
+
+
+def _dorossi_effective_model_id(sess: dict) -> str | None:
+    """這個工作階段目前生效的**完整**模型 id（推不出來回 None）。
+
+    與 `_dorossi_tuning_labels` 同一套「存著的值在這個後端上用不用得到」判準，只是回完整
+    id 而不是別名。完整 id 是後端模型名稱，2026-07-02 的例外只放行別名，所以呼叫端一律經
+    `_owner_detail` 決定露不露（擁有者裁定 2026-10-01：完整版本號只給擁有者）。純函式。
+    """
+    backend = dorossi_session_backend(sess)
+    stored = dorossi_normalise_model_key(sess.get("tune_model"))
+    return dorossi_model_full_id(
+        backend, stored if dorossi_model_applies(backend, stored) else None)
 
 
 def _dorossi_render_session_list(state: dict, uid: str, *,
@@ -25908,6 +26001,12 @@ def _dorossi_model_options(backend: str, typed: str) -> list:
     pairs.append(("預設", DOROSSI_TUNE_DEFAULT))
     matched = [pair for pair in pairs if needle in pair[1].lower()]
     return matched[:_DOROSSI_AUTOCOMPLETE_LIMIT]
+
+
+@dorossi_group.command(name="model_list", description="列出每個後端支援的模型",
+                       extras={"public": True})
+async def slash_dorossi_model_list(interaction: discord.Interaction) -> None:
+    await _slash_run(interaction, mcmd_model_list)
 
 
 @dorossi_group.command(name="model", description="顯示或設定這個工作階段的模型",

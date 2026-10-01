@@ -508,3 +508,68 @@ def test_the_wrapper_scan_actually_reads_a_declaration():
     # 「autocomplete 抽得到東西」——抽不到的話上面那支的 else 分支會空過。
     assert _autocomplete_options("slash_dorossi_model"), (
         "抽不到 `slash_dorossi_model` 的 autocomplete 宣告")
+
+
+# ---------------------------------------------------------------------------
+# 完整版本號（`/dorossi model`）與模型清單（`/dorossi model_list`），2026-10-01
+#
+# 擁有者裁定：完整版本號只給擁有者；`model_list` 公開，非擁有者只看別名，含服務名的別名
+# 只報數量。完整 id 是後端模型名稱，2026-07-02 的例外只放行別名，所以非擁有者那一面一個
+# 完整 id、一個服務名都不能出現。
+# ---------------------------------------------------------------------------
+def test_full_model_id_resolution_rules(monkeypatch):
+    monkeypatch.setattr(db, "_DOROSSI_MODEL_CATALOG",
+                        {"resolved": {"claude": {"opus": "claude-opus-9-9"}}})
+    assert db.dorossi_model_full_id("claude_code", "opus") == "claude-opus-9-9"   # 目錄
+    assert db.dorossi_model_full_id("claude_code", None) == "claude-opus-9-9"     # 預設＝opus
+    assert db.dorossi_model_full_id("claude_code", "sonnet-4.6") == "claude-sonnet-4-6"
+    assert db.dorossi_model_full_id("api", None) == db.DOROSSI_MODEL
+    assert db.dorossi_model_full_id("codex", None) is None                        # 它自己的設定
+    assert db.dorossi_model_full_id("claude_code", "not-a-model") is None
+    monkeypatch.setattr(db, "_DOROSSI_MODEL_CATALOG", {})
+    # 沒有目錄：退回內建表同族版號最大的那個（不是原樣回裸別名）
+    assert db.dorossi_model_full_id("claude_code", "opus") == \
+        db._dorossi_newest_pinned_in_family(db.DOROSSI_MODEL_CHOICES, "opus")
+
+
+def test_the_model_reply_carries_the_full_version_for_the_owner(store):
+    msg = _Msg()
+    _run(b.mcmd_model(msg, "sonnet-4.6"))
+    assert "claude-sonnet-4-6" in msg.text, msg.text
+    shown = _Msg()
+    _run(b.mcmd_model(shown, ""))
+    assert "完整版本" in shown.text and "claude-sonnet-4-6" in shown.text, shown.text
+
+
+def _model_list(uid: int = 0) -> str:
+    msg = _Msg(uid)
+    _run(b.mcmd_model_list(msg, ""))
+    return msg.text
+
+
+def test_the_owner_sees_every_backend_with_full_ids(store):
+    text = _model_list()
+    for provider in ("`claude`", "`codex`", "`gemini`"):
+        assert provider in text, text
+    assert "→ `claude-" in text and "沒指定時" in text and "模型目錄最後檢查" in text, text
+
+
+def test_a_non_owner_sees_aliases_but_no_full_id_or_service_name(store):
+    stranger = b.OWNER_USER_ID + 1
+    text = _model_list(stranger)
+    assert "`opus`" in text, text                       # 別名照列
+    assert "→" not in text and "沒指定時" not in text, text
+    assert not b._SCRUB_VENDOR_RE.search(text), text    # 沒有任何服務名
+    assert "只對擁有者列出" in text, text                 # 第三個後端只報數量
+    assert "後端 A" in text or "後端 C" in text, text    # 中性代號，不是後端 id
+
+
+def test_an_alias_added_by_the_catalog_is_marked(store, monkeypatch):
+    table = dict(db.DOROSSI_GEMINI_MODEL_CHOICES)
+    table["gemini-9.9-test"] = "gemini-9.9-test"
+    monkeypatch.setitem(db.DOROSSI_BACKEND_MODEL_CHOICES, "gemini", table)
+    text = _model_list()
+    line = next(row for row in text.splitlines() if "gemini-9.9-test" in row)
+    assert "目錄新增" in line, line
+    builtin = next(row for row in text.splitlines() if "`gemini-3.8-flash-high`" in row)
+    assert "目錄新增" not in builtin, builtin

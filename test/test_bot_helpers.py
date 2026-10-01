@@ -15737,6 +15737,15 @@ def _is_inert(stmt) -> bool:
             and isinstance(stmt.value.value, str))
 
 
+# 刻意公開、不經擁有者閘的 `/dorossi` 子指令，每一筆都要寫理由（擁有者裁定）。兩個方向都對帳：
+# 列了卻已經不存在的子指令會紅，列了卻又有擁有者閘也會紅——那表示豁免已經過期。
+_DOROSSI_PUBLIC_SUB_COMMANDS = {
+    ("dorossi_group", "model_list"): (
+        "擁有者裁定 2026-10-01：公開；非擁有者只看到模型別名（含服務名的只報數量），完整版本號"
+        "與來源經 `_owner_detail` 只給擁有者。handler 只讀、不改任何狀態。"),
+}
+
+
 def test_every_dorossi_sub_command_reaches_an_owner_gate():
     """`/dorossi` 每一個子指令委派到的 handler 都要先過擁有者閘才做事。
 
@@ -15752,10 +15761,19 @@ def test_every_dorossi_sub_command_reaches_an_owner_gate():
 
     delegates = _dorossi_slash_delegates()
     problems = []
+    stale = sorted(set(_DOROSSI_PUBLIC_SUB_COMMANDS) - set(delegates))
+    assert not stale, (
+        f"`_DOROSSI_PUBLIC_SUB_COMMANDS` 列了不存在的子指令 {stale}——改名之後豁免會安靜失效")
     for (group, sub), delegate in sorted(delegates.items()):
         label = f"/{group.replace('_group', '').replace('dorossi_', 'dorossi ')} {sub}"
         if delegate is None or delegate not in funcs:
             problems.append(f"{label}：找不到它委派的 handler（{delegate!r}）")
+            continue
+        if (group, sub) in _DOROSSI_PUBLIC_SUB_COMMANDS:
+            gate, _before, _ret = _owner_gate_position(funcs[delegate])
+            if gate is not None:
+                problems.append(f"{label} 列在公開豁免裡，`{delegate}` 卻有擁有者閘——"
+                                "要嘛拿掉豁免，要嘛拿掉閘")
             continue
         idx, before, has_return = _owner_gate_position(funcs[delegate])
         if idx is None:
