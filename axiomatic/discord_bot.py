@@ -4323,12 +4323,21 @@ async def mcmd_autocomplete(message: discord.Message, rest: str) -> None:
     cat_label = {
         0: "general", 1: "artist", 3: "copyright", 4: "character", 5: "meta",
     }
-    lines = [f"**`{pattern}`** tag 補全（top {len(hits)}）："]
+    # 回應是外部資料：少了 `name`（或不是字串）的那一筆跳過，分類與張數不是整數就當不知道。
+    rows = []
     for t in hits:
-        cat = cat_label.get(t.get("category", -1), "?")
-        lines.append(
-            f"- `{t['name']}` ({cat}, {t.get('post_count', 0)} posts)"
-        )
+        name = _json_text(t.get("name")).strip()
+        if not name:
+            continue
+        cat = cat_label.get(_json_count(t.get("category")), "?")
+        rows.append(f"- `{name}` ({cat}, {_json_count(t.get('post_count')) or 0} posts)")
+    if len(rows) < len(hits):
+        print(f"/tag autocomplete: skipped {len(hits) - len(rows)} tag record(s) without a "
+              f"usable `name`", file=sys.stderr)
+    if not rows:
+        await safe_reply(message, _BOARD_LOOKUP_FAILED)
+        return
+    lines = [f"**`{pattern}`** tag 補全（top {len(rows)}）：", *rows]
     await safe_reply(message, "\n".join(lines))
 
 
@@ -4673,6 +4682,27 @@ _IQDB_URL = "https://iqdb.org/"
 IQDB_TIMEOUT_SEC = 20.0
 
 
+# 圖庫回應的形狀不對時給使用者的那一句。跟 `/web` 那一組（`_json_dict`／`_json_text`）同一個
+# 理由：網站回應的形狀不是我們控制的，讀到不是物件、不是字串的欄位時，原本整個指令只剩一句內部錯誤。
+_BOARD_LOOKUP_FAILED = "圖庫查詢失敗，請稍後再試。"
+
+
+async def _board_post_malformed(message: discord.Message, command: str, field: str,
+                                value) -> None:
+    """圖庫回應裡某個欄位的型別不對：stderr 記哪個指令、哪個欄位、拿到什麼型別，使用者拿泛用句。
+
+    只記型別名不記內容：stderr 會進 log，而 `/log tail` 會把 log 送進頻道，所以「寫 stderr
+    就安全」在這裡不成立。指令用斜線寫法記，不寫站名。"""
+    print(f"{command}: post field `{field}` is {type(value).__name__}, not the expected type",
+          file=sys.stderr)
+    await safe_reply(message, _BOARD_LOOKUP_FAILED)
+
+
+def _board_post_id(pid: int | None) -> str:
+    """回覆裡的 post 編號：站方給的不是整數就寫 `?`，不把不受控的值原樣送出去。"""
+    return str(pid) if pid is not None else "?"
+
+
 async def mcmd_safebooru(message: discord.Message, rest: str) -> None:
     """`/safebooru <tag(s)>` — random Safebooru post（站本身 SFW only）。"""
     tags = _normalise_tag_input(rest or "")
@@ -4684,13 +4714,16 @@ async def mcmd_safebooru(message: discord.Message, rest: str) -> None:
         await safe_reply(message, f"找不到符合 `{tags}` 的圖片")
         return
     url = post.get("file_url")
-    pid = post.get("id")
+    if url is not None and not isinstance(url, str):
+        await _board_post_malformed(message, "/safebooru", "file_url", url)
+        return
+    pid = _json_count(post.get("id"))
     page = (
         f"https://safebooru.org/index.php?page=post&s=view&id={pid}"
         if pid else None
     )
     if not url:
-        await safe_reply(message, f"post {pid} has no fetchable URL")
+        await safe_reply(message, f"post {_board_post_id(pid)} has no fetchable URL")
         return
     parts = [f"<{page}>"] if page else []
     parts.append(url)
@@ -4723,14 +4756,21 @@ async def mcmd_e621(message: discord.Message, rest: str) -> None:
             shown = resolved or tags
             await safe_reply(message, f"找不到符合 `{shown}` 的圖片")
             return
-    file_obj = post.get("file") or {}
-    url = file_obj.get("url")
-    pid = post.get("id")
+    file_obj = post.get("file")
+    if file_obj is not None and not isinstance(file_obj, dict):
+        await _board_post_malformed(message, "/e621", "file", file_obj)
+        return
+    url = (file_obj or {}).get("url")
+    if url is not None and not isinstance(url, str):
+        await _board_post_malformed(message, "/e621", "file.url", url)
+        return
+    pid = _json_count(post.get("id"))
     page = f"https://e621.net/posts/{pid}" if pid else None
     if not url:
+        # `file.url` 是 null 是站方的正常回應（分級鎖住、匿名看不到），不是格式壞掉。
         await safe_reply(
             message,
-            f"post {pid} no fetchable URL（rating-locked 或匿名看不到）"
+            f"post {_board_post_id(pid)} no fetchable URL（rating-locked 或匿名看不到）"
         )
         return
     parts: list[str] = []
