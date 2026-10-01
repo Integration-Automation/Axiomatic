@@ -37,6 +37,7 @@ workflow
 commands_channel
 commands_mention
 platforms
+dashboard
 config
 troubleshooting
 ```

@@ -64,7 +64,7 @@
 | `py -3 start_webrunner.py [selenium\|je]` | webrunner 監督迴圈（退避、快速失敗放棄、參與瀏覽器槽協定） |
 | `py -3 run_batch.py [selenium\|je] [--clear-pause]` | 本機一鍵批次：前置檢查 → 印 run-plan → 交棒給 `start_webrunner.py` |
 | `py -3 install_autostart.py --install\|--status\|--remove` | 登入時自動拉起**開著的每個平台**與批次監督者（Windows 工作排程器，`\Axiomatic\Bot-<平台>`／`\Axiomatic\Batch`；名稱由 `_platform_runtime.autostart_task_names()` 算，`/sys doctor` 查的是同一份） |
-| `py -3 axiomatic/dashboard_server.py` | 本機唯讀狀態儀表板 |
+| `py -3 axiomatic/dashboard_server.py [--platform <名稱>]` | 本機唯讀狀態儀表板（批次、佇列、Dorossi、系統；一個平台一份，見 `docs/dashboard.md`） |
 | `py -3 axiomatic/verify_browser.py [--full] [--variant je]` | 隔離瀏覽器驗證，不碰正式設定檔 |
 | `py -3 -m pytest` | 全部測試（`pytest.ini` 的 `testpaths` 指向 `test/`；單檔 `py -3 -m pytest test/test_x.py`） |
 

@@ -10,20 +10,27 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import shutil
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 try:
     from _bot_config import load_bot_config
     from _process_control import _pid_alive
-    from _platform_runtime import platform_file as _platform_state
+    from _platform_runtime import (
+        STATE_ROOT, active_platform, normalise_platform,
+        platform_file as _platform_state)
+    from _run_progress import read_progress
 except ImportError:
     from axiomatic._bot_config import load_bot_config  # type: ignore
     from axiomatic._process_control import _pid_alive  # type: ignore
     from axiomatic._platform_runtime import (  # type: ignore
+        STATE_ROOT, active_platform, normalise_platform,
         platform_file as _platform_state)
+    from axiomatic._run_progress import read_progress  # type: ignore
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +49,14 @@ WEBRUNNER_PID_FILE = PROJECT_ROOT / "webrunner.pid"
 WEBRUNNER_PAUSE_FILE = PROJECT_ROOT / "webrunner.pause"
 BATCH_LABEL_FILE = PROJECT_ROOT / "batch_label.txt"
 OUTPUT_ROOT = PROJECT_ROOT / "output"
+# 批次的四個佇列檔。角色二是**位置對應**的：空行代表「這一對拿掉角色二」，所以算行數、
+# 不略過空行；另外三個空行不算一筆（與 `read_todo_entries` 同一套規則）。
+QUEUE_FILES = {
+    "prompt": (PROJECT_ROOT / "todo_prompt.md", False),
+    "char1": (PROJECT_ROOT / "todo_character1.md", False),
+    "char2": (PROJECT_ROOT / "todo_character2.md", True),
+    "undesired": (PROJECT_ROOT / "todo_undesired.md", False),
+}
 
 
 def _read_ndjson_tail(path: Path, n: int = 20) -> list[dict]:
@@ -161,6 +176,50 @@ def _dir_image_count(path: Path) -> int:
     return total
 
 
+def _queue_depth(path: Path, positional: bool) -> int | None:
+    """佇列檔還剩幾筆；檔案不在＝0，讀不出來＝None（看板顯示「—」，不假裝是 0）。"""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+    lines = text.splitlines()
+    return len(lines) if positional else sum(1 for line in lines if line.strip())
+
+
+def _progress_summary() -> dict:
+    """目前角色的進度：資料夾名、已存張數、目標張數。
+
+    **刻意不帶提示詞**：檢查點裡存著整段提示詞與角色字串，看板只需要「做到哪裡」，
+    不需要把那些文字端出去（這個頁面沒有認證，綁錯位址時整個網段都讀得到）。
+    """
+    progress = read_progress() or {}
+    out = {}
+    folder = progress.get("folder")
+    if isinstance(folder, str):
+        out["folder"] = folder[:120]
+    for key in ("saved", "target"):
+        value = progress.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[key] = value
+    return out
+
+
+def _system_summary() -> dict:
+    """磁碟剩餘（GB，專案所在的磁碟）與記憶體使用率；拿不到的欄位是 None。"""
+    try:
+        disk_free_gb = round(shutil.disk_usage(PROJECT_ROOT).free / 1e9, 1)
+    except OSError:
+        disk_free_gb = None
+    try:
+        import psutil  # type: ignore  # noqa: PLC0415  # 必要相依，但看板不該因為它而起不來
+        memory_percent = round(float(psutil.virtual_memory().percent), 1)
+    except (ImportError, OSError, AttributeError, ValueError):
+        memory_percent = None
+    return {"disk_free_gb": disk_free_gb, "memory_percent": memory_percent}
+
+
 def _hostname_of(raw: str) -> str:
     """從 `Host` 標頭取出主機名稱，去掉埠號與 IPv6 的方括號。
 
@@ -223,7 +282,46 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def build_status() -> dict:
+def known_platforms() -> list[str]:
+    """這台機器上有狀態的平台（`state/<名稱>/` 存在），加上這個行程自己的平台。
+
+    只收 `normalise_platform` 認得的名字，所以 `?platform=` 帶進來的字串不可能變成
+    任意路徑：不在這份清單裡的值一律退回這個行程的平台。
+    """
+    names = {active_platform()}
+    try:
+        for child in STATE_ROOT.iterdir():
+            if child.is_dir() and normalise_platform(child.name) == child.name:
+                names.add(child.name)
+    except OSError:
+        pass
+    return sorted(names)
+
+
+def _platform_files(platform: str) -> dict:
+    """某個平台自己那一份的檔案。這個行程的平台直接用模組常數（測試會替換它們）。"""
+    if platform == active_platform():
+        return {"dorossi_queue": DOROSSI_QUEUE_FILE,
+                "dorossi_failed": DOROSSI_FAILED_QUEUE_FILE,
+                "dorossi_events": DOROSSI_EVENTS_FILE,
+                "generate_history": GENERATE_HISTORY_FILE}
+    return {
+        "dorossi_queue": _platform_state(
+            PROJECT_ROOT / "dorossi_queue.ndjson", platform=platform),
+        "dorossi_failed": _platform_state(
+            PROJECT_ROOT / "dorossi_queue_failed.ndjson", platform=platform),
+        "dorossi_events": _platform_state(
+            PROJECT_ROOT / "dorossi_events.ndjson", platform=platform),
+        "generate_history": _platform_state(
+            PROJECT_ROOT / "generate_history.ndjson", platform=platform),
+    }
+
+
+def build_status(platform: str | None = None) -> dict:
+    """儀表板的狀態。`platform` 只換「每個平台各一份」的那幾塊；批次全機一份，不跟著換。"""
+    platforms = known_platforms()
+    chosen = platform if platform in platforms else active_platform()
+    files = _platform_files(chosen)
     pid, pid_known = _read_pid()
     log_mtime = _safe_mtime(WEBRUNNER_LOG)
     # `alive` 刻意是**三態**：True／False／None。None ＝「pid 檔讀不出來，判不
@@ -244,15 +342,22 @@ def build_status() -> dict:
             "log_age_sec": (time.time() - log_mtime) if log_mtime else None,
         },
         "dorossi": {
-            "queue": _count_ndjson(DOROSSI_QUEUE_FILE),
-            "failed_queue": _count_ndjson(DOROSSI_FAILED_QUEUE_FILE),
-            "events": _read_ndjson_tail(DOROSSI_EVENTS_FILE, 10),
+            "queue": _count_ndjson(files["dorossi_queue"]),
+            "failed_queue": _count_ndjson(files["dorossi_failed"]),
+            "events": _read_ndjson_tail(files["dorossi_events"], 10),
         },
         "generate": {
-            "history": _read_ndjson_tail(GENERATE_HISTORY_FILE, 10),
+            "history": _read_ndjson_tail(files["generate_history"], 10),
         },
         "events": _read_ndjson_tail(EVENTS_FILE, 10),
         "output_images": _dir_image_count(OUTPUT_ROOT),
+        "progress": _progress_summary(),
+        "queues": {name: _queue_depth(path, positional)
+                   for name, (path, positional) in QUEUE_FILES.items()},
+        "system": _system_summary(),
+        # 這一份狀態讀的是哪一個平台；`platforms` 是頁首下拉選單的選項。
+        "platform": chosen,
+        "platforms": platforms,
     }
 
 
@@ -260,46 +365,175 @@ HTML = """<!doctype html>
 <html lang="zh-Hant">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>axiomatic Dashboard</title>
+<title>Axiomatic 儀表板</title>
 <style>
-body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#101418;color:#e8edf2}
-main{max-width:1100px;margin:0 auto;padding:24px}
-h1{font-size:24px;margin:0 0 16px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
-.card{border:1px solid #2c3440;border-radius:8px;padding:14px;background:#171d24}
-.k{color:#9fb0c0}.v{font-size:22px;font-weight:700}
-pre{white-space:pre-wrap;word-break:break-word;background:#0b0f13;border-radius:8px;padding:12px;max-height:360px;overflow:auto}
-button{background:#2f81f7;color:white;border:0;border-radius:6px;padding:8px 12px;font-weight:600}
+:root{--bg:#f4f6f8;--panel:#ffffff;--line:#d8dee5;--text:#18202a;--muted:#5d6b7a;
+  --accent:#2563eb;--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--code:#eef1f4}
+@media (prefers-color-scheme: dark){:root{--bg:#0f141a;--panel:#171e26;--line:#2a3441;
+  --text:#e6ebf0;--muted:#93a2b3;--accent:#60a5fa;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--code:#0b1015}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:15px/1.5 system-ui,-apple-system,"Segoe UI","Noto Sans TC",sans-serif}
+header{position:sticky;top:0;z-index:1;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;
+  padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+header h1{font-size:18px;margin:0;flex:1 1 auto}
+.meta{color:var(--muted);font-size:13px}
+button{font:inherit;background:var(--accent);color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer}
+button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
+main{max-width:1180px;margin:0 auto;padding:16px;display:grid;gap:16px;
+  grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;min-width:0}
+section.wide{grid-column:1/-1}
+section h2{font-size:14px;margin:0 0 10px;color:var(--muted);letter-spacing:.04em}
+.rows{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;align-items:baseline}
+.rows dt{color:var(--muted)}
+.rows dd{margin:0;font-weight:600;min-width:0;overflow-wrap:anywhere}
+.pill{display:inline-block;padding:1px 10px;border-radius:999px;font-weight:700;font-size:13px;border:1px solid currentColor}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
+.bar{height:8px;border-radius:4px;background:var(--code);overflow:hidden;margin-top:4px}
+.bar>span{display:block;height:100%;background:var(--accent);width:0}
+ol.events{list-style:none;margin:0;padding:0;display:grid;gap:4px;max-height:320px;overflow:auto}
+ol.events li{display:grid;grid-template-columns:auto auto 1fr;gap:8px;font-size:13px;
+  padding:4px 0;border-bottom:1px solid var(--line);min-width:0}
+ol.events time{color:var(--muted);font-variant-numeric:tabular-nums}
+ol.events b{font-weight:600}
+ol.events span{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;background:var(--code);border-radius:8px;
+  padding:12px;max-height:360px;overflow:auto;font-size:12px}
+#platform{font:inherit;padding:2px 6px;border-radius:6px;border:1px solid var(--line);
+  background:var(--panel);color:var(--text)}
+details summary{cursor:pointer;color:var(--muted)}
 </style>
+<header>
+  <h1>Axiomatic 儀表板</h1>
+  <label class="meta">平台 <select id="platform" aria-label="平台"></select></label>
+  <span class="meta">更新於 <span id="updated">—</span></span>
+  <label class="meta"><input type="checkbox" id="auto" checked> 每 15 秒自動更新</label>
+  <button id="refresh" type="button">重新整理</button>
+</header>
 <main>
-<h1>axiomatic Dashboard</h1>
-<button onclick="load()">Refresh</button>
-<div id="cards" class="grid"></div>
-<h2>Raw Status</h2>
-<pre id="raw">loading...</pre>
+  <section>
+    <h2>批次</h2>
+    <dl class="rows">
+      <dt>狀態</dt><dd><span id="batch-state" class="pill muted">—</span></dd>
+      <dt>批次標籤</dt><dd id="batch-label">—</dd>
+      <dt>目前角色</dt><dd id="batch-folder">—</dd>
+      <dt>進度</dt><dd><span id="batch-progress">—</span><div class="bar"><span id="batch-bar"></span></div></dd>
+      <dt>log 最後更新</dt><dd id="batch-log">—</dd>
+    </dl>
+  </section>
+  <section>
+    <h2>佇列</h2>
+    <dl class="rows">
+      <dt>提示詞</dt><dd id="q-prompt">—</dd>
+      <dt>角色一</dt><dd id="q-char1">—</dd>
+      <dt>角色二（位置對應）</dt><dd id="q-char2">—</dd>
+      <dt>負面提示詞</dt><dd id="q-undesired">—</dd>
+    </dl>
+  </section>
+  <section>
+    <h2>Dorossi</h2>
+    <dl class="rows">
+      <dt>等待中的提問</dt><dd id="d-queue">—</dd>
+      <dt>還原失敗</dt><dd id="d-failed">—</dd>
+    </dl>
+    <ol class="events" id="d-events"></ol>
+  </section>
+  <section>
+    <h2>系統</h2>
+    <dl class="rows">
+      <dt>輸出圖片</dt><dd id="s-images">—</dd>
+      <dt>磁碟剩餘</dt><dd id="s-disk">—</dd>
+      <dt>記憶體使用</dt><dd id="s-mem">—</dd>
+    </dl>
+  </section>
+  <section class="wide">
+    <h2>最近的批次事件</h2>
+    <ol class="events" id="events"></ol>
+  </section>
+  <section class="wide">
+    <details><summary>原始狀態（JSON）</summary><pre id="raw">loading...</pre></details>
+  </section>
 </main>
 <script>
-function card(k, v){
-  const box=document.createElement('div'); box.className='card';
-  const kd=document.createElement('div'); kd.className='k'; kd.textContent=k;
-  const vd=document.createElement('div'); vd.className='v'; vd.textContent=v;
-  box.append(kd, vd); return box;
+const $ = (id) => document.getElementById(id);
+function setText(id, value){ $(id).textContent = (value === null || value === undefined || value === '') ? '—' : String(value); }
+function clock(ts){ if(!ts) return '—'; const d = new Date(ts * 1000); return d.toLocaleTimeString('zh-TW', {hour12:false}); }
+function ago(sec){
+  if(sec === null || sec === undefined) return '—';
+  if(sec < 90) return Math.round(sec) + ' 秒前';
+  if(sec < 5400) return Math.round(sec / 60) + ' 分鐘前';
+  return (sec / 3600).toFixed(1) + ' 小時前';
+}
+// 三態：alive 為 null＝pid 檔讀不出來、判斷不出，絕不顯示成「已停止」。
+function batchState(webrunner){
+  if(webrunner.alive === null) return ['判斷不出（pid 檔讀不到）', 'warn'];
+  if(!webrunner.alive) return ['已停止', 'bad'];
+  if(webrunner.paused) return ['已暫停', 'warn'];
+  return ['執行中', 'ok'];
+}
+function renderEvents(listId, events){
+  const items = (events || []).slice().reverse().map((event) => {
+    const li = document.createElement('li');
+    const t = document.createElement('time'); t.textContent = clock(event.ts);
+    const b = document.createElement('b'); b.textContent = event.type || '?';
+    const rest = Object.assign({}, event); delete rest.ts; delete rest.type;
+    const s = document.createElement('span'); s.textContent = JSON.stringify(rest);
+    s.title = s.textContent;
+    li.append(t, b, s); return li;
+  });
+  $(listId).replaceChildren(...items);
+}
+function render(s){
+  const [label, tone] = batchState(s.webrunner);
+  const pill = $('batch-state'); pill.textContent = label; pill.className = 'pill ' + tone;
+  setText('batch-label', s.label);
+  const p = s.progress || {};
+  setText('batch-folder', p.folder);
+  const saved = Number(p.saved || 0), target = Number(p.target || 0);
+  setText('batch-progress', target ? saved + ' / ' + target : '');
+  $('batch-bar').style.width = target ? Math.min(100, saved * 100 / target) + '%' : '0';
+  setText('batch-log', ago(s.webrunner.log_age_sec));
+  const q = s.queues || {};
+  for(const key of ['prompt', 'char1', 'char2', 'undesired']) setText('q-' + key, q[key]);
+  setText('d-queue', s.dorossi.queue); setText('d-failed', s.dorossi.failed_queue);
+  renderEvents('d-events', s.dorossi.events);
+  renderEvents('events', s.events);
+  const sys = s.system || {};
+  setText('s-images', s.output_images);
+  setText('s-disk', sys.disk_free_gb === null || sys.disk_free_gb === undefined ? '' : sys.disk_free_gb + ' GB');
+  setText('s-mem', sys.memory_percent === null || sys.memory_percent === undefined ? '' : sys.memory_percent + '%');
+  setText('updated', clock(s.ts));
+  renderPlatforms(s.platforms || [], s.platform);
+  $('raw').textContent = JSON.stringify(s, null, 2);
+}
+let chosenPlatform = '';
+function renderPlatforms(names, current){
+  const select = $('platform');
+  if(select.dataset.names !== names.join(',')){
+    select.replaceChildren(...names.map(name => {
+      const option = document.createElement('option');
+      option.value = name; option.textContent = name;
+      return option;
+    }));
+    select.dataset.names = names.join(',');
+  }
+  select.value = current || '';
+  chosenPlatform = current || '';
 }
 async function load(){
-  const r=await fetch('/api/status',{cache:'no-store'});
-  const s=await r.json();
-  const cards=document.getElementById('cards');
-  cards.replaceChildren(...[
-    ['Background', s.webrunner.alive === null ? 'unknown (pid unreadable)' : (s.webrunner.alive ? 'running' : 'stopped')],
-    ['Paused', s.webrunner.paused ? 'yes' : 'no'],
-    ['Batch', s.label || '(none)'],
-    ['Dorossi Queue', s.dorossi.queue],
-    ['Failed Restore', s.dorossi.failed_queue],
-    ['Output Images', s.output_images],
-  ].map(([k,v])=>card(k,v)));
-  document.getElementById('raw').textContent=JSON.stringify(s,null,2);
+  try {
+    const query = chosenPlatform ? '?platform=' + encodeURIComponent(chosenPlatform) : '';
+    const r = await fetch('/api/status' + query, {cache: 'no-store'});
+    render(await r.json());
+  } catch (error) {
+    setText('updated', '讀取失敗，稍後重試');
+  }
 }
-load(); setInterval(load, 15000);
+$('refresh').addEventListener('click', load);
+$('platform').addEventListener('change', event => { chosenPlatform = event.target.value; load(); });
+setInterval(() => { if($('auto').checked) load(); }, 15000);
+load();
 </script>
 </html>
 """
@@ -369,8 +603,10 @@ class Handler(BaseHTTPRequestHandler):
                            b'{"error": "host not allowed"}')
                 return
             if self.path.startswith("/api/status"):
+                query = parse_qs(urlsplit(self.path).query)
+                wanted = (query.get("platform") or [None])[0]
                 data = json.dumps(
-                    build_status(), ensure_ascii=False).encode("utf-8")
+                    build_status(wanted), ensure_ascii=False).encode("utf-8")
                 self._send(200, "application/json; charset=utf-8", data)
                 return
             self._send(200, "text/html; charset=utf-8", HTML.encode("utf-8"))

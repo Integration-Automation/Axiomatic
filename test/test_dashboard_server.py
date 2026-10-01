@@ -164,10 +164,10 @@ def test_build_status_uses_count_for_depth_and_tail_for_events():
             continue
         if node.func.id in ("_count_ndjson", "_read_ndjson_tail") and node.args:
             wiring.setdefault(node.func.id, set()).add(ast.unparse(node.args[0]))
-    assert "DOROSSI_QUEUE_FILE" in wiring.get("_count_ndjson", set()), wiring
-    assert "DOROSSI_FAILED_QUEUE_FILE" in wiring.get("_count_ndjson", set()), wiring
-    assert not (wiring.get("_read_ndjson_tail", set())
-                & {"DOROSSI_QUEUE_FILE", "DOROSSI_FAILED_QUEUE_FILE"}), (
+    # 2026-10-01 起每個平台各一份的檔案經 `files[...]`（`_platform_files`）取得。
+    depth = {"files['dorossi_queue']", "files['dorossi_failed']"}
+    assert depth <= wiring.get("_count_ndjson", set()), wiring
+    assert not (wiring.get("_read_ndjson_tail", set()) & depth), (
         "佇列深度被改成用 tail 量了——長過上限之後會無聲少報")
 
 
@@ -258,18 +258,46 @@ def test_the_dashboard_never_shows_unreadable_as_stopped(tmp_path, monkeypatch):
 def test_the_front_end_renders_all_three_states():
     """後端分了三態，前端也要分——否則資訊在最後一步被丟掉。
 
-    這頁的 HTML/JS 是內嵌字串，沒有前端測試框架，所以用原始碼比對。判準刻意窄：
-    只要求那一行同時處理 `null` 與真假兩種情況。
+    這頁的 HTML/JS 是內嵌字串，沒有前端測試框架，所以用原始碼比對：狀態一律經
+    `batchState()` 決定，而它必須先處理 `alive === null`（判斷不出），再處理停止與執行中。
+    2026-10-01 改版之前看的是 `'Background'` 那一行，改版後換成這支函式。
     """
-    import inspect
-    src = inspect.getsource(ds)
-    line = [ln for ln in src.splitlines() if "'Background'" in ln]
-    assert line, "找不到看板那一行——改過的話這支測試要跟著改"
-    row = line[0]
-    assert "null" in row, (
-        f"前端沒有處理 `alive === null`，讀不出來會顯示成 stopped：{row.strip()}")
-    assert "running" in row and "stopped" in row, (
-        f"另外兩態不見了：{row.strip()}")
+    import re
+    match = re.search(r"function batchState\(webrunner\)\{(.*?)\n\}", ds.HTML, re.S)
+    assert match, "找不到 batchState()——改過的話這支測試要跟著改"
+    body = match.group(1)
+    assert "alive === null" in body, f"前端沒有處理判斷不出的那一態：{body}"
+    assert "已停止" in body and "執行中" in body, f"另外兩態不見了：{body}"
+    assert body.index("alive === null") < body.index("已停止"), (
+        "要先判 null 再判停止——`!null` 是 true，順序反了就會把判斷不出顯示成已停止")
+    assert "batchState(s.webrunner)" in ds.HTML, "渲染時沒有用 batchState()"
+
+
+def test_the_progress_summary_never_carries_the_prompt(tmp_path, monkeypatch):
+    """檢查點存著整段提示詞；看板只拿資料夾名與張數。"""
+    monkeypatch.setattr(ds, "read_progress", lambda: {
+        "prompt": "secret prompt", "char1": "secret char", "char2": "",
+        "undesired": "", "folder": "some folder", "target": 120, "saved": 7})
+    assert ds._progress_summary() == {"folder": "some folder", "saved": 7, "target": 120}
+    monkeypatch.setattr(ds, "read_progress", lambda: None)
+    assert ds._progress_summary() == {}
+
+
+def test_queue_depth_skips_blanks_except_in_the_positional_queue(tmp_path):
+    path = tmp_path / "q.md"
+    path.write_text("a\n\n b \n\n", encoding="utf-8")
+    assert ds._queue_depth(path, positional=False) == 2
+    assert ds._queue_depth(path, positional=True) == 4
+    assert ds._queue_depth(tmp_path / "missing.md", positional=False) == 0
+    assert ds._queue_depth(tmp_path, positional=False) is None     # 讀不出來不是 0
+
+
+def test_build_status_carries_the_new_sections():
+    status = ds.build_status()
+    assert set(status["queues"]) == {"prompt", "char1", "char2", "undesired"}
+    assert set(status["system"]) == {"disk_free_gb", "memory_percent"}
+    assert isinstance(status["progress"], dict)
+    assert isinstance(status["platform"], str) and status["platform"]
 
 
 def test_a_missing_mtime_is_none_not_zero(tmp_path):
@@ -632,3 +660,68 @@ def test_a_client_hangup_is_re_raised_not_turned_into_500():
         "否則對方斷線時會被當成內部錯誤再寫一次")
     assert any(isinstance(s, ast.Raise) for s in tries[0].handlers[0].body), (
         "OSError 那一支沒有重拋")
+
+
+# ---------------------------------------------------------------------------
+# 切換平台（2026-10-01）：每個平台各一份的那幾塊跟著換，全機一份的批次不換
+# ---------------------------------------------------------------------------
+
+def _two_platforms(tmp_path, monkeypatch):
+    import _platform_runtime  # noqa: PLC0415
+    state = tmp_path / "state"
+    (state / "discord").mkdir(parents=True)
+    (state / "telegram").mkdir(parents=True)
+    (state / "bad name").mkdir()  # 不合規則的資料夾名不能變成選項
+    monkeypatch.setattr(_platform_runtime, "STATE_ROOT", state)
+    monkeypatch.setattr(ds, "STATE_ROOT", state)
+    monkeypatch.setattr(ds, "active_platform", lambda: "discord")
+    own = state / "discord" / "discord.dorossi_queue.ndjson"
+    own.write_text('{"a": 1}\n', encoding="utf-8")
+    monkeypatch.setattr(ds, "DOROSSI_QUEUE_FILE", own)
+    for name in ("DOROSSI_FAILED_QUEUE_FILE", "DOROSSI_EVENTS_FILE", "GENERATE_HISTORY_FILE"):
+        monkeypatch.setattr(ds, name, state / "discord" / f"{name.lower()}.ndjson")
+    other = state / "telegram" / "telegram.dorossi_queue.ndjson"
+    other.write_text('{"a": 1}\n{"b": 2}\n{"c": 3}\n', encoding="utf-8")
+    monkeypatch.setattr(ds, "BATCH_LABEL_FILE", tmp_path / "batch_label.txt")
+    (tmp_path / "batch_label.txt").write_text("shared-batch", encoding="utf-8")
+
+
+def test_the_status_switches_the_per_platform_parts_only(tmp_path, monkeypatch):
+    _two_platforms(tmp_path, monkeypatch)
+    own = ds.build_status()
+    other = ds.build_status("telegram")
+    assert own["platforms"] == ["discord", "telegram"]
+    assert (own["platform"], own["dorossi"]["queue"]) == ("discord", 1)
+    assert (other["platform"], other["dorossi"]["queue"]) == ("telegram", 3)
+    assert own["label"] == other["label"] == "shared-batch"
+
+
+@pytest.mark.parametrize("wanted", ["../../etc", "bad name", "slack", "", None])
+def test_an_unknown_platform_falls_back_to_this_processs_own(tmp_path, monkeypatch, wanted):
+    """`?platform=` 是外部輸入：只有 `state/` 底下真的有、名字也合規則的才收。"""
+    _two_platforms(tmp_path, monkeypatch)
+    status = ds.build_status(wanted)
+    assert (status["platform"], status["dorossi"]["queue"]) == ("discord", 1)
+
+
+def test_the_query_string_reaches_build_status(monkeypatch):
+    seen = []
+    monkeypatch.setattr(ds, "build_status", lambda platform=None: seen.append(platform) or {})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ds.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/status?platform=telegram", timeout=5) as resp:
+            assert resp.status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert seen == ["telegram"]
+
+
+def test_the_page_has_a_platform_switcher_and_no_unported_console():
+    assert '<select id="platform"' in ds.HTML
+    assert "encodeURIComponent(chosenPlatform)" in ds.HTML
+    assert 'id="console"' not in ds.HTML and "JeffreyRPA" not in ds.HTML

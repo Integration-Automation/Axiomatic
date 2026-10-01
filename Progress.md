@@ -4,7 +4,6 @@
 
 ## 待辦
 
-- 2026-10-01 **（移植・UI 重新設計之一）重做本機儀表板網頁。** Axiomatic 的差異：`axiomatic/dashboard_server.py` 一次只看一個平台（`--platform`／`AXIOMATIC_PLATFORM`，狀態經 `_platform_state`），新版面要能切換平台或並列所有開著的平台；全機共用的批次只有一份，不要按平台重複顯示。完成條件：兩個平台同時開著時實際開過；`test_dashboard_server.py` 綠；四份 README 的儀表板段落更新。
 - 2026-10-01 **（移植・UI 重新設計之二）bot 回覆版面改版。** Axiomatic 的差異：transport 已經有兩個以上，版面原語的純文字退路一開始就要用能力旗標判，不能只為一個平台寫。完成條件：每換一群指令一個階段提交，每個已接上的平台各實測一次；`architecture.md` 記版面原語。
 - 2026-10-01 **（移植・單一 WebRunner 實體）只留 je_web_runner 變體，拿掉 `axiomatic/webrunner_novelai.py`。** Axiomatic 的差異：它用的是套件庫上的 je_web_runner（`requirements.txt` 的 `je_web_runner>=0.0.88`），Jeffrey_RPA 為了補齊 je 變體而加進函式庫的 API 要先發版，再把下限拉到那個版本（照 `requirements.txt` 的下限註解寫法）。`start_webrunner.py`、`run_batch.py` 的變體選擇一起收斂。完成條件：整批與單張產圖只經 je 變體跑完；`CLAUDE.md`、`architecture.md`、四份 README 改成單一變體；整套測試綠。
 - 2026-10-01 **（移植・WebRunner 優先目錄）函式庫工作樹的位置改成可設定。** Axiomatic 的差異：散布版的使用者多半只有套件庫版本，沒有同層的工作樹，所以設定鍵的預設值要讓「沒設定」直接落到已安裝套件而不警告；新鍵同時寫進 `bot_config.example.json`（佔位值，不得帶任何主機路徑）與 `docs/config.md`。完成條件：每種來源各一支測試；四份 README 說明新鍵。

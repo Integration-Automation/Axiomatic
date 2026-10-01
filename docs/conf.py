@@ -28,7 +28,8 @@ myst_enable_extensions = [
 ]
 myst_heading_anchors = 3
 
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+# updates/ 是更新紀錄，不是使用文件。
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "updates"]
 
 # 介面語言（影響搜尋斷詞、自動產生的字串）
 language = "zh_TW"
