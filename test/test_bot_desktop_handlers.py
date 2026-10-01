@@ -674,6 +674,12 @@ class _TemplateSpy:
      "✅ 圖片已出現 → (1, 2)"),
     ("cmd_wait_gone", "wait_image_gone", "image 12 0.6", None, (12.0,),
      {"threshold": 0.6}, "✅ 那張圖已經從畫面上消失"),
+    # 只給一個數字：跟 `/locate image wait` 同一種讀法——0.8 是門檻、秒數照預設；
+    # 45 是秒數、門檻照預設。舊的讀法把 0.8 當成等 0.8 秒。
+    ("cmd_wait_gone", "wait_image_gone", "image 0.8", None, (30.0,),
+     {"threshold": 0.8}, "✅ 那張圖已經從畫面上消失"),
+    ("cmd_wait_gone", "wait_image_gone", "image 45", None, (45.0,),
+     {"threshold": 0.9}, "✅ 那張圖已經從畫面上消失"),
 ])
 def test_image_locators_use_the_attachment_as_the_template(gui, replies, tmp_path, handler,
                                                           call, payload, result, args,
@@ -707,12 +713,60 @@ def test_find_image_lists_hits_without_clicking(gui, replies):
     ("cmd_find_image", "abc", "❌ 門檻必須是 0.1 到 1.0 之間的數字。"),
     ("cmd_wait_image", "soon", "❌ 秒數必須是數字。"),
     ("cmd_wait_image", "700 0.9", "❌ The maximum is 600 seconds."),
+    ("cmd_wait_gone", "image soon", "❌ 秒數必須是數字。"),
+    ("cmd_wait_gone", "image 700 0.9", "❌ The maximum is 600 seconds."),
+    ("cmd_wait_gone", "image 0.05", "❌ 門檻必須介於 0.1 到 1.0。"),
 ])
 def test_image_locators_reject_bad_options_and_still_clean_up(gui, replies, tmp_path,
                                                               handler, payload, reply_start):
     _run(getattr(b, handler)(_message(attachments=[_Attachment(b"t")]), payload))
     assert replies.texts()[-1].startswith(reply_start), replies
     assert gui.calls == [] and list(tmp_path.iterdir()) == []
+
+
+# 兩個指令的參數讀法必須逐格一樣：各自有測試、各自是綠的，不等於兩邊說的是同一件事。
+_IMAGE_WAIT_CORPUS = ["", "0.8", "45", "45 0.8", "1", "1 0.5", "1.5", "600", "0.1"]
+
+
+@pytest.mark.parametrize("payload", _IMAGE_WAIT_CORPUS)
+def test_image_wait_and_image_gone_read_the_arguments_identically(gui, replies, payload):
+    seen = {}
+    for handler, call, text in (("cmd_wait_image", "wait_image", payload),
+                                ("cmd_wait_gone", "wait_image_gone", f"image {payload}")):
+        spy = _TemplateSpy((1, 2))
+        gui.returns[call] = spy
+        _run(getattr(b, handler)(_message(attachments=[_Attachment(b"t")]), text))
+        (_path, _data, args, kwargs), = spy.seen
+        seen[handler] = (args, kwargs)
+    assert seen["cmd_wait_image"] == seen["cmd_wait_gone"], seen
+
+
+def test_the_shared_image_wait_parser_reads_one_number_by_its_size():
+    """單獨一個數字：大於 1 是秒數、其餘是門檻；`1` 是兩者唯一重疊的值，讀成門檻。"""
+    parse = b._parse_image_wait_args
+    assert parse("") == (30.0, b.LOCATE_THRESHOLD_DEFAULT)
+    assert parse("0.8") == (30.0, 0.8)
+    assert parse("1") == (30.0, 1.0)
+    assert parse("1.5") == (1.5, b.LOCATE_THRESHOLD_DEFAULT)
+    assert parse("1 0.5") == (1.0, 0.5)
+    assert parse("12", default_timeout=7.0) == (12.0, b.LOCATE_THRESHOLD_DEFAULT)
+    assert parse("0.5", default_timeout=7.0) == (7.0, 0.5)
+
+
+def test_the_slash_image_wait_sends_both_numbers_so_one_second_is_not_a_threshold(
+        monkeypatch):
+    """斜線指令的 `seconds:1` 沒帶門檻時，以前只送一個 `1`，被讀成門檻 1.0、等 30 秒。"""
+    sent: list = []
+
+    async def _record(_interaction, _attachment, handler, payload, **_kwargs):
+        sent.append((handler, payload))
+
+    monkeypatch.setattr(b, "_slash_run_with_file", _record)
+    _run(b.slash_locate_image_wait.callback(object(), object(), 1))
+    _run(b.slash_locate_image_wait.callback(object(), object(), 1, 0.5))
+    assert [handler for handler, _payload in sent] == [b.cmd_wait_image] * 2
+    assert [b._parse_image_wait_args(payload) for _handler, payload in sent] == [
+        (1.0, b.LOCATE_THRESHOLD_DEFAULT), (1.0, 0.5)]
 
 
 @pytest.mark.parametrize("handler", ["cmd_click_image", "cmd_find_image", "cmd_wait_image"])

@@ -19032,11 +19032,14 @@ async def cmd_wait_text(message: discord.Message, payload: str) -> None:
     await safe_reply(message, f"✅ 文字已出現 → ({x}, {y})")
 
 
+LOCATE_THRESHOLD_DEFAULT = 0.9   # 圖片定位的比對門檻預設值
+
+
 def _parse_locate_threshold(raw: str) -> float:
-    """圖片定位的比對門檻（0.1..1.0，預設 0.9）。不合法就丟 `_GuiError`。"""
+    """圖片定位的比對門檻（0.1..1.0，預設 `LOCATE_THRESHOLD_DEFAULT`）。不合法就丟 `_GuiError`。"""
     text = (raw or "").strip()
     if not text:
-        return 0.9
+        return LOCATE_THRESHOLD_DEFAULT
     try:
         value = float(text.split()[0])
     except ValueError as error:
@@ -19044,6 +19047,30 @@ def _parse_locate_threshold(raw: str) -> float:
     if not 0.1 <= value <= 1.0:
         raise _GuiError("門檻必須介於 0.1 到 1.0。")
     return value
+
+
+IMAGE_WAIT_ARGS_HINT = "[秒] [門檻 0.1..1]（只給一個數字：大於 1 是秒數，其餘是門檻）"
+
+
+def _parse_image_wait_args(raw: str, default_timeout: float = 30.0) -> tuple[float, float]:
+    """`[秒] [門檻]` → `(秒數, 門檻)`；`/locate image wait` 與 `/locate gone image` 共用的唯一讀法。
+
+    兩個參數都是數字，`split_timeout` 的「開頭是數字就當秒數」分不出來。規則（擁有者裁定
+    2026-10-01 兩個指令統一成這一種）：兩個參數 → 秒數在前；只有一個 → 大於 1 當秒數，
+    否則當門檻。門檻的合法範圍是 0.1..1.0，唯一跟秒數重疊的是 `1`：單獨一個 `1` 讀成門檻
+    1.0，要等 1 秒就連門檻一起給（斜線指令的包裝一律送兩個）。不合法就丟 `_GuiError`。
+    """
+    parts = (raw or "").split()
+    timeout = default_timeout
+    if parts:
+        try:
+            first = float(parts[0])
+        except ValueError as error:
+            raise _GuiError("秒數必須是數字。") from error
+        if len(parts) >= 2 or first > 1.0:
+            timeout = _gui.parse_duration(parts[0], maximum=600.0)
+            parts = parts[1:]
+    return timeout, _parse_locate_threshold(" ".join(parts))
 
 
 async def _with_attachment_template(message: discord.Message, usage: str,
@@ -19124,27 +19151,14 @@ async def cmd_wait_image(message: discord.Message, payload: str) -> None:
     辨識引擎沒裝時，這是唯一能用畫面內容當同步點的方法（`/locate text wait` 不可用）。
     """
     async def _work(path: str) -> None:
-        parts = (payload or "").strip().split()
-        timeout = 30.0
-        # 兩個參數都是數字，`split_timeout` 的「開頭是數字就當秒數」分不出來。
-        # 規則：兩個參數 → 秒數在前；只有一個 → 大於 1 當秒數，否則當門檻
-        # （門檻的合法範圍就是 0.1..1.0，不會跟秒數重疊）。
-        if parts:
-            try:
-                first = float(parts[0])
-            except ValueError as error:
-                raise _GuiError("秒數必須是數字。") from error
-            if len(parts) >= 2 or first > 1.0:
-                timeout = _gui.parse_duration(parts[0], maximum=600.0)
-                parts = parts[1:]
-        threshold = _parse_locate_threshold(" ".join(parts))
+        timeout, threshold = _parse_image_wait_args(payload)
         x, y = await asyncio.to_thread(
             _gui.wait_image, path, timeout, threshold=threshold)
         await safe_reply(message, f"✅ 圖片已出現 → ({x}, {y})")
 
     await _with_attachment_template(
         message,
-        "用法：上傳一張要等待的圖片，訊息內容打 `/locate image wait [秒] [門檻 0..1]`",
+        f"用法：上傳一張要等待的圖片，訊息內容打 `/locate image wait` {IMAGE_WAIT_ARGS_HINT}",
         _work)
 
 
@@ -19546,7 +19560,7 @@ async def cmd_wait_gone(message: discord.Message, payload: str) -> None:
     usage = ("用法：\n"
              "• `/locate gone text [秒] <文字>`（可加 `--in <x> <y> <寬> <高>`）\n"
              "• `/locate gone window [秒] <視窗標題片段>`\n"
-             "• `/locate gone image [秒] [門檻]`（附一張圖）")
+             f"• `/locate gone image` {IMAGE_WAIT_ARGS_HINT}（附一張圖）")
     raw = (payload or "").strip()
     parts = raw.split(maxsplit=1)
     sub = parts[0].lower() if parts else ""
@@ -19554,18 +19568,14 @@ async def cmd_wait_gone(message: discord.Message, payload: str) -> None:
 
     if sub == "image":
         async def _work(path: str) -> None:
-            bits = rest.split()
-            timeout = 30.0
-            if bits:
-                timeout = _gui.parse_duration(bits[0], maximum=600.0)
-                bits = bits[1:]
-            threshold = _parse_locate_threshold(" ".join(bits))
+            timeout, threshold = _parse_image_wait_args(rest)
             await asyncio.to_thread(
                 _gui.wait_image_gone, path, timeout, threshold=threshold)
             await safe_reply(message, "✅ 那張圖已經從畫面上消失")
 
         await _with_attachment_template(
-            message, "用法：上傳一張圖，訊息內容打 `/locate gone image [秒] [門檻]`",
+            message,
+            f"用法：上傳一張圖，訊息內容打 `/locate gone image` {IMAGE_WAIT_ARGS_HINT}",
             _work)
         return
 
@@ -27825,8 +27835,11 @@ async def slash_locate_image_wait(
         interaction: discord.Interaction, template: discord.Attachment,
         seconds: discord.app_commands.Range[int, 1, 600] = 30,
         threshold: discord.app_commands.Range[float, 0.1, 1.0] = None) -> None:
-    payload = str(seconds) if threshold is None else f"{seconds} {threshold}"
-    await _slash_run_with_file(interaction, template, cmd_wait_image, payload,
+    # 一律送兩個數字：單獨一個 `1` 會被讀成門檻（`_parse_image_wait_args`）。
+    if threshold is None:
+        threshold = LOCATE_THRESHOLD_DEFAULT
+    await _slash_run_with_file(interaction, template, cmd_wait_image,
+                               f"{seconds} {threshold}",
                                detach_ack="⏳ 等待中…")
 
 
