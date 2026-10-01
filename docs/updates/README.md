@@ -60,3 +60,4 @@
 | U-20261001-06 | 2026-10-01 | 本機儀表板重新設計，加上平台切換 | #done |
 | U-20261001-07 | 2026-10-01 | 回覆改成卡片與分頁：/dorossi running、/sys health、/gen plan、/out stats | #done |
 | U-20261001-08 | 2026-10-01 | 補齊設定鍵說明，新增桌面自動化與 Dorossi 專頁 | #done |
+| U-20261001-09 | 2026-10-01 | 移植 bot 修正：/sys version、長輸入截短、圖庫欄位、/gen current | #done |

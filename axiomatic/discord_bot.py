@@ -17288,7 +17288,8 @@ async def cmd_current(message: discord.Message) -> None:
             await safe_reply(message, "目前沒有進行中的角色 — 背景產圖程式未在執行")
         return
     name = current.get("name", "?")
-    target = current.get("target", 0) or 0
+    # 事件檔是另一個行程寫的 JSON：`NaN`／`Infinity` 進得來，`int()` 會在畫進度條時丟例外。
+    target = int(_event_number(current.get("target")) or 0)
     folder = current.get("folder", name)
     saved = _count_folder_images(folder)
     started = current.get("ts")
@@ -23656,7 +23657,9 @@ def _event_number(value) -> float | None:
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # `OverflowError`：JSON 的整數沒有上限，`float(10**400)` 丟的是它，不是 ValueError——
+        # 少了它，這支「never raises」會丟例外，連帶 `_format_duration_short` 也丟。
         return None
     return number if math.isfinite(number) else None
 
