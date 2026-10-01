@@ -85,8 +85,11 @@ fallback 檔（`prompt.md` / `character1.md` / `character2.md` /
 
 ## 排程節奏（工作 / 休息）
 
-webrunner 累計工作時間達 `schedule_limit_hours`（預設 16h）後，會睡
-`rest_hours`（預設 6h）再繼續，計時歸零。這是為了模擬人類節奏、避免被限流。
+webrunner 在角色與角色之間檢查工作時間：再開一個角色會讓累計工作時間超過
+`schedule_limit_hours`（預設 16h）時（以剛收工那個角色花的時間估下一個），就先睡
+`rest_hours`（預設 6h）再繼續，計時歸零；佇列裡沒有下一個角色時不睡、直接收工。
+這是為了模擬人類節奏、避免被限流，也縮短瀏覽器連續運轉的時間。細節見設定說明的
+`schedule_limit_hours`。
 
 ## 記憶體洩漏緩解：定期重啟 Chrome
 

@@ -6642,6 +6642,89 @@ def serve_single_image_request(port, req: dict, in_band: bool = False) -> None:
               file=sys.stderr)
 
 
+# A resumed character must run at least this fraction of its images in this process before
+# its duration is used to extrapolate "how long a whole character takes". Below half, the
+# multiplier exceeds 2, and the rate of that short stretch is decided almost entirely by the
+# quota state at that moment: just refilled, it burns through in one go; just run dry, it is
+# one sixty-minute wait — the extrapolation can be off by several times in either direction.
+_RESUME_ESTIMATE_MIN_FRACTION = 0.5
+
+
+def estimate_next_character_hours(char_hours: float, target: int,
+                                  resume_count: int) -> float | None:
+    """Estimate "how many hours the next character takes" from the one that just finished;
+    None when there is no usable estimate.
+
+    `char_hours` is what this character actually spent in this process (quota waits and pauses
+    inside the character included — the next character meets quota waits too, which is exactly
+    why a character takes more than ten hours).
+
+    * A character run from image 1 (`resume_count == 0`): returned as is. One kept in the
+      queue for falling short of the threshold counts too — `generate_loop` still walked every
+      image, and the time the failed ones cost is the cost of the next character.
+    * A resumed character only did the remaining images: if this process ran at least half a
+      character, extrapolate by image count (`char_hours × target / images run this round`);
+      below half return None, for the reason at `_RESUME_ESTIMATE_MIN_FRACTION`.
+    * A character already finished last round and merely not popped
+      (`resume_count >= target`) produced nothing this round and took seconds: None.
+
+    On None the caller falls back to looking at elapsed hours alone (the rule before this
+    change). Under-estimating is the safe direction: the worst case is one extra character, as
+    before; only over-estimating makes the rest come early, and the multiplier is capped at 2.
+
+    The division cannot divide by zero: reaching the last line means `resume_count > 0` and
+    `attempted >= target / 2`, which together give `attempted >= resume_count > 0`.
+    """
+    if resume_count <= 0:
+        return char_hours
+    attempted = target - resume_count
+    if attempted < target * _RESUME_ESTIMATE_MIN_FRACTION:
+        return None
+    return char_hours * target / attempted
+
+
+def schedule_rest_due(elapsed_hours: float, limit_hours: float,
+                      next_character_hours: float | None) -> bool:
+    """Whether to rest now, at the moment a character finishes: **do not start a character
+    that would end past the limit**.
+
+    A rest only ever falls between two characters (stopping mid-character means refilling the
+    fields, deliberately not done here), so the question is not "are we past the limit yet" but
+    "would one more character end past it". Comparing only the former lets a whole extra
+    character run after the limit is crossed: the hours past the limit buy no output (quota
+    accumulates during the rest all the same), only a longer continuous browser run, and
+    shortening that is the reason the rest exists.
+
+    `next_character_hours` is the result of `estimate_next_character_hours`; None (no usable
+    estimate) falls back to `elapsed_hours` alone. Exactly at the limit does not count as
+    crossing it, matching the old rule's `>`.
+    """
+    if next_character_hours is None:
+        return elapsed_hours > limit_hours
+    return elapsed_hours + next_character_hours > limit_hours
+
+
+def _another_character_pending(skip: int, produced: int) -> bool:
+    """Peek at the queues: will `run_batch`'s next turn really start a character.
+
+    For the scheduled rest. The reason to rest is "do not start a character that would cross
+    the limit"; with no next character to start, a rest only delays the finish by `rest_hours`
+    (6 hours by default) — the browser sits open and `todo_done` goes out six hours late. With
+    the rule now a prediction, that would happen almost every time (the last character usually
+    "is predicted to cross"), so it is blocked.
+
+    The test copies the top of the loop: `decide` returns BREAK, or the next main prompt is
+    `end` (and not a fallback) = the next turn produces nothing. The peek before a Chrome
+    restart asks only the first half; this one also asks about `end`, because resting six
+    hours in front of an `end` is the same wasted wait.
+    """
+    real, eff, fb = read_queues()
+    peek = _queue_consume.decide(*real, *eff, *fb, skip, produced)
+    if peek.action == _queue_consume.ACTION_BREAK:
+        return False
+    return fb[0] or not _queue_consume.is_end_marker(peek.batch[0])
+
+
 def rest_until(port, wake_ts: float, *, slice_sec: float = 30.0) -> bool:
     """**Sliced** sleep for the scheduled rest (the `rest_hours` after `schedule_limit_hours`
     is reached).
@@ -7566,6 +7649,12 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
         end_sentinel_hit = False
         while True:
             wait_if_paused("pair boundary")
+            # When this character starts counting, for the scheduled rest to estimate "how
+            # long the next character takes" when it finishes. Placed after the boundary
+            # pause: time spent paused between two characters belongs to neither. A turn that
+            # `continue`s after a failed field fill restarts the count on the next turn, so it
+            # is not charged to the next character.
+            char_started_mono = time.monotonic()
             # Every turn re-reads the four real queues and applies the fallbacks → eff + fb
             # flags.
             real, eff, fb = read_queues()
@@ -7961,10 +8050,32 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                       f"todo entry retained for retry")
                 skip += 1
 
-            elapsed_h = (time.monotonic() - schedule_start_mono) / 3600
-            print(f"  schedule elapsed: {elapsed_h:.2f}h")
+            # Scheduled rest: **do not start a character that would end past the limit** (the
+            # rule is in `schedule_rest_due`). Both durations come from one `now_mono`, so
+            # they agree with each other.
+            now_mono = time.monotonic()
+            elapsed_h = (now_mono - schedule_start_mono) / 3600
+            next_char_h = estimate_next_character_hours(
+                (now_mono - char_started_mono) / 3600, target_count,
+                resume_count)
+            if next_char_h is None:
+                print(f"  schedule elapsed: {elapsed_h:.2f}h (resumed at "
+                      f"{resume_count}/{target_count}; too little ran here to "
+                      f"estimate the next character)")
+            else:
+                print(f"  schedule elapsed: {elapsed_h:.2f}h (the next character "
+                      f"would end near {elapsed_h + next_char_h:.2f}h)")
             schedule_limit_h = batch_cfg["schedule_limit_hours"]
-            if elapsed_h > schedule_limit_h:
+            rest_due = schedule_rest_due(elapsed_h, schedule_limit_h,
+                                         next_char_h)
+            if rest_due and (fallback_single or not _another_character_pending(
+                    skip, produced)):
+                # The rest exists so the next character is not started; with no next
+                # character it only delays the finish by `rest_hours` (see
+                # `_another_character_pending`).
+                print("  schedule rest skipped: no character left to start")
+                rest_due = False
+            if rest_due:
                 rest_h = batch_cfg["rest_hours"]
                 rest_s = rest_h * 3600
                 # `rest_hours: 0` is a legitimate setting (= no rest, just reset the timer).
@@ -7994,8 +8105,16 @@ def run_batch(port, email, password, *, setup_fn, minimize_fn,
                     wake_ts = time.time() + rest_s
                     wake_at = time.strftime(
                         "%Y-%m-%d %H:%M:%S", time.localtime(wake_ts))
-                    print(f"  schedule limit ({schedule_limit_h}h) exceeded; "
-                          f"resting {rest_h}h (wake at {wake_at})")
+                    # Say which kind it is: already past, or predicted to be crossed by the
+                    # next character — in the latter case `schedule elapsed` is still under
+                    # the limit, and without this it would read as a misjudgment.
+                    if elapsed_h > schedule_limit_h:
+                        why = f"schedule limit ({schedule_limit_h}h) exceeded"
+                    else:
+                        why = (f"schedule limit ({schedule_limit_h}h) would be "
+                               f"crossed by the next character "
+                               f"(~{next_char_h:.2f}h)")
+                    print(f"  {why}; resting {rest_h}h (wake at {wake_at})")
                     # Resting is **deliberate** idling, not a hang — but from outside the two
                     # cannot be told apart: `/rate`'s "no new image for over an hour" warning
                     # would light up for every minute of the rest. Emitting an event lets the

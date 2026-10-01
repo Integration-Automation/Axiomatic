@@ -2273,8 +2273,11 @@ def test_run_batch_announces_the_scheduled_rest():
         seen = []
         h.patch("rest_until", lambda port, wake_ts, **kw:
                 seen.append(wake_ts) or False)
+        # 要有**第二個**角色：休息只落在兩個角色之間，佇列裡最後一個角色收工時
+        # 不休息（`_another_character_pending`），所以單一角色的佇列根本走不到
+        # 這裡要驗的事件。第二個角色收工時也不休息——所以下面仍然是剛好一筆。
         h.write_queue("todo_prompt.md", ["P"])
-        h.write_queue("todo_character1.md", ["a"])
+        h.write_queue("todo_character1.md", ["a", "b"])
         before = time.time()
         rc = _run_batch(FakeBrowserPort())
         after = time.time()
@@ -2305,12 +2308,19 @@ def test_a_zero_length_rest_stays_silent():
         h.cfg_over = {"schedule_limit_hours": 0, "rest_hours": 0}
         called = []
         h.patch("rest_until", lambda *a, **k: called.append(1) or False)
+        # 兩個角色：佇列裡最後一個角色收工時根本不進休息分支，只有一個角色的話
+        # 下面三句「沒有發生」的斷言會在分支完全沒跑到的情況下照樣成立。
         h.write_queue("todo_prompt.md", ["P"])
-        h.write_queue("todo_character1.md", ["a"])
-        rc = _run_batch(FakeBrowserPort())
+        h.write_queue("todo_character1.md", ["a", "b"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = _run_batch(FakeBrowserPort())
         rest = h.events_of("schedule_rest")
         back = h.events_of("schedule_resumed")
     assert rc == 0, rc
+    # 正面對照：休息分支真的跑到了（計時器照樣要歸零），上面才算驗到東西。
+    assert out.getvalue().count("schedule timer reset to 0") == 1, (
+        f"休息分支沒有跑到，下面的斷言驗不到任何東西: {out.getvalue()[-2000:]}")
     assert not rest and not back, f"零長度休息不該發事件: {h.events}"
     assert not called, "零長度休息不該進切片睡"
     print("  PASS\n")
@@ -2338,6 +2348,186 @@ def test_a_rest_that_served_a_single_image_forces_a_refill():
         f"沒插播就不該多填一次: {_run(False)}")
     assert _run(True) == ["P", "P"], (
         f"插播過就必須強制重填主提示詞: {_run(True)}")
+    print("  PASS\n")
+
+
+# ---------- 排程休息：不開一個做完會跨過上限的角色 ------------------------------
+#
+# 2026-09-13～09-19 五個完整週期，休息時的 `schedule elapsed` 是
+# 29.60／24.32／24.76／24.45／23.39 小時（上限 16）：舊規則只在角色收工後比
+# `elapsed > 上限`，所以超過之後還會把整整一個角色做完。下面幾支用假時鐘讓每個角色
+# 花掉指定的時數，看休息落在哪一個角色之後。
+
+
+def _rests_for(durations_h, limit_h, *, prompts=None, images=None,
+               resume_existing=0):
+    """跑一次 `run_batch`：第 i 個角色（名字 `c<i>`）在單調時鐘上花 `durations_h[i]`
+    小時。回 `(批序, [(休息前剛收工的角色, 已工作時數)], 每個角色收到的 resume_count)`。
+
+    `resume_existing > 0` 時在 `output/c0/` 放那麼多張圖並寫一份對得上的檢查點，
+    讓第一個角色以續跑的身分進來。
+    """
+    names = [f"c{i}" for i in range(len(durations_h))]
+    with _RunBatchHarness() as h:
+        h.cfg_over = {"schedule_limit_hours": limit_h, "rest_hours": 6}
+        if images is not None:
+            h.cfg_over["images_per_character"] = images
+        h.patch("rest_until", lambda port, wake_ts, **kw: False)
+        h.write_queue("todo_prompt.md", prompts or ["P"])
+        h.write_queue("todo_character1.md", names)
+        if resume_existing:
+            folder = h.dir / "output" / "c0"
+            folder.mkdir(parents=True)
+            for i in range(1, resume_existing + 1):
+                (folder / f"c0_{i:04d}_20260101_000000.png").write_bytes(b"x")
+            _rp.write_progress((prompts or ["P"])[0], "c0", "", "", "c0",
+                               images)
+        with _fake_clock() as clk:
+            spent = iter(durations_h)
+
+            def fake_gen(port, character_name, *a, **k):
+                h.gen_calls.append({"name": character_name,
+                                    "resume_count": k.get("resume_count", 0)})
+                clk.now += next(spent) * 3600
+                return h.gen_saved
+            h.patch("generate_loop", fake_gen)
+            rc = _run_batch(FakeBrowserPort())
+        assert rc == 0, rc
+        rests = [(r["character"], round(r["worked_sec"] / 3600, 2))
+                 for r in h.events_of("schedule_rest")]
+        resumes = [c["resume_count"] for c in h.gen_calls]
+        order = [c["name"] for c in h.gen_calls]
+    return order, rests, resumes
+
+
+def test_the_schedule_rests_before_a_character_that_would_cross_the_limit():
+    """預測會跨過 → 現在就休息。
+
+    每個角色 10 小時、上限 16：第一個角色收工時才工作 10 小時（舊規則照樣往下做，
+    做完第二個已經 20 小時），但再開一個會在 20 小時收工，所以**現在**就休息。休息
+    完計時器歸零，第二個角色收工時是同一個局面，再休息一次。
+
+    第三個（最後一個）角色收工時同樣「預測會跨過」，但佇列裡已經沒有下一個角色可開，
+    休息只會把收工延後六小時——不休息（另有一支專門釘這件事）。
+    """
+    print("test_the_schedule_rests_before_a_character_that_would_cross_the_limit")
+    order, rests, _ = _rests_for([10, 10, 10], 16)
+    assert order == ["c0", "c1", "c2"], order
+    assert rests == [("c0", 10.0), ("c1", 10.0)], (
+        f"每個角色 10h、上限 16h：要在每個角色之後就休息，不可以等做完兩個"
+        f"（20h）才休息: {rests}")
+    print("  PASS\n")
+
+
+def test_the_schedule_keeps_working_while_the_next_character_still_fits():
+    """還早 → 繼續做；估計用的是**剛收工的那一個**角色。
+
+    第一組：每個角色 5 小時、上限 16。5+5、10+5 都還在上限內，繼續；做完第三個
+    是 15 小時，再開一個會到 20——這時才休息（舊規則在 15 小時不休息，要到 20）。
+    拿「已工作時數」當估計的話，第二個角色收工時 10+10 就會休息。
+
+    第二組：角色長度不一（2、9、2、2）。第二個角色收工時才工作 11 小時，但**它**花了
+    9 小時，再開一個會到 20，所以休息。拿第一個角色（2 小時）當估計的話 11+2 還在
+    上限內，會誤判成繼續。
+
+    第三組：先一個 12 小時的角色，之後都是 2 小時。休息之後估計要跟著換成 2 小時：
+    記著 12 小時（歷史最大值）的話，第四個角色收工時 6+12 會誤判成要休息。
+    """
+    print("test_the_schedule_keeps_working_while_the_next_character_still_fits")
+    order, rests, _ = _rests_for([5, 5, 5, 5], 16)
+    assert order == ["c0", "c1", "c2", "c3"], order
+    assert rests == [("c2", 15.0)], (
+        f"5h 的角色在 5／10 小時收工時都還放得下下一個，要到 15 小時才休息: {rests}")
+
+    order, rests, _ = _rests_for([2, 9, 2, 2], 16)
+    assert rests == [("c1", 11.0)], (
+        f"估計要用剛收工的那個角色（9h），不是第一個角色（2h）: {rests}")
+
+    order, rests, _ = _rests_for([12, 2, 2, 2, 2], 16)
+    assert rests == [("c0", 12.0)], (
+        f"休息之後的估計要跟著最新的角色（2h），不是記著 12h: {rests}")
+    print("  PASS\n")
+
+
+def test_a_character_resumed_from_late_in_its_run_does_not_predict_the_next():
+    """第一個角色沒有可用的歷史值 → 照舊只看已工作時數。
+
+    監督者重生之後，第一個角色常常是續跑進來的，本行程只做了剩下那幾張；拿它的耗時當
+    「一個角色要多久」會失真（兩個方向都有，見 `_RESUME_ESTIMATE_MIN_FRACTION`）。
+    這裡 10 張裡已經有 7 張，本行程只跑 3 張：它收工時工作 10 小時，**不**預測，所以
+    不休息；第二個角色從第 1 張開始，收工時 20 小時，照舊規則休息。
+    """
+    print("test_a_character_resumed_from_late_in_its_run_does_not_predict_the_next")
+    order, rests, resumes = _rests_for([10, 10, 1], 16, images=10,
+                                       resume_existing=7)
+    assert resumes[0] == 7, f"第一個角色要以續跑的身分進來: {resumes}"
+    assert rests == [("c1", 20.0)], (
+        f"只跑了 3/10 張的續跑角色不可以拿來預測下一個（會在 10h 就休息）: {rests}")
+    print("  PASS\n")
+
+
+def test_a_character_resumed_early_in_its_run_is_scaled_to_a_whole_one():
+    """續跑進來、但本行程至少跑了一半的角色：按張數外推成一整個角色。
+
+    10 張裡已經有 4 張，本行程跑 6 張花 6 小時 → 一整個角色估 10 小時。上限 15：
+    6+10 會跨過，所以現在休息。不外推（拿 6 小時當估計）或不預測的話都不會休息。
+    """
+    print("test_a_character_resumed_early_in_its_run_is_scaled_to_a_whole_one")
+    order, rests, resumes = _rests_for([6, 1, 1], 15, images=10,
+                                       resume_existing=4)
+    assert resumes[0] == 4, f"第一個角色要以續跑的身分進來: {resumes}"
+    assert rests == [("c0", 6.0)], (
+        f"跑了 6/10 張、花 6h 的續跑角色要外推成 10h，6+10 > 15 → 休息: {rests}")
+    print("  PASS\n")
+
+
+def test_no_rest_when_there_is_no_next_character_to_start():
+    """休息只落在兩個角色之間：佇列裡沒有下一個角色可開，就不休息。
+
+    休息是為了「別開一個會跨過上限的角色」；沒有下一個角色的時候它只會把收工延後
+    六小時（瀏覽器開著空等、`todo_done` 晚六小時才發）。改成預測之後最後一個角色
+    收工時幾乎每次都「預測會跨過」，所以這件事從偶爾變成常態。
+
+    三種「沒有下一個」：佇列空了（已經超過上限與只是預測會跨過兩種都要擋）、下一筆
+    主提示詞是 `end`。正面對照：同樣的時數、佇列裡還有下一個角色時，休息確實會發生。
+    """
+    print("test_no_rest_when_there_is_no_next_character_to_start")
+    # 正面對照：c0 收工時預測會跨過，而且還有 c1 → 休息。
+    _, rests, _ = _rests_for([10, 10], 16)
+    assert rests == [("c0", 10.0)], f"還有下一個角色時要休息: {rests}"
+    # 預測會跨過、但佇列只剩這一個。
+    _, rests, _ = _rests_for([10], 16)
+    assert rests == [], f"沒有下一個角色可開，不該休息: {rests}"
+    # 已經超過上限（舊規則那條路）、佇列只剩這一個。
+    _, rests, _ = _rests_for([20], 16)
+    assert rests == [], f"已經超過上限也一樣，沒有下一個角色就不休息: {rests}"
+    # 下一筆主提示詞是 `end`：下一圈只會停下來，不會產圖。
+    order, rests, _ = _rests_for([10, 10], 16, prompts=["P", "end"])
+    assert order == ["c0"], order
+    assert rests == [], f"下一筆是 end 時休息只是白等: {rests}"
+    print("  PASS\n")
+
+
+def test_the_schedule_rest_rule_itself():
+    """`schedule_rest_due` 與 `estimate_next_character_hours` 的邊界，直接對純函式。
+
+    剛好等於上限不算跨過（舊規則是 `>`，換成預測之後維持同一個語意）；外推的門檻是
+    「本行程至少跑了半個角色」，剛好一半算數。
+    """
+    print("test_the_schedule_rest_rule_itself")
+    due = ws.schedule_rest_due
+    assert due(8.0, 16.0, 8.0) is False, "8+8 剛好等於 16，不算跨過"
+    assert due(8.0, 16.0, 8.5) is True
+    assert due(15.0, 16.0, None) is False, "沒有估計時照舊只看已工作時數"
+    assert due(16.5, 16.0, None) is True
+    assert due(16.5, 16.0, 0.0) is True, "已經超過就一定休息"
+
+    est = ws.estimate_next_character_hours
+    assert est(7.5, 10, 0) == 7.5, "從第 1 張開始的角色原樣回傳"
+    assert est(5.0, 10, 5) == 10.0, "剛好跑一半：外推兩倍"
+    assert est(4.0, 10, 6) is None, "不到一半：不外推"
+    assert est(0.01, 10, 10) is None, "上一輪已做滿、這一輪一張都沒產"
+    assert est(0.01, 10, 12) is None
     print("  PASS\n")
 
 
