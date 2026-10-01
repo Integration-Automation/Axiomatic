@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "axiomatic"))
 from _dorossi_gemini import (  # noqa: E402
     GeminiStreamState, gemini_argv, gemini_round_info, _api_equivalent_rates,
-    parse_agy_usage_report,
+    parse_agy_usage_report, stdin_message,
 )
 from dorossi_backend import (  # noqa: E402
     dorossi_resolve_model, dorossi_session_backend, _dorossi_loop_resume_plan,
@@ -51,12 +51,21 @@ def test_resume_uses_only_new_tokens_and_never_claims_zero_bill():
 
 
 def test_agy_argv_uses_current_headless_flags():
-    argv = gemini_argv("agy.exe", "hello", session_id="sid-1",
+    argv = gemini_argv("agy.exe", session_id="sid-1",
                        model="gemini-3.1-pro-high", effort="max", full=True)
-    assert argv == ["agy.exe", "-p", "hello", "--output-format", "stream-json",
+    assert argv == ["agy.exe", "-p", "", "--input-format", "stream-json",
+                    "--output-format", "stream-json",
                     "--conversation", "sid-1", "--model", "gemini-3.1-pro-high",
                     "--effort", "high",
                     "--dangerously-skip-permissions"]
+
+
+def test_the_stdin_message_has_the_shape_the_cli_accepts():
+    """量出來的形狀（2026-10-01）：event 必須是 `user`、message 必須是 role/content 的對話訊息。"""
+    line = stdin_message("你好 \"quoted\"")
+    assert line.endswith(b"\n") and line.count(b"\n") == 1
+    assert json.loads(line) == {"event": "user",
+                                "message": {"role": "user", "content": "你好 \"quoted\""}}
 
 
 def test_gemini_session_selection_model_and_loop_resume():
@@ -89,6 +98,7 @@ def test_agy_quota_report_accepts_only_validated_model_rows():
 # 2026-10-01. The fake process below replaces only `create_subprocess_exec`.
 
 import asyncio  # noqa: E402
+import json  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -109,10 +119,26 @@ class _ResumeGone(Exception):
     pass
 
 
+class _FakeStdin:
+    def __init__(self):
+        self.data = b""
+        self.closed = False
+
+    def write(self, data):
+        self.data += data
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
 class _FakeProc:
     """A child whose stdout is a fixed list of lines; `kill` says it already exited."""
 
     def __init__(self, lines, *, rc=0, stderr=b"", hang=False):
+        self.stdin = _FakeStdin()
         self.stdout = asyncio.StreamReader()
         for line in lines:
             self.stdout.feed_data(line.encode("utf-8") + b"\n")
@@ -229,3 +255,16 @@ def test_a_timeout_survives_a_child_that_already_exited(monkeypatch):
     with pytest.raises(TimeoutError):
         _run(monkeypatch, make, hard_limit=0.05)
     assert made and made[0].kills >= 1
+
+
+def test_a_long_prompt_goes_over_stdin_not_the_command_line(monkeypatch):
+    """命令列上限 32,767 字元；提示放在 stdin，就再也撞不到它。"""
+    prompt = "x" * 40000
+    (answer, _sid, _info), spawned, _recorded = _run(
+        monkeypatch, lambda: _FakeProc(_OK), prompt=prompt)
+    argv, proc = spawned[0], spawned[1]
+    assert answer == "done"
+    assert all(prompt not in arg for arg in argv) and sum(map(len, argv)) < 2000
+    assert proc.stdin.closed
+    sent = json.loads(proc.stdin.data)
+    assert sent["event"] == "user" and prompt in sent["message"]["content"]

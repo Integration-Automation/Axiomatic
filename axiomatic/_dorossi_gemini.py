@@ -70,12 +70,19 @@ def find_gemini_executable() -> str | None:
     return None
 
 
-def gemini_argv(exe: str, prompt: str, *, session_id: str | None = None,
+def gemini_argv(exe: str, *, session_id: str | None = None,
                 model: str | None = None, effort: str | None = None,
                 full: bool = False,
                 extra_dir: str | None = None) -> list[str]:
-    """Build one Antigravity headless turn using its documented flags."""
-    args = [exe, "-p", prompt, "--output-format", "stream-json"]
+    """Build one Antigravity headless turn. The prompt is NOT on the command line.
+
+    It goes over stdin as one stream-json message (`stdin_message`): a Windows
+    command line tops out at 32,767 characters, and the system prompt plus loop
+    guidance alone is about 2,700, so a long paste or a batch of folded-in
+    additions used to fail at `CreateProcess` with nothing but a generic error.
+    """
+    args = [exe, "-p", "", "--input-format", "stream-json",
+            "--output-format", "stream-json"]
     if session_id:
         args += ["--conversation", session_id]
     if model:
@@ -105,6 +112,18 @@ async def _bounded_stderr(task, timeout: float = 5.0) -> str:
         if not task.done():
             task.cancel()
     return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw or "")
+
+
+def stdin_message(prompt: str) -> bytes:
+    """One prompt as the CLI's stream-json input line (measured 2026-10-01, CLI 1.1.15+).
+
+    The documented flag only says "newline-delimited JSON prompts"; the shape was
+    found by probing: the event must be `user` and `message` must be a chat message
+    with `role`/`content` (a bare string, or `{"text": ...}`, is rejected). Closing
+    stdin afterwards ends the run after this one turn.
+    """
+    record = {"event": "user", "message": {"role": "user", "content": prompt}}
+    return (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def _count(value) -> int:
@@ -247,12 +266,12 @@ async def via_gemini(prompt: str, session_id: str | None, *, on_text=None,
                 + str(extra_dir) + "\n\n" + wire)
     if not session_id:
         wire = system_prompt + "\n\nUser message:\n" + wire
-    args = gemini_argv(exe, wire, session_id=session_id, model=model,
+    args = gemini_argv(exe, session_id=session_id, model=model,
                        effort=effort, full=full,
                        extra_dir=extra_dir)
     args += ["--print-timeout", f"{max(1, int(hard_limit))}s"]
     proc = await asyncio.create_subprocess_exec(
-        *args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        *args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, cwd=workdir, limit=16 * 1024 * 1024)
     if on_proc:
         try:
@@ -268,6 +287,14 @@ async def via_gemini(prompt: str, session_id: str | None, *, on_text=None,
             proc.kill()
         except ProcessLookupError:
             pass   # exited between the returncode check and the kill
+    try:
+        proc.stdin.write(stdin_message(wire))
+        await proc.stdin.drain()
+        proc.stdin.close()
+    except (BrokenPipeError, ConnectionResetError, OSError) as error:
+        # An aborted (killed) child, or one that died at start-up: the run below
+        # reads EOF and reports the failure; the pipe error itself goes to stderr.
+        print(f"[dorossi] agy stdin failed: {error!r}", file=sys.stderr)
     stderr_task = asyncio.create_task(drain(proc.stderr))
     state = GeminiStreamState(session_id)
     clock = clock_factory() if clock_factory else None
