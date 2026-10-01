@@ -23,6 +23,7 @@ import 會讀設定檔、建 client、連帶要有憑證。
 """
 import argparse
 import ast
+import json
 import sys
 from pathlib import Path
 
@@ -614,15 +615,20 @@ class Surface:
             return OWNER_INNER
         return None
 
-    def role_line(self, command):
+    def role_name(self, command):
+        """角色閘要求的最低角色（`viewer`／`operator`／`admin`）；公開指令回 None。"""
         if self.is_public(command):
             return None
         bang = command["extras"].get("bang")
         if bang and bang in self.viewer_bangs:
-            return "權限：viewer 以上"
+            return "viewer"
         if bang and bang in self.admin_bangs:
-            return "權限：admin 以上"
-        return "權限：operator 以上"
+            return "admin"
+        return "operator"
+
+    def role_line(self, command):
+        role = self.role_name(command)
+        return "權限：%s 以上" % role if role else None
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +812,8 @@ def render_index(surface: Surface) -> str:
               % (len(flat), len(top_vars), top_total, SLASH_TOP_LEVEL_LIMIT,
                  SLASH_TOP_LEVEL_LIMIT - top_total, len(surface.commands)), ""]
     lines += ["指令群只佔一個頂層額度、群內子指令不計——這是唯一能長期擴充的作法。", ""]
+    lines += ["同一份清單的機器可讀版本在 [`commands.json`](commands.json)"
+              "（同一個產生器、同一次抽取：名稱、描述、參數、權限）。", ""]
     lines += ["| 檔案 | 範圍 | 內容 | 子指令 |", "|---|:--:|---|---:|"] + rows + [""]
     lines += ["🔒 限頻道（擁有者可跨頻道）／🌐 跨頻道。", ""]
     lines += ["## 權限", "",
@@ -832,11 +840,59 @@ def render_index(surface: Surface) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+# `commands.json` 的格式版本。欄位改名或拿掉時加一；只加欄位不必（讀的人照樣讀得到舊欄位）。
+COMMANDS_JSON_SCHEMA = 1
+_OWNER_GATE_KEYS = {OWNER_PRE: "before_dispatch", OWNER_INNER: "inside_handler"}
+
+
+def render_json(surface: Surface) -> str:
+    """同一份指令樹的機器可讀版本（`commands/commands.json`）。
+
+    跟 `.md` 是**同一次抽取**的產物，不是第二個抽取器——所以兩份不會對不上，`--check`
+    與 `test_docs_sync.test_commands_docs_are_generated` 也一併比對它。給程式讀的：儀表板
+    的指令補全、與可散布鏡像比對指令差異。
+
+    **刻意不收文字指令（`extras["bang"]`／`mention`）**：這份檔案住在斜線平台的使用者
+    文件目錄裡，DoD #3 禁止任何使用者文件教 `!cmd`；沒有斜線選單的平台要文字寫法時，由
+    bot 送出那一刻的 `_chat_platform.rewrite_command_hints` 換，不從這裡拿。
+
+    `access`：`owner`（兩種擁有者閘任一）、`public`（跨頻道、不受角色閘）、否則是角色閘
+    要求的最低角色（`viewer`／`operator`／`admin`）。排序依完整指令名，輸出固定，重跑
+    不會產生差異。
+    """
+    rows = []
+    for command in sorted(surface.commands, key=lambda c: c["qualified"]):
+        owner = surface.owner_line(command)
+        if owner:
+            access = "owner"
+        elif surface.is_public(command):
+            access = "public"
+        else:
+            access = surface.role_name(command)
+        rows.append({
+            "name": "/" + command["qualified"],
+            "group": command["path"][0] if len(command["path"]) > 1 else None,
+            "description": command["description"],
+            "access": access,
+            "owner_gate": _OWNER_GATE_KEYS.get(owner),
+            "public": surface.is_public(command),
+            "params": [{"name": param["name"], "type": param["type"],
+                        "required": param["required"], "description": param["desc"]}
+                       for param in command["params"]],
+        })
+    payload = {"schema": COMMANDS_JSON_SCHEMA,
+               "source": "axiomatic/discord_bot.py",
+               "count": len(rows),
+               "commands": rows}
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
 def build() -> dict:
     """檔名 -> 應有的內容。"""
     surface = Surface()
     out = {"README.md": render_index(surface),
-           "_direct.md": render_direct(surface)}
+           "_direct.md": render_direct(surface),
+           "commands.json": render_json(surface)}
     for var in surface.registered:
         out["%s.md" % surface.groups[var]["name"]] = render_group(surface, var)
     return out

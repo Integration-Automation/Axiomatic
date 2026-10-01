@@ -697,6 +697,31 @@ def test_commands_docs_are_generated():
         "（編輯性質的補充說明寫進 `gen_command_docs.NOTES` / `COMMAND_NOTES`。）")
 
 
+def test_commands_json_is_the_same_tree_as_the_markdown():
+    """`commands/commands.json` 跟 `.md` 是同一次抽取的產物，內容必須說同一件事。
+
+    上一支只證明「磁碟上的檔案＝產生器的輸出」；這一支證明產生器的 JSON 本身沒有漏：
+    每一個斜線指令剛好一列、`access` 與擁有者閘一致，而且**不帶文字指令**——這份檔案
+    住在斜線平台的使用者文件目錄裡，DoD #3 禁止使用者文件教 `!cmd`。
+    """
+    import json  # noqa: PLC0415
+    import gen_command_docs  # noqa: PLC0415
+
+    text = gen_command_docs.build()["commands.json"]
+    data = json.loads(text)
+    assert data["schema"] == gen_command_docs.COMMANDS_JSON_SCHEMA
+    names = [row["name"] for row in data["commands"]]
+    assert len(names) >= 250, f"只抽到 {len(names)} 個指令，抽取器多半壞了"
+    assert len(names) == len(set(names)) == data["count"]
+    tree = {"/" + command["qualified"]
+            for command in gen_command_docs.Surface().commands}
+    assert set(names) == tree
+    for row in data["commands"]:
+        assert row["access"] in {"owner", "public", "viewer", "operator", "admin"}, row
+        assert (row["access"] == "owner") == (row["owner_gate"] is not None), row
+    assert '"bang"' not in text and '"mention"' not in text
+    assert not re.search(r"(?<![\w!])![a-z_]{2,}", text), "JSON 裡出現了文字指令寫法"
+
 def _orphan_notes(notes: dict, valid: set, allow=frozenset()) -> list:
     """回「指向不存在的東西」的那些 key。
 

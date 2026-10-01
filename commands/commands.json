@@ -1,0 +1,4486 @@
+{
+  "schema": 1,
+  "source": "axiomatic/discord_bot.py",
+  "count": 271,
+  "commands": [
+    {
+      "name": "/booru",
+      "group": null,
+      "description": "圖庫搜圖：tag 隨機一張（可模糊；不帶 tag 用預設圖）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "tags",
+          "type": "文字",
+          "required": false,
+          "description": "tag 字串（可模糊輸入；留空 = 預設圖）"
+        },
+        {
+          "name": "latest",
+          "type": "是／否",
+          "required": false,
+          "description": "抓最新一張（不隨機）"
+        },
+        {
+          "name": "grid",
+          "type": "是／否",
+          "required": false,
+          "description": "抓 4 張拼成 2x2 上傳"
+        }
+      ]
+    },
+    {
+      "name": "/clip files",
+      "group": "clip",
+      "description": "剪貼簿裡的檔案清單（只回數量與副檔名）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/clip formats",
+      "group": "clip",
+      "description": "剪貼簿現在放著哪幾種內容",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/clip image",
+      "group": "clip",
+      "description": "讀剪貼簿裡的圖片",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/clip paste",
+      "group": "clip",
+      "description": "寫入後直接貼上（輸入中日文只能走這條）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要貼上的文字"
+        }
+      ]
+    },
+    {
+      "name": "/clip read",
+      "group": "clip",
+      "description": "讀剪貼簿文字",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/clip set",
+      "group": "clip",
+      "description": "寫入剪貼簿",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要寫入的文字"
+        }
+      ]
+    },
+    {
+      "name": "/clip setimage",
+      "group": "clip",
+      "description": "把附件圖片寫進剪貼簿",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "image",
+          "type": "附件",
+          "required": true,
+          "description": "要寫入剪貼簿的圖片"
+        }
+      ]
+    },
+    {
+      "name": "/config reload",
+      "group": "config",
+      "description": "重載執行期可熱更新的設定",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/config reset",
+      "group": "config",
+      "description": "還原某項設定，或 all 全部還原",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "key",
+          "type": "文字",
+          "required": true,
+          "description": "要還原的設定名稱，或 all"
+        }
+      ]
+    },
+    {
+      "name": "/config set",
+      "group": "config",
+      "description": "修改一項設定",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "key",
+          "type": "文字",
+          "required": true,
+          "description": "要修改的設定名稱"
+        },
+        {
+          "name": "value",
+          "type": "文字",
+          "required": true,
+          "description": "新的值"
+        }
+      ]
+    },
+    {
+      "name": "/config show",
+      "group": "config",
+      "description": "顯示目前各項設定",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/dorossi abort",
+      "group": "dorossi",
+      "description": "中止進行中的工作",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "target",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號，或 all 全部（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi ai",
+      "group": "dorossi",
+      "description": "顯示或切換這個工作階段的後端",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "provider",
+          "type": "文字",
+          "required": false,
+          "description": "留空 = 只顯示目前設定"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi allowdir add",
+      "group": "dorossi",
+      "description": "新增一個可存取的目錄",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "path",
+          "type": "文字",
+          "required": true,
+          "description": "目錄路徑"
+        },
+        {
+          "name": "session",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi allowdir list",
+      "group": "dorossi",
+      "description": "列出額外可存取的目錄",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "session",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi allowdir remove",
+      "group": "dorossi",
+      "description": "移除額外可存取的目錄",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "session",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi ask",
+      "group": "dorossi",
+      "description": "提問（可能跑很久）",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "prompt",
+          "type": "文字",
+          "required": true,
+          "description": "要問的內容；開頭可加 /effort 或 /model 調整這個工作階段的設定"
+        },
+        {
+          "name": "session",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號（如 s3）；只影響這一次，不會切換目前的工作階段"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi compact",
+      "group": "dorossi",
+      "description": "壓縮對話脈絡（可能跑數分鐘）",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "session",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號（可省略 = 目前這個）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi effort",
+      "group": "dorossi",
+      "description": "顯示或設定這個工作階段的思考力度",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "effort",
+          "type": "文字",
+          "required": false,
+          "description": "留空 = 只顯示目前設定；「預設」= 清除覆寫"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi errors",
+      "group": "dorossi",
+      "description": "最近的警告與錯誤事件",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi fullmode",
+      "group": "dorossi",
+      "description": "顯示目前的工具模式",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi health",
+      "group": "dorossi",
+      "description": "健康檢查",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi logs",
+      "group": "dorossi",
+      "description": "最近的執行期事件",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "n",
+          "type": "整數（1–50）",
+          "required": false,
+          "description": "筆數（預設 20、上限 50）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi model",
+      "group": "dorossi",
+      "description": "顯示或設定這個工作階段的模型",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "model",
+          "type": "文字",
+          "required": false,
+          "description": "留空 = 只顯示目前設定；「預設」= 清除覆寫"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi queue clear",
+      "group": "dorossi",
+      "description": "清空等待佇列",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "session",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號，或 all 全部"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi queue detail",
+      "group": "dorossi",
+      "description": "列出等待中的提問（含內容）",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi queue failed_clear",
+      "group": "dorossi",
+      "description": "清掉失敗佇列",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi queue move",
+      "group": "dorossi",
+      "description": "調整等待中提問的順序",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "source",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "原本的編號"
+        },
+        {
+          "name": "target",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "要移到的編號"
+        },
+        {
+          "name": "session",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi queue remove",
+      "group": "dorossi",
+      "description": "取消第 N 筆（或指定 id）等待中的提問",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "index",
+          "type": "整數（1–9999）",
+          "required": false,
+          "description": "編號"
+        },
+        {
+          "name": "session",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號（可省略）"
+        },
+        {
+          "name": "id",
+          "type": "文字",
+          "required": false,
+          "description": "detail 印出的 id，填了就不看編號；停放中的提問只能用這個"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi queue retry_failed",
+      "group": "dorossi",
+      "description": "重試失敗的提問",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi queue show",
+      "group": "dorossi",
+      "description": "列出等待中的提問",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi queue undo",
+      "group": "dorossi",
+      "description": "復原上一次佇列操作",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi retry",
+      "group": "dorossi",
+      "description": "重試上一個提問（可能跑很久）",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "session",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號（可省略 = 目前這個）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi running",
+      "group": "dorossi",
+      "description": "正在執行的工作與同時執行上限",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi session archive",
+      "group": "dorossi",
+      "description": "封存工作階段",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "id",
+          "type": "文字",
+          "required": true,
+          "description": "工作階段代號"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi session continue",
+      "group": "dorossi",
+      "description": "接續未完成的自走任務（沒有回合上限）",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "id",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號，或 all 全部接續（可省略 = 目前這個）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi session delete",
+      "group": "dorossi",
+      "description": "刪除工作階段",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "id",
+          "type": "文字",
+          "required": true,
+          "description": "工作階段代號"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi session export",
+      "group": "dorossi",
+      "description": "把工作階段匯出成檔案",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "id",
+          "type": "文字",
+          "required": true,
+          "description": "工作階段代號"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi session list",
+      "group": "dorossi",
+      "description": "列出所有工作階段",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi session new",
+      "group": "dorossi",
+      "description": "開一個新的工作階段並切換過去",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "label",
+          "type": "文字",
+          "required": false,
+          "description": "標籤（可省略）"
+        },
+        {
+          "name": "workdir",
+          "type": "文字",
+          "required": false,
+          "description": "工作目錄（可省略；要是已存在的目錄）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi session rename",
+      "group": "dorossi",
+      "description": "改工作階段的標籤",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "id",
+          "type": "文字",
+          "required": true,
+          "description": "工作階段代號"
+        },
+        {
+          "name": "label",
+          "type": "文字",
+          "required": true,
+          "description": "新的標籤"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi session reset",
+      "group": "dorossi",
+      "description": "清空工作階段的對話脈絡",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "id",
+          "type": "文字",
+          "required": true,
+          "description": "工作階段代號"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi session switch",
+      "group": "dorossi",
+      "description": "切換到指定工作階段",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "id",
+          "type": "文字",
+          "required": true,
+          "description": "工作階段代號"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi status",
+      "group": "dorossi",
+      "description": "執行期狀態",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi tokens",
+      "group": "dorossi",
+      "description": "本機用量（估算美元）與後端帳號額度",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/dorossi workspace_clean",
+      "group": "dorossi",
+      "description": "清理舊的工作目錄",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "dry",
+          "type": "是／否",
+          "required": false,
+          "description": "只預覽不刪除"
+        },
+        {
+          "name": "days",
+          "type": "整數（1–3650）",
+          "required": false,
+          "description": "保留幾天（預設 30）"
+        }
+      ]
+    },
+    {
+      "name": "/dorossi yield",
+      "group": "dorossi",
+      "description": "讓自走任務提交後暫停、交出編輯權",
+      "access": "owner",
+      "owner_gate": "inside_handler",
+      "public": true,
+      "params": [
+        {
+          "name": "target",
+          "type": "文字",
+          "required": false,
+          "description": "工作階段代號，或 all 全部（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/e621",
+      "group": null,
+      "description": "furry 取向圖庫隨機一張（預設 NSFW；加 rating:safe 限 SFW）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "tags",
+          "type": "文字",
+          "required": true,
+          "description": "tag 字串（可模糊輸入）"
+        }
+      ]
+    },
+    {
+      "name": "/eta",
+      "group": null,
+      "description": "預估完成時間（有終止標記只算到標記為止）",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/fav clear",
+      "group": "fav",
+      "description": "清空收藏（`*` = 全部角色）",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "character",
+          "type": "文字",
+          "required": true,
+          "description": "角色名稱，或 `*` 清全部"
+        }
+      ]
+    },
+    {
+      "name": "/fav list",
+      "group": "fav",
+      "description": "收藏總覽，或某角色的編號清單",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "character",
+          "type": "文字",
+          "required": false,
+          "description": "角色名稱（留空 = 總覽）"
+        }
+      ]
+    },
+    {
+      "name": "/fav remove",
+      "group": "fav",
+      "description": "移除該角色第 i 筆收藏",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "character",
+          "type": "文字",
+          "required": true,
+          "description": "角色名稱"
+        },
+        {
+          "name": "index",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "收藏編號"
+        }
+      ]
+    },
+    {
+      "name": "/fav show",
+      "group": "fav",
+      "description": "上傳該角色的前 N 張收藏",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "character",
+          "type": "文字",
+          "required": true,
+          "description": "角色名稱"
+        },
+        {
+          "name": "n",
+          "type": "整數（1–5）",
+          "required": false,
+          "description": "幾張（上限 5）（預設 `1`）"
+        }
+      ]
+    },
+    {
+      "name": "/fun 8ball",
+      "group": "fun",
+      "description": "魔術 8 球",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "question",
+          "type": "文字",
+          "required": true,
+          "description": "你的問題"
+        }
+      ]
+    },
+    {
+      "name": "/fun ascii",
+      "group": "fun",
+      "description": "大字 ASCII art",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要放大的文字（上限 60 字）"
+        }
+      ]
+    },
+    {
+      "name": "/fun calc",
+      "group": "fun",
+      "description": "安全計算機（不執行任意程式碼）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "expression",
+          "type": "文字",
+          "required": true,
+          "description": "算式，例如 2+2*3"
+        }
+      ]
+    },
+    {
+      "name": "/fun choose",
+      "group": "fun",
+      "description": "隨機選一個（| 分隔選項）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "options",
+          "type": "文字",
+          "required": true,
+          "description": "A | B | C（至少兩個，| 分隔）"
+        }
+      ]
+    },
+    {
+      "name": "/fun coinflip",
+      "group": "fun",
+      "description": "擲硬幣",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/fun rand",
+      "group": "fun",
+      "description": "範圍內隨機整數",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "minimum",
+          "type": "整數",
+          "required": true,
+          "description": "下限（整數）"
+        },
+        {
+          "name": "maximum",
+          "type": "整數",
+          "required": true,
+          "description": "上限（整數）"
+        }
+      ]
+    },
+    {
+      "name": "/fun reverse",
+      "group": "fun",
+      "description": "字串反轉",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要反轉的文字"
+        }
+      ]
+    },
+    {
+      "name": "/fun roll",
+      "group": "fun",
+      "description": "擲骰子（NdM，預設 1d6）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "dice",
+          "type": "文字",
+          "required": false,
+          "description": "NdM — N 1-100、M 2-1000（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/fun rps",
+      "group": "fun",
+      "description": "剪刀石頭布",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "move",
+          "type": "文字",
+          "required": true,
+          "description": "rock / paper / scissors（或 r / p / s）"
+        }
+      ]
+    },
+    {
+      "name": "/fun timer",
+      "group": "fun",
+      "description": "倒數計時，結束時 @ 提醒你",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "duration",
+          "type": "文字",
+          "required": true,
+          "description": "時長，例如 30s / 5m / 1h"
+        },
+        {
+          "name": "message",
+          "type": "文字",
+          "required": false,
+          "description": "提醒內容（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/gen current",
+      "group": "gen",
+      "description": "目前正在產的角色與進度",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/gen image",
+      "group": "gen",
+      "description": "依提示詞產生單張圖（限擁有者）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "prompt",
+          "type": "文字",
+          "required": true,
+          "description": "主提示詞"
+        },
+        {
+          "name": "character1",
+          "type": "文字",
+          "required": false,
+          "description": "角色 1（可省略）"
+        },
+        {
+          "name": "character2",
+          "type": "文字",
+          "required": false,
+          "description": "角色 2（可省略）"
+        },
+        {
+          "name": "negative",
+          "type": "文字",
+          "required": false,
+          "description": "負面提示詞（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/gen image_queue",
+      "group": "gen",
+      "description": "單張產圖佇列（限擁有者）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "args",
+          "type": "文字",
+          "required": false,
+          "description": "留空 = 顯示；clear / remove <N> / front <N> / history / retry <id> / undo"
+        }
+      ]
+    },
+    {
+      "name": "/gen pause",
+      "group": "gen",
+      "description": "在安全邊界暫停背景產圖",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "after",
+          "type": "整數（0–999）",
+          "required": false,
+          "description": "再跑幾個配對才暫停（0 = 做完目前這個就停）"
+        }
+      ]
+    },
+    {
+      "name": "/gen plan",
+      "group": "gen",
+      "description": "完整跑批計畫（會依序跑的所有配對）",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "n",
+          "type": "整數（1–60）",
+          "required": false,
+          "description": "最多列幾列（預設 25、上限 60）"
+        }
+      ]
+    },
+    {
+      "name": "/gen preview",
+      "group": "gen",
+      "description": "預覽下一輪要跑的三元組",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/gen progress",
+      "group": "gen",
+      "description": "各角色對目標張數的進度條",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/gen resume",
+      "group": "gen",
+      "description": "恢復已暫停的批次",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/grid",
+      "group": null,
+      "description": "圖庫最新 4 張拼 2x2 上傳（等同 /booru 同時開 latest 與 grid）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "tags",
+          "type": "文字",
+          "required": true,
+          "description": "tag 字串（可模糊輸入）"
+        }
+      ]
+    },
+    {
+      "name": "/help",
+      "group": null,
+      "description": "指令說明（tw / cn / en）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "lang",
+          "type": "文字",
+          "required": false,
+          "description": "語言：tw / cn / en（預設 tw）"
+        }
+      ]
+    },
+    {
+      "name": "/host get",
+      "group": "host",
+      "description": "把主機上的檔案取回（限擁有者）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "path",
+          "type": "文字",
+          "required": true,
+          "description": "主機上的檔案路徑"
+        }
+      ]
+    },
+    {
+      "name": "/host job clear",
+      "group": "host",
+      "description": "清掉已結束的作業紀錄",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/host job eof",
+      "group": "host",
+      "description": "關掉某個作業的輸入端",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "id",
+          "type": "整數（1–99999）",
+          "required": true,
+          "description": "作業編號"
+        }
+      ]
+    },
+    {
+      "name": "/host job list",
+      "group": "host",
+      "description": "列出背景作業",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/host job log",
+      "group": "host",
+      "description": "看某個作業的輸出",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "id",
+          "type": "整數（1–99999）",
+          "required": true,
+          "description": "作業編號"
+        },
+        {
+          "name": "lines",
+          "type": "整數（1–500）",
+          "required": false,
+          "description": "要看幾行"
+        }
+      ]
+    },
+    {
+      "name": "/host job run",
+      "group": "host",
+      "description": "丟到背景跑，不等它結束",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "command",
+          "type": "文字",
+          "required": true,
+          "description": "要執行的指令"
+        },
+        {
+          "name": "keep_stdin",
+          "type": "是／否",
+          "required": false,
+          "description": "保留輸入端（之後可用 send / eof）"
+        }
+      ]
+    },
+    {
+      "name": "/host job send",
+      "group": "host",
+      "description": "送一行文字給互動式作業",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "id",
+          "type": "整數（1–99999）",
+          "required": true,
+          "description": "作業編號"
+        },
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要送出的文字"
+        }
+      ]
+    },
+    {
+      "name": "/host job stop",
+      "group": "host",
+      "description": "中止某個作業",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "id",
+          "type": "整數（1–99999）",
+          "required": true,
+          "description": "作業編號"
+        }
+      ]
+    },
+    {
+      "name": "/host panic",
+      "group": "host",
+      "description": "一次全停（限擁有者）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/host put",
+      "group": "host",
+      "description": "把附件寫到主機上（限擁有者）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "file",
+          "type": "附件",
+          "required": true,
+          "description": "要寫入的檔案"
+        },
+        {
+          "name": "path",
+          "type": "文字",
+          "required": true,
+          "description": "主機上的目的地"
+        },
+        {
+          "name": "force",
+          "type": "是／否",
+          "required": false,
+          "description": "目的地已存在時仍然覆寫"
+        }
+      ]
+    },
+    {
+      "name": "/host sh cd",
+      "group": "host",
+      "description": "切換工作目錄（記住到重啟）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "path",
+          "type": "文字",
+          "required": false,
+          "description": "新的工作目錄（留空 = 回專案根目錄）"
+        }
+      ]
+    },
+    {
+      "name": "/host sh run",
+      "group": "host",
+      "description": "執行一行指令",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "command",
+          "type": "文字",
+          "required": true,
+          "description": "要執行的指令"
+        },
+        {
+          "name": "timeout",
+          "type": "整數（1–900）",
+          "required": false,
+          "description": "逾時秒數（預設 60、上限 900）"
+        }
+      ]
+    },
+    {
+      "name": "/host sh stop",
+      "group": "host",
+      "description": "中止所有還在跑的指令",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/info avatar",
+      "group": "info",
+      "description": "顯示頭貼（預設自己）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "user",
+          "type": "使用者",
+          "required": false,
+          "description": "要查頭貼的使用者（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/info channel",
+      "group": "info",
+      "description": "channel 元資料",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/info ping",
+      "group": "info",
+      "description": "回應延遲",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/info server",
+      "group": "info",
+      "description": "server 元資料",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/info uptime",
+      "group": "info",
+      "description": "bot 已執行多久",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/info version",
+      "group": "info",
+      "description": "版本（short SHA ＋ branch）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/input click",
+      "group": "input",
+      "description": "在指定座標按一下",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "X 座標"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "Y 座標"
+        },
+        {
+          "name": "button",
+          "type": "選項：`左鍵` / `右鍵` / `中鍵`",
+          "required": false,
+          "description": "要按哪個鍵（預設 `left`）"
+        },
+        {
+          "name": "window",
+          "type": "文字",
+          "required": false,
+          "description": "改用相對此視窗左上角的座標（視窗一移動絕對座標就全錯）"
+        },
+        {
+          "name": "background",
+          "type": "是／否",
+          "required": false,
+          "description": "送給背景視窗、不搶焦點（盡力而為）"
+        },
+        {
+          "name": "shot",
+          "type": "是／否",
+          "required": false,
+          "description": "完成後附一張截圖"
+        }
+      ]
+    },
+    {
+      "name": "/input hotkey",
+      "group": "input",
+      "description": "送出快捷鍵組合",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "combo",
+          "type": "文字",
+          "required": true,
+          "description": "`+` 分隔，例如 ctrl+s 或 alt+f4"
+        }
+      ]
+    },
+    {
+      "name": "/input key clear",
+      "group": "input",
+      "description": "放開全部按住的鍵",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/input key down",
+      "group": "input",
+      "description": "按住某個鍵不放",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "鍵名，例如 shift / ctrl / a"
+        }
+      ]
+    },
+    {
+      "name": "/input key press",
+      "group": "input",
+      "description": "按一下某個鍵",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "鍵名"
+        },
+        {
+          "name": "window",
+          "type": "文字",
+          "required": false,
+          "description": "送給背景視窗、不搶焦點（盡力而為）"
+        }
+      ]
+    },
+    {
+      "name": "/input key status",
+      "group": "input",
+      "description": "目前按住哪些鍵、各多久",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/input key up",
+      "group": "input",
+      "description": "放開某個鍵",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "鍵名"
+        }
+      ]
+    },
+    {
+      "name": "/input mouse click",
+      "group": "input",
+      "description": "按一下（不給座標就點目前位置）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "button",
+          "type": "選項：`左鍵` / `右鍵` / `中鍵`",
+          "required": false,
+          "description": "要按哪個鍵（預設 `left`）"
+        },
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": false,
+          "description": "X 座標（可省略）"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": false,
+          "description": "Y 座標（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/input mouse dclick",
+      "group": "input",
+      "description": "雙擊",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "X 座標"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "Y 座標"
+        },
+        {
+          "name": "button",
+          "type": "選項：`左鍵` / `右鍵` / `中鍵`",
+          "required": false,
+          "description": "要按哪個鍵（預設 `left`）"
+        }
+      ]
+    },
+    {
+      "name": "/input mouse down",
+      "group": "input",
+      "description": "按住滑鼠鍵不放",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "button",
+          "type": "選項：`左鍵` / `右鍵` / `中鍵`",
+          "required": false,
+          "description": "要按住哪個鍵（預設 `left`）"
+        },
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": false,
+          "description": "X 座標（可省略）"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": false,
+          "description": "Y 座標（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/input mouse drag",
+      "group": "input",
+      "description": "拖曳",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "x1",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "起點 X"
+        },
+        {
+          "name": "y1",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "起點 Y"
+        },
+        {
+          "name": "x2",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "終點 X"
+        },
+        {
+          "name": "y2",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "終點 Y"
+        },
+        {
+          "name": "button",
+          "type": "選項：`左鍵` / `右鍵` / `中鍵`",
+          "required": false,
+          "description": "要按哪個鍵（預設 `left`）"
+        }
+      ]
+    },
+    {
+      "name": "/input mouse move",
+      "group": "input",
+      "description": "移動游標",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "X 座標"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "Y 座標"
+        }
+      ]
+    },
+    {
+      "name": "/input mouse pos",
+      "group": "input",
+      "description": "目前游標座標",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/input mouse scroll",
+      "group": "input",
+      "description": "捲動（正值往上）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "amount",
+          "type": "整數（-1000–1000）",
+          "required": true,
+          "description": "格數，正值往上、負值往下"
+        },
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": false,
+          "description": "X 座標（可省略）"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": false,
+          "description": "Y 座標（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/input mouse up",
+      "group": "input",
+      "description": "放開滑鼠鍵",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "button",
+          "type": "選項：`左鍵` / `右鍵` / `中鍵`",
+          "required": false,
+          "description": "要放開哪個鍵（預設 `left`）"
+        },
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": false,
+          "description": "X 座標（可省略）"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": false,
+          "description": "Y 座標（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/input type",
+      "group": "input",
+      "description": "把文字原樣輸入到焦點視窗",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要輸入的字串（打不出中日文，那用 /clip paste）"
+        }
+      ]
+    },
+    {
+      "name": "/iqdb",
+      "group": null,
+      "description": "跨圖庫反向圖搜（回前幾名來源＋相似度 %）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "url",
+          "type": "文字",
+          "required": true,
+          "description": "直連圖片 URL"
+        }
+      ]
+    },
+    {
+      "name": "/latest",
+      "group": null,
+      "description": "上傳最近 N 張產出圖",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "n",
+          "type": "整數",
+          "required": false,
+          "description": "幾張（預設 1、上限 5）"
+        }
+      ]
+    },
+    {
+      "name": "/launcher start",
+      "group": "launcher",
+      "description": "啟動獨立監督者",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/launcher status",
+      "group": "launcher",
+      "description": "看獨立監督者在不在跑",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/launcher stop",
+      "group": "launcher",
+      "description": "停止獨立監督者",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/locate gone",
+      "group": "locate",
+      "description": "等某個東西從畫面上消失",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "kind",
+          "type": "選項：`文字` / `視窗` / `圖片`",
+          "required": true,
+          "description": "要等哪一種目標消失"
+        },
+        {
+          "name": "target",
+          "type": "文字",
+          "required": true,
+          "description": "目標內容"
+        },
+        {
+          "name": "seconds",
+          "type": "整數（1–600）",
+          "required": false,
+          "description": "最長等幾秒（預設 `30`）"
+        }
+      ]
+    },
+    {
+      "name": "/locate image click",
+      "group": "locate",
+      "description": "找到樣板圖片就點它的中心",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "template",
+          "type": "附件",
+          "required": true,
+          "description": "要比對的樣板圖片"
+        },
+        {
+          "name": "threshold",
+          "type": "數字（0.1–1.0）",
+          "required": false,
+          "description": "相似度門檻（預設 0.9）"
+        }
+      ]
+    },
+    {
+      "name": "/locate image find",
+      "group": "locate",
+      "description": "找出畫面上所有命中處，不點下去",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "template",
+          "type": "附件",
+          "required": true,
+          "description": "要比對的樣板圖片"
+        },
+        {
+          "name": "threshold",
+          "type": "數字（0.1–1.0）",
+          "required": false,
+          "description": "相似度門檻（預設 0.9）"
+        }
+      ]
+    },
+    {
+      "name": "/locate image wait",
+      "group": "locate",
+      "description": "等樣板圖片出現在畫面上",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "template",
+          "type": "附件",
+          "required": true,
+          "description": "要等的樣板圖片"
+        },
+        {
+          "name": "seconds",
+          "type": "整數（1–600）",
+          "required": false,
+          "description": "最長等幾秒（預設 `30`）"
+        },
+        {
+          "name": "threshold",
+          "type": "數字（0.1–1.0）",
+          "required": false,
+          "description": "相似度門檻（預設 0.9）"
+        }
+      ]
+    },
+    {
+      "name": "/locate pixel",
+      "group": "locate",
+      "description": "等某一點變成（或不再是）指定顏色",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "X 座標"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "Y 座標"
+        },
+        {
+          "name": "color",
+          "type": "文字",
+          "required": true,
+          "description": "#RRGGBB"
+        },
+        {
+          "name": "invert",
+          "type": "是／否",
+          "required": false,
+          "description": "改成等它「不等於」該顏色"
+        },
+        {
+          "name": "seconds",
+          "type": "整數（1–600）",
+          "required": false,
+          "description": "最長等幾秒（預設 `30`）"
+        },
+        {
+          "name": "tolerance",
+          "type": "整數（0–255）",
+          "required": false,
+          "description": "容許誤差"
+        }
+      ]
+    },
+    {
+      "name": "/locate text click",
+      "group": "locate",
+      "description": "找到畫面上的文字就點下去",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要點的文字"
+        },
+        {
+          "name": "lang",
+          "type": "文字",
+          "required": false,
+          "description": "辨識語言代碼"
+        },
+        {
+          "name": "shot",
+          "type": "是／否",
+          "required": false,
+          "description": "完成後附一張截圖"
+        }
+      ]
+    },
+    {
+      "name": "/locate text find",
+      "group": "locate",
+      "description": "找文字並回座標與信心值",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要找的文字"
+        },
+        {
+          "name": "region",
+          "type": "文字",
+          "required": false,
+          "description": "限定區域「x y 寬 高」"
+        },
+        {
+          "name": "lang",
+          "type": "文字",
+          "required": false,
+          "description": "辨識語言代碼（留空 = 自動判斷）"
+        }
+      ]
+    },
+    {
+      "name": "/locate text wait",
+      "group": "locate",
+      "description": "等某段文字出現在畫面上",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要等的文字"
+        },
+        {
+          "name": "seconds",
+          "type": "整數（1–600）",
+          "required": false,
+          "description": "最長等幾秒（預設 `30`）"
+        },
+        {
+          "name": "lang",
+          "type": "文字",
+          "required": false,
+          "description": "辨識語言代碼"
+        }
+      ]
+    },
+    {
+      "name": "/locate ui click",
+      "group": "locate",
+      "description": "找到元素就點下去",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "元素名稱"
+        },
+        {
+          "name": "type",
+          "type": "文字",
+          "required": false,
+          "description": "控制項型別（可省略）"
+        },
+        {
+          "name": "window",
+          "type": "文字",
+          "required": false,
+          "description": "限定視窗"
+        },
+        {
+          "name": "shot",
+          "type": "是／否",
+          "required": false,
+          "description": "完成後附一張截圖"
+        }
+      ]
+    },
+    {
+      "name": "/locate ui find",
+      "group": "locate",
+      "description": "找元素並回精確矩形",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "元素名稱"
+        },
+        {
+          "name": "type",
+          "type": "文字",
+          "required": false,
+          "description": "控制項型別（可省略）"
+        },
+        {
+          "name": "window",
+          "type": "文字",
+          "required": false,
+          "description": "限定視窗（強烈建議帶，快 60 倍）"
+        }
+      ]
+    },
+    {
+      "name": "/locate ui gone",
+      "group": "locate",
+      "description": "等元素消失",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "元素名稱"
+        },
+        {
+          "name": "seconds",
+          "type": "整數（1–600）",
+          "required": false,
+          "description": "最長等幾秒（預設 `30`）"
+        },
+        {
+          "name": "type",
+          "type": "文字",
+          "required": false,
+          "description": "控制項型別"
+        },
+        {
+          "name": "window",
+          "type": "文字",
+          "required": false,
+          "description": "限定視窗"
+        }
+      ]
+    },
+    {
+      "name": "/locate ui read",
+      "group": "locate",
+      "description": "讀元素現在的值",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "元素名稱"
+        },
+        {
+          "name": "type",
+          "type": "文字",
+          "required": false,
+          "description": "控制項型別（可省略）"
+        },
+        {
+          "name": "window",
+          "type": "文字",
+          "required": false,
+          "description": "限定視窗"
+        }
+      ]
+    },
+    {
+      "name": "/locate ui tree",
+      "group": "locate",
+      "description": "列出可點的元素",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "window",
+          "type": "文字",
+          "required": false,
+          "description": "限定視窗（不指定要掃最前面幾個視窗，慢很多）"
+        }
+      ]
+    },
+    {
+      "name": "/locate ui wait",
+      "group": "locate",
+      "description": "等元素出現",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "元素名稱"
+        },
+        {
+          "name": "seconds",
+          "type": "整數（1–600）",
+          "required": false,
+          "description": "最長等幾秒（預設 `30`）"
+        },
+        {
+          "name": "type",
+          "type": "文字",
+          "required": false,
+          "description": "控制項型別"
+        },
+        {
+          "name": "window",
+          "type": "文字",
+          "required": false,
+          "description": "限定視窗"
+        }
+      ]
+    },
+    {
+      "name": "/log clear",
+      "group": "log",
+      "description": "清空紀錄檔",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/log errors",
+      "group": "log",
+      "description": "列出最近的警告與錯誤行",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/log grep",
+      "group": "log",
+      "description": "在紀錄檔內搜尋（不分大小寫）",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要搜尋的字串"
+        }
+      ]
+    },
+    {
+      "name": "/log size",
+      "group": "log",
+      "description": "紀錄檔大小與行數",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/log tail",
+      "group": "log",
+      "description": "紀錄檔最後 N 行",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "n",
+          "type": "整數（1–200）",
+          "required": false,
+          "description": "行數（預設 20、上限 200）"
+        }
+      ]
+    },
+    {
+      "name": "/macro delete",
+      "group": "macro",
+      "description": "刪除巨集",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "巨集名稱"
+        }
+      ]
+    },
+    {
+      "name": "/macro edit",
+      "group": "macro",
+      "description": "改寫巨集的第 N 行",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "巨集名稱"
+        },
+        {
+          "name": "line",
+          "type": "整數（1–200）",
+          "required": true,
+          "description": "行號"
+        },
+        {
+          "name": "step",
+          "type": "文字",
+          "required": true,
+          "description": "新的步驟內容"
+        }
+      ]
+    },
+    {
+      "name": "/macro insert",
+      "group": "macro",
+      "description": "在第 N 行前插入一步",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "巨集名稱"
+        },
+        {
+          "name": "line",
+          "type": "整數（1–200）",
+          "required": true,
+          "description": "行號"
+        },
+        {
+          "name": "step",
+          "type": "文字",
+          "required": true,
+          "description": "要插入的步驟"
+        }
+      ]
+    },
+    {
+      "name": "/macro list",
+      "group": "macro",
+      "description": "列出所有巨集",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/macro record",
+      "group": "macro",
+      "description": "錄製操作成巨集（限擁有者）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "action",
+          "type": "選項：`開始` / `結束`",
+          "required": true,
+          "description": "開始或結束錄製"
+        },
+        {
+          "name": "name",
+          "type": "文字",
+          "required": false,
+          "description": "巨集名稱"
+        }
+      ]
+    },
+    {
+      "name": "/macro rm_line",
+      "group": "macro",
+      "description": "刪掉巨集的第 N 行",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "巨集名稱"
+        },
+        {
+          "name": "line",
+          "type": "整數（1–200）",
+          "required": true,
+          "description": "行號"
+        }
+      ]
+    },
+    {
+      "name": "/macro run",
+      "group": "macro",
+      "description": "執行巨集",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "巨集名稱"
+        },
+        {
+          "name": "args",
+          "type": "文字",
+          "required": false,
+          "description": "填進步驟裡 $1..$9 的參數（步驟裡字面的 $ 寫成 $$）"
+        },
+        {
+          "name": "shot",
+          "type": "是／否",
+          "required": false,
+          "description": "跑完附一張截圖"
+        }
+      ]
+    },
+    {
+      "name": "/macro save",
+      "group": "macro",
+      "description": "存一份巨集",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "巨集名稱"
+        },
+        {
+          "name": "steps",
+          "type": "文字",
+          "required": false,
+          "description": "步驟，用 `;` 分隔一步（選項輸入框打不出換行）"
+        },
+        {
+          "name": "file",
+          "type": "附件",
+          "required": false,
+          "description": "或者直接附一個檔案，一行一步（比 `;` 好寫得多）"
+        }
+      ]
+    },
+    {
+      "name": "/macro show",
+      "group": "macro",
+      "description": "顯示巨集內容",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "巨集名稱"
+        }
+      ]
+    },
+    {
+      "name": "/macro stop",
+      "group": "macro",
+      "description": "中止正在跑的巨集",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/nsfw",
+      "group": null,
+      "description": "圖庫搜圖 NSFW 捷徑（自動補 rating:explicit）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "tags",
+          "type": "文字",
+          "required": true,
+          "description": "tag 字串（可模糊；自帶 rating: 時不覆蓋）"
+        }
+      ]
+    },
+    {
+      "name": "/out debug_show",
+      "group": "out",
+      "description": "列出或上傳除錯截圖",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": false,
+          "description": "截圖名稱（留空 = 列出）"
+        }
+      ]
+    },
+    {
+      "name": "/out history",
+      "group": "out",
+      "description": "近期產出時間表",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "n",
+          "type": "整數（1–50）",
+          "required": false,
+          "description": "列幾筆（預設 `10`）"
+        }
+      ]
+    },
+    {
+      "name": "/out latest_for",
+      "group": "out",
+      "description": "指定角色的最新一張",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "character",
+          "type": "文字",
+          "required": false,
+          "description": "角色名稱"
+        }
+      ]
+    },
+    {
+      "name": "/out rate",
+      "group": "out",
+      "description": "產圖吞吐量（近 1、6、24 小時的張數與平均）",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/out sample",
+      "group": "out",
+      "description": "隨機抽幾張",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "character",
+          "type": "文字",
+          "required": true,
+          "description": "角色名稱"
+        },
+        {
+          "name": "n",
+          "type": "整數（1–5）",
+          "required": false,
+          "description": "抽幾張（上限 5）（預設 `1`）"
+        }
+      ]
+    },
+    {
+      "name": "/out stats",
+      "group": "out",
+      "description": "各輸出資料夾的圖檔數",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/preset info",
+      "group": "preset",
+      "description": "列出兩個預設值與四個佇列的內容",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/preset main append",
+      "group": "preset",
+      "description": "在主提示詞預設後面追加文字",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "要追加的內容"
+        }
+      ]
+    },
+    {
+      "name": "/preset main clear",
+      "group": "preset",
+      "description": "清空主提示詞預設",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/preset main set",
+      "group": "preset",
+      "description": "覆寫主提示詞預設",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "新的預設內容"
+        }
+      ]
+    },
+    {
+      "name": "/preset neg append",
+      "group": "preset",
+      "description": "在負面提示詞預設後面追加文字",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "要追加的內容"
+        }
+      ]
+    },
+    {
+      "name": "/preset neg clear",
+      "group": "preset",
+      "description": "清空負面提示詞預設",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/preset neg set",
+      "group": "preset",
+      "description": "覆寫負面提示詞預設",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "新的預設內容"
+        }
+      ]
+    },
+    {
+      "name": "/proc kill",
+      "group": "proc",
+      "description": "強制結束指定程式",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "執行檔名稱，例如 notepad"
+        }
+      ]
+    },
+    {
+      "name": "/proc launch",
+      "group": "proc",
+      "description": "啟動白名單或別名上的程式",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "名稱或絕對路徑"
+        }
+      ]
+    },
+    {
+      "name": "/proc list",
+      "group": "proc",
+      "description": "列出正在執行的程式",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "substr",
+          "type": "文字",
+          "required": false,
+          "description": "只列名稱含此子字串的（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/proc usage",
+      "group": "proc",
+      "description": "本專案占用的資源與行程數（依角色分組）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/queue",
+      "group": null,
+      "description": "各佇列剩餘筆數與實際會跑的配對數",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/run",
+      "group": null,
+      "description": "啟動背景產圖（可排程：in 90m / at 02:00 / cancel）",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "when",
+          "type": "文字",
+          "required": false,
+          "description": "排程：`in 90m` / `in 2h` / `at 02:00` / `cancel`；也可寫 `label <名稱>` 先命名這一批"
+        }
+      ]
+    },
+    {
+      "name": "/safebooru",
+      "group": null,
+      "description": "全站 SFW 圖庫隨機一張",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "tags",
+          "type": "文字",
+          "required": true,
+          "description": "tag 字串"
+        }
+      ]
+    },
+    {
+      "name": "/schedule add",
+      "group": "schedule",
+      "description": "新增一筆排程",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "when",
+          "type": "文字",
+          "required": true,
+          "description": "`HH:MM`／`mon-fri HH:MM`／`every 30m`／`once at HH:MM`"
+        },
+        {
+          "name": "kind",
+          "type": "選項：`執行巨集` / `執行指令`",
+          "required": true,
+          "description": "到點要做什麼"
+        },
+        {
+          "name": "what",
+          "type": "文字",
+          "required": true,
+          "description": "巨集名稱，或要執行的指令"
+        }
+      ]
+    },
+    {
+      "name": "/schedule list",
+      "group": "schedule",
+      "description": "列出所有排程",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/schedule remove",
+      "group": "schedule",
+      "description": "刪掉某筆排程",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "id",
+          "type": "整數（1–99999）",
+          "required": true,
+          "description": "排程編號"
+        }
+      ]
+    },
+    {
+      "name": "/schedule run",
+      "group": "schedule",
+      "description": "立刻跑一次某筆排程",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "id",
+          "type": "整數（1–99999）",
+          "required": true,
+          "description": "排程編號"
+        }
+      ]
+    },
+    {
+      "name": "/screen all",
+      "group": "screen",
+      "description": "整個虛擬桌面（多螢幕時唯一看得到副螢幕的方式）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/screen gif",
+      "group": "screen",
+      "description": "連拍成一小段動畫",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "seconds",
+          "type": "整數（1–30）",
+          "required": false,
+          "description": "錄幾秒（預設 `3`）"
+        },
+        {
+          "name": "fps",
+          "type": "整數（1–20）",
+          "required": false,
+          "description": "每秒張數（預設 `4`）"
+        }
+      ]
+    },
+    {
+      "name": "/screen info",
+      "group": "screen",
+      "description": "解析度、虛擬桌面範圍、螢幕數、是否鎖定",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/screen main",
+      "group": "screen",
+      "description": "主螢幕截圖",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/screen pixel",
+      "group": "screen",
+      "description": "取某一點的顏色（RGB ＋ hex）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "X 座標"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "Y 座標"
+        }
+      ]
+    },
+    {
+      "name": "/screen region",
+      "group": "screen",
+      "description": "指定區域截圖",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "左上 X（虛擬桌面座標，副螢幕在左/上時為負）"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "左上 Y"
+        },
+        {
+          "name": "width",
+          "type": "整數（1–65535）",
+          "required": true,
+          "description": "寬"
+        },
+        {
+          "name": "height",
+          "type": "整數（1–65535）",
+          "required": true,
+          "description": "高"
+        }
+      ]
+    },
+    {
+      "name": "/screen text",
+      "group": "screen",
+      "description": "把畫面上的文字整段讀出來",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "region",
+          "type": "文字",
+          "required": false,
+          "description": "區域「x y 寬 高」（留空 = 全螢幕）"
+        },
+        {
+          "name": "lang",
+          "type": "文字",
+          "required": false,
+          "description": "辨識語言代碼（留空 = 自動判斷）"
+        }
+      ]
+    },
+    {
+      "name": "/screen window",
+      "group": "screen",
+      "description": "只截指定視窗的矩形",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "title",
+          "type": "文字",
+          "required": true,
+          "description": "視窗標題片段"
+        }
+      ]
+    },
+    {
+      "name": "/status",
+      "group": null,
+      "description": "背景產圖的執行狀態與變體",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/stop",
+      "group": null,
+      "description": "停止背景產圖",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys audit",
+      "group": "sys",
+      "description": "最近的操作稽核紀錄",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "n",
+          "type": "整數（1–50）",
+          "required": false,
+          "description": "筆數（預設 20、上限 50）"
+        },
+        {
+          "name": "grep",
+          "type": "文字",
+          "required": false,
+          "description": "只列 head 含此子字串的條目"
+        }
+      ]
+    },
+    {
+      "name": "/sys backfill_paths",
+      "group": "sys",
+      "description": "把本頻道舊訊息裡的目錄補成完整顯示",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": true,
+      "params": [
+        {
+          "name": "limit",
+          "type": "整數（1–500）",
+          "required": false,
+          "description": "往回掃幾則訊息（預設 200、上限 500）"
+        },
+        {
+          "name": "apply",
+          "type": "是／否",
+          "required": false,
+          "description": "真的寫入（預設只試算、不動訊息）"
+        }
+      ]
+    },
+    {
+      "name": "/sys churn",
+      "group": "sys",
+      "description": "今日各 repo 的 git 活動（提交數與增刪行數）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys cleanup_debug",
+      "group": "sys",
+      "description": "刪除所有除錯截圖",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys dashboard",
+      "group": "sys",
+      "description": "本機唯讀儀表板的網址",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys disk",
+      "group": "sys",
+      "description": "輸出與設定檔目錄的磁碟用量",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys doctor",
+      "group": "sys",
+      "description": "非破壞式排障摘要",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys git_pull",
+      "group": "sys",
+      "description": "拉取更新（預設成功後重啟）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "noreboot",
+          "type": "是／否",
+          "required": false,
+          "description": "拉完不要自動重啟"
+        }
+      ]
+    },
+    {
+      "name": "/sys health",
+      "group": "sys",
+      "description": "綜合健康檢查",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "mode",
+          "type": "選項：`完整` / `精簡`",
+          "required": false,
+          "description": "quick = 只回核心狀態"
+        }
+      ]
+    },
+    {
+      "name": "/sys introspect_dom",
+      "group": "sys",
+      "description": "要求背景程式 dump 目前頁面的輸入欄位",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys metrics",
+      "group": "sys",
+      "description": "執行期指標（uptime / 次數 / 錯誤）",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys probe_status",
+      "group": "sys",
+      "description": "狀態偵測的根因摘要",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys restart",
+      "group": "sys",
+      "description": "結束行程讓監督者重新啟動",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys undo",
+      "group": "sys",
+      "description": "撤回最近一次破壞性寫入",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/sys update_check",
+      "group": "sys",
+      "description": "比對本機與遠端的版本落差",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/tag autocomplete",
+      "group": "tag",
+      "description": "tag 前綴補全（top 10 by post count）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "prefix",
+          "type": "文字",
+          "required": true,
+          "description": "tag 前綴；用 *tok* 走 substring glob"
+        }
+      ]
+    },
+    {
+      "name": "/tag count",
+      "group": "tag",
+      "description": "查 tag 的 post 數",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "tag",
+          "type": "文字",
+          "required": true,
+          "description": "tag 名稱"
+        }
+      ]
+    },
+    {
+      "name": "/tag suggest",
+      "group": "tag",
+      "description": "聚合角色 30 張隨機 post 的常見搭配 tag（top 20）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "character",
+          "type": "文字",
+          "required": true,
+          "description": "角色 tag（可模糊輸入）"
+        }
+      ]
+    },
+    {
+      "name": "/tag wiki",
+      "group": "tag",
+      "description": "tag 的 wiki 內文",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "tag",
+          "type": "文字",
+          "required": true,
+          "description": "tag 名稱"
+        }
+      ]
+    },
+    {
+      "name": "/todo char1 add",
+      "group": "todo",
+      "description": "在角色1佇列後面新增一筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "條目內容（多筆用 \\ 分隔）"
+        }
+      ]
+    },
+    {
+      "name": "/todo char1 addx3",
+      "group": "todo",
+      "description": "新增到角色1 佇列並重複 ×3",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "要重複 3 次寫入的條目"
+        }
+      ]
+    },
+    {
+      "name": "/todo char1 clear",
+      "group": "todo",
+      "description": "清空角色1佇列",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo char1 list",
+      "group": "todo",
+      "description": "列出角色1佇列的所有條目",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo char1 pop",
+      "group": "todo",
+      "description": "刪除角色1佇列最後一筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo char1 remove",
+      "group": "todo",
+      "description": "刪除角色1佇列第 i 筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "index",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "要刪除的編號（1 起算）"
+        }
+      ]
+    },
+    {
+      "name": "/todo char2 add",
+      "group": "todo",
+      "description": "在角色2佇列後面新增一筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "條目內容（多筆用 \\ 分隔）"
+        }
+      ]
+    },
+    {
+      "name": "/todo char2 clear",
+      "group": "todo",
+      "description": "清空角色2佇列",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo char2 default",
+      "group": "todo",
+      "description": "把角色2 預設內容當一筆推進佇列",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo char2 list",
+      "group": "todo",
+      "description": "列出角色2佇列的所有條目",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo char2 pop",
+      "group": "todo",
+      "description": "刪除角色2佇列最後一筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo char2 remove",
+      "group": "todo",
+      "description": "刪除角色2佇列第 i 筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "index",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "要刪除的編號（1 起算）"
+        }
+      ]
+    },
+    {
+      "name": "/todo dedupe",
+      "group": "todo",
+      "description": "移除重複條目（保留第一筆）",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "queue",
+          "type": "選項：`主提示詞` / `角色1` / `角色2` / `負面提示詞`",
+          "required": true,
+          "description": "要操作的佇列"
+        }
+      ]
+    },
+    {
+      "name": "/todo duplicate",
+      "group": "todo",
+      "description": "複製某一筆 n 次",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "queue",
+          "type": "選項：`主提示詞` / `角色1` / `角色2` / `負面提示詞`",
+          "required": true,
+          "description": "要操作的佇列"
+        },
+        {
+          "name": "index",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "條目編號"
+        },
+        {
+          "name": "n",
+          "type": "整數（1–50）",
+          "required": false,
+          "description": "複製幾份（預設 1）"
+        }
+      ]
+    },
+    {
+      "name": "/todo find",
+      "group": "todo",
+      "description": "在佇列內搜尋（不分大小寫）",
+      "access": "viewer",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "queue",
+          "type": "選項：`主提示詞` / `角色1` / `角色2` / `負面提示詞`",
+          "required": true,
+          "description": "要搜尋的佇列"
+        },
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要找的字串"
+        }
+      ]
+    },
+    {
+      "name": "/todo move",
+      "group": "todo",
+      "description": "把某一筆搬到最前或最後",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "queue",
+          "type": "選項：`主提示詞` / `角色1` / `角色2` / `負面提示詞`",
+          "required": true,
+          "description": "要操作的佇列"
+        },
+        {
+          "name": "index",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "條目編號（1 起算）"
+        },
+        {
+          "name": "where",
+          "type": "選項：`最前` / `最後`",
+          "required": true,
+          "description": "搬到最前或最後"
+        }
+      ]
+    },
+    {
+      "name": "/todo negp add",
+      "group": "todo",
+      "description": "在負面提示詞佇列後面新增一筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "條目內容（多筆用 \\ 分隔）"
+        }
+      ]
+    },
+    {
+      "name": "/todo negp clear",
+      "group": "todo",
+      "description": "清空負面提示詞佇列",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo negp list",
+      "group": "todo",
+      "description": "列出負面提示詞佇列的所有條目",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo negp pop",
+      "group": "todo",
+      "description": "刪除負面提示詞佇列最後一筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo negp remove",
+      "group": "todo",
+      "description": "刪除負面提示詞佇列第 i 筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "index",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "要刪除的編號（1 起算）"
+        }
+      ]
+    },
+    {
+      "name": "/todo prompt add",
+      "group": "todo",
+      "description": "在主提示詞佇列後面新增一筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "條目內容（多筆用 \\ 分隔）"
+        }
+      ]
+    },
+    {
+      "name": "/todo prompt clear",
+      "group": "todo",
+      "description": "清空主提示詞佇列",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo prompt default",
+      "group": "todo",
+      "description": "把預設提示詞當一筆推進佇列",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo prompt end",
+      "group": "todo",
+      "description": "追加終止標記，跑到那筆就乾淨收工",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo prompt insert",
+      "group": "todo",
+      "description": "把內容插進主提示詞佇列第 i 筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "index",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "插入位置（1 起算；填「最後一筆 +1」等於附加）"
+        },
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要插入的條目內容（多筆用 \\ 分隔，依序插入）"
+        }
+      ]
+    },
+    {
+      "name": "/todo prompt list",
+      "group": "todo",
+      "description": "列出主提示詞佇列的所有條目",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo prompt pop",
+      "group": "todo",
+      "description": "刪除主提示詞佇列最後一筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo prompt remove",
+      "group": "todo",
+      "description": "刪除主提示詞佇列第 i 筆",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "index",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "要刪除的編號（1 起算）"
+        }
+      ]
+    },
+    {
+      "name": "/todo prompt template",
+      "group": "todo",
+      "description": "把指定範本當一筆推進佇列",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": false,
+          "description": "範本名稱（留空 = 列出可用範本）"
+        }
+      ]
+    },
+    {
+      "name": "/todo prompt unend",
+      "group": "todo",
+      "description": "移除所有終止標記，讓佇列跑完整批",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/todo shuffle",
+      "group": "todo",
+      "description": "打亂佇列順序",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "queue",
+          "type": "選項：`主提示詞` / `角色1` / `角色2` / `負面提示詞`",
+          "required": true,
+          "description": "要操作的佇列"
+        }
+      ]
+    },
+    {
+      "name": "/todo swap",
+      "group": "todo",
+      "description": "對調兩筆的位置",
+      "access": "operator",
+      "owner_gate": null,
+      "public": false,
+      "params": [
+        {
+          "name": "queue",
+          "type": "選項：`主提示詞` / `角色1` / `角色2` / `負面提示詞`",
+          "required": true,
+          "description": "要操作的佇列"
+        },
+        {
+          "name": "i",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "第一筆編號"
+        },
+        {
+          "name": "j",
+          "type": "整數（1–9999）",
+          "required": true,
+          "description": "第二筆編號"
+        }
+      ]
+    },
+    {
+      "name": "/tool base64",
+      "group": "tool",
+      "description": "Base64 編碼",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要編碼的文字"
+        }
+      ]
+    },
+    {
+      "name": "/tool color",
+      "group": "tool",
+      "description": "色票圖（3 或 6 個 hex digits）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "value",
+          "type": "文字",
+          "required": true,
+          "description": "hex 色碼，例如 ff8800 或 f80"
+        }
+      ]
+    },
+    {
+      "name": "/tool hash",
+      "group": "tool",
+      "description": "md5 / sha1 / sha256",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要雜湊的文字"
+        }
+      ]
+    },
+    {
+      "name": "/tool qr",
+      "group": "tool",
+      "description": "產生 QR code 圖",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要編進 QR code 的內容"
+        }
+      ]
+    },
+    {
+      "name": "/tool say",
+      "group": "tool",
+      "description": "讓 bot 代為發言（限 server owner）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要讓 bot 說的內容"
+        }
+      ]
+    },
+    {
+      "name": "/tool unbase64",
+      "group": "tool",
+      "description": "Base64 解碼",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要解碼的 base64 字串"
+        }
+      ]
+    },
+    {
+      "name": "/tool urldecode",
+      "group": "tool",
+      "description": "URL 解碼",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要解碼的文字"
+        }
+      ]
+    },
+    {
+      "name": "/tool urlencode",
+      "group": "tool",
+      "description": "URL 編碼",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要編碼的文字"
+        }
+      ]
+    },
+    {
+      "name": "/watch clip",
+      "group": "watch",
+      "description": "等剪貼簿變動（給文字就等它含那段）",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": false,
+          "description": "要等的內容（留空 = 內容變了就通知）"
+        },
+        {
+          "name": "run",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的巨集"
+        },
+        {
+          "name": "then",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的指令（限擁有者）"
+        }
+      ]
+    },
+    {
+      "name": "/watch job",
+      "group": "watch",
+      "description": "等某個背景作業結束",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "id",
+          "type": "整數（1–99999）",
+          "required": true,
+          "description": "作業編號"
+        },
+        {
+          "name": "run",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的巨集"
+        },
+        {
+          "name": "then",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的指令（限擁有者）"
+        }
+      ]
+    },
+    {
+      "name": "/watch list",
+      "group": "watch",
+      "description": "列出進行中的監看",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/watch pixel",
+      "group": "watch",
+      "description": "等某一點變成指定顏色",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "X 座標"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "Y 座標"
+        },
+        {
+          "name": "color",
+          "type": "文字",
+          "required": true,
+          "description": "#RRGGBB"
+        },
+        {
+          "name": "run",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的巨集"
+        },
+        {
+          "name": "then",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的指令（限擁有者）"
+        }
+      ]
+    },
+    {
+      "name": "/watch port",
+      "group": "watch",
+      "description": "等某個埠接得上",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "target",
+          "type": "文字",
+          "required": true,
+          "description": "`<埠>` 或 `<主機:埠>`"
+        },
+        {
+          "name": "run",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的巨集"
+        },
+        {
+          "name": "then",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的指令（限擁有者）"
+        }
+      ]
+    },
+    {
+      "name": "/watch process",
+      "group": "watch",
+      "description": "等某個程式開始執行",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "程式名稱"
+        },
+        {
+          "name": "run",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的巨集"
+        },
+        {
+          "name": "then",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的指令（限擁有者）"
+        }
+      ]
+    },
+    {
+      "name": "/watch stop",
+      "group": "watch",
+      "description": "停掉某個監看",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "id",
+          "type": "整數（1–99999）",
+          "required": true,
+          "description": "監看編號"
+        }
+      ]
+    },
+    {
+      "name": "/watch text",
+      "group": "watch",
+      "description": "等某段文字出現在畫面上",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "text",
+          "type": "文字",
+          "required": true,
+          "description": "要等的文字"
+        },
+        {
+          "name": "run",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的巨集"
+        },
+        {
+          "name": "then",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的指令（限擁有者）"
+        }
+      ]
+    },
+    {
+      "name": "/watch ui",
+      "group": "watch",
+      "description": "等某個元素出現",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "元素名稱"
+        },
+        {
+          "name": "run",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的巨集"
+        },
+        {
+          "name": "then",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的指令（限擁有者）"
+        }
+      ]
+    },
+    {
+      "name": "/watch window",
+      "group": "watch",
+      "description": "等某個視窗出現",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "substr",
+          "type": "文字",
+          "required": true,
+          "description": "視窗標題片段"
+        },
+        {
+          "name": "run",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的巨集"
+        },
+        {
+          "name": "then",
+          "type": "文字",
+          "required": false,
+          "description": "成立時執行的指令（限擁有者）"
+        }
+      ]
+    },
+    {
+      "name": "/web anime",
+      "group": "web",
+      "description": "動畫資料庫查詢",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "作品名稱"
+        }
+      ]
+    },
+    {
+      "name": "/web cat",
+      "group": "web",
+      "description": "隨機貓圖",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/web crypto",
+      "group": "web",
+      "description": "加密貨幣價格（USD / TWD）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "symbol",
+          "type": "文字",
+          "required": true,
+          "description": "幣別代號，例如 btc / eth"
+        }
+      ]
+    },
+    {
+      "name": "/web dict",
+      "group": "web",
+      "description": "英文字典",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "word",
+          "type": "文字",
+          "required": true,
+          "description": "要查的英文單字"
+        }
+      ]
+    },
+    {
+      "name": "/web dog",
+      "group": "web",
+      "description": "隨機狗圖",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/web fact",
+      "group": "web",
+      "description": "隨機冷知識",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/web github",
+      "group": "web",
+      "description": "程式碼平台 repo 概要",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "repo",
+          "type": "文字",
+          "required": true,
+          "description": "user/repo 形式"
+        }
+      ]
+    },
+    {
+      "name": "/web joke",
+      "group": "web",
+      "description": "隨機 dad joke",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/web quote",
+      "group": "web",
+      "description": "隨機名言",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": []
+    },
+    {
+      "name": "/web wiki",
+      "group": "web",
+      "description": "百科摘要",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "topic",
+          "type": "文字",
+          "required": true,
+          "description": "要查的主題"
+        }
+      ]
+    },
+    {
+      "name": "/web xkcd",
+      "group": "web",
+      "description": "網路漫畫（隨機 / 指定編號）",
+      "access": "public",
+      "owner_gate": null,
+      "public": true,
+      "params": [
+        {
+          "name": "n",
+          "type": "整數（1–10000）",
+          "required": false,
+          "description": "漫畫編號（省略 = 隨機）"
+        }
+      ]
+    },
+    {
+      "name": "/win focus",
+      "group": "win",
+      "description": "把視窗拉到前景",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "substr",
+          "type": "文字",
+          "required": true,
+          "description": "視窗標題片段（不分大小寫）"
+        }
+      ]
+    },
+    {
+      "name": "/win grid",
+      "group": "win",
+      "description": "把多個視窗排成方格",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "windows",
+          "type": "文字",
+          "required": true,
+          "description": "標題片段，用 `|` 分隔（片段可含空白）"
+        }
+      ]
+    },
+    {
+      "name": "/win layout list",
+      "group": "win",
+      "description": "列出已存的版面",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": []
+    },
+    {
+      "name": "/win layout remove",
+      "group": "win",
+      "description": "刪除已存的版面",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "版面名稱"
+        }
+      ]
+    },
+    {
+      "name": "/win layout restore",
+      "group": "win",
+      "description": "還原已存的版面",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "版面名稱"
+        }
+      ]
+    },
+    {
+      "name": "/win layout save",
+      "group": "win",
+      "description": "把目前版面存成名稱",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "name",
+          "type": "文字",
+          "required": true,
+          "description": "版面名稱"
+        }
+      ]
+    },
+    {
+      "name": "/win list",
+      "group": "win",
+      "description": "列出可見視窗",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "substr",
+          "type": "文字",
+          "required": false,
+          "description": "只列標題含此子字串的（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/win move",
+      "group": "win",
+      "description": "搬位置，可順便改大小",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "x",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "新的左上 X"
+        },
+        {
+          "name": "y",
+          "type": "整數（-65535–65535）",
+          "required": true,
+          "description": "新的左上 Y"
+        },
+        {
+          "name": "substr",
+          "type": "文字",
+          "required": true,
+          "description": "視窗標題片段"
+        },
+        {
+          "name": "width",
+          "type": "整數（1–65535）",
+          "required": false,
+          "description": "新寬度（可省略）"
+        },
+        {
+          "name": "height",
+          "type": "整數（1–65535）",
+          "required": false,
+          "description": "新高度（可省略）"
+        }
+      ]
+    },
+    {
+      "name": "/win pos",
+      "group": "win",
+      "description": "位置 / 大小 / 中心點",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "substr",
+          "type": "文字",
+          "required": true,
+          "description": "視窗標題片段"
+        }
+      ]
+    },
+    {
+      "name": "/win snap",
+      "group": "win",
+      "description": "靠到螢幕的某一半或某一角",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "position",
+          "type": "選項：`左半` / `右半` / `上半` / `下半` / `左上` / `右上` / `左下` / `右下` / `最大化`",
+          "required": true,
+          "description": "要靠到哪裡"
+        },
+        {
+          "name": "substr",
+          "type": "文字",
+          "required": true,
+          "description": "視窗標題片段"
+        }
+      ]
+    },
+    {
+      "name": "/win state",
+      "group": "win",
+      "description": "關閉 / 最小化 / 最大化 / 還原 / 顯示 / 隱藏",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "action",
+          "type": "選項：`關閉` / `最小化` / `最大化` / `還原` / `顯示` / `隱藏`",
+          "required": true,
+          "description": "要做的動作"
+        },
+        {
+          "name": "substr",
+          "type": "文字",
+          "required": true,
+          "description": "視窗標題片段"
+        }
+      ]
+    },
+    {
+      "name": "/win wait",
+      "group": "win",
+      "description": "等視窗出現",
+      "access": "owner",
+      "owner_gate": "before_dispatch",
+      "public": false,
+      "params": [
+        {
+          "name": "substr",
+          "type": "文字",
+          "required": true,
+          "description": "視窗標題片段"
+        },
+        {
+          "name": "seconds",
+          "type": "整數（1–600）",
+          "required": false,
+          "description": "最長等幾秒（預設 `30`）"
+        }
+      ]
+    }
+  ]
+}

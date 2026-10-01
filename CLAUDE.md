@@ -84,7 +84,11 @@ Every change MUST satisfy these before commit:
    the generator's output, so a hand edit now fails instead of surviving until
    someone regenerates. Editorial prose that the tree cannot supply (per-group
    notes, per-command notes) lives in the generator's `NOTES` / `COMMAND_NOTES`
-   dicts — put it there, never in the `.md`.
+   dicts — put it there, never in the `.md`. The same run also writes
+   `commands/commands.json` (schema `COMMANDS_JSON_SCHEMA`; name, group,
+   description, params, access per command) from the same extraction, so it is
+   generated and checked exactly like the `.md` files; it deliberately carries no
+   `!` / mention aliases (DoD #3).
 3. **`!` and `@bot` stay, unadvertised.** They remain as hidden compat paths
    for phone typing, multi-line pastes and reply context — things an option
    box cannot do. Two consequences, both guarded: a new `!` / `@bot` handler
