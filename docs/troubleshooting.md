@@ -116,6 +116,9 @@ presence 鏡像有去重，網路斷線重連後快取可能過期。`on_resumed
 - **跑到某處自然停**：在 `todo_prompt.md` 想停的位置放 `end`（`/todo prompt end` 或
   `/todo prompt insert <i> end`），webrunner 跑到那裡會乾淨結束。佇列是每個角色邊界
   動態重讀的，所以**跑批途中放 `end` 也會生效**（最晚下個角色邊界收尾）。
+- 存成「UTF-8 含 BOM」（記事本、Windows PowerShell 5.1 的 `Set-Content -Encoding UTF8`）
+  也沒關係：檔頭的 BOM 不算第一筆，第一行寫的 `end` 照樣會停；下一次改寫佇列時 BOM 就會
+  被拿掉。
   見 {doc}`workflow`。
 
 ## 兩個監督器不要同時跑

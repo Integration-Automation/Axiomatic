@@ -1722,6 +1722,30 @@ def test_run_batch_end_sentinel_rc0():
     print("  PASS\n")
 
 
+def test_run_batch_end_sentinel_behind_a_bom_rc0():
+    """佇列以「UTF-8 含 BOM」存檔、第一行就是 `end`：照樣要停，而且一張都不產。
+
+    記事本與 Windows PowerShell 5.1 存出來的 UTF-8 檔頭帶 EF BB BF。讀取端用
+    `utf-8` 讀的話第一筆是 `'\\ufeffend'`（`str.strip()` 不會去掉 U+FEFF），
+    `is_end_marker` 認不得，整份佇列照跑——使用者放的停止標記完全無效，也沒有任何
+    錯誤訊息。消耗掉 `end` 之後寫回的檔案不得再帶 BOM（寫入端寫的是不含 BOM 的
+    UTF-8）。"""
+    print("test_run_batch_end_sentinel_behind_a_bom_rc0")
+    with _RunBatchHarness() as h:
+        (h.dir / "todo_prompt.md").write_bytes(b"\xef\xbb\xbfend\nP2\n")
+        h.write_queue("todo_character1.md", ["a", "b"])
+        rc = _run_batch(FakeBrowserPort())
+        done = h.events_of("todo_done")
+        prompt_raw = (h.dir / "todo_prompt.md").read_bytes()
+        gen = list(h.gen_calls)
+    assert rc == 0, f"end sentinel must exit rc=0, got {rc}"
+    assert gen == [], f"a BOM must not hide the `end` on the first line: {gen}"
+    assert len(done) == 1 and done[0].get("stopped_by_end") is True, done
+    assert not prompt_raw.startswith(b"\xef\xbb\xbf"), prompt_raw
+    assert prompt_raw.decode("utf-8").splitlines() == ["P2"], prompt_raw
+    print("  PASS\n")
+
+
 def test_run_batch_zero_save_rc3():
     print("test_run_batch_zero_save_rc3")
     with _RunBatchHarness() as h:

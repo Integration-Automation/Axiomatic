@@ -2017,9 +2017,13 @@ def _queue_decode_error(path: Path, error: UnicodeDecodeError) -> QueueDecodeErr
 def read_text_safe(path: Path) -> str:
     """The reader for fallback files. **Swallows only "file not found"** — not found means this
     fallback is not configured, and returning an empty string is the right semantics. Every
-    other failure (permissions, encoding) propagates; see `QueueDecodeError` for why."""
+    other failure (permissions, encoding) propagates; see `QueueDecodeError` for why.
+
+    Read as `utf-8-sig`, for the same reason as `read_todo_characters` (a leading BOM is not
+    content, and `str.strip()` does not remove U+FEFF); the bot's `_fallback_text` must use the
+    same codec, or the `/gen plan` preview and the real run answer differently for one file."""
     try:
-        return path.read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8-sig").strip()
     except FileNotFoundError:
         return ""
     except UnicodeDecodeError as error:
@@ -2034,9 +2038,20 @@ def read_todo_characters(path: Path, *, preserve_blank: bool = False) -> list[st
 
     File missing → `[]` (the queue was never created, same as an empty queue). File present
     but not UTF-8 → **raises `QueueDecodeError`, does not return `[]`**; for why that is the
-    right direction, see that class's docstring."""
+    right direction, see that class's docstring.
+
+    **A leading BOM is not part of the first entry**, so the file is read as `utf-8-sig`
+    (identical to `utf-8` when there is no BOM). A queue saved as "UTF-8 with BOM" (Windows
+    PowerShell 5.1 `Set-Content -Encoding UTF8`, Notepad's option) read as `utf-8` gives a first
+    entry of `'\\ufeffAmiya'` — identical on screen, a different string, and `str.strip()` does
+    **not** remove U+FEFF: an `end` on the first line does not stop the run, the character
+    lands in a second output folder that looks identically named, and a BOM followed by a blank
+    row becomes an invisible entry (in the Character 2 queue, "no Character 2 for this pair"
+    turns into "Character 2 is one invisible character"). Only the **leading** one is dropped;
+    `write_todo_characters` writes no BOM, so one pop removes it from the file. The bot's
+    `read_todo_entries` must use the same codec (`CLAUDE.md` → todo file format)."""
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return []
     except UnicodeDecodeError as error:
@@ -2067,7 +2082,9 @@ def write_todo_characters(path: Path, entries: list[str]) -> None:
     interruption is the resume checkpoint (webrunner_progress.json), which stays atomic in
     _run_progress.
     On-disk contract: a non-empty list is joined with "\n" plus one trailing "\n"; an empty
-    list is written as 0 bytes."""
+    list is written as 0 bytes.
+    What it writes is UTF-8 **without** a BOM: the readers drop a leading BOM, so one pop also
+    removes a BOM the user saved in — that is deliberate, do not make this preserve it."""
     text = "\n".join(entries)
     path.write_text(text + ("\n" if entries else ""), encoding="utf-8")
 

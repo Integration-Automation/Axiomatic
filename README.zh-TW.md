@@ -195,7 +195,8 @@ copy undesired.example.md   undesired.md
 
 佇列本身通常不用手建——`/todo char1 add <角色描述>` 就會寫出來。格式是**一行一筆**、
 不切逗號；`todo_character2.md` 是位置對應的，空行代表「這一對不要第二個角色」，
-要保留。
+要保留。檔頭的 UTF-8 BOM（記事本、Windows PowerShell 5.1 存檔時會加）不算第一筆的
+一部分；fallback 檔與範本同樣適用，下一次改寫就會拿掉。
 
 ---
 

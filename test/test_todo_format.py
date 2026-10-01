@@ -22,10 +22,12 @@ Character 2」；刪掉一列，後面每一列往前位移，之後每一對都
 """
 import ast
 import asyncio
+import codecs
 import os
 import re
 import sys
 import textwrap
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,7 @@ import pytest
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "axiomatic"))
 
+import _queue_consume                   # noqa: E402
 import _webrunner_shared as ws          # noqa: E402
 import discord_bot as b                 # noqa: E402
 
@@ -85,6 +88,22 @@ _CONTRACT_CASES = [
     # 放進契約表；完整清單的逐一驗證在下面「寫入端保證一筆寫進去、一筆讀回來」。
     ("Unicode 行分隔字元（U+2028）兩側都當換行",
      "a b\n", False, ["a", "b"]),
+    # 契約第 4 條：檔頭的 BOM 不屬於第一筆（兩側都用 `utf-8-sig` 讀）。`_read_both`
+    # 用 `utf-8` 把 `\ufeff` 寫出去，所以檔案真的以 EF BB BF 開頭——就是記事本與
+    # PowerShell 5.1 存出來的樣子。`str.strip()` 不會去掉 U+FEFF，所以用 `utf-8`
+    # 讀的話，下面每一格都會多出（或留著）一個看不見的字元。
+    ("檔頭的 BOM 不屬於第一筆",
+     "\ufeffAmiya\nTexas\n", False, ["Amiya", "Texas"]),
+    ("BOM 後面接空白列，不會變成一筆看不見的條目",
+     "\ufeff\na\n", False, ["a"]),
+    ("角色2 佇列檔頭的 BOM 也不屬於第一筆",
+     "\ufeffAmiya\n\nTexas\n", True, ["Amiya", "", "Texas"]),
+    # 位置式佇列最要緊的一格：用 `utf-8` 讀，第一列是 `"\ufeff"` 而不是 `""`——
+    # 「這一對不要 Character 2」會變成「Character 2 填一個看不見的字」。
+    ("角色2 的 BOM 後面接位置空白列，空白列照樣保留",
+     "\ufeff\nAmiya\n", True, ["", "Amiya"]),
+    ("只有 BOM 的檔讀成空清單", "\ufeff", False, []),
+    ("只有 BOM 的角色2 檔也讀成空清單、不是一列空白", "\ufeff", True, []),
 ]
 
 
@@ -115,6 +134,397 @@ def test_neither_reader_ever_splits_on_a_comma(tmp_path, monkeypatch):
         assert len(bot_result) == 1, f"bot 被 {comma!r} 切開了：{bot_result}"
         assert len(runner_result) == 1, (
             f"webrunner 被 {comma!r} 切開了：{runner_result}")
+
+
+# --------------------------------------------------------------------------
+# 檔頭的 BOM：每一個讀這些檔的地方都要把它拿掉，而且兩側要一致
+# --------------------------------------------------------------------------
+_BOM = codecs.BOM_UTF8
+
+
+def test_only_the_leading_bom_is_dropped_and_both_sides_agree_on_the_rest(
+        tmp_path, monkeypatch):
+    """`utf-8-sig` 只拿掉位元組 0 的那一個；契約講的也只有「檔頭」。
+
+    檔案**中間**的 U+FEFF（兩個含 BOM 的檔被接在一起時會出現）這一格刻意不規定
+    答案，只規定兩側一致——兩側各自改成「每一行都去掉 U+FEFF」是一個合理的決定，
+    但只改一邊就是預覽與實際產圖分岔，正是這整節要擋的東西。
+    """
+    for positional in (False, True):
+        bot_result, runner_result = _read_both(
+            "\ufeffa\n\ufeffb\n", tmp_path, positional=positional,
+            monkeypatch=monkeypatch)
+        assert bot_result == runner_result, (
+            f"兩側對檔案中間的 U+FEFF 處理不一樣：bot={bot_result!r} "
+            f"webrunner={runner_result!r}")
+        assert bot_result[0] == "a", bot_result
+
+
+def _point_both_sides_at(tmp_path: Path, monkeypatch) -> dict[str, Path]:
+    """把兩側的八個佇列／fallback 常數都指到 `tmp_path` 底下**同名**的檔。
+
+    兩側的常數名不一樣（`CHARACTER1_FILE` 對 `CHARACTER1_FALLBACK_FILE`），檔名
+    一樣——所以照檔名配對，兩側讀的就是同一組位元組。**八個都要**：漏一個，那一
+    側會安靜地讀到 repo 根目錄的真檔。回 `{檔名: 暫存路徑}`。
+    """
+    files: dict[str, Path] = {}
+    for module, names in (
+            (b, ("TODO_PROMPT_FILE", "TODO_FILE_1", "TODO_FILE_2",
+                 "TODO_UNDESIRED_FILE", "PROMPT_FILE", "CHARACTER1_FILE",
+                 "CHARACTER2_FILE", "UNDESIRED_FILE")),
+            (ws, ("TODO_PROMPT_FILE", "TODO_FILE_1", "TODO_FILE_2",
+                  "TODO_UNDESIRED_FILE", "PROMPT_FILE",
+                  "CHARACTER1_FALLBACK_FILE", "CHARACTER2_FALLBACK_FILE",
+                  "UNDESIRED_FILE"))):
+        for name in names:
+            target = tmp_path / getattr(module, name).name
+            monkeypatch.setattr(module, name, target)
+            files[target.name] = target
+    assert len(files) == 8, f"兩側的八個檔名對不起來：{sorted(files)}"
+    return files
+
+
+def _both_plans() -> tuple[tuple, tuple]:
+    """(bot 的預覽, 產圖批次的讀取) → 各自的 `(配對, fallback 旗標)`。"""
+    bot_pairs, bot_fb = b._compute_run_plan()
+    _real, eff, fb = ws.read_queues()
+    runner_pairs = _queue_consume.pair_todos(*eff)
+    bot_flags = tuple(bot_fb[key]
+                      for key in ("prompt", "char1", "char2", "undesired"))
+    return (bot_pairs, bot_flags), (runner_pairs, tuple(fb))
+
+
+_FALLBACK_NAMES = ("prompt.md", "character1.md", "character2.md", "undesired.md")
+
+
+def test_a_fallback_file_with_a_bom_reads_the_same_on_both_sides(
+        tmp_path, monkeypatch):
+    """四個 fallback 檔以「UTF-8 含 BOM」存檔：兩側都要讀成同一組、不帶 BOM 的內容。
+
+    fallback 是整份檔案當一筆，所以 BOM 會直接變成送出去的提示詞的第一個字元。
+    `read_text_safe`（產圖）與 `_fallback_text`（`/gen plan`、`/queue`）只要有一邊
+    還用 `utf-8`，兩邊的第一個配對就不一樣。
+    """
+    files = _point_both_sides_at(tmp_path, monkeypatch)
+    for name in _FALLBACK_NAMES:
+        files[name].write_bytes(_BOM + f"{name[:-3]} text\n".encode("utf-8"))
+
+    bot, runner = _both_plans()
+
+    expected = [("prompt text", "character1 text", "character2 text",
+                 "undesired text")]
+    assert bot == runner, f"預覽與實際產圖不一致：bot={bot!r} webrunner={runner!r}"
+    assert bot == (expected, (True, True, True, True)), bot
+
+
+def test_a_fallback_file_holding_only_a_bom_is_empty_on_both_sides(
+        tmp_path, monkeypatch):
+    """只有 BOM 的 fallback 檔＝空的 fallback，不是一筆看不見的內容。
+
+    `str.strip()` 不會去掉 U+FEFF，所以用 `utf-8` 讀，這個檔是**真值**：
+    `undesired.md` 變成「負面提示詞是一個看不見的字」，四個都這樣時批次還會拿
+    `ACTION_FALLBACK_SINGLE` 憑空產一個角色。
+    """
+    files = _point_both_sides_at(tmp_path, monkeypatch)
+    for name in _FALLBACK_NAMES:
+        files[name].write_bytes(_BOM)
+
+    bot, runner = _both_plans()
+
+    assert bot == runner, f"預覽與實際產圖不一致：bot={bot!r} webrunner={runner!r}"
+    assert bot == ([], (False, False, False, False)), bot
+
+
+def test_a_bom_before_end_still_stops_both_the_preview_and_the_run(
+        tmp_path, monkeypatch):
+    """第一行寫 `end` 的佇列以「UTF-8 含 BOM」存檔，兩側都要認得那個 `end`。
+
+    修之前實測 `_queue_consume.is_end_marker('\\ufeffend')` 為假：預覽說要跑兩對，
+    批次也真的跑下去。這裡走真的讀取路徑（bot 的 `read_todo_entries` 與預覽指令、
+    產圖批次的 `read_queues`），不是直接餵字串給 `is_end_marker`——壞掉的是讀取端，
+    不是判斷式。`run_batch` 整條路徑另有一支（`test_webrunner_shared.
+    test_run_batch_end_sentinel_behind_a_bom_rc0`）。
+    """
+    from test_bot_helpers import _run_reply      # noqa: PLC0415
+
+    files = _point_both_sides_at(tmp_path, monkeypatch)
+    files["todo_prompt.md"].write_bytes(_BOM + b"end\nP2\n")
+    files["todo_character1.md"].write_bytes(b"a\nb\n")
+
+    real, _eff, _fb = ws.read_queues()
+    assert _queue_consume.is_end_marker(real[0][0]), real[0]
+
+    prompts = b.read_todo_entries(b.TODO_PROMPT_FILE)
+    char1 = b.read_todo_entries(b.TODO_FILE_1)
+    assert b._effective_pair_count(prompts, char1, []) == (0, 0), prompts
+
+    reply = _run_reply(monkeypatch, lambda: b.cmd_preview(object()))
+    assert "`end` marker" in reply, f"預覽沒有認出 `end`：{reply!r}"
+
+
+# 讀這些檔的每一支函式，都要「有沒有 BOM 讀出來都一樣」。上面幾支走的是整條路徑，
+# 這一支一個一個點名，所以改壞哪一支就紅哪一格。新增一支讀佇列／fallback／範本
+# 檔的函式就加進來（下面那支 AST 守門會先把它找出來）。
+_QUEUE_FILE_READERS = [
+    ("webrunner.read_todo_characters", ws.read_todo_characters),
+    ("webrunner.read_todo_characters(角色2)",
+     lambda path: ws.read_todo_characters(path, preserve_blank=True)),
+    ("webrunner.read_text_safe", ws.read_text_safe),
+    ("bot.read_todo_entries",
+     lambda path: b.read_todo_entries(path, preserve_blank=False)),
+    ("bot.read_todo_entries(角色2)",
+     lambda path: b.read_todo_entries(path, preserve_blank=True)),
+    ("bot._fallback_text", b._fallback_text),
+    ("bot.read_file_text", b.read_file_text),
+]
+
+
+@pytest.mark.parametrize("reader", [r[1] for r in _QUEUE_FILE_READERS],
+                         ids=[r[0] for r in _QUEUE_FILE_READERS])
+@pytest.mark.parametrize("body", ["Amiya, (arknights)\n", "\nAmiya\n"],
+                         ids=["entry-first", "blank-first"])
+def test_every_queue_file_reader_ignores_a_leading_bom(reader, body, tmp_path):
+    """同一份內容，存成有 BOM 與沒有 BOM，讀出來必須一模一樣。"""
+    plain = tmp_path / "plain.md"
+    plain.write_bytes(body.encode("utf-8"))
+    with_bom = tmp_path / "with_bom.md"
+    with_bom.write_bytes(_BOM + body.encode("utf-8"))
+    assert reader(with_bom) == reader(plain)
+
+
+def test_push_default_does_not_carry_a_bom_into_the_middle_of_a_queue(
+        tmp_path, monkeypatch):
+    """記事本存的範本／預設檔推進**非空**佇列：BOM 不可以跟著進去。
+
+    推進去的那一筆落在檔案中間，那裡沒有任何讀取端會把 U+FEFF 拿掉，所以來源
+    讀錯一次，那一筆就永遠帶著一個看不見的字元。
+    """
+    templates, dest = _push_fixture(tmp_path, monkeypatch)
+    source = templates / "with_bom.md"
+    source.write_bytes(_BOM + "Texas, (arknights)\n".encode("utf-8"))
+
+    asyncio.run(b._cmd_push_default(_FakeMessage(), source, dest))
+
+    assert b.read_todo_entries(dest) == ["A", "", "B", "Texas, (arknights)"]
+    assert "\ufeff" not in dest.read_text(encoding="utf-8")
+
+
+def test_a_rewrite_drops_the_bom_on_both_sides(tmp_path, monkeypatch):
+    """寫入端不寫 BOM：使用者存進來的 BOM，第一次改寫（一次 pop、一次 bot 編輯）就沒了。
+
+    兩側都驗，而且是「讀進來、拿掉第一筆、寫回去」——就是批次 pop 與 `/todo … pop`
+    的形狀。
+    """
+    monkeypatch.setattr(b, "BACKUP_DIR", tmp_path / ".backup")
+    monkeypatch.setattr(b, "_UNDO_STACK", deque(maxlen=50))
+    monkeypatch.setattr(b, "TODO_FILE_2", tmp_path / "not-char2.md")
+    raw = _BOM + b"Amiya\nTexas\n"
+    for label, read, write in (
+            ("webrunner", ws.read_todo_characters, ws.write_todo_characters),
+            ("bot", b.read_todo_entries, b.write_todo_entries)):
+        path = tmp_path / f"{label}.md"
+        path.write_bytes(raw)
+        write(path, read(path)[1:])
+        assert not path.read_bytes().startswith(_BOM), f"{label} 寫回了 BOM"
+        assert read(path) == ["Texas"], f"{label} 讀回來不對"
+
+
+def test_the_undo_backup_keeps_the_bom_so_undo_restores_the_original(
+        tmp_path, monkeypatch):
+    """`_safe_write` 的備份刻意照 `utf-8` 讀——BOM 留在備份裡，`/sys undo` 才還原得
+    回使用者原本的檔。還原之後讀取端照樣把 BOM 拿掉，所以兩件事不衝突。"""
+    monkeypatch.setattr(b, "BACKUP_DIR", tmp_path / ".backup")
+    monkeypatch.setattr(b, "_UNDO_STACK", deque(maxlen=50))
+    path = tmp_path / "todo_prompt.md"
+    monkeypatch.setattr(b, "TODO_FILE_2", tmp_path / "not-char2.md")
+    path.write_bytes(_BOM + b"Amiya\nTexas\n")
+
+    b.write_todo_entries(path, ["Texas"])
+    assert not path.read_bytes().startswith(_BOM)
+
+    asyncio.run(b.cmd_undo(_FakeMessage()))
+
+    assert path.read_bytes().startswith(_BOM), "undo 沒有還原出原本的 BOM"
+    assert b.read_todo_entries(path) == ["Amiya", "Texas"]
+
+
+# ---- 找出「讀這些檔的地方」：AST 推導，不靠名單 ------------------------------
+# 契約管的九個檔名（四條佇列、四個 fallback、`/todo prompt default` 的範本）。
+# 範本目錄裡的檔沒有固定名字，它們跟 `default_prompt.md` 走同一支 `_cmd_push_default`，
+# 所以只要那支被找到就一起蓋到。
+_QUEUE_FILE_NAMES = frozenset({
+    "todo_prompt.md", "todo_character1.md", "todo_character2.md",
+    "todo_undesired.md", "prompt.md", "character1.md", "character2.md",
+    "undesired.md", "default_prompt.md"})
+
+# 讀到這些檔、卻刻意**不**用 `utf-8-sig` 的地方，連理由一起寫。
+_BOM_KEEPING_READS = {
+    ("discord_bot.py", "_safe_write"):
+        "讀的是改寫前的內容、存成 `/sys undo` 的備份；BOM 要原樣留著，還原回去才是"
+        "使用者原本的位元組（`test_the_undo_backup_keeps_the_bom_so_undo_restores_"
+        "the_original`）。它不把內容交給任何人當佇列讀。",
+}
+
+# 推導的正面對照：這幾支今天一定要被找到。找不到代表推導壞了（或有人把讀取端
+# 改成推導看不到的形狀），不是「全部乾淨」。
+_KNOWN_QUEUE_FILE_READERS = {
+    ("_webrunner_shared.py", "read_todo_characters"),
+    ("_webrunner_shared.py", "read_text_safe"),
+    ("discord_bot.py", "read_todo_entries"),
+    ("discord_bot.py", "_fallback_text"),
+    ("discord_bot.py", "read_file_text"),
+    ("discord_bot.py", "_cmd_push_default"),
+    ("discord_bot.py", "_safe_write"),
+}
+
+
+def _queue_file_constants(trees) -> set[str]:
+    """各模組裡 `X = <任何東西> / "<契約檔名>"` 的 X（兩側常數名不同，檔名相同）。"""
+    found: set[str] = set()
+    for _module, tree in trees:
+        for node in tree.body:
+            value = getattr(node, "value", None)
+            if (isinstance(node, ast.Assign) and isinstance(value, ast.BinOp)
+                    and isinstance(value.op, ast.Div)
+                    and isinstance(value.right, ast.Constant)
+                    and value.right.value in _QUEUE_FILE_NAMES):
+                found |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    return found
+
+
+def _own_calls(func):
+    """`func` 自己的呼叫節點（不含巢狀函式裡的——那些歸巢狀函式自己）。"""
+    stack = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Call):
+            yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _queue_file_reads(trees) -> dict[tuple[str, str], list[object]]:
+    """`{(模組, 函式): [每一個讀到契約檔的 read_text 的 encoding 值]}`。
+
+    「讀到契約檔」有兩種形狀：直接對常數呼叫 `CONST.read_text(...)`，或函式在某個
+    呼叫點**收到**一個常數當引數、再對那個參數呼叫 `read_text`（`read_todo_entries(path)`
+    就是這樣）。只看參數本身的 `read_text`，同一支函式讀別的檔不算——否則一支順手
+    讀 log 的指令處理器會被誤報。
+
+    看不到的形狀（刻意不追）：路徑只經過變數或別名表才傳進去的呼叫端
+    （`read_todo_entries(_resolve_list(name))`），以及 `open()`。前者不要緊——那幾支
+    讀取函式在別的呼叫點照樣收到常數；新的讀取函式若**只**用這種方式被呼叫，就得自己
+    加進 `_QUEUE_FILE_READERS`。
+    """
+    consts = _queue_file_constants(trees)
+
+    def is_const(expr) -> bool:
+        return ((isinstance(expr, ast.Name) and expr.id in consts)
+                or (isinstance(expr, ast.Attribute) and expr.attr in consts))
+
+    defs: dict[str, list] = {}
+    for module, tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defs.setdefault(node.name, []).append((module, node))
+
+    handed: dict[str, set[str]] = {}          # 函式名 → 收到常數的參數名
+    for _module, tree in trees:
+        for call in ast.walk(tree):
+            if not isinstance(call, ast.Call):
+                continue
+            name = (call.func.id if isinstance(call.func, ast.Name)
+                    else getattr(call.func, "attr", None))
+            for _mod, func in defs.get(name, ()):
+                params = [a.arg for a in func.args.posonlyargs + func.args.args]
+                for index, arg in enumerate(call.args):
+                    if is_const(arg) and index < len(params):
+                        handed.setdefault(name, set()).add(params[index])
+                for keyword in call.keywords:
+                    if keyword.arg and is_const(keyword.value):
+                        handed.setdefault(name, set()).add(keyword.arg)
+
+    reads: dict[tuple[str, str], list[object]] = {}
+    for name, entries in defs.items():
+        for module, func in entries:
+            for call in _own_calls(func):
+                func_node = call.func
+                if not (isinstance(func_node, ast.Attribute)
+                        and func_node.attr == "read_text"):
+                    continue
+                receiver = func_node.value
+                if not (is_const(receiver)
+                        or (isinstance(receiver, ast.Name)
+                            and receiver.id in handed.get(name, ()))):
+                    continue
+                encoding = next((kw.value for kw in call.keywords
+                                 if kw.arg == "encoding"), None)
+                value = (encoding.value if isinstance(encoding, ast.Constant)
+                         else ast.unparse(encoding) if encoding else None)
+                reads.setdefault((module, name), []).append(value)
+    return reads
+
+
+def _bom_violations(reads) -> set[tuple[str, str]]:
+    return {key for key, encodings in reads.items()
+            if key not in _BOM_KEEPING_READS
+            and any(enc != "utf-8-sig" for enc in encodings)}
+
+
+def test_every_read_of_a_queue_file_drops_the_leading_bom():
+    """讀佇列／fallback／範本檔的每一個 `read_text` 都要是 `utf-8-sig`。
+
+    `utf-8-sig` 在沒有 BOM 時與 `utf-8` 完全相同，所以用錯的那一支平常一點症狀都
+    沒有；它只在使用者用記事本或 PowerShell 5.1 存檔的那一天開始安靜地讀錯。
+    """
+    reads = _queue_file_reads(_project_module_asts())
+    missing = _KNOWN_QUEUE_FILE_READERS - set(reads)
+    assert not missing, (
+        f"推導沒有找到這些讀取端：{sorted(missing)}——推導壞了，或讀取端被改成它"
+        "看不到的形狀。兩者都代表這支守門已經在空轉。")
+    violations = _bom_violations(reads)
+    assert not violations, (
+        "這些地方讀佇列／fallback／範本檔卻沒有用 `utf-8-sig`："
+        + "、".join(f"{m}:{f}" for m, f in sorted(violations))
+        + "。檔頭的 BOM 會變成第一筆的一部分（見 CLAUDE.md → todo file format "
+          "第 4 條）；真的要保留 BOM 就寫進 `_BOM_KEEPING_READS` 並說明理由。")
+    stale = set(_BOM_KEEPING_READS) - set(reads)
+    assert not stale, f"`_BOM_KEEPING_READS` 裡這些已經不讀契約檔了，清掉：{sorted(stale)}"
+
+
+def test_the_bom_scan_flags_utf8_and_follows_the_parameter():
+    """合成對照組：真實的樹是乾淨的，所以偵測那一半在正常執行裡從來不會觸發。"""
+    source = textwrap.dedent('''
+        TODO_PROMPT_FILE = ROOT / "todo_prompt.md"
+        LOG_FILE = ROOT / "webrunner.log"
+
+        def good(path):
+            return path.read_text(encoding="utf-8-sig")
+
+        def bad(path):
+            return path.read_text(encoding="utf-8")
+
+        def reads_something_else(path, log):
+            log.read_text(encoding="utf-8")
+            return path.read_text(encoding="utf-8-sig")
+
+        def never_handed_a_queue_file(path):
+            return path.read_text(encoding="utf-8")
+
+        def direct():
+            return TODO_PROMPT_FILE.read_text(encoding="utf-8")
+
+        good(TODO_PROMPT_FILE)
+        bad(path=TODO_PROMPT_FILE)
+        reads_something_else(TODO_PROMPT_FILE, LOG_FILE)
+        never_handed_a_queue_file(LOG_FILE)
+        ''')
+    reads = _queue_file_reads([("synthetic.py", ast.parse(source))])
+    assert set(reads) == {("synthetic.py", n) for n in (
+        "good", "bad", "reads_something_else", "direct")}, sorted(reads)
+    assert _bom_violations(reads) == {
+        ("synthetic.py", "bad"), ("synthetic.py", "direct")}
 
 
 # --------------------------------------------------------------------------

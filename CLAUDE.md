@@ -298,10 +298,28 @@ to commas, JSON, or YAML. Both `read_todo_characters` (webrunner) and
    rows, because an empty row means remove/disable Character 2 for that pair.
    (`str.strip()` already treats `\xa0` NBSP as whitespace.)
 3. Replace `\xa0` (NBSP) with a regular space inside each surviving entry.
+4. **A leading BOM is not part of the first entry** — decode with
+   `utf-8-sig`, never `utf-8`. A queue saved as "UTF-8 with BOM" (Windows
+   PowerShell 5.1 `Set-Content -Encoding UTF8`, Notepad's option) otherwise
+   reads its first entry as `\ufeffAmiya`: identical on screen, a different
+   string, and `str.strip()` does **not** remove U+FEFF. So an `end` on the
+   first line does not stop the run, the character lands in a second output
+   folder that looks identically named, and a BOM followed by a blank row
+   becomes an invisible entry (in Character 2, "no Character 2 for this pair"
+   turns into "Character 2 is one invisible character"). Only the leading one
+   is dropped. This binds **every** reader of these files, not just the two
+   named above: the four fallback files (`read_text_safe` / `_fallback_text`),
+   `read_file_text`, and the source of `_cmd_push_default`.
+   `test_todo_format.test_every_read_of_a_queue_file_drops_the_leading_bom`
+   finds them by AST; the one deliberate exception (`_safe_write`'s undo
+   backup, which must keep the BOM so `/sys undo` restores the original bytes)
+   is listed with its reason in `_BOM_KEEPING_READS`.
 
 `write_*` MUST preserve Character 2's positional empty rows, end the file with
 exactly one trailing newline when non-empty, and write nothing when the list
-is empty. Blank lines in the other three queues remain invalid.
+is empty. Blank lines in the other three queues remain invalid. Writers write
+UTF-8 **without** a BOM, so the first rewrite (a pop, a bot edit) drops a BOM
+the user saved in; do not make a writer preserve it.
 A writer MUST NOT write an entry that contains any of those line boundaries:
 it would read back as several entries, and in the positional Character 2
 queue that shifts every later pair with no error anywhere. The bot's

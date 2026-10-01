@@ -211,7 +211,9 @@ copy undesired.example.md   undesired.md
 You rarely create the queues by hand — `/todo char1 add <description>` writes
 them for you. The format is **one entry per line**, never split on commas;
 `todo_character2.md` is positional, so an empty row means "no second character
-for this pair" and must be preserved.
+for this pair" and must be preserved. A UTF-8 BOM at the start of a file (Notepad
+and Windows PowerShell 5.1 add one) is not part of the first entry; fallback
+files and templates are read the same way, and the next rewrite drops it.
 
 ---
 

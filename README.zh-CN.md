@@ -195,7 +195,8 @@ copy undesired.example.md   undesired.md
 
 队列本身通常不用手建——`/todo char1 add <角色描述>` 就会写出来。格式是**一行一条**、
 不按逗号切；`todo_character2.md` 是按位置对应的，空行代表「这一对不要第二个角色」，
-要保留。
+要保留。文件开头的 UTF-8 BOM（记事本、Windows PowerShell 5.1 保存时会加）不算第一条的
+一部分；fallback 文件与模板同样适用，下一次改写就会去掉。
 
 ---
 

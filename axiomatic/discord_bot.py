@@ -1062,10 +1062,17 @@ def read_token(path: Path) -> str:
 
 
 def read_todo_entries(path: Path, *, preserve_blank: bool | None = None) -> list[str]:
+    """讀一份 todo 佇列，一行一筆（契約見 `CLAUDE.md` → todo file format）。
+
+    用 `utf-8-sig` 讀：**檔頭的 BOM 不屬於第一筆**，而 `str.strip()` 不會去掉
+    U+FEFF。產圖批次那一側的 `read_todo_characters` 用同一個編碼，兩邊必須一起改
+    ——只改一邊，預覽（`/gen plan`、`/queue`）與實際產圖就會對同一個檔給出不同的
+    答案。寫入端不寫 BOM，所以任何一次改寫都會把它拿掉。
+    """
     if not path.exists():
         return []   # 佇列沒建立過 ＝ 空佇列，這個空值是對的
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as error:
         # 解不開**不是**空佇列，所以不能回 `[]`——理由見 `_QueueFileNotUtf8`
         # 與 `_webrunner_shared.QueueDecodeError` 的 docstring。
@@ -1155,11 +1162,14 @@ def read_file_text(path: Path) -> str:
 
     不存在代表那份預設沒有設定，回 `""` 是正確語意；解不開則不是——同一個空字
     串在下游會被當成「使用者就是要空的提示詞」。兩者要分得開，所以後者往外拋。
+
+    用 `utf-8-sig` 讀，與其他佇列／fallback 讀取端一致（檔頭的 BOM 不屬於內容）；
+    `/preset … append` 拿它讀回來再寫回去，所以改寫之後檔案就不帶 BOM 了。
     """
     if not path.exists():
         return ""
     try:
-        return path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as error:
         raise _queue_file_not_utf8(path, error) from error
 
@@ -1393,6 +1403,10 @@ def _safe_write(path: Path, content: str, *, encoding: str = "utf-8") -> None:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     if path.exists():
         try:
+            # 刻意照 `encoding` 讀（預設 `utf-8`，**不是**佇列讀取端的 `utf-8-sig`）：
+            # 這份是 `/sys undo` 的備份，檔頭的 BOM 要原樣留著，還原回去才是原來的
+            # 位元組。代價是帶 BOM 的檔永遠不等於新內容，所以一定會被改寫——而改寫
+            # 本來就該把 BOM 拿掉。
             prior = path.read_text(encoding=encoding)
         except (OSError, UnicodeDecodeError) as error:
             print(f"_safe_write: prior read failed for {path.name}: {error!r}",
@@ -2834,8 +2848,10 @@ def _fallback_text(path: Path) -> str:
     # fallback 沒東西」，跟檔案不存在同一條路。
     # 刻意不加 `errors="replace"`：把亂碼當成有效提示詞送進佇列預覽，比「當作空的」
     # 糟得多——後者至少是已知且可預期的行為。
+    # `utf-8-sig` 與產圖批次的 `read_text_safe` 一致：檔頭的 BOM 不屬於內容，而
+    # `.strip()` 不會去掉 U+FEFF——只有 BOM 的檔會被當成「有內容」的 fallback。
     try:
-        return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+        return path.read_text(encoding="utf-8-sig").strip() if path.exists() else ""
     except (OSError, UnicodeDecodeError):
         return ""
 
@@ -14129,7 +14145,9 @@ async def _cmd_push_default(message: discord.Message, source: Path, dest: Path) 
         await safe_reply(message, f"**{src_label}** 不存在")
         return
     try:
-        text = source.read_text(encoding="utf-8").strip()
+        # `utf-8-sig`：來源的 BOM 若跟著變成一筆，推進非空佇列時會落在**檔案中間**，
+        # 那裡沒有任何讀取端會把它去掉，那一筆就永遠帶著一個看不見的字元。
+        text = source.read_text(encoding="utf-8-sig").strip()
     except UnicodeDecodeError as error:
         # 這裡刻意不退回空字串：那會回下面那句「是空的；沒有東西可加入」，
         # 而檔案其實是滿的，只是編碼不對——使用者去看檔案只會看到裡面明明
