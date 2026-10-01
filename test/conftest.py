@@ -307,6 +307,15 @@ _sys.meta_path.insert(0, _CwdParkingFinder(_GUI_LIB_LOG_MODULE, _GUI_LIB_LOG_DIR
 # finder 照樣留著：fresh clone 從套件庫裝到的發佈版（0.0.222）還是以相對路徑寫 cwd，兩代都要擋。
 _os.makedirs(_GUI_LIB_LOG_DIR, exist_ok=True)
 _os.environ["JE_AUTOCONTROL_LOG_FILE"] = str(_GUI_LIB_LOG_DIR / "AutoControlGUI.log")
+# **瀏覽器函式庫的原始碼樹 2026-10-01 也換了同一種寫法**（WebRunner cb8449d）：日誌位置改由
+# `WEBRUNNER_LOG_PATH`／`WEBRUNNER_LOG_DIR` 決定，都沒設就寫家目錄的 `~/.je_web_runner/logs/`，
+# 上面那個換 cwd 的 finder 同樣不再起作用。症狀是順序相依：測試行程先匯入了任一個批次變體
+# （它們會把同層的 WebRunner 工作樹插到 `sys.path` 最前面，載入的就是新寫法），之後
+# `test_the_browser_library_log_is_parked_outside_the_repo` 才會紅，而測試已經寫進家目錄那份
+# 正式檔；單獨跑、或先匯入的是套件庫發佈版時都是綠的。理由與寫法照上面那一段：覆寫、目錄先
+# 建好、finder 照樣留著（套件庫的發佈版還是以相對路徑寫 cwd）。
+_os.makedirs(_BROWSER_LIB_LOG_DIR, exist_ok=True)
+_os.environ["WEBRUNNER_LOG_PATH"] = str(_BROWSER_LIB_LOG_DIR / "WEBRunner.log")
 
 # 正式程式碼「順手」append 的記錄檔：(模組名, 常數名)。每一支測試開始前都先導到
 # 暫存目錄。`test_suite_safety` 兩個方向對帳這張表：列的常數要真的存在，而正式
