@@ -99,6 +99,13 @@ class PlatformCapabilities:
     `text_limit` is the per-message character limit (chunked before sending by
     `chunk_text()`); `file_bytes_limit` is the byte limit for a single
     attachment, and 0 means this platform accepts no attachments.
+    `buttons` is whether a sent message can carry buttons (`view=`). A platform
+    without them silently drops that argument, so a paged reply
+    (`_reply_pager.send_paged`) asks this flag to decide between buttons and
+    sending every page in turn. Every transport declares it explicitly
+    (`test_platform_transports` checks), because the default is the answer for a
+    platform that has no buttons, and a transport that grows them later must
+    flip it on purpose.
     """
 
     edit_message: bool = False
@@ -112,6 +119,8 @@ class PlatformCapabilities:
     # Whether the platform has a native slash menu. Without one, the command hints the bot
     # sends are rewritten into text commands at send time (see `rewrite_command_hints`).
     slash_commands: bool = False
+    # Whether a sent message can carry buttons. See the class docstring.
+    buttons: bool = False
 
 
 # ---------------------------------------------------------------------------

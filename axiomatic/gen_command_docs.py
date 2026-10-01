@@ -286,6 +286,30 @@ def _const(node):
     return None
 
 
+def _int_constants(tree: ast.Module) -> dict:
+    """模組層 `NAME = <整數>` → `{NAME: 整數}`，只看最外層的指派。
+
+    斜線選項的上限有時寫成常數（`Range[int, 1, PLAN_MAX_ROWS]`），讓選項與 handler 的夾值共用
+    同一個數字；不解開的話，文件會渲染成「整數（1–None）」。
+    """
+    found = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        value = _const(node.value)
+        if isinstance(target, ast.Name) and isinstance(value, int)                 and not isinstance(value, bool):
+            found[target.id] = value
+    return found
+
+
+def _bound(node, constants: dict):
+    """`Range` 的一個上下限：字面值，或模組層整數常數的名字。"""
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    return _const(node)
+
+
 def _str_set(tree: ast.Module, name: str) -> list:
     """模組層 `NAME = frozenset({...})` / `{...}` 的字串元素，**保留宣告順序**。
 
@@ -400,7 +424,7 @@ def _number(value) -> str:
     return repr(value) if isinstance(value, float) else str(value)
 
 
-def _type_label(annotation, choice_names) -> str:
+def _type_label(annotation, choice_names, constants: dict | None = None) -> str:
     if choice_names:
         return "選項：" + " / ".join("`%s`" % c for c in choice_names)
     if annotation is None:
@@ -412,8 +436,8 @@ def _type_label(annotation, choice_names) -> str:
                     if isinstance(annotation.slice, ast.Tuple) else [])
             kind = _dotted(elts[0]).rsplit(".", 1)[-1] if elts else "int"
             word = TYPE_WORDS.get(kind, "整數")
-            low = _const(elts[1]) if len(elts) > 1 else None
-            high = _const(elts[2]) if len(elts) > 2 else None
+            low = _bound(elts[1], constants or {}) if len(elts) > 1 else None
+            high = _bound(elts[2], constants or {}) if len(elts) > 2 else None
             if low is None and high is None:
                 return word
             return "%s（%s–%s）" % (word, _number(low), _number(high))
@@ -421,10 +445,10 @@ def _type_label(annotation, choice_names) -> str:
         inner = annotation.slice
         if isinstance(inner, ast.Tuple) and inner.elts:
             inner = inner.elts[0]
-        return _type_label(inner, None)
+        return _type_label(inner, None, constants)
     if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
         # `discord.User | None` —— 新式 Optional，取左邊那個具體型別。
-        return _type_label(annotation.left, None)
+        return _type_label(annotation.left, None, constants)
     return TYPE_WORDS.get(_dotted(annotation).rsplit(".", 1)[-1], "文字")
 
 
@@ -442,7 +466,8 @@ def _default_note(value, describe: str) -> str:
     return "（預設 `%s`）" % value
 
 
-def _params(func, describes: dict, choices: dict) -> list:
+def _params(func, describes: dict, choices: dict,
+            constants: dict | None = None) -> list:
     """簽章 → `[{name, type, required, desc}]`（跳過 `interaction`）。"""
     args = func.args.args
     defaults = func.args.defaults
@@ -458,7 +483,7 @@ def _params(func, describes: dict, choices: dict) -> list:
                                       describe)
         out.append({
             "name": arg.arg,
-            "type": _type_label(arg.annotation, choices.get(arg.arg)),
+            "type": _type_label(arg.annotation, choices.get(arg.arg), constants),
             "required": required,
             "desc": describe,
         })
@@ -505,6 +530,7 @@ def _choice_vars(tree: ast.Module) -> dict:
 
 def _commands(tree: ast.Module, groups: dict, choice_vars: dict) -> list:
     """走訪所有 `@x.command(...)`，回一批 dict。"""
+    constants = _int_constants(tree)
     out = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -557,7 +583,7 @@ def _commands(tree: ast.Module, groups: dict, choice_vars: dict) -> list:
             "name": name,
             "description": description,
             "extras": extras if isinstance(extras, dict) else {},
-            "params": _params(node, describes, choices),
+            "params": _params(node, describes, choices, constants),
             "func": node.name,
             "handler": handler,
         })

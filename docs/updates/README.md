@@ -58,3 +58,4 @@
 | U-20261001-04 | 2026-10-01 | 第三個對話後端的提示改從 stdin 送 | #done |
 | U-20261001-05 | 2026-10-01 | /dorossi model 完整版本號與 /dorossi model_list | #done |
 | U-20261001-06 | 2026-10-01 | 本機儀表板重新設計，加上平台切換 | #done |
+| U-20261001-07 | 2026-10-01 | 回覆改成卡片與分頁：/dorossi running、/sys health、/gen plan、/out stats | #done |

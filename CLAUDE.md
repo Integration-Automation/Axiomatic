@@ -175,7 +175,7 @@ it too, in a separate change applied only while no batch runs) — its only stat
 is a process-local counter, never shared across processes;
 `_connectivity` is a pure "can this host reach the internet" probe both batch
 supervisors use to tell a network outage from a crash. (`_external_apis`,
-`_help_strings`, `dorossi_backend`, `_dorossi_gemini`, `discord_rpc` are bot-only helpers, not
+`_help_strings`, `dorossi_backend`, `_dorossi_gemini`, `_reply_card`, `_reply_pager`, `discord_rpc` are bot-only helpers, not
 boundary channels; `_gui_control` is bot-only too — the desktop-automation
 façade over the external library. None of them may import `discord_bot` —
 that would be circular.)

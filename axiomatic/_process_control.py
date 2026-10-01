@@ -451,6 +451,9 @@ STALE_COMPONENTS = {
         # 2026-09-28: the third conversation backend's CLI adapter; both
         # `dorossi_backend` and the bot import it at module level.
         "axiomatic/_dorossi_gemini.py",
+        # 2026-10-01: the reply-card and paged-reply primitives (bot-only helpers).
+        "axiomatic/_reply_card.py",
+        "axiomatic/_reply_pager.py",
     )),
     "batch supervisor": ("start_webrunner.py", (
         "start_webrunner.py",

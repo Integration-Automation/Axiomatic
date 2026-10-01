@@ -554,8 +554,32 @@ def test_the_owner_gets_the_report(registry, monkeypatch, tmp_path):
     asyncio.run(b.mcmd_dorossi_running(_msg()))
     assert len(replies) == 1
     content, kw = replies[0]
-    assert "`s1`" in content and "主專案" in content, content
+    # 2026-10-01 起送的是卡片；沒有卡片的平台看到的是 `flatten_embed` 攤平的文字，這裡讀的就是那一份。
+    from _chat_platform import outbound_text  # noqa: PLC0415
+    text = outbound_text(content, kw.get("embed"))
+    assert "`s1`" in text and "主專案" in text, text
     assert "allowed_mentions" in kw, "標籤是使用者打的字，送出時不能帶 ping"
+
+
+def test_the_card_says_what_the_text_report_says(registry):
+    """卡片與文字版由同一支 `_dorossi_running_parts` 組：每件工作一個欄位，摘要在描述，狀態決定顏色。"""
+    from _chat_platform import flatten_embed  # noqa: PLC0415
+    import _reply_card  # noqa: PLC0415
+    now = time.time()
+    _turn("s1", "run", started=now - 30)
+    text = b._dorossi_running_report(_report_state(), _msg(), now=now)
+    card = b._dorossi_running_card(_report_state(), _msg(), now=now)
+    assert len(card.fields) == 1 and "`s1`" in card.fields[0].name
+    assert card.color.value == _reply_card.STATUS_COLORS["ok"]
+    flat = flatten_embed(card)
+    for line in text.splitlines()[1:]:
+        assert line.strip().removeprefix("• ") in flat, (line, flat)
+
+
+def test_an_idle_card_is_grey(registry):
+    import _reply_card  # noqa: PLC0415
+    card = b._dorossi_running_card({}, _msg(), now=time.time())
+    assert not card.fields and card.color.value == _reply_card.STATUS_COLORS["idle"]
 
 
 def test_the_command_is_on_the_tree_next_to_status():

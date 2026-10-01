@@ -178,6 +178,9 @@ class TelegramTransport(ChatTransport):
             read_attachments=True,
             text_limit=TEXT_CHUNK_LIMIT,
             file_bytes_limit=UPLOAD_LIMIT_BYTES,
+            # 這個 transport 不送按鈕（`deliver` 只取它認得的鍵，`view=` 會被丟掉），
+            # 所以分頁回覆在這裡改成逐頁送出（`_reply_pager.send_paged`）。
+            buttons=False,
         )
 
     # -- HTTP --------------------------------------------------------------

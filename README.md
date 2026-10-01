@@ -434,6 +434,15 @@ does.
 React ⭐ on an image the bot posted to favourite it, 🗑️ to delete the file.
 Writes go through the backup mechanism, so `/sys undo` can restore them.
 
+### Reply layout
+
+Status replies are cards: a title, a status colour, sectioned fields and a
+footer note (`/sys health`, `/gen plan`, `/dorossi running`, `/out stats`). A
+list longer than one card is paged, with ◀ ▶ buttons under the message that only
+the person who ran the command can press; they stop working after 5 idle
+minutes. That is why `/gen plan [n]` can list up to 500 pairs. Platforms without
+cards or buttons get the same content as plain text, one message per page.
+
 ### Platforms without a slash menu
 
 On a platform that has no native slash menu, the same commands are reached

@@ -70,6 +70,44 @@ def test_importing_the_transport_modules_registers_them():
     assert tg.PLATFORM_NAME in cp.registered_transports()
 
 
+def _capability_calls(path: Path) -> list[ast.Call]:
+    return [node for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None)) == "PlatformCapabilities"]
+
+
+def test_every_transport_declares_whether_it_has_buttons():
+    """`buttons` 預設是 False（沒有按鈕的答案），所以每個 transport 都要**明寫**。
+
+    分頁回覆（`_reply_pager.send_paged`）靠這個旗標決定放翻頁按鈕還是逐頁送出；transport 會
+    安靜地丟掉它不認得的 `view=`，所以一個其實有按鈕、卻沒宣告的平台只會少了按鈕，而一個
+    沒有按鈕、卻被當成有的平台只會送出第一頁——兩種都沒有任何症狀。明寫讓之後接上按鈕的
+    人必須改這一行。
+    """
+    files = sorted(PKG_ROOT.glob("_*_transport.py"))
+    assert files, "一個 transport 模組都找不到——glob 壞了，這支等於沒在對帳"
+    for path in files:
+        calls = _capability_calls(path)
+        assert calls, f"{path.name} 沒有建立 `PlatformCapabilities(...)`"
+        for call in calls:
+            assert any(k.arg == "buttons" for k in call.keywords), (
+                f"{path.name} 的 `PlatformCapabilities(...)` 沒有明寫 `buttons=`")
+
+
+def test_the_buttons_check_sees_a_missing_declaration(tmp_path):
+    """正面對照：沒寫 `buttons=` 的呼叫真的會被認出來，否則上面那支永遠是綠的。"""
+    path = tmp_path / "_demo_transport.py"
+    path.write_text("x = PlatformCapabilities(edit_message=True)\n", encoding="utf-8")
+    calls = _capability_calls(path)
+    assert len(calls) == 1 and not any(k.arg == "buttons" for k in calls[0].keywords)
+
+
+def test_the_text_platform_has_no_buttons():
+    """這個平台不送按鈕，所以分頁回覆在這裡要逐頁送出。"""
+    transport = tg.TelegramTransport("x", context=None, owner_ids=(), allowed_chat_ids=())
+    assert transport.capabilities.buttons is False
+
+
 def test_the_adapter_layer_does_not_import_the_bot():
     """`_chat_platform` import `discord_bot` 就是循環——而且那條循環會在 import 期
     炸掉整支 bot。另外它也刻意不 import 函式庫本身：附件與嵌入訊息一律鴨子型別。"""

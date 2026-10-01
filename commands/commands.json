@@ -1077,9 +1077,9 @@
       "params": [
         {
           "name": "n",
-          "type": "整數（1–60）",
+          "type": "整數（1–500）",
           "required": false,
-          "description": "最多列幾列（預設 25、上限 60）"
+          "description": "最多列幾組（預設 25、上限 500；超過 25 組會分頁）"
         }
       ]
     },

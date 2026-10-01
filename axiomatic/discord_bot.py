@@ -190,6 +190,9 @@ from _webrunner_shared import SINGLE_IMAGE_SERVER_FLAG
 # runtime orchestration（mcmd_dorossi／process_turn／run_loop／mcmd_session／live 串流／
 # 佇列鎖／自走旗標／回覆組裝），把後端叫用、session 儲存與純判定委派給這裡。
 from _dorossi_gemini import parse_agy_usage_report
+# 卡片版面（狀態色、長度上限）。bot-only helper，不 import discord_bot。
+import _reply_card
+import _reply_pager
 from dorossi_backend import (
     # --- backend config / corpus the bot orchestration still references -------
     DOROSSI_BACKEND,
@@ -2839,19 +2842,24 @@ def _compute_run_plan() -> tuple[list[tuple[str, str, str, str]], dict]:
     return pairs, fb
 
 
+# `/gen plan [n]` 的上限。超過一張卡片（25 組）就分頁，所以上限是頁數 × 每頁，不是一則訊息放得下多少。
+PLAN_MAX_ROWS = 500
+
+
 async def cmd_plan(message: discord.Message, payload: str) -> None:
     """Full run plan — exactly the pairs webrunner would walk on `/run`,
     after fallback substitution and `end`-marker truncation. `/gen plan [N]`
-    caps the listed rows (default 25, max 60)."""
+    caps the listed rows (default 25, max `PLAN_MAX_ROWS`); more than one
+    card's worth goes out as pages (`_reply_pager`)."""
     arg = payload.strip()
     try:
         cap = int(arg) if arg else 25
     except ValueError:
         cap = 25
-    cap = max(1, min(cap, 60))
+    cap = max(1, min(cap, PLAN_MAX_ROWS))
     pairs, fb = _compute_run_plan()
     if not pairs:
-        await safe_reply(message, "all queues empty (and no fallbacks) — nothing to run")
+        await safe_reply(message, "所有佇列都是空的（也沒有 fallback）——沒有東西可跑。")
         return
     # `end` is located over ALL pairs, not inside the capped listing loop: with
     # the marker past the cap, a loop that stops at the cap never reaches it and
@@ -2862,25 +2870,27 @@ async def cmd_plan(message: discord.Message, payload: str) -> None:
     rows: list[str] = []
     for i, (p, c1, c2, _u) in enumerate(pairs[:min(effective, cap)], 1):
         name = _plan_char_name(c1) if c1 else (
-            _plan_char_name(c2) if c2 else "(no character)")
+            _plan_char_name(c2) if c2 else "（沒有角色）")
         rows.append(f"[{i}] {name}  ⟵ {_shorten(p, 46)}")
-    body = "\n".join(rows) if rows else "(no pairs before the `end` marker)"
-    if len(body) > 1700:
-        body = body[:1700] + "\n… (truncated)"
-    safe = _fence_escape(body)
+    # 一頁 25 組；卡片描述上限 4096，每頁 3800 字扣掉程式碼區塊的框還有餘裕。
+    row_pages = _reply_pager.paginate_rows(
+        rows, per_page=25, max_chars=3800) or [["（`end` 之前沒有任何一組）"]]
     notes: list[str] = []
     used_fb = [k for k, v in fb.items() if v]
     if used_fb:
-        notes.append("fallback used for: " + ", ".join(used_fb))
+        notes.append("用了 fallback：" + "、".join(used_fb))
     if stopped_at is not None:
-        notes.append(f"⏹ `end` marker at pair #{stopped_at} — stops there")
+        notes.append(f"⏹ `end` 標記在第 #{stopped_at} 組，跑到那裡就停")
     if effective > len(rows):
-        notes.append(f"showing {len(rows)} of {effective} pairs (`/gen plan {effective}` for more)")
-    footer = ("\n" + " · ".join(notes)) if notes else ""
-    await safe_reply(
-        message,
-        f"**run plan — {effective} pair(s) will run:**\n```\n{safe}\n```{footer}"
-    )
+        notes.append(f"顯示 {len(rows)} / {effective} 組"
+                     f"（`/gen plan {min(effective, PLAN_MAX_ROWS)}` 看更多）")
+    # 卡片（`_reply_card`），超過一頁就分頁（`_reply_pager`）：清單放描述的程式碼區塊，附註放頁尾。
+    pages = [_reply_card.card(
+        f"🗺️ 產圖計畫：這次會跑 {effective} 組",
+        status="ok" if effective else "warn",
+        description="```\n" + _fence_escape("\n".join(page)) + "\n```",
+        footer=" · ".join(notes) or None) for page in row_pages]
+    await _reply_pager.send_paged(safe_reply, message, pages)
 
 
 async def cmd_move(message: discord.Message, payload: str) -> None:
@@ -3468,14 +3478,12 @@ async def cmd_output_stats(message: discord.Message) -> None:
         total += count
         name = d.name if len(d.name) <= 48 else d.name[:45] + "…"
         rows.append(f"{name:<48}  {count:>5}")
-    body = "\n".join(rows)
-    if len(body) > 1700:
-        body = body[:1700] + "\n… (truncated)"
-    await safe_reply(
-        message,
-        f"**產出統計** — {len(dirs)} folders, {total} images total\n"
-        f"```\n{_fence_escape(body)}\n```"
-    )
+    # 原本整份截在 1700 字，資料夾一多後面就看不到；改成卡片、一頁 30 個資料夾（`_reply_pager`）。
+    pages = [_reply_card.card(
+        f"📁 產出統計：{len(dirs)} 個資料夾、共 {total} 張",
+        description="```\n" + _fence_escape("\n".join(page)) + "\n```")
+        for page in _reply_pager.paginate_rows(rows, per_page=30, max_chars=3800)]
+    await _reply_pager.send_paged(safe_reply, message, pages)
 
 
 async def cmd_rate(message: discord.Message) -> None:
@@ -6837,9 +6845,12 @@ def _dorossi_running_pid(source, proc) -> str:
     return _owner_detail(source, f" · PID {pid}", "")
 
 
-def _dorossi_running_report(state: dict, source, *,
-                            now: float | None = None) -> str:
-    """`/dorossi running` 的內容：此刻每一件進行中的 Dorossi 工作。
+def _dorossi_running_parts(state: dict, source, *,
+                           now: float | None = None) -> tuple[list, list]:
+    """`/dorossi running` 的內容，拆成 `(摘要行, [(標頭, 細節), …])`：此刻每一件進行中的 Dorossi 工作。
+
+    文字版（`_dorossi_running_report`）與卡片版（`_dorossi_running_card`）都由這一支組，所以兩邊
+    講的永遠是同一件事；工作依開始時刻排好。
 
     三個來源全部是既有的記憶體狀態，唯讀、不取任何鎖：`_dorossi_turns`（單輪回合，
     含回覆後的背景壓縮與 `/dorossi compact`）、`_dorossi_loops`（自走迴圈）、
@@ -6955,10 +6966,30 @@ def _dorossi_running_report(state: dict, source, *,
             for sid, at in waiting[:3])
         lines.append(f"⏸️ 自走任務在等方案用量重設：{len(waiting)} 件（{clocks}，"
                      "時間到會自動接續，不佔名額）")
-    for _ts, head, tail in sorted(items, key=lambda item: item[0]):
-        lines.append(head)
-        lines.append(tail)
+    return lines, [(head, tail) for _ts, head, tail in sorted(items, key=lambda item: item[0])]
+
+
+def _dorossi_running_report(state: dict, source, *, now: float | None = None) -> str:
+    """`/dorossi running` 的文字版（每件工作兩行）。內容見 `_dorossi_running_parts`。"""
+    lines, items = _dorossi_running_parts(state, source, now=now)
+    for head, tail in items:
+        lines += [head, tail]
     return "\n".join(lines)
+
+
+def _dorossi_running_card(state: dict, source, *, now: float | None = None) -> discord.Embed:
+    """`/dorossi running` 的卡片版：摘要放描述、每件工作一個欄位（標頭當欄位名、細節當值）。
+
+    狀態色：有東西在等（網路、方案用量、讓出）是 `warn`，有工作在跑是 `ok`，什麼都沒有是 `idle`。
+    沒有卡片的平台由 `flatten_embed` 攤回文字，所以內容與文字版一致。
+    """
+    lines, items = _dorossi_running_parts(state, source, now=now)
+    waiting = any(line.startswith("⏸️") for line in lines[1:]) or any(
+        "⏸️" in head for head, _tail in items)
+    status = "warn" if waiting else ("ok" if items else "idle")
+    return _reply_card.card(
+        lines[0].rstrip("：:"), status=status, description="\n".join(lines[1:]),
+        fields=[(head.removeprefix("• "), tail.strip()) for head, tail in items])
 
 
 async def mcmd_dorossi_running(message: discord.Message, rest: str = "") -> None:
@@ -6970,10 +7001,8 @@ async def mcmd_dorossi_running(message: discord.Message, rest: str = "") -> None
     if not _dorossi_owner_only(message):
         await safe_reply(message, "此指令僅限擁有者使用。")
         return
-    text = _dorossi_running_report(_dorossi_load_state(), message)
-    for chunk in _chunk_for_discord(text):
-        await safe_reply(message, chunk,
-                         allowed_mentions=discord.AllowedMentions.none())
+    await safe_reply(message, embed=_dorossi_running_card(_dorossi_load_state(), message),
+                     allowed_mentions=discord.AllowedMentions.none())
     _dorossi_event("running", uid=str(message.author.id),
                    turns=len(_dorossi_turns), loops=len(_dorossi_loops))
 
@@ -21772,11 +21801,11 @@ async def cmd_health(message: discord.Message, payload: str = "") -> None:
         print(f"health presence-probe section error: {error!r}", file=sys.stderr)
         lines.append("- **presence probe**: (err — 請查看 log)")
 
-    # 原本是 `text[:1900] + "\n…"`：切在行中間、不說少了什麼。改走 doctor 那支——只在
-    # 行與行之間切，最後一行講清楚少了幾項。回覆外面沒有 code fence，所以上限就是
-    # 整則訊息的長度，1900 離單則上限 2000 還有餘裕。
-    await safe_reply(message, _join_findings_within(
-        lines, omitted=_health_omitted_line))
+    # 2026-10-01 起是卡片（`_reply_card.from_bullets`）：每一段一個欄位，狀態色由各段的標記決定。截斷規則照舊——
+    # 只整項拿掉、不送半項，頁尾用 health 自己的句子講少了幾項（`from_bullets` 的 drop 模式）。
+    # 沒有卡片的平台由 `flatten_embed` 攤回「名稱: 值」一行一項。
+    await safe_reply(message, embed=_reply_card.from_bullets(
+        "🩺 健康檢查", lines[1:], omitted=_health_omitted_line))
 
 
 # `requirements.txt` 裡的套件名 → 實際的 import 名。**只列 `-` 換成 `_` 之後仍然
@@ -26780,10 +26809,10 @@ async def slash_gen_preview(interaction: discord.Interaction) -> None:
 
 @gen_group.command(name="plan", description="完整跑批計畫（會依序跑的所有配對）",
                    extras={"bang": "!plan"})
-@discord.app_commands.describe(n="最多列幾列（預設 25、上限 60）")
+@discord.app_commands.describe(n="最多列幾組（預設 25、上限 500；超過 25 組會分頁）")
 async def slash_gen_plan(
         interaction: discord.Interaction,
-        n: discord.app_commands.Range[int, 1, 60] = 25) -> None:
+        n: discord.app_commands.Range[int, 1, PLAN_MAX_ROWS] = 25) -> None:
     await _slash_run(interaction, cmd_plan, str(n))
 
 

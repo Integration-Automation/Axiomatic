@@ -41,8 +41,8 @@
 | `axiomatic/webrunner_novelai.py`、`axiomatic/webrunner_je_only.py` | 執行層的兩個變體（Selenium 為正式預設、wrapper 為備援）：瀏覽器生命週期、登入、設定檔快照、`BrowserPort` adapter |
 | `axiomatic/_webrunner_shared.py` | 兩個變體的共用核心，不 import 任何 driver：DOM 操作、佇列 I/O、輸出資料夾分配、產圖迴圈、單圖服務、`run_batch` |
 | `axiomatic/_batch_config.py`、`_bot_config.py`、`_queue_consume.py`、`_run_progress.py`、`_supervisor.py`、`_chrome_slot.py`、`_code_fingerprint.py`、`_warn_dedup.py` | 無狀態的共用模組：設定載入、佇列消耗決策、續跑檢查點、退避與單一實例鎖、跨行程瀏覽器槽鎖、程式碼指紋、警告去重（允許當第三通道的完整清單以 `CLAUDE.md`「Module boundaries」為準） |
-| `axiomatic/_process_control.py`、`_gui_control.py`、`_external_apis.py`、`_help_strings.py`、`_bot_prompts.py`、`dorossi_backend.py`、`_dorossi_gemini.py`、`presence_probe.py`、`discord_rpc.py`、`_resource_report.py` | bot 專屬模組：行程探查與終止、桌面自動化門面、外部圖庫／web API、說明文字資料、外部化 prompt 載入、Dorossi 後端與工作階段、Gemini CLI 串流與用量解析、本機狀態探測、本機 Rich Presence、依角色分組的行程數與資源占用（`/proc usage`，只讀作業系統行程表，只回數字與角色代號、不組送出字串） |
-| `axiomatic/_chat_platform.py`、`_telegram_transport.py`、`_platform_runtime.py` | bot 專屬的對話平台層：介接接縫（身分映射、能力旗標、送出引數正規化、沒有斜線選單時的指令提示改寫、transport 註冊表）、逐平台 transport（一個平台一個 `_*_transport.py`）、行程的平台身分與它自己的狀態／鎖／記錄檔位置 |
+| `axiomatic/_process_control.py`、`_gui_control.py`、`_external_apis.py`、`_help_strings.py`、`_bot_prompts.py`、`dorossi_backend.py`、`_dorossi_gemini.py`、`presence_probe.py`、`discord_rpc.py`、`_resource_report.py`、`_reply_card.py`、`_reply_pager.py` | bot 專屬模組：行程探查與終止、桌面自動化門面、外部圖庫／web API、說明文字資料、外部化 prompt 載入、Dorossi 後端與工作階段、Gemini CLI 串流與用量解析、本機狀態探測、本機 Rich Presence、依角色分組的行程數與資源占用（`/proc usage`，只讀作業系統行程表，只回數字與角色代號、不組送出字串）、回覆的卡片原語與分頁回覆（見 §4「回覆版面」） |
+| `axiomatic/_chat_platform.py`、`_telegram_transport.py`、`_platform_runtime.py` | bot 專屬的對話平台層：介接接縫（身分映射、能力旗標——含 `slash_commands` 與 `buttons`，每個 transport 都明寫——、送出引數正規化與嵌入訊息攤平、沒有斜線選單時的指令提示改寫、transport 註冊表）、逐平台 transport（一個平台一個 `_*_transport.py`）、行程的平台身分與它自己的狀態／鎖／記錄檔位置 |
 | `start_platforms.py`、`start_discord_bot.py`、`start_webrunner.py`、`run_batch.py`、`install_autostart.py`、`wake_autostart.py` | repo 根目錄的啟動器：把每個開著的平台各起一個受監督行程、單一平台的監督迴圈（`--platform`）、批次監督迴圈、一鍵批次入口、Windows 工作排程器自動啟動的註冊與手動叫醒 |
 | `axiomatic/verify_*.py`、`dashboard_server.py` | 手動驗證腳本（瀏覽器、外部 API、額度對話框、後端 CLI）與本機唯讀狀態儀表板 |
 | `axiomatic/gen_command_docs.py`、`audit_dependencies.py`、`audit_simplified_chars.py`、`mutation_harness.py` | 文件產生、相依與字形稽核、變異測試骨架 |
@@ -109,6 +109,16 @@
 3. **Dorossi 對話（`/dorossi ask`、`@bot Dorossi <提問>`）**：解析開頭的微調 token → 決定工作
    階段 slot → 取 per-session 鎖 → `dorossi_backend.py` 串流叫用後端並套兩段式看門狗 →
    即時更新單一訊息 → 記錄用量、存 `dorossi_session.json`。
+4. **回覆版面**：狀態類回覆（`/sys health`、`/gen plan`、`/dorossi running`、`/out stats`）由
+   `_reply_card.card(title, status=, description=, fields=, footer=)` 組成卡片——狀態決定顏色
+   （`ok`／`warn`／`bad`／`info`／`idle`），平台的長度上限在這裡一次處理，放不下的欄位不送、頁尾講
+   還有幾項沒顯示（`overflow="drop"` 時太長的欄位整項拿掉，`from_bullets` 把 `- **名稱**: 值`
+   的條列報告排成卡片）。超過一張卡片的清單交給 `_reply_pager.send_paged(safe_reply, message, pages)`：
+   平台有按鈕（`PlatformCapabilities.buttons`，沒有 `capabilities` 的原生平台視為有）而且取得到
+   發起人時，一則訊息帶 ◀ ▶ 按鈕，只有發起人按得動、`PAGE_TIMEOUT_SEC` 後停用；其他情況每一頁
+   依序送出（上限 `MAX_PAGES`，截掉的頁數寫在最後一頁）。沒有嵌入訊息的平台由
+   `_chat_platform.flatten_embed` 把同一張卡片攤成「標題／描述／名稱: 值／頁尾」，不另寫文字版。
+   兩個模組都不 import `discord_bot`；送出那一步由呼叫端注入。
 
 ## 5. 擴充點
 
@@ -123,6 +133,7 @@
 | 對話平台 | 新增 `axiomatic/_<平台>_transport.py`，列進 `_chat_platform.TRANSPORT_MODULES`，在 `_bot_config` 的 `_DEFAULT_PLATFORMS` / `_PLATFORM_COERCERS` 各加一列，憑證檔照 `<平台>_bot_token.md` 的約定命名（連同範本與 `.gitignore`、`test_gitignore_coverage._IGNORED_RUNTIME`），並在 `docs/platforms.md` 寫使用說明。要讓延後的回報（`/run in`、斷網接續、排程回報）回到原對話，transport 要實作 `conversation_for(platform_chat_id)`；送不出去時丟 `_chat_platform.DeliveryFailed`，連線恢復時呼叫 `TransportContext.on_recovered`，擁有者的回覆才會先留著、之後補送 |
 | 使用者說明（README） | 四份 README 一起改：章節用 `<!-- section: <key> -->` 標記對齊，指令表四份逐字相同，切換器四份互連；數字引用在 `test_docs_sync._README_NUMBER_PATTERNS` 每種語言各一組。簡體與日文那兩份整份豁免語言守門，名單同時列在 `test_language._NON_TRADITIONAL_MARKDOWN` 與 `audit_simplified_chars.DELIBERATE_FILES`（兩向對帳） |
 | 桌面控制功能 | `axiomatic/_gui_control.py`，錯誤以泛用訊息的 `GuiError` 拋出 |
+| 狀態類回覆／長清單 | 用 `_reply_card.card(...)` 組卡片（不自己挑顏色、不自己處理長度上限）；超過一張卡片就交給 `_reply_pager.send_paged`，**不要自己傳 `view=`**——transport 會安靜地丟掉不認得的引數，使用者只看得到第一頁。翻頁按鈕之外的按鈕（會做事的那種）要在 callback 裡重新套擁有者閘與角色閘，因為元件互動不經 `tree.interaction_check` |
 | prompt 文字／presence 規則 | `bot_prompts/`（由 `_bot_prompts.py` 載入）；`presence_games.json`、`presence_music.json`、`presence_rpc.json`（各自的 `.example.json` 是範本） |
 
 ## 6. 跨專案邊界

@@ -1569,8 +1569,13 @@ def test_an_undecidable_pid_read_is_treated_as_still_running(
 
 
 def _run_reply(monkeypatch, coro_factory):
-    """跑一個會 `safe_reply` 的 handler，把它送出的文字抓回來。"""
+    """跑一個會 `safe_reply` 的 handler，把它送出的文字抓回來。
+
+    送的是卡片時回**攤平後**的文字（`outbound_text`）——就是沒有卡片的平台看到的那一份，所以
+    `- **名稱**: 值` 的條列在這裡讀起來是 `名稱: 值`（2026-10-01 `/sys health` 改成卡片）。
+    """
     import asyncio as _asyncio
+    from _chat_platform import outbound_text  # noqa: PLC0415
     box = {}
 
     async def _recorder(_message, content=None, **kw):
@@ -1579,7 +1584,20 @@ def _run_reply(monkeypatch, coro_factory):
 
     monkeypatch.setattr(b, "safe_reply", _recorder)
     _asyncio.run(coro_factory())
-    return box.get("content") or ""
+    return outbound_text(box.get("content"), box.get("embed"))
+
+
+def _run_reply_embed(monkeypatch, coro_factory):
+    """同上，但回原本那張卡片（測欄位與頁尾用）。"""
+    import asyncio as _asyncio
+    box = {}
+
+    async def _recorder(_message, content=None, **kw):
+        box["embed"] = kw.get("embed")
+
+    monkeypatch.setattr(b, "safe_reply", _recorder)
+    _asyncio.run(coro_factory())
+    return box.get("embed")
 
 
 def _health_background_line(monkeypatch, scan, alive=False, decided=True):
@@ -2021,7 +2039,7 @@ def test_health_reads_what_the_bot_replaces_on_the_loop_and_walks_off_it(
     seen: dict[str, set] = {}
     _isolate_full_health(monkeypatch, seen)
     text = _run_reply(monkeypatch, lambda: b.cmd_health(object()))
-    assert "- **disk**: `x`=`1 B`" in text and "3 `.bak` files" in text, (
+    assert "disk: `x`=`1 B`" in text and "3 `.bak` files" in text, (
         f"替身沒有接上，下面等於沒測：{text!r}")
     loop_side = ("WEBRUNNER_LOG", "EVENTS_FILE", "AUDIT_FILE", "FAVORITES_FILE",
                  "RECENT_IMAGE_MSGS_FILE", "favorites")
@@ -2384,18 +2402,20 @@ def test_an_overlong_health_report_is_cut_on_a_line_and_says_so(monkeypatch):
     """
     seen: dict[str, set] = {}
     _isolate_full_health(monkeypatch, seen)
-    full = _run_reply(monkeypatch, lambda: b.cmd_health(object()))
-    assert len(full) <= b._DOCTOR_REPLY_LIMIT, "語料本身就放不下，下面等於沒測"
-    assert full.split("\n")[-1].startswith("- **presence probe**"), full[-200:]
+    full = _run_reply_embed(monkeypatch, lambda: b.cmd_health(object()))
+    names = [f.name for f in full.fields]
+    assert names and names[-1] == "presence probe", names
+    assert full.footer.text is None, "語料本身就放不下，下面等於沒測"
 
+    # 2026-10-01 起是卡片：放不下的那一項**整項拿掉**、不截成半項，頁尾用 health 自己的句子講少了幾項。
     monkeypatch.setattr(b, "_local_probed_activity", _NamedActivity("z" * 3000))
-    cut = _run_reply(monkeypatch, lambda: b.cmd_health(object()))
-    assert len(cut) <= b._DOCTOR_REPLY_LIMIT < 2000, len(cut)
-    *kept, tail = cut.split("\n")
-    assert kept == full.split("\n")[:-1], "截斷點之前的行被動到了"
-    assert tail == b._health_omitted_line(1), (
-        f"最後一行不是 health 的截斷註記（或數字不對）：{tail!r}")
-    assert "zzz" not in cut, "放不下的那一行被切成半行送出去了"
+    cut = _run_reply_embed(monkeypatch, lambda: b.cmd_health(object()))
+    assert [(f.name, f.value) for f in cut.fields] == [
+        (f.name, f.value) for f in full.fields][:-1], "截斷點之前的項目被動到了"
+    assert cut.footer.text == b._health_omitted_line(1), (
+        f"頁尾不是 health 的截斷註記（或數字不對）：{cut.footer.text!r}")
+    from _chat_platform import flatten_embed  # noqa: PLC0415
+    assert "zzz" not in flatten_embed(cut), "放不下的那一項被切成半項送出去了"
 
 
 def test_the_recent_log_count_reads_only_the_tail_and_tells_missing_from_unreadable(
@@ -3209,9 +3229,11 @@ def _plan_reply(monkeypatch, prompts: list[str], payload: str = "") -> str:
     monkeypatch.setattr(b, "_compute_run_plan", lambda: (pairs, {
         "prompt": False, "char1": False, "char2": False, "undesired": False}))
     sent: list[str] = []
+    from _chat_platform import outbound_text  # noqa: PLC0415
 
-    async def _reply(_message, text=None, **_kw):
-        sent.append(text)
+    async def _reply(_message, text=None, **kw):
+        # 2026-10-01 起送的是卡片；讀攤平後的文字（沒有卡片的平台看到的那一份）。
+        sent.append(outbound_text(text, kw.get("embed")))
 
     monkeypatch.setattr(b, "safe_reply", _reply)
     asyncio.run(b.cmd_plan(types.SimpleNamespace(), payload))
@@ -3223,9 +3245,9 @@ def _plan_reply(monkeypatch, prompts: list[str], payload: str = "") -> str:
     # `end` 落在顯示上限（預設 25）之後：2026-09-23 之前迴圈先被上限截斷、根本走不到
     # `end`，於是標題報 40 筆（連 `end` 之後的都算進去）而且不提 `end`。
     ([f"p{i}" for i in range(1, 30)] + ["end"] + [f"q{i}" for i in range(10)],
-     29, "#30", "showing 25 of 29"),
+     29, "#30", "顯示 25 / 29 組"),
     (["p1", "p2", "end", "q1", "q2"], 2, "#3", None),
-    ([f"p{i}" for i in range(1, 41)], 40, None, "showing 25 of 40"),
+    ([f"p{i}" for i in range(1, 41)], 40, None, "顯示 25 / 40 組"),
 ], ids=["end-past-the-cap", "end-within-the-cap", "no-end"])
 def test_the_plan_counts_only_the_pairs_before_end_whatever_the_cap(
         monkeypatch, prompts, runs, end_note, showing):
@@ -3233,16 +3255,98 @@ def test_the_plan_counts_only_the_pairs_before_end_whatever_the_cap(
     `end` 截斷（上面那支釘住了），所以截斷只能在這裡做，而且不能跟顯示上限綁在同一個
     迴圈裡——`end` 在上限之後時，使用者會被告知一個比實際多的數字，也看不到 `end` 在哪。"""
     reply = _plan_reply(monkeypatch, prompts)
-    assert f"{runs} pair(s) will run" in reply, reply
+    assert f"這次會跑 {runs} 組" in reply, reply
     if end_note is None:
-        assert "`end` marker" not in reply, reply
+        assert "`end` 標記" not in reply, reply
     else:
-        assert f"`end` marker at pair {end_note}" in reply, reply
+        assert f"`end` 標記在第 {end_note} 組" in reply, reply
     if showing is None:
-        assert "showing" not in reply, reply
+        assert "顯示" not in reply, reply
     else:
         assert showing in reply, reply
     assert "q1" not in reply, "`end` 之後的筆數不該出現在清單裡"
+
+
+def test_a_plan_longer_than_one_card_is_paged_not_cut(monkeypatch):
+    """2026-10-01 起超過 25 組就分頁（`_reply_pager`）：每一組都在某一頁，沒有一組被截掉。
+    替身訊息沒有發起人，所以照「沒有按鈕」的路逐頁送出——每一頁就是一則。"""
+    pairs = [(f"prompt{i}", f"c{i}", "", "") for i in range(1, 61)]
+    monkeypatch.setattr(b, "_compute_run_plan", lambda: (pairs, {
+        "prompt": False, "char1": False, "char2": False, "undesired": False}))
+    embeds: list = []
+
+    async def _reply(_message, text=None, **kw):
+        embeds.append(kw.get("embed"))
+
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    asyncio.run(b.cmd_plan(types.SimpleNamespace(), "60"))
+    assert [e.footer.text for e in embeds] == ["第 1/3 頁", "第 2/3 頁", "第 3/3 頁"]
+    listed = [line for e in embeds for line in e.description.splitlines()
+              if line.startswith("[")]
+    assert len(listed) == 60 and listed[-1].startswith("[60] ")
+    assert all(e.title == "🗺️ 產圖計畫：這次會跑 60 組" for e in embeds)
+
+
+def test_the_plan_cap_is_shared_by_the_slash_range_and_the_handler():
+    """斜線選項的上限與 handler 的夾值是同一個常數，否則兩邊各說各的。"""
+    tree = ast.parse(Path(b.__file__).read_text(encoding="utf-8"))
+    slash = next(node for node in ast.walk(tree)
+                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "slash_gen_plan")
+    annotation = ast.unparse(slash.args.args[1].annotation)
+    assert annotation == "discord.app_commands.Range[int, 1, PLAN_MAX_ROWS]", annotation
+    handler = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.AsyncFunctionDef) and node.name == "cmd_plan")
+    assert "min(cap, PLAN_MAX_ROWS)" in ast.unparse(handler)
+
+
+def test_the_generated_docs_show_the_plan_cap_as_a_number():
+    """`Range[int, 1, PLAN_MAX_ROWS]` 的上限是常數名；產生器要解開它，不然文件寫「整數（1–None）」。"""
+    import gen_command_docs  # noqa: PLC0415
+    plan = next(c for c in gen_command_docs.Surface().commands if c["qualified"] == "gen plan")
+    assert plan["params"][0]["type"] == f"整數（1–{b.PLAN_MAX_ROWS}）", plan["params"]
+
+
+def _output_stats_embeds(monkeypatch, root: Path) -> list:
+    """跑 `/out stats`，回它送出的每一張卡片（替身訊息沒有發起人，所以多頁時逐頁送出）。"""
+    monkeypatch.setattr(b, "OUTPUT_ROOT", root)
+    embeds: list = []
+
+    async def _reply(_message, content=None, **kw):
+        embeds.append(kw.get("embed"))
+
+    monkeypatch.setattr(b, "safe_reply", _reply)
+    asyncio.run(b.cmd_output_stats(types.SimpleNamespace()))
+    return embeds
+
+
+def test_output_stats_is_a_card_that_counts_only_image_files(monkeypatch, tmp_path):
+    """`/out stats` 是卡片：標題講資料夾數與總張數，清單在描述；只算資料夾裡直接放的圖檔。"""
+    from _chat_platform import flatten_embed  # noqa: PLC0415
+    root = tmp_path / "output"
+    (root / "alice" / "sub.png").mkdir(parents=True)
+    for name in ("a.PNG", "b.jpg", "notes.txt"):
+        (root / "alice" / name).write_bytes(b"x")
+    (root / "bob").mkdir()
+    embeds = _output_stats_embeds(monkeypatch, root)
+    assert len(embeds) == 1 and embeds[0] is not None, embeds
+    assert embeds[0].title == "📁 產出統計：2 個資料夾、共 2 張", embeds[0].title
+    flat = flatten_embed(embeds[0])
+    rows = {line.split()[0]: int(line.split()[-1]) for line in flat.splitlines()
+            if line.split() and line.split()[0] in ("alice", "bob")}
+    assert rows == {"alice": 2, "bob": 0}, flat
+
+
+def test_output_stats_with_many_folders_is_paged_not_cut(monkeypatch, tmp_path):
+    """原本整份截在 1700 字，資料夾一多後面就看不到；現在一頁 30 個，每一個都在某一頁。"""
+    root = tmp_path / "output"
+    names = [f"c{i:02d}" for i in range(70)]
+    for name in names:
+        (root / name).mkdir(parents=True)
+    embeds = _output_stats_embeds(monkeypatch, root)
+    assert [e.footer.text for e in embeds] == ["第 1/3 頁", "第 2/3 頁", "第 3/3 頁"]
+    listed = [line.split()[0] for e in embeds for line in e.description.splitlines()
+              if line.startswith("c")]
+    assert listed == names
 
 
 def _fences_balanced(chunk: str) -> bool:

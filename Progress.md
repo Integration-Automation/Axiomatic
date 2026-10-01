@@ -4,7 +4,7 @@
 
 ## 待辦
 
-- 2026-10-01 **（移植・UI 重新設計之二）bot 回覆版面改版。** Axiomatic 的差異：transport 已經有兩個以上，版面原語的純文字退路一開始就要用能力旗標判，不能只為一個平台寫。完成條件：每換一群指令一個階段提交，每個已接上的平台各實測一次；`architecture.md` 記版面原語。
+- 2026-10-01 **（移植・UI 重新設計之二）bot 回覆版面改版：剩下的部分。** 卡片原語 `_reply_card`、分頁回覆 `_reply_pager` 與已換掉的 `/dorossi running`、`/sys health`、`/gen plan`、`/out stats` 已移植（`architecture.md` §4「回覆版面」）。還缺：(1) `/queue` 與 `/eta` 換成原語、欄位名改中文——上游還沒換（卡在它待套的批次分支），換完再移植；`test/test_bot_helpers.py` 裡讀 `/eta` 欄位名的那一組測試要一起改。(2) 會清空或刪除東西的指令要不要加確認／取消按鈕，等上游擁有者決定；要做的話按鈕的 callback 裡要重新套擁有者閘與角色閘（元件互動不經 `tree.interaction_check`，見 `axiomatic/_reply_pager.py` 的 docstring）。(3) 每個已接上的平台各實測一次：有卡片與按鈕的原生平台看翻頁與逾時停用，`_telegram_transport` 看攤平後的文字與逐頁送出；這一輪只有測試替身，沒有實機跑過。完成條件：三項各一個階段提交。
 - 2026-10-01 **（移植・單一 WebRunner 實體）只留 je_web_runner 變體，拿掉 `axiomatic/webrunner_novelai.py`。** Axiomatic 的差異：它用的是套件庫上的 je_web_runner（`requirements.txt` 的 `je_web_runner>=0.0.88`），Jeffrey_RPA 為了補齊 je 變體而加進函式庫的 API 要先發版，再把下限拉到那個版本（照 `requirements.txt` 的下限註解寫法）。`start_webrunner.py`、`run_batch.py` 的變體選擇一起收斂。完成條件：整批與單張產圖只經 je 變體跑完；`CLAUDE.md`、`architecture.md`、四份 README 改成單一變體；整套測試綠。
 - 2026-10-01 **（移植・WebRunner 優先目錄）函式庫工作樹的位置改成可設定。** Axiomatic 的差異：散布版的使用者多半只有套件庫版本，沒有同層的工作樹，所以設定鍵的預設值要讓「沒設定」直接落到已安裝套件而不警告；新鍵同時寫進 `bot_config.example.json`（佔位值，不得帶任何主機路徑）與 `docs/config.md`。完成條件：每種來源各一支測試；四份 README 說明新鍵。
 - 2026-10-01 **（移植）Bot 的桌面自動化完全改走 AutoControlGUI：剩下要先補進函式庫的那幾項。** 能直接換的三件（打字與組合鍵失敗後的放開交給函式庫的 finally、像素顏色的死分支、UI 型別表）已經移植。剩下的與 Jeffrey_RPA `Progress.md` 同名那筆一樣：OCR、雙擊、拖曳步進、鍵名表要先補進 AutoControlGUI 並**發版**，Axiomatic 用的是套件庫版本，發版之後才能換。完成條件：清單上每一項不是改走函式庫、就是寫明留下的理由；`test_gui_control.py`、`test_gui_facade.py` 綠。
