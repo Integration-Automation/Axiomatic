@@ -2534,13 +2534,22 @@ def _fence_escape(text: str) -> str:
     return text.replace(_CODE_FENCE, "ʼʼʼ")
 
 
+def _clip_text(text: str, limit: int) -> str:
+    """`text` 超過 `limit` 字就截成前 `limit` 字再補一個「…」，否則原樣回傳。
+
+    把使用者給的文字（或由它算出來的文字）原樣送回去的指令都要經過一道上限：單則訊息
+    有長度上限，而斜線選項最多收 6000 字，超過的回覆會被平台整則拒絕，使用者只拿到一句
+    內部錯誤。`/fun reverse`、`/tool urlencode`、`/tool urldecode` 曾經就是那樣；這一支是
+    base64／unbase64／say 原本各自手寫的同一個寫法。"""
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _fence_preview(text: str, limit: int = 120) -> str:
     """Truncate `text` and make it safe to drop inside a ``` code fence.
 
     佇列項目可以是多行、也可以合法地含有 ``` —— 不跳脫的話 fence 會被提前
     關掉，後面的內容就從程式碼區塊漏成一般訊息。"""
-    out = text if len(text) <= limit else text[:limit] + "…"
-    return _fence_escape(out)
+    return _fence_escape(_clip_text(text, limit))
 
 
 def _is_unsafe_folder_name(name: str) -> bool:
@@ -2739,7 +2748,7 @@ def _resolve_list(name: str) -> Path | None:
 def _shorten(text: str, limit: int = 300) -> str:
     if not text:
         return "(empty)"
-    return text if len(text) <= limit else text[:limit] + "…"
+    return _clip_text(text, limit)
 
 
 async def cmd_preview(message: discord.Message) -> None:
@@ -3766,7 +3775,7 @@ async def mcmd_reverse(message: discord.Message, rest: str) -> None:
     if not rest:
         await safe_reply(message, "usage: `/fun reverse <text>`")
         return
-    await safe_reply(message, rest[::-1])
+    await safe_reply(message, _clip_text(rest[::-1], 1900))
 
 
 async def mcmd_ascii(message: discord.Message, rest: str) -> None:
@@ -4868,9 +4877,7 @@ async def mcmd_base64(message: discord.Message, rest: str) -> None:
     if not rest:
         await safe_reply(message, "usage: `/tool base64 <text>`")
         return
-    encoded = _b64.b64encode(rest.encode("utf-8")).decode("ascii")
-    if len(encoded) > 1800:
-        encoded = encoded[:1800] + "…"
+    encoded = _clip_text(_b64.b64encode(rest.encode("utf-8")).decode("ascii"), 1800)
     await safe_reply(message, f"```\n{encoded}\n```")
 
 
@@ -4886,9 +4893,7 @@ async def mcmd_unbase64(message: discord.Message, rest: str) -> None:
         print(f"unbase64 decode failed: {error!r}", file=sys.stderr)
         await safe_reply(message, _owner_error(message, error, "decode failed"))
         return
-    if len(decoded) > 1800:
-        decoded = decoded[:1800] + "…"
-    safe = _fence_escape(decoded)
+    safe = _fence_escape(_clip_text(decoded, 1800))
     await safe_reply(message, f"```\n{safe}\n```")
 
 
@@ -4896,14 +4901,19 @@ async def mcmd_urlencode(message: discord.Message, rest: str) -> None:
     if not rest:
         await safe_reply(message, "usage: `/tool urlencode <text>`")
         return
-    await safe_reply(message, f"`{urllib.parse.quote(rest, safe='')}`")
+    await safe_reply(message, f"`{_clip_text(urllib.parse.quote(rest, safe=''), 1900)}`")
 
 
 async def mcmd_urldecode(message: discord.Message, rest: str) -> None:
     if not rest:
         await safe_reply(message, "usage: `/tool urldecode <text>`")
         return
-    await safe_reply(message, f"`{urllib.parse.unquote(rest)}`")
+    await safe_reply(message, f"`{_clip_text(urllib.parse.unquote(rest), 1900)}`")
+
+
+# QR code 的連結整條就是回覆；超過這個長度就整則送不出去。不用截短：截掉的話 QR code 會安靜地
+# 編進一段不完整的內容，掃出來的東西跟使用者給的不一樣，而且看不出來。
+QR_LINK_MAX = 1900
 
 
 async def mcmd_qr(message: discord.Message, rest: str) -> None:
@@ -4912,10 +4922,14 @@ async def mcmd_qr(message: discord.Message, rest: str) -> None:
         await safe_reply(message, "usage: `/tool qr <text>`")
         return
     encoded = urllib.parse.quote(text)
-    await safe_reply(
-        message,
-        f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={encoded}"
-    )
+    link = f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={encoded}"
+    if len(link) > QR_LINK_MAX:
+        await safe_reply(
+            message,
+            f"text too long for a QR code link (it would be {len(link)} characters; "
+            f"the limit is {QR_LINK_MAX} once URL-encoded)")
+        return
+    await safe_reply(message, link)
 
 
 # ---------- @-mention: discord meta / maintenance --------------------------
@@ -11843,8 +11857,7 @@ async def mcmd_say(message: discord.Message, rest: str) -> None:
     if g is None or message.author.id != g.owner_id:
         await safe_reply(message, "`/tool say` is restricted to the server owner")
         return
-    if len(text) > 1900:
-        text = text[:1900] + "…"
+    text = _clip_text(text, 1900)
     # Don't let `say` turn the bot into a mass-ping relay (@everyone / @here /
     # role pings), even for the owner — suppress all mentions in the output.
     await message.channel.send(
