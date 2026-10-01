@@ -1309,8 +1309,8 @@ _DECLARED_PER_VARIANT = {
 # 現在分工清楚：**下限只負責抓「崩到 0」那一類**（抽取器壞掉、豁免清單倒過來變成
 # 白名單），所以放得夠低；**「範圍有沒有縮掉」交給下面的具名 canary**——那是數字
 # 回答不了的問題，因為 15→12 跟 15→18 在一個 `len()` 上長得一樣。
-_COMMON_FUNC_FLOOR = 10          # 實測 15
-_MIRRORED_FLOOR = 4              # 實測 8（2026-09-09 之前真的是 4，所以這是有據的）
+_COMMON_FUNC_FLOOR = 10          # 實測 16（2026-09-26 加了 `_selenium_manager_binary`）
+_MIRRORED_FLOOR = 4              # 實測 9（2026-09-09 之前真的是 4，所以這是有據的）
 
 # 具名 canary：這幾支不見了就當場點名，不要等某個數字掉破門檻。
 #
@@ -1350,6 +1350,9 @@ _MIRRORED_CANARY = frozenset({
     "_leveldb_manifest_ok",       # profile 快照的完整性判讀
     "_reclaim_dir_sync_residue",  # 同步回寫失敗後的殘留回收
     "_session_entry_present",     # session 還在不在的判讀
+    # 2026-09-26：Selenium Manager 暖機用的執行檔 locator。兩邊必須找同一支——暖機跑的
+    # 若不是繫結等一下跑的那支，拉長的可能是另一份快取的期限。
+    "_selenium_manager_binary",
 })
 
 
@@ -1400,7 +1403,7 @@ def _canary_drift(mirrored, canary) -> tuple:
     ⚠️ **刻意不回傳「受檢總數」，雖然上面那三支都有回傳。** 那三支需要它，是因為它們
     的名冊是被檢集合的**子集**，所以「被檢集合空了」會讓兩個方向同時真空通過。這一支
     不一樣：名冊要求與 `mirrored` **相等**，所以 `mirrored` 空掉的話
-    `unwatched` 會一次列出全部 8 個名字、大聲地紅，而且 `_MIRRORED_FLOOR` 在它之前
+    `unwatched` 會一次列出全部名字（2026-09-26 是 9 個）、大聲地紅，而且 `_MIRRORED_FLOOR` 在它之前
     就先擋掉了。在這裡加一個下限斷言會是**死儀式**——一個永遠成立、刪掉也沒有變異殺
     得掉的斷言，正是本輪一路在拆的東西。
     """
@@ -1638,7 +1641,7 @@ def test_the_divergence_reconciliation_actually_compares(monkeypatch):
 def test_the_mirror_list_is_derived_not_a_hardcoded_set(tmp_path):
     """釘住「要比哪些函式是算出來的」。
 
-    今天寫死的 8 支剛好就是「共有 − 宣告分歧」的答案，所以真實資料上兩種寫法分不
+    寫死的那份名冊（2026-09-26 是 9 支）剛好就是「共有 − 宣告分歧」的答案，所以真實資料上兩種寫法分不
     出來（§8.8(A3)）。唯一分辨得出來的辦法是餵它一個**任何手寫清單都不可能含有**
     的名字——而那正是這道守門要防的情境：有人在兩個變體都加了一支新 helper。
     """

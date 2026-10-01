@@ -774,10 +774,25 @@ def _sync_chrome_profile_back(snapshot: Path) -> None:
               f"{', '.join(absent)}", file=sys.stderr)
 
 
+def _selenium_manager_binary() -> Path:
+    """selenium 內附的 `selenium-manager` 執行檔（給 `ws.warm_up_selenium_manager`）。
+
+    詳見 `webrunner_novelai` 的同名函式；兩份逐字相同（鏡像對帳）。
+    """
+    from selenium.webdriver.common.selenium_manager import SeleniumManager
+    return SeleniumManager._get_binary()  # pylint: disable=protected-access
+
+
 def start_driver() -> None:
     """Boot Chrome via WebDriverWrapper with full anti-bot stealth + snapshot
     profile（避開 .chrome_profile/ 可能被 Defender / OneDrive / Explorer
     抓住的 lockfile）。
+
+    **開機前先看 Selenium Manager 的解析紀錄，到期才暖機——這一側也需要。**
+    `wr.set_driver` 裡的 `ChromeDriverManager(...).install()` 回傳值被丟掉，真正送進
+    `webdriver.Chrome` 的是下面那個沒有 `executable_path` 的 `ChromeService`，所以
+    driver 跟 selenium 變體一樣由 Selenium Manager 解析（實測過），
+    到期時一樣要多花 1～3 分鐘重抓版本清單。
 
     **chromedriver 的記錄檔在這一側也會產生（2026-09-09 接上）。** 在那之前這個
     變體完全沒有它，於是 spawn 失敗只留下本函式結尾那句猜測；而 `/run` 的預設變體
@@ -797,6 +812,9 @@ def start_driver() -> None:
     握著，中途截斷會被作業系統補零。
     """
     from selenium.webdriver.chrome.service import Service as ChromeService
+
+    # 與 selenium 變體同一個位置、同一個理由：最先做、只做一次、絕不丟例外。
+    ws.warm_up_selenium_manager(_selenium_manager_binary)
 
     _trim_chromedriver_log()
     _rotate_chromedriver_log()

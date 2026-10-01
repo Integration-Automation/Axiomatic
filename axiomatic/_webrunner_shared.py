@@ -35,10 +35,14 @@ import math
 import os
 import random
 import re
+# Only used to run the selenium-manager bundled with selenium (`warm_up_selenium_manager`);
+# argv is a list, no shell, and the executable path comes from the variant via selenium's
+# own locator.
+import subprocess  # nosec B404
 import sys
 import time
 import traceback
-from collections.abc import Container
+from collections.abc import Callable, Container
 from pathlib import Path, PureWindowsPath
 
 from _batch_config import load_batch_config  # permitted passive shared loader
@@ -1868,6 +1872,283 @@ def _rotate_chromedriver_log() -> None:
         print(f"failed to keep the previous chromedriver.log ({type(error).__name__}): "
               f"if this run crashes there will be no earlier session's log to look at.",
               file=sys.stderr)
+
+
+# ---------- Selenium Manager warm-up: one chromedriver resolution lasts a day ---------
+#
+# Both variants build `ChromeService` **deliberately without** `executable_path`, so every
+# Chrome start has Selenium Manager resolve chromedriver — the je variant too: the return
+# value of `je_web_runner`'s `ChromeDriverManager(...).install()` is discarded, and the
+# `Service.path` passed in is empty. Selenium Manager records the result in
+# `se-metadata.json` as `drivers[].driver_ttl` (absolute epoch seconds) and by default grants
+# only 3600 seconds; the next resolution after expiry re-downloads a version list of about
+# 5 MB, measured at 1–3 extra minutes per Chrome restart.
+#
+# The **only** thing that extends that lifetime is the command-line `--ttl` (the config
+# file's `ttl` and the `SE_TTL` environment variable were both measured and do nothing; a
+# config-file `ttl` written as a string even makes selenium-manager panic), and selenium's
+# Python bindings never pass `--ttl`. What works is a warm-up: the expiry written by
+# `--ttl 86400` is kept as is by later ordinary resolutions that carry no `--ttl`, and those
+# go straight to the local copy (measured: 42 ms, no network). So before starting Chrome,
+# read `driver_ttl` once and run `selenium-manager --browser chrome --ttl 86400` **only when
+# it has expired**; running it every time saves nothing.
+#
+# ※ **Never write a number into `se-metadata.json` yourself.** `json.dump` writes
+# `time.time() + 86400` as a float, and that field must be an integer; a type mismatch makes
+# selenium-manager treat the **whole** metadata file as absent — no error, it just goes to
+# the network on every resolution from then on (measured 0.030 s vs 1.63 s). This code only
+# reads; writing is left entirely to selenium-manager.
+#
+# It lives in the shared module because the decision and the run need only the standard
+# library and are identical for both variants; the one thing that needs selenium is "where
+# is the bundled executable", and this module must not import selenium
+# (`test_shared_is_driver_agnostic`), so the variant passes the locator in.
+
+# The lifetime the warm-up writes. The same value a manual warm-up was measured with, where
+# "ordinary resolutions keep it as is" was confirmed.
+SELENIUM_MANAGER_WARMUP_TTL_SEC = 86400
+# The wait ceiling for the warm-up. It performs the very download the bindings would have
+# done (measured 1 min 21 s – 2 min 43 s for the whole thing, 48 s for the download step), so
+# the ceiling has to clear the slow end: cut it off when it is nearly done and the bindings
+# download the same thing again. A timeout only falls back to today's behaviour (the
+# bindings resolve it); it does not block the start.
+SELENIUM_MANAGER_WARMUP_TIMEOUT_SEC = 180.0
+# "Less than this left" counts as expired too. Between the moment this is read and the
+# moment the bindings actually resolve lie the profile snapshot, up to three spawn attempts
+# and the orphan sweeps between them; if it expires inside that stretch, the bindings see a
+# record that has just expired and go to the network all the same.
+_SELENIUM_MANAGER_WARMUP_MARGIN_SEC = 600
+_SE_CHROMEDRIVER = "chromedriver"
+
+
+def selenium_manager_cache_dir() -> Path:
+    """Selenium Manager's cache directory: `SE_CACHE_PATH` when set, else `~/.cache/selenium`.
+
+    selenium-manager honours that environment variable itself, and the bindings pass the
+    environment through unchanged when calling it, so the warm-up reads the same file the
+    bindings use. The value is used **as is**, `~` is not expanded: a relative path means the
+    same working directory to both. With no home directory `Path.home()` raises
+    `RuntimeError`, which the caller handles.
+    """
+    raw = os.environ.get("SE_CACHE_PATH", "").strip()
+    if raw:
+        return Path(raw)
+    return Path.home() / ".cache" / "selenium"
+
+
+def _real_int(value) -> bool:
+    """An integer selenium-manager can deserialise: `int` but not `bool` (a subclass of `int`)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _ascii_safe(value) -> str:
+    """Squash text from outside (the metadata file, selenium-manager's output) to plain ASCII
+    before printing it.
+
+    With stdout / stderr on a pipe using the locale codec, an unencodable character makes
+    `print()` itself raise `UnicodeEncodeError` — the warm-up's contract is to never raise,
+    and such a character only ever shows up when nobody expects it.
+    """
+    return str(value).encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _major_rank(entry: dict) -> int:
+    """`major_browser_version` (a string in the file, e.g. `"153"`) compared as a number;
+    unreadable ones sort last."""
+    raw = entry.get("major_browser_version")
+    return int(raw) if isinstance(raw, str) and raw.isdigit() else -1
+
+
+def read_chromedriver_ttl(metadata_path: Path) -> tuple[int | None, str]:
+    """Read `se-metadata.json` and return `(chromedriver's driver_ttl, description)`.
+
+    A `driver_ttl` of `None` means **this record cannot be trusted** and the description is
+    the reason; the caller always treats it as expired. When it can be trusted the description
+    is "chromedriver <version> (Chrome <major>)".
+
+    * **Any** `drivers[].driver_ttl` that is not an integer (float, string, `bool`, missing)
+      makes it untrusted, not just chromedriver's own: when deserialisation fails
+      selenium-manager discards the **whole** file, so one bad entry is the same as no record
+      — and the warm-up rewrites the whole file clean.
+    * With several chromedriver entries (when Chrome changes major version the old one stays
+      until the next write), look at the one with the **highest major version**: Chrome only
+      updates forward, so that is the installed one. The cost of guessing wrong is bounded —
+      this time the bindings go to the network anyway and write the new major's entry, and the
+      next restart sees it expire and warms up.
+    * Read-only, never writes, never raises.
+    """
+    name = metadata_path.name
+    try:
+        raw = metadata_path.read_bytes()
+    except FileNotFoundError:
+        return None, f"{name} not found (nothing resolved yet)"
+    except OSError as error:
+        return None, f"{name} cannot be read ({type(error).__name__})"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, f"{name} is not valid UTF-8 JSON"
+    drivers = data.get("drivers") if isinstance(data, dict) else None
+    if not isinstance(drivers, list):
+        return None, f"{name} has no drivers list"
+    for index, entry in enumerate(drivers):
+        ttl = entry.get("driver_ttl") if isinstance(entry, dict) else None
+        if not _real_int(ttl):
+            return None, (f"{name} drivers[{index}].driver_ttl is not an integer "
+                          f"({type(ttl).__name__}); selenium-manager treats the whole "
+                          f"file as broken")
+    chrome = [entry for entry in drivers
+              if entry.get("driver_name") == _SE_CHROMEDRIVER]
+    if not chrome:
+        return None, f"{name} has no chromedriver resolution record"
+    top = max(_major_rank(entry) for entry in chrome)
+    newest = [entry for entry in chrome if _major_rank(entry) == top]
+    best = max(newest, key=lambda entry: entry["driver_ttl"])
+    return best["driver_ttl"], (
+        f"chromedriver {_ascii_safe(best.get('driver_version'))} "
+        f"(Chrome {_ascii_safe(best.get('major_browser_version'))})")
+
+
+def _driver_ttl_fresh(ttl: int | None, now: float) -> bool:
+    """Is the lifetime still enough — "less than `_SELENIUM_MANAGER_WARMUP_MARGIN_SEC` left"
+    counts as expired too.
+
+    selenium-manager's own test is `driver_ttl > now`; this keeps a margin, for the reason at
+    that constant.
+    """
+    return ttl is not None and ttl > now + _SELENIUM_MANAGER_WARMUP_MARGIN_SEC
+
+
+def _selenium_manager_failure_note(completed) -> str:
+    """The most useful sentence when selenium-manager fails: the JSON `result.message`, the
+    last WARN / ERROR log entry, or the last line of stderr (a panic over a wrong type in
+    `se-config.toml` skips the JSON and only reaches stderr). The return value goes through
+    `_ascii_safe` (this sentence is printed on the failure path only).
+    """
+    note = ""
+    try:
+        payload = json.loads(completed.stdout or "")
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        result = payload.get("result")
+        if isinstance(result, dict) and isinstance(result.get("message"), str):
+            note = result["message"].strip()
+        logs = payload.get("logs")
+        if not note and isinstance(logs, list):
+            for item in reversed(logs):
+                if (isinstance(item, dict) and item.get("level") in ("WARN", "ERROR")
+                        and isinstance(item.get("message"), str)):
+                    note = item["message"].strip()
+                    break
+    if not note:
+        lines = [line for line in (completed.stderr or "").splitlines()
+                 if line.strip()]
+        note = lines[-1].strip() if lines else ""
+    return _ascii_safe(" ".join(note.split())[:200]) if note else "(no output at all)"
+
+
+def warm_up_selenium_manager(locate_binary: Callable[[], Path | str]) -> bool:
+    """Call before starting Chrome: warm up once, only when chromedriver's resolution record
+    has expired (or cannot be read).
+
+    `locate_binary` returns the path of the `selenium-manager` executable bundled with
+    selenium; it is called only when a warm-up is really needed. Return value: whether the
+    resolution record is fresh after this step.
+
+    **Never raises, and the wait is bounded.** The warm-up is a side path: failing costs only
+    a fall back to today's behaviour (the bindings resolve it, over the network as before);
+    blocking the start is the real loss. Every kind of failure prints one line and returns
+    `False`.
+
+    **Judged by the result, not the attempt.** selenium-manager returning 0 does not mean the
+    lifetime was really extended, so the metadata is re-read afterwards: with less than half
+    the lifetime left (say a version that stops honouring `--ttl`) it says so, or else
+    "warming up on every restart, downloading for nothing every time" would look exactly like
+    normal.
+    """
+    try:
+        metadata = selenium_manager_cache_dir() / "se-metadata.json"
+    except RuntimeError as error:          # `Path.home()` cannot find a home directory
+        print(f"  [driver-warmup] Selenium Manager's cache directory cannot be found "
+              f"({type(error).__name__}); skipping the warm-up", file=sys.stderr)
+        return False
+    now = time.time()
+    ttl, detail = read_chromedriver_ttl(metadata)
+    if _driver_ttl_fresh(ttl, now):
+        print(f"  [driver-warmup] the resolution record for {detail} expires in "
+              f"{(ttl - now) / 3600:.1f} h; no warm-up needed")
+        return True
+    if ttl is None:
+        reason = detail
+    elif ttl <= now:
+        reason = (f"the resolution record for {detail} expired "
+                  f"{(now - ttl) / 60:.0f} min ago")
+    else:
+        reason = (f"the resolution record for {detail} expires in "
+                  f"{(ttl - now) / 60:.0f} min")
+
+    try:
+        binary = locate_binary()
+    except Exception as error:  # pylint: disable=broad-except
+        # The locator comes from the variant and raises the driver package's own exceptions
+        # (selenium raises `WebDriverException` when the bundled executable is missing, and a
+        # renamed private API is an `AttributeError`); this module cannot import that
+        # package, so it cannot name those types.
+        print(f"  [driver-warmup] {reason}, but the selenium-manager executable cannot be "
+              f"found ({_long_error(error)}); leaving resolution to Selenium Manager as "
+              f"usual", file=sys.stderr)
+        return False
+
+    argv = [str(binary), "--browser", "chrome",
+            "--ttl", str(SELENIUM_MANAGER_WARMUP_TTL_SEC), "--output", "json"]
+    print(f"  [driver-warmup] {reason}; running selenium-manager "
+          f"--ttl {SELENIUM_MANAGER_WARMUP_TTL_SEC} to warm up "
+          f"(at most {SELENIUM_MANAGER_WARMUP_TIMEOUT_SEC:.0f} s)")
+    started = time.monotonic()
+    try:
+        # The output is UTF-8: selenium-manager is a Rust program that writes UTF-8 bytes
+        # straight to a pipe without looking at the console code page — selenium's own
+        # `SeleniumManager._run` decodes it as utf-8 too.
+        completed = subprocess.run(  # nosec B603
+            argv, capture_output=True, stdin=subprocess.DEVNULL,
+            encoding="utf-8", errors="replace", check=False,
+            timeout=SELENIUM_MANAGER_WARMUP_TIMEOUT_SEC,
+            # Same as when selenium calls it: do not pop up a console window.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        print(f"  [driver-warmup] selenium-manager did not finish within "
+              f"{SELENIUM_MANAGER_WARMUP_TIMEOUT_SEC:.0f} s, warm-up abandoned; "
+              f"leaving resolution to Selenium Manager as usual", file=sys.stderr)
+        return False
+    except (OSError, ValueError) as error:
+        print(f"  [driver-warmup] selenium-manager could not be started "
+              f"({type(error).__name__}); leaving resolution to Selenium Manager as usual",
+              file=sys.stderr)
+        return False
+    elapsed = time.monotonic() - started
+    if completed.returncode != 0:
+        print(f"  [driver-warmup] selenium-manager exit code {completed.returncode} "
+              f"({elapsed:.1f} s): {_selenium_manager_failure_note(completed)}; "
+              f"leaving resolution to Selenium Manager as usual", file=sys.stderr)
+        return False
+
+    after = time.time()
+    new_ttl, new_detail = read_chromedriver_ttl(metadata)
+    if not _driver_ttl_fresh(new_ttl, after):
+        print(f"  [driver-warmup] selenium-manager reported success ({elapsed:.1f} s), "
+              f"but the resolution record is still unusable: {new_detail}", file=sys.stderr)
+        return False
+    remaining = new_ttl - after
+    if remaining < SELENIUM_MANAGER_WARMUP_TTL_SEC / 2:
+        print(f"  [driver-warmup] warm-up finished ({elapsed:.1f} s), but the resolution "
+              f"record for {new_detail} has only {remaining / 3600:.1f} h left — `--ttl` "
+              f"may not have been honoured, and every restart will warm up again",
+              file=sys.stderr)
+        return True
+    print(f"  [driver-warmup] warm-up done ({elapsed:.1f} s): the resolution record for "
+          f"{new_detail} now expires in {remaining / 3600:.1f} h")
+    return True
 
 
 # ---------- file helpers -----------------------------------------------------

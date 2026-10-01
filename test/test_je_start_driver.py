@@ -62,7 +62,7 @@ def boot(monkeypatch, tmp_path):
         # 腳本：每次嘗試要丟的例外，`None` ＝ 成功。
         script=[None],
         order=[], set_driver_calls=[], services=[], snapshots=[],
-        cleared=[], kills=0, dumps=0, sleeps=[],
+        cleared=[], kills=0, dumps=0, sleeps=[], warmups=[],
         versions=[], versions_raise=None, stealth=[], stealth_raise=None,
         caps={"browserVersion": "153.0.0.0"},
     )
@@ -94,6 +94,12 @@ def boot(monkeypatch, tmp_path):
             env.order.append("service")
 
     monkeypatch.setattr(chrome_service, "Service", _FakeService)
+    # ※ **這一行不能省。** 沒有它，`start_driver()` 會真的去讀這台機器的 Selenium
+    # Manager 快取，到期就真的跑 selenium-manager（連網、改寫正式快取）。暖機本身的
+    # 行為由 `test_driver_warmup.py` 測；這裡只記下它被呼叫、排在哪裡。
+    monkeypatch.setattr(ws, "warm_up_selenium_manager",
+                        lambda locate: (env.warmups.append(locate),
+                                        env.order.append("warmup")))
     monkeypatch.setattr(je, "_trim_chromedriver_log",
                         lambda: env.order.append("trim"))
     monkeypatch.setattr(je, "_rotate_chromedriver_log",
@@ -165,6 +171,21 @@ def test_the_log_is_capped_and_rotated_before_the_service_is_built(boot):
     assert boot.order.index("trim") < boot.order.index("service")
     assert boot.order.index("rotate") < boot.order.index("service")
     assert boot.order.index("trim") < boot.order.index("rotate")
+
+
+def test_the_driver_warmup_runs_first_and_once_even_when_the_spawn_retries(boot):
+    """Selenium Manager 暖機排在一切之前，整次開機只做一次——重試迴圈裡不再做。
+
+    je 這一側也要暖機：`wr.set_driver` 丟掉 `install()` 的回傳值，driver 跟 selenium
+    變體一樣由 Selenium Manager 解析。暖機本身的
+    行為在 `test_driver_warmup.py`。
+    """
+    boot.script = [_WrapperError("first attempt fails"), None]
+    je.start_driver()
+    assert len(boot.set_driver_calls) == 2, "前提：真的重試了一次"
+    assert boot.order[0] == "warmup", boot.order
+    assert boot.order.count("warmup") == 1, boot.order
+    assert boot.warmups == [je._selenium_manager_binary]
 
 
 def test_the_snapshot_is_taken_and_unlocked_before_chrome_is_told_about_it(boot):

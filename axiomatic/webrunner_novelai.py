@@ -1060,11 +1060,25 @@ def _sync_chrome_profile_back(snapshot: Path) -> None:
               f"{', '.join(absent)}", file=sys.stderr)
 
 
+def _selenium_manager_binary() -> Path:
+    """selenium 內附的 `selenium-manager` 執行檔（給 `ws.warm_up_selenium_manager`）。
+
+    用 selenium 自己的 locator，不自己拼路徑：它先認 `SE_MANAGER_PATH`，所以暖機跑的
+    一定是繫結等一下解析 driver 時跑的同一支——換成另一支的話，拉長的可能是另一份
+    快取的期限。`_get_binary` 是私有 API（selenium 沒有公開的替代）；改名的話這裡丟
+    `AttributeError`，暖機印一行就略過，`test_driver_warmup` 會先紅。找不到執行檔時
+    丟 `WebDriverException`，同樣由暖機接住。兩個變體逐字相同（鏡像對帳）。
+    """
+    from selenium.webdriver.common.selenium_manager import SeleniumManager
+    return SeleniumManager._get_binary()  # pylint: disable=protected-access
+
+
 def build_stealth_driver() -> webdriver.Chrome:
     """Spawn Chrome 用 snapshot profile（避開原 `.chrome_profile/`
     可能被 Defender / OneDrive / Explorer 抓住的 lockfile）。
 
-    流程：snapshot 原 profile → 用 snapshot 開 Chrome → 失敗 retry 一次。
+    流程：（chromedriver 的解析紀錄到期才）暖機 Selenium Manager → snapshot 原
+    profile → 用 snapshot 開 Chrome → 失敗 retry 一次。
     Webrunner 結束時 `_sync_chrome_profile_back` 把登入寫回。
 
     chromedriver 的記錄寫到 `chromedriver.log`；spawn 真失敗時去
@@ -1077,6 +1091,11 @@ def build_stealth_driver() -> webdriver.Chrome:
     `_kill_orphan_chrome()`）。前提為什麼是硬性的見 `_trim_chromedriver_log`。
     """
     from selenium.webdriver.chrome.service import Service as ChromeService
+
+    # 最先做、而且只做一次（不在下面的重試迴圈裡）：解析紀錄到期才暖機，讓繫結等一下
+    # 那次解析走本機。排在快照之前，log 裡 `snapshot profile` → `[driver]` 的間隔量到
+    # 的就只是繫結解析本身；暖機花多久由它自己那一行交代。絕不丟例外（見該函式）。
+    ws.warm_up_selenium_manager(_selenium_manager_binary)
 
     # 封頂與保留都要在建立 `ChromeService` 之前——它會把路徑變成 chromedriver 的
     # `--log-path=`，之後那個檔就有行程握著了，中途截斷會被補零（實測）。
